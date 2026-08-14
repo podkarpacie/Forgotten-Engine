@@ -28,7 +28,7 @@
 - [x] Define the initial network-capable vertical slice, including a non-production protocol handshake and explicit compatibility limits.
 - [x] Add configuration-driven host/port settings, a persistent TCP listener, graceful shutdown, connection limits, and structured session logging.
 - [x] Implement a bounded diagnostic-session handshake without claiming official Tibia 7.4 packet compatibility.
-- [ ] Implement independently specified account and character-list services after the version-specific 7.4 login codec is defined and tested.
+- [x] Implement independently specified account and character-list services after the version-specific 7.4 login codec is defined and tested.
 - [x] Add TCP integration tests for accepted connections, malformed input, protocol framing, and orderly shutdown.
 - [x] Update runtime documentation to identify exactly what a test client can connect to and what still prevents official Tibia-client interoperability.
 - [x] Validate, commit, and push the tested network-host milestone with no misleading "playable server" claim.
@@ -57,3 +57,10 @@
 - [x] Integrate the opt-in game-session foundation with the host while preserving diagnostic and character-list behaviors.
 - [x] Update runtime, parity, and README documents to distinguish session foundations from official Tibia-client compatibility.
 - [x] Validate formatting, full tests, strict linting, optimized builds, and Windows cross-compilation before publication approval for the session milestone.
+- [x] Define and document the supported OTClient-oriented fe-7.4 custom-client boundary, with no official Tibia-client compatibility claim.
+- [x] Add typed endpoint advertisement settings suitable for OTClient deployments, proxies, and IP-changing redirection without embedding a proprietary client patcher.
+- [x] Specify and test an original custom-client capability handshake that negotiates the FE session-foundation feature set.
+- [x] Implement a deterministic minimal initial-world response containing character identity, start position, and explicit empty-world/map feature gates.
+- [x] Integrate custom-client negotiation and initial-world initialization into the opt-in game-session listener with encrypted TCP fixtures.
+- [x] Update operator documentation with OTClient connection expectations and safe endpoint/IP redirection guidance.
+- [x] Validate formatting, all tests, strict linting, optimized builds, and Windows cross-compilation before publication approval for the OTClient milestone.

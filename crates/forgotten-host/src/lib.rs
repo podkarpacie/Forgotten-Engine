@@ -4,14 +4,16 @@
 
 use forgotten_persistence::EngineDatabase;
 use forgotten_protocol::{
-    decode, decode_legacy_74_envelope, decode_legacy_74_game_session_bootstrap_plaintext,
-    decode_legacy_74_game_session_envelope, decode_legacy_74_login_plaintext,
-    decode_status_request, encode, encode_legacy_74_character_list,
-    encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
-    encode_legacy_74_game_session_ready, encode_login_error, encode_status_binary,
-    encode_status_xml, generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
-    CompatibilityProfile, Frame, Legacy74GameSessionState, LegacyRsaPrivateKey, ProtocolError,
-    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    decode, decode_fe_otclient_capability_ack, decode_legacy_74_envelope,
+    decode_legacy_74_game_session_bootstrap_plaintext, decode_legacy_74_game_session_envelope,
+    decode_legacy_74_login_plaintext, decode_status_request, encode,
+    encode_fe_otclient_capability_offer, encode_fe_otclient_initial_world,
+    encode_legacy_74_character_list, encode_legacy_74_game_challenge,
+    encode_legacy_74_game_session_error, encode_legacy_74_game_session_ready, encode_login_error,
+    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, Frame, InitialWorldSnapshot,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, OtClientEndpoint, ProtocolError, StatusPlayer,
+    StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
 };
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -58,6 +60,7 @@ pub struct GameSessionHostConfig {
     pub bind_addr: SocketAddr,
     pub profile: CompatibilityProfile,
     pub rsa_private_key: Arc<LegacyRsaPrivateKey>,
+    pub advertised_endpoint: OtClientEndpoint,
     pub max_connections: usize,
     pub session_timeout: Duration,
 }
@@ -421,17 +424,17 @@ fn handle_game_session(
             "Account name or password is not correct.",
         );
     };
-    if !account
+    let Some(character) = account
         .characters
         .iter()
-        .any(|character| character.name == bootstrap.request.character_name)
-    {
+        .find(|character| character.name == bootstrap.request.character_name)
+    else {
         return send_game_session_error(
             stream,
             bootstrap.xtea_key,
             "Character is not available on this account.",
         );
-    }
+    };
     let authenticated = Legacy74GameSessionState::Authenticated {
         account_id: account.id,
         character_name: bootstrap.request.character_name.clone(),
@@ -444,6 +447,41 @@ fn handle_game_session(
         stream,
         bootstrap.xtea_key,
         &encode_legacy_74_game_session_ready(&bootstrap.request.character_name),
+    )?;
+    write_game_session_response(
+        stream,
+        bootstrap.xtea_key,
+        &encode_fe_otclient_capability_offer(&config.advertised_endpoint),
+    )?;
+    let acknowledgement = read_frame(stream)?;
+    let acknowledgement =
+        forgotten_protocol::xtea_decrypt_packet(&acknowledgement.0, bootstrap.xtea_key)
+            .map_err(HostError::Protocol)?;
+    if let Err(error) = decode_fe_otclient_capability_ack(&Frame(acknowledgement)) {
+        let _ = send_game_session_error(
+            stream,
+            bootstrap.xtea_key,
+            "A compatible FE OTClient module must acknowledge fe.otclient.v1.",
+        );
+        return Err(HostError::Protocol(error));
+    }
+    let custom_client = Legacy74GameSessionState::CustomClientNegotiated {
+        character_name: bootstrap.request.character_name.clone(),
+    };
+    database.record_event(
+        "info",
+        &format!("game session state peer={peer} state={custom_client:?}"),
+    )?;
+    write_game_session_response(
+        stream,
+        bootstrap.xtea_key,
+        &encode_fe_otclient_initial_world(&InitialWorldSnapshot {
+            character_name: bootstrap.request.character_name.clone(),
+            start_x: character.position.x,
+            start_y: character.position.y,
+            start_z: character.position.z,
+            endpoint: config.advertised_endpoint.clone(),
+        }),
     )?;
     let feature_gate = Legacy74GameSessionState::FeatureGated {
         character_name: bootstrap.request.character_name,
@@ -761,6 +799,10 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             profile: FE_7_4_PROFILE,
             rsa_private_key: key,
+            advertised_endpoint: OtClientEndpoint {
+                host: "fe.example.test".into(),
+                port: 443,
+            },
             max_connections: 2,
             session_timeout: Duration::from_millis(250),
         }
@@ -943,9 +985,26 @@ mod tests {
             response[0],
             forgotten_protocol::LEGACY_74_GAME_SESSION_READY_OPCODE
         );
-        assert!(response
-            .windows(b"feature-gated".len())
-            .any(|window| window == b"feature-gated"));
+        let offer = read_frame(&mut stream).unwrap();
+        let offer = forgotten_protocol::xtea_decrypt_packet(&offer.0, bootstrap.xtea_key).unwrap();
+        assert_eq!(offer[0], forgotten_protocol::FE_OTCLIENT_EXTENDED_OPCODE);
+        let acknowledgement = forgotten_protocol::encode_fe_otclient_capability_ack_for_harness();
+        let acknowledgement =
+            forgotten_protocol::xtea_encrypt_packet(&acknowledgement.0, bootstrap.xtea_key)
+                .unwrap();
+        write_frame(&mut stream, &Frame(acknowledgement)).unwrap();
+        let world = read_frame(&mut stream).unwrap();
+        let world = forgotten_protocol::xtea_decrypt_packet(&world.0, bootstrap.xtea_key).unwrap();
+        assert_eq!(world[0], forgotten_protocol::FE_OTCLIENT_EXTENDED_OPCODE);
+        assert!(world
+            .windows(b"fe.example.test:443".len())
+            .any(|window| window == b"fe.example.test:443"));
+        assert!(world
+            .windows(b"position=100,100,7".len())
+            .any(|window| window == b"position=100,100,7"));
+        assert!(world
+            .windows(b"empty-gated".len())
+            .any(|window| window == b"empty-gated"));
         host.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }

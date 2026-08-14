@@ -23,7 +23,9 @@ For the `fe-7.4` profile only, an operator may enable an **original, bounded leg
 
 An operator can separately set `gameSessionEnabled = true` to expose the **fe-7.4 game-session foundation** on `gameSessionPort` (default `7173`). This deliberately nonconflicting, opt-in endpoint sends a challenge, validates a challenge-bound raw-RSA bootstrap, authenticates that the named character belongs to the supplied account, and returns an XTEA-wrapped explicit world/map feature-gate response. It is a session-boundary test harness, not a playable game endpoint.
 
-It is still **not** an official Tibia login/game service. The login and game-session foundations do not yet establish that an official client emits the precise accepted packet sequence or accepts the current response sequence. They do not provide client-visible world initialization, map/datapack loading, combat, scripting, or continuous world simulation.
+When `gameSessionEnabled` is active, FE can advertise a separately configured public route to a custom OTClient module through `advertisedGameSessionHost` and `advertisedGameSessionPort`. These fields support a domain, proxy, tunnel, or IP-changing route without changing the local bind address. The exact FE custom-client acknowledgement and feature boundary are documented in [OTCLIENT_INTEGRATION.md](OTCLIENT_INTEGRATION.md).
+
+It is still **not** an official Tibia login/game service. The login and game-session foundations do not yet establish that an official client emits the precise accepted packet sequence or accepts the current response sequence. The FE-aware custom OTClient path returns only initial identity, stored position, endpoint metadata, and an empty-world gate; it does not provide normal map/datapack loading, combat, scripting, or continuous world simulation.
 
 ## Path to a connectable server
 
@@ -31,7 +33,7 @@ It is still **not** an official Tibia login/game service. The login and game-ses
 |---|---|---|
 | Long-running host/status | Game and status TCP listeners, graceful shutdown, connection caps/timeouts, session logs, `config.lua` port configuration, and status responses. | Implemented for the diagnostic game endpoint and TFS-style status query families; world tick loop remains planned. |
 | 7.4 login path | Login packet parsing, account/character-list response, RSA/XTEA boundary, and protocol tests based on an independently written specification. | Foundation implemented behind `legacyLoginEnabled`; authorized packet fixtures and official-client acceptance remain pending. |
-| 7.4 game path | Game-session handshake, bounded opcode decoding/encoding, movement, visibility, chat, and client-state synchronization. | Challenge-bound bootstrap and explicit feature-gate response implemented on opt-in `gameSessionPort`; world-session behavior remains unimplemented. |
+| 7.4 game path | Game-session handshake, bounded opcode decoding/encoding, movement, visibility, chat, and client-state synchronization. | Challenge-bound bootstrap, FE-aware OTClient capability acknowledgement, stored identity/position metadata, and explicit empty-world gate implemented on opt-in `gameSessionPort`; world-session behavior remains unimplemented. |
 | World content | Original-compatible map/item loaders, validation, spawn management, and data migration rules. | Not implemented |
 | Gameplay | Combat, conditions, creatures, inventories, NPC/monster behavior, and persistence transactions. | Not implemented |
 | Script/runtime integration | A deliberately specified Lua or alternative scripting API with capability tests. | Planned only |

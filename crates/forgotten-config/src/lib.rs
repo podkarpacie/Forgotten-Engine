@@ -46,6 +46,8 @@ pub struct EngineConfig {
     pub rsa_private_key_path: PathBuf,
     pub game_session_enabled: bool,
     pub game_session_port: u16,
+    pub advertised_game_session_host: String,
+    pub advertised_game_session_port: u16,
 }
 
 impl EngineConfig {
@@ -109,7 +111,7 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
     })?;
     let values = parse_assignments(&contents)?;
 
-    let bind_ip =
+    let bind_ip: IpAddr =
         required_string(&values, "ip")?
             .parse()
             .map_err(|_| ConfigError::InvalidValue {
@@ -135,6 +137,12 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         });
     }
 
+    let game_session_port = optional_u16(&values, "gameSessionPort", 7173)?;
+    let advertised_game_session_host =
+        optional_string_owned(&values, "advertisedGameSessionHost", bind_ip.to_string())?;
+    let advertised_game_session_port =
+        optional_u16(&values, "advertisedGameSessionPort", game_session_port)?;
+
     Ok(EngineConfig {
         bind_ip,
         game_protocol_port,
@@ -158,7 +166,9 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
             "key.pem",
         )?),
         game_session_enabled: optional_boolean(&values, "gameSessionEnabled", false)?,
-        game_session_port: optional_u16(&values, "gameSessionPort", 7173)?,
+        game_session_port,
+        advertised_game_session_host,
+        advertised_game_session_port,
     })
 }
 
@@ -224,7 +234,7 @@ pub fn validate_content(world_directory: impl AsRef<Path>) -> Result<ContentRepo
 
 pub fn template(profile: CompatibilityProfile) -> String {
     format!(
-        "-- Forgotten Engine configuration\n-- TFS-style layout; parsed as a bounded assignment subset during P0.\n\n-- Connection Config\nip = \"127.0.0.1\"\ngameProtocolPort = 7172\nstatusProtocolPort = 7171\nmaxPlayers = 0\nserverName = \"Forgotten Engine\"\n\n-- Legacy login foundation\n-- Set true only after providing an original 1024-bit RSA private key.\nlegacyLoginEnabled = false\nrsaPrivateKey = \"key.pem\"\n\n-- Legacy game-session foundation\n-- Separate opt-in port until official session compatibility is proven.\ngameSessionEnabled = false\ngameSessionPort = 7173\n\n-- Map\nmapName = \"forgotten\"\nworldType = \"pvp\"\n\n-- MySQL compatibility contract (SQLite remains the current storage backend)\nmysqlHost = \"127.0.0.1\"\nmysqlUser = \"forgottenengine\"\nmysqlDatabase = \"forgottenengine\"\n\n-- Forgotten Engine profile\nfeProfile = \"{}\"\ntibiaProtocol = \"{}\"\n",
+        "-- Forgotten Engine configuration\n-- TFS-style layout; parsed as a bounded assignment subset during P0.\n\n-- Connection Config\nip = \"127.0.0.1\"\ngameProtocolPort = 7172\nstatusProtocolPort = 7171\nmaxPlayers = 0\nserverName = \"Forgotten Engine\"\n\n-- Legacy login foundation\n-- Set true only after providing an original 1024-bit RSA private key.\nlegacyLoginEnabled = false\nrsaPrivateKey = \"key.pem\"\n\n-- Legacy game-session foundation\n-- Separate opt-in port until official session compatibility is proven.\ngameSessionEnabled = false\ngameSessionPort = 7173\n-- Public endpoint advertised to a custom OTClient module; may be a proxy/domain/IP-changing endpoint.\nadvertisedGameSessionHost = \"127.0.0.1\"\nadvertisedGameSessionPort = 7173\n\n-- Map\nmapName = \"forgotten\"\nworldType = \"pvp\"\n\n-- MySQL compatibility contract (SQLite remains the current storage backend)\nmysqlHost = \"127.0.0.1\"\nmysqlUser = \"forgottenengine\"\nmysqlDatabase = \"forgottenengine\"\n\n-- Forgotten Engine profile\nfeProfile = \"{}\"\ntibiaProtocol = \"{}\"\n",
         profile.id, profile.tibia_protocol
     )
 }
@@ -309,6 +319,21 @@ fn optional_string<'a>(
 ) -> Result<&'a str, ConfigError> {
     match values.get(key) {
         Some(Literal::String(value)) => Ok(value),
+        Some(_) => Err(ConfigError::InvalidValue {
+            key,
+            message: "must be a quoted string".into(),
+        }),
+        None => Ok(default),
+    }
+}
+
+fn optional_string_owned(
+    values: &BTreeMap<String, Literal>,
+    key: &'static str,
+    default: String,
+) -> Result<String, ConfigError> {
+    match values.get(key) {
+        Some(Literal::String(value)) => Ok(value.clone()),
         Some(_) => Err(ConfigError::InvalidValue {
             key,
             message: "must be a quoted string".into(),
@@ -441,6 +466,8 @@ mod tests {
         assert_eq!(config.rsa_private_key_path, world.join("key.pem"));
         assert!(!config.game_session_enabled);
         assert_eq!(config.game_session_port, 7173);
+        assert_eq!(config.advertised_game_session_host, "127.0.0.1");
+        assert_eq!(config.advertised_game_session_port, 7173);
         let _ = fs::remove_dir_all(world);
     }
 
@@ -451,7 +478,7 @@ mod tests {
         fs::write(
             world.join(CONFIG_FILE_NAME),
             format!(
-                "{}legacyLoginEnabled = true\nrsaPrivateKey = \"keys/legacy.pem\"\ngameSessionEnabled = true\ngameSessionPort = 7183\n",
+                "{}legacyLoginEnabled = true\nrsaPrivateKey = \"keys/legacy.pem\"\ngameSessionEnabled = true\ngameSessionPort = 7183\nadvertisedGameSessionHost = \"fe.example.test\"\nadvertisedGameSessionPort = 443\n",
                 template(FE_7_4_PROFILE)
             ),
         )
@@ -461,6 +488,8 @@ mod tests {
         assert_eq!(config.rsa_private_key_path, world.join("keys/legacy.pem"));
         assert!(config.game_session_enabled);
         assert_eq!(config.game_session_port, 7183);
+        assert_eq!(config.advertised_game_session_host, "fe.example.test");
+        assert_eq!(config.advertised_game_session_port, 443);
         let _ = fs::remove_dir_all(world);
     }
 

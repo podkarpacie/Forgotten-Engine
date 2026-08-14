@@ -5,7 +5,8 @@ use forgotten_host::{
 };
 use forgotten_persistence::{create_backup, EngineDatabase};
 use forgotten_protocol::{
-    profile_by_id, CompatibilityProfile, LegacyRsaPrivateKey, COMPATIBILITY_PROFILES,
+    profile_by_id, CompatibilityProfile, LegacyRsaPrivateKey, OtClientEndpoint,
+    COMPATIBILITY_PROFILES,
 };
 use std::env;
 use std::fs;
@@ -184,6 +185,10 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                 bind_addr: config.game_session_socket_addr(),
                 profile: config.profile,
                 rsa_private_key: Arc::clone(rsa_private_key),
+                advertised_endpoint: OtClientEndpoint {
+                    host: config.advertised_game_session_host.clone(),
+                    port: config.advertised_game_session_port,
+                },
                 max_connections: config.max_connections(),
                 session_timeout: Duration::from_secs(5),
             },

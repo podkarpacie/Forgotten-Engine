@@ -4,7 +4,7 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use forgotten_core::Player;
+use forgotten_core::{Player, Position};
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
@@ -102,7 +102,7 @@ impl EngineDatabase {
         account_id: i64,
     ) -> Result<Vec<LoginCharacter>, PersistenceError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, name, level FROM players WHERE account_id = ?1 ORDER BY name COLLATE NOCASE",
+            "SELECT id, name, level, x, y, z FROM players WHERE account_id = ?1 ORDER BY name COLLATE NOCASE",
         )?;
         let characters = statement
             .query_map(params![account_id], |row| {
@@ -110,6 +110,11 @@ impl EngineDatabase {
                     id: row.get::<_, i64>(0)? as u64,
                     name: row.get(1)?,
                     level: row.get::<_, i64>(2)? as u32,
+                    position: Position {
+                        x: row.get::<_, i64>(3)? as u16,
+                        y: row.get::<_, i64>(4)? as u16,
+                        z: row.get::<_, i64>(5)? as u8,
+                    },
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -209,6 +214,7 @@ pub struct LoginCharacter {
     pub id: u64,
     pub name: String,
     pub level: u32,
+    pub position: Position,
 }
 
 fn unix_seconds() -> u64 {
@@ -319,6 +325,14 @@ mod tests {
             .unwrap();
         assert_eq!(account.id, account_id);
         assert_eq!(account.characters[0].name, "Knight");
+        assert_eq!(
+            account.characters[0].position,
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            }
+        );
         let _ = fs::remove_file(path);
     }
 }
