@@ -42,7 +42,8 @@ pub const PROBE_VERSION: u8 = 1;
 const MAX_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
 const MAX_NATIVE_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
 const NATIVE_OTCLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
-const NATIVE_OTCLIENT_AUTOWALK_STEP_DELAY: Duration = Duration::from_millis(200);
+const NATIVE_OTCLIENT_DEFAULT_GROUND_SPEED: u64 = 150;
+const NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct HostConfig {
@@ -844,7 +845,10 @@ fn handle_native_otclient_game(
                         )? {
                             break 'auto_walk;
                         }
-                        thread::sleep(NATIVE_OTCLIENT_AUTOWALK_STEP_DELAY);
+                        thread::sleep(native_autowalk_step_delay(
+                            snapshot.player_speed,
+                            snapshot.server_beat,
+                        ));
                     }
                 }
             }
@@ -938,6 +942,15 @@ fn native_chat_acknowledgement(message: &str) -> String {
         acknowledgement.push(character);
     }
     acknowledgement
+}
+
+fn native_autowalk_step_delay(player_speed: u16, server_beat: u16) -> Duration {
+    let speed = u64::from(player_speed).max(1);
+    let server_beat = u64::from(server_beat).max(1);
+    let interval_millis = (1000 * NATIVE_OTCLIENT_DEFAULT_GROUND_SPEED / speed)
+        .max(server_beat)
+        .min(NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY.as_millis() as u64);
+    Duration::from_millis(interval_millis)
 }
 
 fn native_player_id(character_id: u64) -> Result<u32, HostError> {
@@ -2002,5 +2015,28 @@ mod tests {
         );
         host.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
+    }
+}
+
+#[cfg(test)]
+mod native_timing_tests {
+    use super::{native_autowalk_step_delay, NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY};
+    use std::time::Duration;
+
+    #[test]
+    fn auto_walk_delay_scales_with_player_speed_and_server_beat() {
+        assert_eq!(
+            native_autowalk_step_delay(220, 50),
+            Duration::from_millis(681)
+        );
+        assert!(native_autowalk_step_delay(440, 50) < native_autowalk_step_delay(220, 50));
+        assert_eq!(
+            native_autowalk_step_delay(1, 50),
+            NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY
+        );
+        assert_eq!(
+            native_autowalk_step_delay(1000, 750),
+            Duration::from_millis(750)
+        );
     }
 }

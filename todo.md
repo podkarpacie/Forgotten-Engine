@@ -26,3 +26,5 @@
 - [x] Decode classic Ctrl-turn client opcodes and preserve the requested facing direction without disconnecting.
 - [x] Display a bounded diagnostic acknowledgement for accepted 740 chat input.
 - [x] Preserve the current facing direction when canceling a boundary walk.
+- [x] Replace fixed native auto-walk delay with speed-derived timing from the player/configured movement speed.
+- [x] Add regression coverage proving faster configured speed shortens the native auto-walk interval while retaining safe bounds.
