@@ -927,9 +927,14 @@ pub fn decode_native_otclient_game_request(
     if reader.byte()? != NATIVE_OTCLIENT_PENDING_GAME {
         return Err(ProtocolError::InvalidNativeGameRequest);
     }
+    let operating_system = reader.u16()?;
+    let protocol_version = reader.u16()?;
+    if reader.byte()? != 0 {
+        return Err(ProtocolError::InvalidNativeGameRequest);
+    }
     let request = NativeOtClientGameRequest {
-        operating_system: reader.u16()?,
-        protocol_version: reader.u16()?,
+        operating_system,
+        protocol_version,
         account_id: reader.u32()?,
         character_name: reader.string(MAX_LOGIN_STRING_BYTES)?,
         password: reader.string(MAX_LOGIN_STRING_BYTES)?,
@@ -1154,6 +1159,7 @@ fn encode_native_otclient_game_request_for_harness(request: &NativeOtClientGameR
     writer.byte(NATIVE_OTCLIENT_PENDING_GAME);
     writer.u16(request.operating_system);
     writer.u16(request.protocol_version);
+    writer.byte(0);
     writer.u32(request.account_id);
     writer.string(&request.character_name);
     writer.string(&request.password);
@@ -1603,6 +1609,9 @@ mod tests {
             .unwrap(),
             game
         );
+        let mut missing_rsa_leading_byte = encode_native_otclient_game_request_for_harness(&game);
+        missing_rsa_leading_byte.0.remove(5);
+        assert!(decode_native_otclient_game_request(&missing_rsa_leading_byte, &profile).is_err());
         assert_eq!(
             encode_native_otclient_game_login_error("Map initialization is pending.").0[0],
             NATIVE_OTCLIENT_GAME_LOGIN_ERROR

@@ -1408,6 +1408,7 @@ mod tests {
         let mut payload = vec![forgotten_protocol::NATIVE_OTCLIENT_PENDING_GAME];
         payload.extend_from_slice(&2_u16.to_le_bytes());
         payload.extend_from_slice(&740_u16.to_le_bytes());
+        payload.push(0);
         payload.extend_from_slice(&account_id.to_le_bytes());
         add_string(&mut payload, character_name);
         add_string(&mut payload, password);
