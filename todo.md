@@ -15,7 +15,7 @@
 - [x] Audit the current profile registry and CLI for Tibia 7.4 extension points.
 - [x] Research and document the direct Tibia 7.4 target without inventing an upstream TFS mapping.
 - [x] Add the FE 7.4.0 profile, configuration selection, profile-specific validation, and regression coverage.
-- [ ] Update the README, compatibility tables, and release notes with the Tibia 7.4 profile and limitations.
+- [x] Update the README, compatibility tables, and release notes with the Tibia 7.4 profile and limitations.
 - [x] Validate all FE profiles and publish the approved FE 7.4.0 tag and GitHub release.
 - [x] Define versioned precompiled archive names, platform support, profile content, checksums, and installation instructions for FE releases.
 - [x] Build and smoke-test a native Linux precompiled archive for FE 7.4.0.
