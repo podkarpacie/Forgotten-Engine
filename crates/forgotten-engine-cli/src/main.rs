@@ -58,7 +58,7 @@ fn selected_profile(
         Some(value) => value,
     };
     profile_by_id(selector).ok_or_else(|| {
-        format!("unknown compatibility profile `{selector}`; use fe-1.2 or fe-8.0").into()
+        format!("unknown compatibility profile `{selector}`; use fe-7.4, fe-8.0, or fe-1.2").into()
     })
 }
 
@@ -259,7 +259,7 @@ fn database_path(directory: &Path) -> PathBuf {
 }
 
 fn print_help() {
-    println!("Forgotten Engine\n\nCompatibility profiles:\n  fe-1.2  — TFS 1.2 / Tibia 10.98\n  fe-8.0  — Tibia 8.0\n\nCommands:\n  init <directory> [--profile fe-1.2|fe-8.0]\n  validate <directory>\n  run <directory>\n  status <directory>\n  backup <directory>\n  command <directory> broadcast <message>\n  compatibility\n  version");
+    println!("Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4\n  fe-8.0  — Tibia 8.0\n  fe-1.2  — TFS 1.2 / Tibia 10.98\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  run <directory>\n  status <directory>\n  backup <directory>\n  command <directory> broadcast <message>\n  compatibility\n  version");
 }
 
 #[cfg(test)]
@@ -272,6 +272,14 @@ mod tests {
         let profile = selected_profile(&arguments, 2).unwrap();
         assert_eq!(profile.id, "fe-8.0");
         assert_eq!(profile.tibia_protocol, "8.0");
+    }
+
+    #[test]
+    fn selects_tibia_7_4_profile_by_direct_selector() {
+        let arguments = vec!["init".to_owned(), "world".to_owned(), "fe-7.4".to_owned()];
+        let profile = selected_profile(&arguments, 2).unwrap();
+        assert_eq!(profile.id, "fe-7.4");
+        assert_eq!(profile.tibia_protocol, "7.4");
     }
 
     #[test]

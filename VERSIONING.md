@@ -22,6 +22,16 @@ Forgotten Engine (FE) version numbers identify a versioned compatibility line. A
 
 > FE 8.0.0 is not a full Tibia 8.0 multiplayer-server claim. Login encryption, complete opcode coverage, map/datapack loading, combat, Lua VM parity, and production networking remain outside its supported scope.
 
+## FE 7.4.0
+
+**FE 7.4.0** is the direct **Tibia 7.4** clean-room compatibility foundation. It has no implied TFS mapping. Public OpenTibia projects identify 7.4 as a separately supported protocol line; these are interoperability references rather than source dependencies.[7] [8]
+
+| FE release | Compatibility reference | Tibia target | Supported in this release |
+|---|---|---:|---|
+| FE 7.4.0 | Tibia 7.4 protocol | 7.4 | Explicit selectable profile, bounded packet framing, deterministic world state, SQLite persistence, diagnostics, local lifecycle/backup commands, and precompiled-archive packaging. |
+
+> FE 7.4.0 is not a full Tibia 7.4 multiplayer-server claim. Login encryption, complete opcode coverage, map/datapack loading, combat, Lua VM parity, and production networking remain outside its supported scope.
+
 ## Roadmap references
 
 The table below separates known upstream references from FE implementation commitments. A row marked **not implemented** is a planning record only.
@@ -35,7 +45,7 @@ The official upstream release list contains `v1.0`, `v1.1`, `v1.2`, `v1.4`, `v1.
 
 ## Product naming and tag format
 
-All new user-facing names use **Forgotten Engine**. Terms such as "Forgotten Server" are reserved only for historical upstream-reference explanations. The Git tag format is `fe-vMAJOR.MINOR.PATCH`. The existing 10.98 release uses **`fe-v1.2.0`**; the direct Tibia 8.0 release uses **`fe-v8.0.0`**.
+All new user-facing names use **Forgotten Engine**. Terms such as "Forgotten Server" are reserved only for historical upstream-reference explanations. The Git tag format is `fe-vMAJOR.MINOR.PATCH`. The existing 10.98 release uses **`fe-v1.2.0`**; the direct Tibia 8.0 release uses **`fe-v8.0.0`**; the direct Tibia 7.4 release uses **`fe-v7.4.0`**.
 
 ## References
 
@@ -45,3 +55,5 @@ All new user-facing names use **Forgotten Engine**. Terms such as "Forgotten Ser
 4. [Official TFS v1.6 GitHub release](https://github.com/otland/forgottenserver/releases/tag/v1.6)
 5. [Official TFS release list](https://github.com/otland/forgottenserver/releases)
 6. [YATC protocol-support statement](https://github.com/opentibia/yatc)
+7. [Avesta 7.4 protocol statement](https://github.com/peonso/avesta74)
+8. [OpenTibia 7.40 experimental-support statement](https://github.com/mtanksl/OpenTibia)

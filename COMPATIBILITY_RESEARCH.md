@@ -38,6 +38,19 @@ Tibia 8.0 is an independent compatibility target, not a TFS 1.2 target. The publ
 3. [YATC protocol-support statement](https://github.com/opentibia/yatc)
 4. [Tibia Specifications Initiative](https://otland.net/threads/tibia-specifications-initiative.241415/)
 
+## Tibia 7.4 reference point
+
+Tibia 7.4 is another direct protocol target rather than a TFS 1.2 derivative. Public OpenTibia projects identify 7.4 as a supported protocol line, including one distribution that names 7.4 as its default protocol and another independently written server that documents experimental support beginning at 7.40. These projects are used only as interoperability references; Forgotten Engine remains an original Rust implementation.
+
+| Forgotten Engine release | Compatibility reference | Tibia protocol target | Status |
+|---|---|---:|---|
+| FE 7.4.0 | Tibia 7.4 protocol | 7.4 | Planned clean-room compatibility foundation |
+
+## Additional sources
+
+5. [Avesta 7.4 protocol statement](https://github.com/peonso/avesta74)
+6. [OpenTibia 7.40 experimental-support statement](https://github.com/mtanksl/OpenTibia)
+
 ## Sources
 
 1. [Official TFS v1.2 GitHub release](https://github.com/otland/forgottenserver/releases/tag/v1.2)

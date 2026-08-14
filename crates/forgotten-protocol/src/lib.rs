@@ -3,6 +3,7 @@
 pub const MAX_FRAME_SIZE: usize = 8 * 1024;
 pub const FE_1_2_RELEASE: &str = "1.2.0";
 pub const FE_8_0_RELEASE: &str = "8.0.0";
+pub const FE_7_4_RELEASE: &str = "7.4.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompatibilityProfile {
@@ -29,7 +30,16 @@ pub const FE_8_0_PROFILE: CompatibilityProfile = CompatibilityProfile {
     complete_protocol_emulation: false,
 };
 
-pub const COMPATIBILITY_PROFILES: [CompatibilityProfile; 2] = [FE_1_2_PROFILE, FE_8_0_PROFILE];
+pub const FE_7_4_PROFILE: CompatibilityProfile = CompatibilityProfile {
+    id: "fe-7.4",
+    fe_release: FE_7_4_RELEASE,
+    compatibility_reference: "Tibia 7.4 protocol",
+    tibia_protocol: "7.4",
+    complete_protocol_emulation: false,
+};
+
+pub const COMPATIBILITY_PROFILES: [CompatibilityProfile; 3] =
+    [FE_7_4_PROFILE, FE_8_0_PROFILE, FE_1_2_PROFILE];
 
 pub fn profile_by_id(id: &str) -> Option<CompatibilityProfile> {
     COMPATIBILITY_PROFILES
@@ -117,6 +127,14 @@ mod tests {
         assert_eq!(FE_8_0_PROFILE.tibia_protocol, "8.0");
         assert_eq!(profile_by_id("fe-8.0"), Some(FE_8_0_PROFILE));
         assert_eq!(profile_by_id("unknown"), None);
+    }
+
+    #[test]
+    fn exposes_a_separate_direct_tibia_7_4_profile() {
+        assert_eq!(FE_7_4_PROFILE.fe_release, "7.4.0");
+        assert_eq!(FE_7_4_PROFILE.compatibility_reference, "Tibia 7.4 protocol");
+        assert_eq!(FE_7_4_PROFILE.tibia_protocol, "7.4");
+        assert_eq!(profile_by_id("fe-7.4"), Some(FE_7_4_PROFILE));
     }
 
     #[test]

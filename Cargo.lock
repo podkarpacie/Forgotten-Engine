@@ -56,11 +56,11 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "forgotten-core"
-version = "8.0.0"
+version = "7.4.0"
 
 [[package]]
 name = "forgotten-engine-cli"
-version = "8.0.0"
+version = "7.4.0"
 dependencies = [
  "forgotten-core",
  "forgotten-persistence",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "forgotten-persistence"
-version = "8.0.0"
+version = "7.4.0"
 dependencies = [
  "forgotten-core",
  "rusqlite",
@@ -78,11 +78,11 @@ dependencies = [
 
 [[package]]
 name = "forgotten-protocol"
-version = "8.0.0"
+version = "7.4.0"
 
 [[package]]
 name = "forgotten-scripting"
-version = "8.0.0"
+version = "7.4.0"
 
 [[package]]
 name = "hashbrown"
