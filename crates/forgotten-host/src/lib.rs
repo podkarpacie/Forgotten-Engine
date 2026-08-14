@@ -626,6 +626,7 @@ fn handle_native_otclient_login(
     config: &NativeOtClientHostConfig,
     database_path: &Path,
 ) -> Result<(), HostError> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(config.session_timeout))?;
     stream.set_write_timeout(Some(config.session_timeout))?;
     let request =
@@ -682,6 +683,7 @@ fn handle_native_otclient_game(
     config: &NativeOtClientHostConfig,
     database_path: &Path,
 ) -> Result<(), HostError> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(config.session_timeout))?;
     stream.set_write_timeout(Some(config.session_timeout))?;
     let request = decode_native_otclient_game_request(&read_frame(stream)?, &config.client_profile)
@@ -757,13 +759,10 @@ fn handle_native_otclient_game(
     for _ in 0..MAX_NATIVE_EMPTY_WORLD_MOVES_PER_SESSION {
         let request = match read_frame(stream) {
             Ok(request) => request,
-            Err(HostError::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                break;
+            Err(HostError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(HostError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
             }
             Err(error) => return Err(error),
         };

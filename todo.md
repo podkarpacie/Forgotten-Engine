@@ -13,3 +13,5 @@
 - [ ] Correct the native 740 game-start transition after the client receives login/map frames but returns to character selection.
 - [ ] Correct the outbound native 740 initialization stream after the real client emits no post-map control frame.
 - [ ] Remove the invalid zero extended-outfit player creature from the asset-free native map diagnostic fixture.
+- [ ] Correct remaining native 740 game-start packet sequencing after map-only initialization still returns to character selection.
+- [ ] Treat Windows nonblocking `WouldBlock` during a native session as a transient condition rather than a rejected game session.
