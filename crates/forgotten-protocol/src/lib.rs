@@ -1,24 +1,42 @@
-//! Bounded packet framing for the FE 1.2.0 Tibia 10.98 compatibility foundation.
+//! Bounded packet framing for versioned Forgotten Engine compatibility profiles.
 
 pub const MAX_FRAME_SIZE: usize = 8 * 1024;
-pub const TARGET_PROTOCOL: &str = "10.98";
-pub const FE_RELEASE: &str = "1.2.0";
-pub const TFS_REFERENCE: &str = "1.2";
+pub const FE_1_2_RELEASE: &str = "1.2.0";
+pub const FE_8_0_RELEASE: &str = "8.0.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompatibilityProfile {
+    pub id: &'static str,
     pub fe_release: &'static str,
-    pub tfs_reference: &'static str,
+    pub compatibility_reference: &'static str,
     pub tibia_protocol: &'static str,
     pub complete_protocol_emulation: bool,
 }
 
 pub const FE_1_2_PROFILE: CompatibilityProfile = CompatibilityProfile {
-    fe_release: FE_RELEASE,
-    tfs_reference: TFS_REFERENCE,
-    tibia_protocol: TARGET_PROTOCOL,
+    id: "fe-1.2",
+    fe_release: FE_1_2_RELEASE,
+    compatibility_reference: "TFS 1.2",
+    tibia_protocol: "10.98",
     complete_protocol_emulation: false,
 };
+
+pub const FE_8_0_PROFILE: CompatibilityProfile = CompatibilityProfile {
+    id: "fe-8.0",
+    fe_release: FE_8_0_RELEASE,
+    compatibility_reference: "Tibia 8.0 protocol",
+    tibia_protocol: "8.0",
+    complete_protocol_emulation: false,
+};
+
+pub const COMPATIBILITY_PROFILES: [CompatibilityProfile; 2] = [FE_1_2_PROFILE, FE_8_0_PROFILE];
+
+pub fn profile_by_id(id: &str) -> Option<CompatibilityProfile> {
+    COMPATIBILITY_PROFILES
+        .iter()
+        .copied()
+        .find(|profile| profile.id == id)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame(pub Vec<u8>);
@@ -87,9 +105,18 @@ mod tests {
     #[test]
     fn exposes_an_explicit_and_limited_tfs_1_2_profile() {
         assert_eq!(FE_1_2_PROFILE.fe_release, "1.2.0");
-        assert_eq!(FE_1_2_PROFILE.tfs_reference, "1.2");
+        assert_eq!(FE_1_2_PROFILE.compatibility_reference, "TFS 1.2");
         assert_eq!(FE_1_2_PROFILE.tibia_protocol, "10.98");
         assert!(!FE_1_2_PROFILE.complete_protocol_emulation);
+    }
+
+    #[test]
+    fn exposes_a_separate_direct_tibia_8_profile() {
+        assert_eq!(FE_8_0_PROFILE.fe_release, "8.0.0");
+        assert_eq!(FE_8_0_PROFILE.compatibility_reference, "Tibia 8.0 protocol");
+        assert_eq!(FE_8_0_PROFILE.tibia_protocol, "8.0");
+        assert_eq!(profile_by_id("fe-8.0"), Some(FE_8_0_PROFILE));
+        assert_eq!(profile_by_id("unknown"), None);
     }
 
     #[test]

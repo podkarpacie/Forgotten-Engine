@@ -1,12 +1,12 @@
 [package]
-name = "forgotten-cli"
+name = "forgotten-engine-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "forgotten"
+name = "forgotten-engine"
 path = "src/main.rs"
 
 [dependencies]

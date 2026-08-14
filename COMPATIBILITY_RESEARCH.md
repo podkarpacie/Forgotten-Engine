@@ -25,6 +25,19 @@ The official TFS 1.4 release record identifies its updated map/data context as 1
 
 The initial Engine protocol crate labels itself as an `8.0` future-work foundation. That label conflicts with the requested FE 1.2 compatibility target. FE 1.2.0 must instead expose an explicit **Tibia 10.98** profile, while keeping framing code clearly separated from a claim of complete network-protocol emulation.
 
+## Tibia 8.0 reference point
+
+Tibia 8.0 is an independent compatibility target, not a TFS 1.2 target. The public YATC project documents support beginning at Tibia-compatible protocol 8.0, which confirms that 8.0 is a distinct protocol line suitable for a separately versioned FE profile. FE will implement this profile from published behavior specifications and original tests rather than copied server or client code.
+
+| Forgotten Engine release | Compatibility reference | Tibia protocol target | Status |
+|---|---|---:|---|
+| FE 8.0.0 | Tibia 8.0 protocol | 8.0 | Planned clean-room compatibility foundation |
+
+## Additional source
+
+3. [YATC protocol-support statement](https://github.com/opentibia/yatc)
+4. [Tibia Specifications Initiative](https://otland.net/threads/tibia-specifications-initiative.241415/)
+
 ## Sources
 
 1. [Official TFS v1.2 GitHub release](https://github.com/otland/forgottenserver/releases/tag/v1.2)

@@ -5,11 +5,11 @@ members = [
   "crates/forgotten-persistence",
   "crates/forgotten-protocol",
   "crates/forgotten-scripting",
-  "crates/forgotten-cli",
+  "crates/forgotten-engine-cli",
 ]
 
 [workspace.package]
-version = "1.2.0"
+version = "8.0.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
