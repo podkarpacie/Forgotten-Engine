@@ -4,11 +4,14 @@
 
 use forgotten_persistence::EngineDatabase;
 use forgotten_protocol::{
-    decode, decode_legacy_74_envelope, decode_legacy_74_login_plaintext, decode_status_request,
-    encode, encode_legacy_74_character_list, encode_login_error, encode_status_binary,
-    encode_status_xml, xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, Frame,
-    LegacyRsaPrivateKey, ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot,
-    MAX_FRAME_SIZE,
+    decode, decode_legacy_74_envelope, decode_legacy_74_game_session_bootstrap_plaintext,
+    decode_legacy_74_game_session_envelope, decode_legacy_74_login_plaintext,
+    decode_status_request, encode, encode_legacy_74_character_list,
+    encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
+    encode_legacy_74_game_session_ready, encode_login_error, encode_status_binary,
+    encode_status_xml, generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    CompatibilityProfile, Frame, Legacy74GameSessionState, LegacyRsaPrivateKey, ProtocolError,
+    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
 };
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -50,6 +53,15 @@ pub struct StatusHostConfig {
     pub session_timeout: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct GameSessionHostConfig {
+    pub bind_addr: SocketAddr,
+    pub profile: CompatibilityProfile,
+    pub rsa_private_key: Arc<LegacyRsaPrivateKey>,
+    pub max_connections: usize,
+    pub session_timeout: Duration,
+}
+
 impl HostConfig {
     pub fn validate(&self) -> Result<(), HostError> {
         if self.max_connections == 0 {
@@ -68,6 +80,25 @@ impl HostConfig {
 
 impl StatusHostConfig {
     pub fn validate(&self) -> Result<(), HostError> {
+        if self.max_connections == 0 {
+            return Err(HostError::InvalidConfiguration(
+                "max_connections must be greater than zero".into(),
+            ));
+        }
+        if self.session_timeout.is_zero() {
+            return Err(HostError::InvalidConfiguration(
+                "session_timeout must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl GameSessionHostConfig {
+    pub fn validate(&self) -> Result<(), HostError> {
+        if self.profile.id != "fe-7.4" {
+            return Err(HostError::LegacyLoginUnavailable);
+        }
         if self.max_connections == 0 {
             return Err(HostError::InvalidConfiguration(
                 "max_connections must be greater than zero".into(),
@@ -152,6 +183,34 @@ pub fn start_status(
             thread_shutdown,
             active_connections,
             Instant::now(),
+        )
+    });
+    Ok(HostHandle {
+        local_addr,
+        shutdown,
+        thread: Some(thread),
+    })
+}
+
+pub fn start_game_session(
+    config: GameSessionHostConfig,
+    database_path: impl AsRef<Path>,
+) -> Result<HostHandle, HostError> {
+    config.validate()?;
+    let listener = TcpListener::bind(config.bind_addr)?;
+    listener.set_nonblocking(true)?;
+    let local_addr = listener.local_addr()?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let database_path = database_path.as_ref().to_path_buf();
+    let thread_shutdown = Arc::clone(&shutdown);
+    let thread = thread::spawn(move || {
+        serve_game_session(
+            listener,
+            config,
+            database_path,
+            thread_shutdown,
+            active_connections,
         )
     });
     Ok(HostHandle {
@@ -274,6 +333,143 @@ fn serve_status(
     }
     record_event(&database_path, "info", "status service stopped");
     Ok(())
+}
+
+fn serve_game_session(
+    listener: TcpListener,
+    config: GameSessionHostConfig,
+    database_path: PathBuf,
+    shutdown: Arc<AtomicBool>,
+    active_connections: Arc<AtomicUsize>,
+) -> Result<(), HostError> {
+    record_event(
+        &database_path,
+        "info",
+        &format!(
+            "game session foundation started addr={} profile={}",
+            listener.local_addr()?,
+            config.profile.id
+        ),
+    );
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((mut stream, peer)) => {
+                let active = active_connections.fetch_add(1, Ordering::SeqCst);
+                if active >= config.max_connections {
+                    active_connections.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+                let session_config = config.clone();
+                let session_database_path = database_path.clone();
+                let session_connections = Arc::clone(&active_connections);
+                thread::spawn(move || {
+                    let result = handle_game_session(
+                        &mut stream,
+                        peer,
+                        &session_config,
+                        &session_database_path,
+                    );
+                    if let Err(error) = result {
+                        record_event(
+                            &session_database_path,
+                            "warn",
+                            &format!("game session rejected peer={peer} reason={error}"),
+                        );
+                    }
+                    session_connections.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(HostError::Io(error)),
+        }
+    }
+    record_event(&database_path, "info", "game session foundation stopped");
+    Ok(())
+}
+
+fn handle_game_session(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    config: &GameSessionHostConfig,
+    database_path: &Path,
+) -> Result<(), HostError> {
+    stream.set_read_timeout(Some(config.session_timeout))?;
+    stream.set_write_timeout(Some(config.session_timeout))?;
+    let challenge = generate_legacy_74_game_challenge();
+    write_frame(stream, &encode_legacy_74_game_challenge(challenge))?;
+    let envelope = decode_legacy_74_game_session_envelope(&read_frame(stream)?)
+        .map_err(HostError::Protocol)?;
+    let plaintext = config
+        .rsa_private_key
+        .decrypt_raw_block(&envelope.encrypted_block)
+        .map_err(HostError::Protocol)?;
+    let bootstrap = decode_legacy_74_game_session_bootstrap_plaintext(
+        envelope.client_version,
+        &plaintext,
+        challenge,
+    )
+    .map_err(HostError::Protocol)?;
+    let database = EngineDatabase::open(database_path)?;
+    let Some(account) = database
+        .authenticate_account(&bootstrap.request.account_name, &bootstrap.request.password)?
+    else {
+        return send_game_session_error(
+            stream,
+            bootstrap.xtea_key,
+            "Account name or password is not correct.",
+        );
+    };
+    if !account
+        .characters
+        .iter()
+        .any(|character| character.name == bootstrap.request.character_name)
+    {
+        return send_game_session_error(
+            stream,
+            bootstrap.xtea_key,
+            "Character is not available on this account.",
+        );
+    }
+    let authenticated = Legacy74GameSessionState::Authenticated {
+        account_id: account.id,
+        character_name: bootstrap.request.character_name.clone(),
+    };
+    database.record_event(
+        "info",
+        &format!("game session state peer={peer} state={authenticated:?}"),
+    )?;
+    write_game_session_response(
+        stream,
+        bootstrap.xtea_key,
+        &encode_legacy_74_game_session_ready(&bootstrap.request.character_name),
+    )?;
+    let feature_gate = Legacy74GameSessionState::FeatureGated {
+        character_name: bootstrap.request.character_name,
+    };
+    database.record_event(
+        "info",
+        &format!("game session state peer={peer} state={feature_gate:?}"),
+    )?;
+    Ok(())
+}
+
+fn send_game_session_error(
+    stream: &mut TcpStream,
+    key: forgotten_protocol::XteaKey,
+    message: &str,
+) -> Result<(), HostError> {
+    write_game_session_response(stream, key, &encode_legacy_74_game_session_error(message))
+}
+
+fn write_game_session_response(
+    stream: &mut TcpStream,
+    key: forgotten_protocol::XteaKey,
+    response: &Frame,
+) -> Result<(), HostError> {
+    let encrypted = xtea_encrypt_packet(&response.0, key).map_err(HostError::Protocol)?;
+    write_frame(stream, &Frame(encrypted))
 }
 
 fn handle_status_session(
@@ -560,6 +756,16 @@ mod tests {
         }
     }
 
+    fn game_session_config(key: Arc<LegacyRsaPrivateKey>) -> GameSessionHostConfig {
+        GameSessionHostConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            profile: FE_7_4_PROFILE,
+            rsa_private_key: key,
+            max_connections: 2,
+            session_timeout: Duration::from_millis(250),
+        }
+    }
+
     #[test]
     fn accepts_a_bounded_probe_and_returns_the_selected_profile() {
         let database = database_path("probe");
@@ -676,6 +882,70 @@ mod tests {
         let response = forgotten_protocol::xtea_decrypt_packet(&response.0, [1, 2, 3, 4]).unwrap();
         assert_eq!(response[0], 0x64);
         assert!(response.windows(6).any(|window| window == b"Knight"));
+        host.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn completes_a_challenge_bound_game_session_and_returns_a_feature_gate() {
+        let database_path = database_path("game-session");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("admin", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let key = Arc::new(LegacyRsaPrivateKey::generate().unwrap());
+        let host =
+            start_game_session(game_session_config(Arc::clone(&key)), &database_path).unwrap();
+        let mut stream = TcpStream::connect(host.local_addr()).unwrap();
+        let challenge = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            challenge.0[0],
+            forgotten_protocol::LEGACY_74_GAME_CHALLENGE_OPCODE
+        );
+        let challenge = forgotten_protocol::Legacy74GameChallenge {
+            timestamp: u32::from_le_bytes(challenge.0[1..5].try_into().unwrap()),
+            random: challenge.0[5],
+        };
+        let bootstrap = forgotten_protocol::Legacy74GameSessionBootstrap {
+            xtea_key: [1, 2, 3, 4],
+            request: forgotten_protocol::Legacy74GameSessionRequest {
+                client_version: 740,
+                account_name: "admin".into(),
+                password: "correct horse battery staple".into(),
+                character_name: "Knight".into(),
+                challenge,
+            },
+        };
+        let request = forgotten_protocol::encode_legacy_74_game_session_bootstrap_for_harness(
+            &key, &bootstrap,
+        )
+        .unwrap();
+        write_frame(&mut stream, &request).unwrap();
+        let response = read_frame(&mut stream).unwrap();
+        let response =
+            forgotten_protocol::xtea_decrypt_packet(&response.0, bootstrap.xtea_key).unwrap();
+        assert_eq!(
+            response[0],
+            forgotten_protocol::LEGACY_74_GAME_SESSION_READY_OPCODE
+        );
+        assert!(response
+            .windows(b"feature-gated".len())
+            .any(|window| window == b"feature-gated"));
         host.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }

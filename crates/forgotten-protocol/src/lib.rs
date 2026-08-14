@@ -2,12 +2,17 @@
 //!
 //! The legacy 7.4 types below are a tested foundation, not a claim of official-client support.
 
-use rand::rngs::OsRng;
+use rand::{rngs::OsRng, RngCore};
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use rsa::{BigUint, RsaPrivateKey};
-use std::{fs, net::IpAddr, path::Path};
+use std::{
+    fs,
+    net::IpAddr,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 pub const MAX_FRAME_SIZE: usize = 8 * 1024;
 pub const FE_1_2_RELEASE: &str = "1.2.0";
@@ -394,6 +399,218 @@ pub fn decode_legacy_74_login_plaintext(
         password,
     })
 }
+
+pub const LEGACY_74_GAME_CHALLENGE_OPCODE: u8 = 0x1f;
+pub const LEGACY_74_GAME_SESSION_REQUEST_OPCODE: u8 = 0x02;
+pub const LEGACY_74_GAME_SESSION_READY_OPCODE: u8 = 0xf0;
+pub const LEGACY_74_GAME_SESSION_ERROR_OPCODE: u8 = 0xf1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Legacy74GameChallenge {
+    pub timestamp: u32,
+    pub random: u8,
+}
+
+pub fn generate_legacy_74_game_challenge() -> Legacy74GameChallenge {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32;
+    Legacy74GameChallenge {
+        timestamp,
+        random: OsRng.next_u32() as u8,
+    }
+}
+
+pub fn encode_legacy_74_game_challenge(challenge: Legacy74GameChallenge) -> Frame {
+    let mut writer = Writer::default();
+    writer.byte(LEGACY_74_GAME_CHALLENGE_OPCODE);
+    writer.u32(challenge.timestamp);
+    writer.byte(challenge.random);
+    Frame(writer.finish())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Legacy74GameSessionRequest {
+    pub client_version: u16,
+    pub account_name: String,
+    pub password: String,
+    pub character_name: String,
+    pub challenge: Legacy74GameChallenge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Legacy74GameSessionState {
+    ChallengeIssued(Legacy74GameChallenge),
+    Authenticated {
+        account_id: i64,
+        character_name: String,
+    },
+    FeatureGated {
+        character_name: String,
+    },
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Legacy74GameSessionBootstrap {
+    pub xtea_key: XteaKey,
+    pub request: Legacy74GameSessionRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Legacy74GameSessionEnvelope {
+    pub client_version: u16,
+    pub encrypted_block: [u8; LEGACY_RSA_BLOCK_SIZE],
+}
+
+pub fn decode_legacy_74_game_session_envelope(
+    frame: &Frame,
+) -> Result<Legacy74GameSessionEnvelope, ProtocolError> {
+    if frame.0.len() != LEGACY_RSA_BLOCK_SIZE + 3
+        || frame.0[0] != LEGACY_74_GAME_SESSION_REQUEST_OPCODE
+    {
+        return Err(ProtocolError::InvalidGameSessionRequest);
+    }
+    let mut encrypted_block = [0; LEGACY_RSA_BLOCK_SIZE];
+    encrypted_block.copy_from_slice(&frame.0[3..]);
+    Ok(Legacy74GameSessionEnvelope {
+        client_version: u16::from_le_bytes([frame.0[1], frame.0[2]]),
+        encrypted_block,
+    })
+}
+
+pub fn decode_legacy_74_game_session_bootstrap_plaintext(
+    client_version: u16,
+    plaintext: &[u8; LEGACY_RSA_BLOCK_SIZE],
+    expected_challenge: Legacy74GameChallenge,
+) -> Result<Legacy74GameSessionBootstrap, ProtocolError> {
+    let mut reader = Reader::new(plaintext);
+    if reader.byte()? != 0 {
+        return Err(ProtocolError::InvalidLoginMarker);
+    }
+    let xtea_key = [reader.u32()?, reader.u32()?, reader.u32()?, reader.u32()?];
+    let request = Legacy74GameSessionRequest {
+        client_version,
+        account_name: reader.string(MAX_LOGIN_STRING_BYTES)?,
+        password: reader.string(MAX_LOGIN_STRING_BYTES)?,
+        character_name: reader.string(MAX_LOGIN_STRING_BYTES)?,
+        challenge: Legacy74GameChallenge {
+            timestamp: reader.u32()?,
+            random: reader.byte()?,
+        },
+    };
+    if request.client_version != 740 {
+        return Err(ProtocolError::UnsupportedGameSessionVersion(
+            request.client_version,
+        ));
+    }
+    if request.account_name.is_empty()
+        || request.password.is_empty()
+        || request.character_name.is_empty()
+        || request.challenge != expected_challenge
+    {
+        return Err(ProtocolError::InvalidGameSessionRequest);
+    }
+    Ok(Legacy74GameSessionBootstrap { xtea_key, request })
+}
+
+pub fn encode_legacy_74_game_session_bootstrap_for_harness(
+    key: &LegacyRsaPrivateKey,
+    bootstrap: &Legacy74GameSessionBootstrap,
+) -> Result<Frame, ProtocolError> {
+    let mut writer = Writer::default();
+    writer.byte(0);
+    for word in bootstrap.xtea_key {
+        writer.u32(word);
+    }
+    writer.string(&bootstrap.request.account_name);
+    writer.string(&bootstrap.request.password);
+    writer.string(&bootstrap.request.character_name);
+    writer.u32(bootstrap.request.challenge.timestamp);
+    writer.byte(bootstrap.request.challenge.random);
+    let body = writer.finish();
+    if body.len() > LEGACY_RSA_BLOCK_SIZE {
+        return Err(ProtocolError::InvalidLength(body.len()));
+    }
+    let mut plaintext = [0; LEGACY_RSA_BLOCK_SIZE];
+    plaintext[..body.len()].copy_from_slice(&body);
+    let encrypted = key.encrypt_raw_block_for_harness(&plaintext)?;
+    let mut envelope = vec![LEGACY_74_GAME_SESSION_REQUEST_OPCODE];
+    envelope.extend_from_slice(&bootstrap.request.client_version.to_le_bytes());
+    envelope.extend_from_slice(&encrypted);
+    Ok(Frame(envelope))
+}
+
+pub fn encode_legacy_74_game_session_request(
+    request: &Legacy74GameSessionRequest,
+    key: XteaKey,
+) -> Result<Frame, ProtocolError> {
+    let mut writer = Writer::default();
+    writer.byte(LEGACY_74_GAME_SESSION_REQUEST_OPCODE);
+    writer.u16(request.client_version);
+    writer.string(&request.account_name);
+    writer.string(&request.password);
+    writer.string(&request.character_name);
+    writer.u32(request.challenge.timestamp);
+    writer.byte(request.challenge.random);
+    Ok(Frame(xtea_encrypt_packet(&writer.finish(), key)?))
+}
+
+pub fn decode_legacy_74_game_session_request(
+    frame: &Frame,
+    key: XteaKey,
+    expected_challenge: Legacy74GameChallenge,
+) -> Result<Legacy74GameSessionRequest, ProtocolError> {
+    let decrypted = xtea_decrypt_packet(&frame.0, key)?;
+    let mut reader = Reader::new(&decrypted);
+    if reader.byte()? != LEGACY_74_GAME_SESSION_REQUEST_OPCODE {
+        return Err(ProtocolError::InvalidGameSessionRequest);
+    }
+    let request = Legacy74GameSessionRequest {
+        client_version: reader.u16()?,
+        account_name: reader.string(MAX_LOGIN_STRING_BYTES)?,
+        password: reader.string(MAX_LOGIN_STRING_BYTES)?,
+        character_name: reader.string(MAX_LOGIN_STRING_BYTES)?,
+        challenge: Legacy74GameChallenge {
+            timestamp: reader.u32()?,
+            random: reader.byte()?,
+        },
+    };
+    if !reader.done()
+        || request.account_name.is_empty()
+        || request.password.is_empty()
+        || request.character_name.is_empty()
+    {
+        return Err(ProtocolError::InvalidGameSessionRequest);
+    }
+    if request.client_version != 740 {
+        return Err(ProtocolError::UnsupportedGameSessionVersion(
+            request.client_version,
+        ));
+    }
+    if request.challenge != expected_challenge {
+        return Err(ProtocolError::ChallengeMismatch);
+    }
+    Ok(request)
+}
+
+pub fn encode_legacy_74_game_session_ready(character_name: &str) -> Frame {
+    let mut writer = Writer::default();
+    writer.byte(LEGACY_74_GAME_SESSION_READY_OPCODE);
+    writer.string(character_name);
+    writer.string("Game session authenticated; world/map simulation is feature-gated.");
+    writer.byte(0);
+    Frame(writer.finish())
+}
+
+pub fn encode_legacy_74_game_session_error(message: &str) -> Frame {
+    let mut writer = Writer::default();
+    writer.byte(LEGACY_74_GAME_SESSION_ERROR_OPCODE);
+    writer.string(message);
+    Frame(writer.finish())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CharacterListEntry {
     pub name: String,
@@ -443,6 +660,9 @@ pub enum ProtocolError {
     InvalidLoginEnvelope,
     InvalidLoginMarker,
     MissingLoginCredential,
+    InvalidGameSessionRequest,
+    UnsupportedGameSessionVersion(u16),
+    ChallengeMismatch,
     TooManyCharacters,
     UnsupportedAddressFamily,
     StringTooLong(usize),
@@ -628,5 +848,78 @@ mod tests {
         plaintext[127] = 1;
         let encrypted = key.encrypt_raw_block_for_harness(&plaintext).unwrap();
         assert_eq!(key.decrypt_raw_block(&encrypted).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn encrypted_game_session_request_validates_its_challenge() {
+        let challenge = Legacy74GameChallenge {
+            timestamp: 1_700_000_000,
+            random: 42,
+        };
+        let request = Legacy74GameSessionRequest {
+            client_version: 740,
+            account_name: "admin".into(),
+            password: "secret".into(),
+            character_name: "Knight".into(),
+            challenge,
+        };
+        let frame = encode_legacy_74_game_session_request(&request, [1, 2, 3, 4]).unwrap();
+        assert_eq!(
+            decode_legacy_74_game_session_request(&frame, [1, 2, 3, 4], challenge).unwrap(),
+            request
+        );
+        assert!(matches!(
+            decode_legacy_74_game_session_request(
+                &frame,
+                [1, 2, 3, 4],
+                Legacy74GameChallenge {
+                    timestamp: challenge.timestamp,
+                    random: 43,
+                }
+            ),
+            Err(ProtocolError::ChallengeMismatch)
+        ));
+    }
+
+    #[test]
+    fn game_session_ready_response_declares_the_world_feature_gate() {
+        let response = encode_legacy_74_game_session_ready("Knight");
+        assert_eq!(response.0[0], LEGACY_74_GAME_SESSION_READY_OPCODE);
+        assert!(response
+            .0
+            .windows(b"feature-gated".len())
+            .any(|window| window == b"feature-gated"));
+    }
+
+    #[test]
+    fn raw_rsa_game_session_bootstrap_binds_the_expected_challenge() {
+        let key = LegacyRsaPrivateKey::generate().unwrap();
+        let challenge = Legacy74GameChallenge {
+            timestamp: 1_700_000_000,
+            random: 7,
+        };
+        let bootstrap = Legacy74GameSessionBootstrap {
+            xtea_key: [1, 2, 3, 4],
+            request: Legacy74GameSessionRequest {
+                client_version: 740,
+                account_name: "admin".into(),
+                password: "secret".into(),
+                character_name: "Knight".into(),
+                challenge,
+            },
+        };
+        let envelope =
+            encode_legacy_74_game_session_bootstrap_for_harness(&key, &bootstrap).unwrap();
+        let envelope = decode_legacy_74_game_session_envelope(&envelope).unwrap();
+        let plaintext = key.decrypt_raw_block(&envelope.encrypted_block).unwrap();
+        assert_eq!(
+            decode_legacy_74_game_session_bootstrap_plaintext(
+                envelope.client_version,
+                &plaintext,
+                challenge
+            )
+            .unwrap(),
+            bootstrap
+        );
     }
 }

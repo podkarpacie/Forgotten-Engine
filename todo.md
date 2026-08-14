@@ -50,3 +50,10 @@
 - [x] Add an offline command that generates an original 1024-bit RSA private key for the opt-in legacy-login foundation and cover an end-to-end encrypted character-list fixture.
 - [x] Update runtime and parity documentation to distinguish protocol foundations from completed official Tibia-client support.
 - [x] Validate formatting, tests, Clippy, optimized builds, and cross-compilation before requesting publication approval for the protocol milestone.
+- [x] Inspect upstream game-session challenge, first-packet, and initial-response boundaries as clean-room behavioral references.
+- [x] Define bounded fe-7.4 challenge, session-authentication, disconnect, and initial game-response contracts with synthetic test fixtures.
+- [x] Implement original Rust challenge generation, challenge validation, encrypted session request parsing, and typed session-state transitions.
+- [x] Implement a minimal initial game-session response contract that reports explicit feature gates rather than pretending map/world support exists.
+- [x] Integrate the opt-in game-session foundation with the host while preserving diagnostic and character-list behaviors.
+- [x] Update runtime, parity, and README documents to distinguish session foundations from official Tibia-client compatibility.
+- [x] Validate formatting, full tests, strict linting, optimized builds, and Windows cross-compilation before publication approval for the session milestone.

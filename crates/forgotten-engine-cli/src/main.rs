@@ -1,5 +1,8 @@
 use forgotten_config::{ensure_content_skeleton, load, validate_content, write_template};
-use forgotten_host::{start, start_status, HostConfig, LegacyLoginConfig, StatusHostConfig};
+use forgotten_host::{
+    start, start_game_session, start_status, GameSessionHostConfig, HostConfig, LegacyLoginConfig,
+    StatusHostConfig,
+};
 use forgotten_persistence::{create_backup, EngineDatabase};
 use forgotten_protocol::{
     profile_by_id, CompatibilityProfile, LegacyRsaPrivateKey, COMPATIBILITY_PROFILES,
@@ -121,20 +124,26 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     database.record_event("info", "Forgotten Engine host startup requested")?;
 
     println!(">> Registering services");
-    let legacy_login = if config.legacy_login_enabled {
+    let rsa_private_key = if config.legacy_login_enabled || config.game_session_enabled {
         if config.profile.id != "fe-7.4" {
             return Err(
-                "legacyLoginEnabled is currently available only for the fe-7.4 profile".into(),
+                "legacy login and game-session foundations are currently available only for the fe-7.4 profile".into(),
             );
         }
-        println!(">> Loading legacy-login private key");
-        Some(LegacyLoginConfig {
-            rsa_private_key: Arc::new(LegacyRsaPrivateKey::load_pem(&config.rsa_private_key_path)?),
-            server_name: config.server_name.clone(),
-            message_of_the_day: format!("Welcome to {}", config.server_name),
-        })
+        println!(">> Loading fe-7.4 foundation private key");
+        Some(Arc::new(LegacyRsaPrivateKey::load_pem(
+            &config.rsa_private_key_path,
+        )?))
     } else {
         None
+    };
+    let legacy_login = match (config.legacy_login_enabled, &rsa_private_key) {
+        (true, Some(rsa_private_key)) => Some(LegacyLoginConfig {
+            rsa_private_key: Arc::clone(rsa_private_key),
+            server_name: config.server_name.clone(),
+            message_of_the_day: format!("Welcome to {}", config.server_name),
+        }),
+        _ => None,
     };
     let host = start(
         HostConfig {
@@ -164,14 +173,47 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             return Err(Box::new(error));
         }
     };
+    let game_session = if config.game_session_enabled {
+        let Some(rsa_private_key) = &rsa_private_key else {
+            status.shutdown()?;
+            host.shutdown()?;
+            return Err("gameSessionEnabled requires an FE legacy private key".into());
+        };
+        match start_game_session(
+            GameSessionHostConfig {
+                bind_addr: config.game_session_socket_addr(),
+                profile: config.profile,
+                rsa_private_key: Arc::clone(rsa_private_key),
+                max_connections: config.max_connections(),
+                session_timeout: Duration::from_secs(5),
+            },
+            &config.database_path,
+        ) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                status.shutdown()?;
+                host.shutdown()?;
+                return Err(Box::new(error));
+            }
+        }
+    } else {
+        None
+    };
     let game_shutdown = host.shutdown_signal();
     let status_shutdown = status.shutdown_signal();
+    let game_session_shutdown = game_session
+        .as_ref()
+        .map(|session| session.shutdown_signal());
     ctrlc::set_handler({
         let game_shutdown = game_shutdown.clone();
         let status_shutdown = status_shutdown.clone();
+        let game_session_shutdown = game_session_shutdown.clone();
         move || {
             game_shutdown.store(true, Ordering::SeqCst);
             status_shutdown.store(true, Ordering::SeqCst);
+            if let Some(game_session_shutdown) = &game_session_shutdown {
+                game_session_shutdown.store(true, Ordering::SeqCst);
+            }
         }
     })?;
 
@@ -185,6 +227,12 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         "> TFS-style status service running on {}",
         status.local_addr()
     );
+    if let Some(game_session) = &game_session {
+        println!(
+            "> Bounded fe-7.4 game-session foundation running on {}; official-client acceptance remains unverified.",
+            game_session.local_addr()
+        );
+    }
     if config.legacy_login_enabled {
         println!("> Bounded 7.4 login/character-list foundation is enabled; official-client acceptance remains unverified.");
     } else {
@@ -194,8 +242,17 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("> Server host online. Press Ctrl+C for an orderly shutdown.");
 
-    while !game_shutdown.load(Ordering::SeqCst) && !status_shutdown.load(Ordering::SeqCst) {
+    while !game_shutdown.load(Ordering::SeqCst)
+        && !status_shutdown.load(Ordering::SeqCst)
+        && game_session_shutdown
+            .as_ref()
+            .map(|shutdown| !shutdown.load(Ordering::SeqCst))
+            .unwrap_or(true)
+    {
         thread::sleep(Duration::from_millis(100));
+    }
+    if let Some(game_session) = game_session {
+        game_session.shutdown()?;
     }
     status.shutdown()?;
     host.shutdown()?;

@@ -44,6 +44,8 @@ pub struct EngineConfig {
     pub database_path: PathBuf,
     pub legacy_login_enabled: bool,
     pub rsa_private_key_path: PathBuf,
+    pub game_session_enabled: bool,
+    pub game_session_port: u16,
 }
 
 impl EngineConfig {
@@ -53,6 +55,10 @@ impl EngineConfig {
 
     pub fn status_socket_addr(&self) -> SocketAddr {
         SocketAddr::new(self.bind_ip, self.status_protocol_port)
+    }
+
+    pub fn game_session_socket_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.bind_ip, self.game_session_port)
     }
 
     pub fn max_connections(&self) -> usize {
@@ -151,6 +157,8 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
             "rsaPrivateKey",
             "key.pem",
         )?),
+        game_session_enabled: optional_boolean(&values, "gameSessionEnabled", false)?,
+        game_session_port: optional_u16(&values, "gameSessionPort", 7173)?,
     })
 }
 
@@ -216,7 +224,7 @@ pub fn validate_content(world_directory: impl AsRef<Path>) -> Result<ContentRepo
 
 pub fn template(profile: CompatibilityProfile) -> String {
     format!(
-        "-- Forgotten Engine configuration\n-- TFS-style layout; parsed as a bounded assignment subset during P0.\n\n-- Connection Config\nip = \"127.0.0.1\"\ngameProtocolPort = 7172\nstatusProtocolPort = 7171\nmaxPlayers = 0\nserverName = \"Forgotten Engine\"\n\n-- Legacy login foundation\n-- Set true only after providing an original 1024-bit RSA private key.\nlegacyLoginEnabled = false\nrsaPrivateKey = \"key.pem\"\n\n-- Map\nmapName = \"forgotten\"\nworldType = \"pvp\"\n\n-- MySQL compatibility contract (SQLite remains the current storage backend)\nmysqlHost = \"127.0.0.1\"\nmysqlUser = \"forgottenengine\"\nmysqlDatabase = \"forgottenengine\"\n\n-- Forgotten Engine profile\nfeProfile = \"{}\"\ntibiaProtocol = \"{}\"\n",
+        "-- Forgotten Engine configuration\n-- TFS-style layout; parsed as a bounded assignment subset during P0.\n\n-- Connection Config\nip = \"127.0.0.1\"\ngameProtocolPort = 7172\nstatusProtocolPort = 7171\nmaxPlayers = 0\nserverName = \"Forgotten Engine\"\n\n-- Legacy login foundation\n-- Set true only after providing an original 1024-bit RSA private key.\nlegacyLoginEnabled = false\nrsaPrivateKey = \"key.pem\"\n\n-- Legacy game-session foundation\n-- Separate opt-in port until official session compatibility is proven.\ngameSessionEnabled = false\ngameSessionPort = 7173\n\n-- Map\nmapName = \"forgotten\"\nworldType = \"pvp\"\n\n-- MySQL compatibility contract (SQLite remains the current storage backend)\nmysqlHost = \"127.0.0.1\"\nmysqlUser = \"forgottenengine\"\nmysqlDatabase = \"forgottenengine\"\n\n-- Forgotten Engine profile\nfeProfile = \"{}\"\ntibiaProtocol = \"{}\"\n",
         profile.id, profile.tibia_protocol
     )
 }
@@ -324,6 +332,26 @@ fn optional_boolean(
     }
 }
 
+fn optional_u16(
+    values: &BTreeMap<String, Literal>,
+    key: &'static str,
+    default: u16,
+) -> Result<u16, ConfigError> {
+    match values.get(key) {
+        Some(Literal::Integer(value)) => {
+            u16::try_from(*value).map_err(|_| ConfigError::InvalidValue {
+                key,
+                message: "must be between 0 and 65535".into(),
+            })
+        }
+        Some(_) => Err(ConfigError::InvalidValue {
+            key,
+            message: "must be an integer".into(),
+        }),
+        None => Ok(default),
+    }
+}
+
 fn required_u16(values: &BTreeMap<String, Literal>, key: &'static str) -> Result<u16, ConfigError> {
     let value = required_u32(values, key)?;
     u16::try_from(value).map_err(|_| ConfigError::InvalidValue {
@@ -411,6 +439,8 @@ mod tests {
         assert_eq!(config.world_type, WorldType::Pvp);
         assert!(!config.legacy_login_enabled);
         assert_eq!(config.rsa_private_key_path, world.join("key.pem"));
+        assert!(!config.game_session_enabled);
+        assert_eq!(config.game_session_port, 7173);
         let _ = fs::remove_dir_all(world);
     }
 
@@ -421,7 +451,7 @@ mod tests {
         fs::write(
             world.join(CONFIG_FILE_NAME),
             format!(
-                "{}legacyLoginEnabled = true\nrsaPrivateKey = \"keys/legacy.pem\"\n",
+                "{}legacyLoginEnabled = true\nrsaPrivateKey = \"keys/legacy.pem\"\ngameSessionEnabled = true\ngameSessionPort = 7183\n",
                 template(FE_7_4_PROFILE)
             ),
         )
@@ -429,6 +459,8 @@ mod tests {
         let config = load(&world).unwrap();
         assert!(config.legacy_login_enabled);
         assert_eq!(config.rsa_private_key_path, world.join("keys/legacy.pem"));
+        assert!(config.game_session_enabled);
+        assert_eq!(config.game_session_port, 7183);
         let _ = fs::remove_dir_all(world);
     }
 
