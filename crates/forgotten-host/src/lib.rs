@@ -600,6 +600,7 @@ fn serve_native_otclient_game(
                         &session_database_path,
                     );
                     if let Err(error) = result {
+                        eprintln!("> Native OTCv8 game session ended peer={peer} reason={error}");
                         record_event(
                             &session_database_path,
                             "warn",
@@ -736,6 +737,11 @@ fn handle_native_otclient_game(
         &encode_native_otclient_empty_world_map(&config.client_profile, &snapshot)
             .map_err(HostError::Protocol)?,
     )?;
+    eprintln!(
+        "> Native OTCv8 init sent peer={peer} player={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
+        character.name,
+        snapshot.ground_thing_id == 0 && snapshot.player_look_type == 0,
+    );
 
     let account_id = u64::try_from(account.id).map_err(|_| {
         HostError::InvalidConfiguration("native numeric account IDs must be non-negative".into())
@@ -766,6 +772,11 @@ fn handle_native_otclient_game(
             }
             Err(error) => return Err(error),
         };
+        let opcode = request.0.first().copied().unwrap_or_default();
+        eprintln!(
+            "> Native OTCv8 frame peer={peer} opcode=0x{opcode:02x} len={}",
+            request.0.len()
+        );
         match decode_native_otclient_game_action(&request, &config.client_profile)
             .map_err(HostError::Protocol)?
         {
