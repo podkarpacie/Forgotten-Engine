@@ -18,3 +18,7 @@
 - [x] Send the native 740 player bootstrap packets required for non-negative HUD statistics and the local-player identity.
 - [x] Restore a visible, profile-selected empty-world player/map diagnostic fixture without bundling client assets.
 - [x] Keep a native 740 active session alive by replying to the real client keepalive sequence.
+- [x] Decode click-to-walk (`0x14`) without dropping an otherwise valid native 740 session.
+- [x] Decode and safely acknowledge classic 740 chat traffic without dropping the session.
+- [x] Preserve the local player’s mapped creature identity when sending cardinal movement updates.
+- [x] Stream a replacement map viewport or reject the move cleanly before a native empty-world boundary causes a client disconnect.

@@ -787,10 +787,16 @@ pub const NATIVE_OTCLIENT_GAME_PING: u8 = 0x1e;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATS: u8 = 0xa0;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_SKILLS: u8 = 0xa1;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATE: u8 = 0xa2;
+pub const NATIVE_OTCLIENT_GAME_TEXT_MESSAGE: u8 = 0xb4;
+pub const NATIVE_OTCLIENT_GAME_CANCEL_WALK: u8 = 0xb5;
 pub const NATIVE_OTCLIENT_ENTER_GAME: u8 = 0x0f;
+pub const NATIVE_OTCLIENT_LEAVE_GAME: u8 = 0x14;
 pub const NATIVE_OTCLIENT_CLIENT_PING: u8 = 0x1d;
 pub const NATIVE_OTCLIENT_CLIENT_PING_BACK: u8 = 0x1e;
+pub const NATIVE_OTCLIENT_CLIENT_AUTO_WALK: u8 = 0x64;
+pub const NATIVE_OTCLIENT_CLIENT_STOP: u8 = 0x69;
 pub const NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES: u8 = 0xa0;
+pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_UNKNOWN_CREATURE: u16 = 0x0061;
 pub const NATIVE_OTCLIENT_MAPPED_CREATURE: u16 = 0xffff;
 pub const NATIVE_OTCLIENT_TILE_END: u16 = 0xff00;
@@ -885,10 +891,67 @@ impl NativeOtClientCardinalDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeOtClientAutoWalkDirection {
+    East,
+    NorthEast,
+    North,
+    NorthWest,
+    West,
+    SouthWest,
+    South,
+    SouthEast,
+}
+
+impl NativeOtClientAutoWalkDirection {
+    fn from_native_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::East),
+            2 => Some(Self::NorthEast),
+            3 => Some(Self::North),
+            4 => Some(Self::NorthWest),
+            5 => Some(Self::West),
+            6 => Some(Self::SouthWest),
+            7 => Some(Self::South),
+            8 => Some(Self::SouthEast),
+            _ => None,
+        }
+    }
+
+    pub fn cardinal_steps(self) -> &'static [NativeOtClientCardinalDirection] {
+        match self {
+            Self::East => &[NativeOtClientCardinalDirection::East],
+            Self::NorthEast => &[
+                NativeOtClientCardinalDirection::North,
+                NativeOtClientCardinalDirection::East,
+            ],
+            Self::North => &[NativeOtClientCardinalDirection::North],
+            Self::NorthWest => &[
+                NativeOtClientCardinalDirection::North,
+                NativeOtClientCardinalDirection::West,
+            ],
+            Self::West => &[NativeOtClientCardinalDirection::West],
+            Self::SouthWest => &[
+                NativeOtClientCardinalDirection::South,
+                NativeOtClientCardinalDirection::West,
+            ],
+            Self::South => &[NativeOtClientCardinalDirection::South],
+            Self::SouthEast => &[
+                NativeOtClientCardinalDirection::South,
+                NativeOtClientCardinalDirection::East,
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeOtClientGameAction {
     EnterGame,
+    LeaveGame,
     Ping,
     PingBack,
+    Stop,
+    AutoWalk(Vec<NativeOtClientAutoWalkDirection>),
+    Talk,
     ChangeFightModes,
     CardinalMove(NativeOtClientCardinalDirection),
 }
@@ -1100,8 +1163,30 @@ pub fn decode_native_otclient_game_action(
     let mut reader = Reader::new(&frame.0);
     let action = match reader.byte()? {
         NATIVE_OTCLIENT_ENTER_GAME => NativeOtClientGameAction::EnterGame,
+        NATIVE_OTCLIENT_LEAVE_GAME => NativeOtClientGameAction::LeaveGame,
         NATIVE_OTCLIENT_CLIENT_PING => NativeOtClientGameAction::Ping,
         NATIVE_OTCLIENT_CLIENT_PING_BACK => NativeOtClientGameAction::PingBack,
+        NATIVE_OTCLIENT_CLIENT_STOP => NativeOtClientGameAction::Stop,
+        NATIVE_OTCLIENT_CLIENT_AUTO_WALK => {
+            let length = usize::from(reader.byte()?);
+            if length > 64 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            let mut path = Vec::with_capacity(length);
+            for _ in 0..length {
+                path.push(
+                    NativeOtClientAutoWalkDirection::from_native_byte(reader.byte()?)
+                        .ok_or(ProtocolError::InvalidNativeGameRequest)?,
+                );
+            }
+            NativeOtClientGameAction::AutoWalk(path)
+        }
+        NATIVE_OTCLIENT_CLIENT_TALK => {
+            reader.byte()?;
+            let remaining = reader.remaining();
+            reader.take(remaining)?;
+            NativeOtClientGameAction::Talk
+        }
         NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES => {
             reader.byte()?;
             reader.byte()?;
@@ -1136,6 +1221,29 @@ pub fn encode_native_otclient_game_ping(
     Ok(Frame(vec![NATIVE_OTCLIENT_GAME_PING]))
 }
 
+pub fn encode_native_otclient_game_cancel_walk(
+    profile: &NativeOtClientProfile,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    Ok(Frame(vec![NATIVE_OTCLIENT_GAME_CANCEL_WALK, 0]))
+}
+
+pub fn encode_native_otclient_game_status_message(
+    profile: &NativeOtClientProfile,
+    message: &str,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() || message.len() > MAX_LOGIN_STRING_BYTES {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_TEXT_MESSAGE);
+    writer.byte(30);
+    writer.string(message);
+    Ok(Frame(writer.finish()))
+}
+
 pub fn encode_native_otclient_move_creature(
     profile: &NativeOtClientProfile,
     player_id: u32,
@@ -1151,6 +1259,23 @@ pub fn encode_native_otclient_move_creature(
     writer.u16(NATIVE_OTCLIENT_MAPPED_CREATURE);
     writer.u32(player_id);
     write_native_otclient_position(&mut writer, position);
+    Ok(Frame(writer.finish()))
+}
+
+pub fn encode_native_otclient_move_creature_at(
+    profile: &NativeOtClientProfile,
+    old_position: NativeOtClientPosition,
+    old_stack_position: u8,
+    new_position: NativeOtClientPosition,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() || old_stack_position == u8::MAX {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_MOVE_CREATURE);
+    write_native_otclient_position(&mut writer, old_position);
+    writer.byte(old_stack_position);
+    write_native_otclient_position(&mut writer, new_position);
     Ok(Frame(writer.finish()))
 }
 
@@ -1806,6 +1931,40 @@ mod tests {
             NativeOtClientGameAction::ChangeFightModes
         );
         assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_AUTO_WALK, 2, 1, 3]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::AutoWalk(vec![
+                NativeOtClientAutoWalkDirection::East,
+                NativeOtClientAutoWalkDirection::North,
+            ])
+        );
+        assert!(decode_native_otclient_game_action(
+            &Frame(vec![NATIVE_OTCLIENT_CLIENT_AUTO_WALK, 65]),
+            &profile,
+        )
+        .is_err());
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_TALK, 1, 2, 0, b'h', b'i']),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::Talk
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(&Frame(vec![NATIVE_OTCLIENT_CLIENT_STOP]), &profile)
+                .unwrap(),
+            NativeOtClientGameAction::Stop
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(&Frame(vec![NATIVE_OTCLIENT_LEAVE_GAME]), &profile)
+                .unwrap(),
+            NativeOtClientGameAction::LeaveGame
+        );
+        assert_eq!(
             encode_native_otclient_game_ping_back(&profile).unwrap().0,
             vec![NATIVE_OTCLIENT_GAME_PING_BACK]
         );
@@ -1833,6 +1992,24 @@ mod tests {
             snapshot.player_id
         );
         assert_eq!(&movement.0[7..12], &[101, 0, 100, 0, 7]);
+        let coordinate_movement = encode_native_otclient_move_creature_at(
+            &profile,
+            snapshot.player_position,
+            1,
+            NativeOtClientPosition {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+        )
+        .unwrap();
+        assert_eq!(coordinate_movement.0[0], NATIVE_OTCLIENT_GAME_MOVE_CREATURE);
+        assert_eq!(&coordinate_movement.0[1..7], &[100, 0, 100, 0, 7, 1]);
+        assert_eq!(&coordinate_movement.0[7..12], &[101, 0, 100, 0, 7]);
+        assert_eq!(
+            encode_native_otclient_game_cancel_walk(&profile).unwrap().0,
+            vec![NATIVE_OTCLIENT_GAME_CANCEL_WALK, 0]
+        );
 
         let asset_free_snapshot = NativeOtClientEmptyWorldSnapshot {
             ground_thing_id: 0,

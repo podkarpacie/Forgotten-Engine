@@ -15,10 +15,11 @@ use forgotten_protocol::{
     encode_fe_otclient_world_tick, encode_legacy_74_character_list,
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
-    encode_native_otclient_game_initialization, encode_native_otclient_game_login_error,
-    encode_native_otclient_game_ping, encode_native_otclient_game_ping_back,
-    encode_native_otclient_login_error, encode_native_otclient_move_creature, encode_status_binary,
-    encode_status_xml, generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    encode_native_otclient_game_cancel_walk, encode_native_otclient_game_initialization,
+    encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
+    encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
+    encode_native_otclient_move_creature_at, encode_status_binary, encode_status_xml,
+    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
     CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
     Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientCardinalDirection,
     NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPosition,
@@ -759,6 +760,7 @@ fn handle_native_otclient_game(
         })
         .map_err(HostError::Core)?;
     let initial_position = character.position;
+    let mut player_position = initial_position;
     let mut remaining_moves = MAX_NATIVE_EMPTY_WORLD_MOVES_PER_SESSION;
     loop {
         let request = match read_frame(stream) {
@@ -793,34 +795,45 @@ fn handle_native_otclient_game(
             )?,
             NativeOtClientGameAction::PingBack
             | NativeOtClientGameAction::EnterGame
-            | NativeOtClientGameAction::ChangeFightModes => {}
-            NativeOtClientGameAction::CardinalMove(direction) => {
-                if remaining_moves == 0 {
-                    break;
-                }
-                let (_, destination) = world
-                    .move_player_cardinal(character.id, native_cardinal_direction(direction))
-                    .map_err(HostError::Core)?;
-                if !native_empty_world_position_is_visible(initial_position, destination) {
-                    write_frame(
-                        stream,
-                        &encode_native_otclient_game_login_error(
-                            "Native empty-world viewport boundary reached; map-row streaming is not available yet.",
-                        ),
-                    )?;
-                    return Ok(());
-                }
-                database.update_player_position(character.id, destination)?;
-                write_frame(
-                    stream,
-                    &encode_native_otclient_move_creature(
-                        &config.client_profile,
-                        player_id,
-                        native_position(destination),
-                    )
+            | NativeOtClientGameAction::ChangeFightModes
+            | NativeOtClientGameAction::Talk => {}
+            NativeOtClientGameAction::LeaveGame => break,
+            NativeOtClientGameAction::Stop => write_frame(
+                stream,
+                &encode_native_otclient_game_cancel_walk(&config.client_profile)
                     .map_err(HostError::Protocol)?,
+            )?,
+            NativeOtClientGameAction::AutoWalk(path) => {
+                for direction in path {
+                    for cardinal in direction.cardinal_steps() {
+                        if !move_native_empty_world_player(
+                            stream,
+                            &config.client_profile,
+                            &database,
+                            &mut world,
+                            character.id,
+                            initial_position,
+                            &mut player_position,
+                            &mut remaining_moves,
+                            *cardinal,
+                        )? {
+                            break;
+                        }
+                    }
+                }
+            }
+            NativeOtClientGameAction::CardinalMove(direction) => {
+                let _ = move_native_empty_world_player(
+                    stream,
+                    &config.client_profile,
+                    &database,
+                    &mut world,
+                    character.id,
+                    initial_position,
+                    &mut player_position,
+                    &mut remaining_moves,
+                    direction,
                 )?;
-                remaining_moves -= 1;
             }
         }
     }
@@ -833,6 +846,54 @@ fn handle_native_otclient_game(
         ),
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn move_native_empty_world_player(
+    stream: &mut TcpStream,
+    profile: &NativeOtClientProfile,
+    database: &EngineDatabase,
+    world: &mut WorldState,
+    character_id: u64,
+    initial_position: Position,
+    player_position: &mut Position,
+    remaining_moves: &mut usize,
+    direction: NativeOtClientCardinalDirection,
+) -> Result<bool, HostError> {
+    if *remaining_moves == 0 {
+        write_frame(
+            stream,
+            &encode_native_otclient_game_cancel_walk(profile).map_err(HostError::Protocol)?,
+        )?;
+        return Ok(false);
+    }
+    let destination = player_position
+        .step(native_cardinal_direction(direction))
+        .map_err(HostError::Core)?;
+    if !native_empty_world_position_is_visible(initial_position, destination) {
+        write_frame(
+            stream,
+            &encode_native_otclient_game_cancel_walk(profile).map_err(HostError::Protocol)?,
+        )?;
+        return Ok(false);
+    }
+    let (previous, destination) = world
+        .move_player_cardinal(character_id, native_cardinal_direction(direction))
+        .map_err(HostError::Core)?;
+    database.update_player_position(character_id, destination)?;
+    write_frame(
+        stream,
+        &encode_native_otclient_move_creature_at(
+            profile,
+            native_position(previous),
+            1,
+            native_position(destination),
+        )
+        .map_err(HostError::Protocol)?,
+    )?;
+    *player_position = destination;
+    *remaining_moves -= 1;
+    Ok(true)
 }
 
 fn native_player_id(character_id: u64) -> Result<u32, HostError> {
@@ -1710,18 +1771,41 @@ mod tests {
         let ping_back = read_frame(&mut stream).unwrap();
         assert_eq!(ping_back.0, vec![0x1d]);
 
+        write_frame(&mut stream, &Frame(vec![0x64, 2, 1, 3])).unwrap();
+        let auto_walk_east = read_frame(&mut stream).unwrap();
+        assert_eq!(&auto_walk_east.0[1..7], &[100, 0, 100, 0, 7, 1]);
+        assert_eq!(&auto_walk_east.0[7..12], &[101, 0, 100, 0, 7]);
+        let auto_walk_north = read_frame(&mut stream).unwrap();
+        assert_eq!(&auto_walk_north.0[1..7], &[101, 0, 100, 0, 7, 1]);
+        assert_eq!(&auto_walk_north.0[7..12], &[101, 0, 99, 0, 7]);
+
         write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
         let movement = read_frame(&mut stream).unwrap();
         assert_eq!(
             movement.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
         );
-        assert_eq!(&movement.0[7..12], &[101, 0, 100, 0, 7]);
+        assert_eq!(&movement.0[1..7], &[101, 0, 99, 0, 7, 1]);
+        assert_eq!(&movement.0[7..12], &[102, 0, 99, 0, 7]);
         assert_eq!(
             database.characters_for_account(account_id).unwrap()[0]
                 .position
                 .x,
-            101
+            102
+        );
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0]
+                .position
+                .y,
+            99
+        );
+
+        write_frame(&mut stream, &Frame(vec![0x96, 1, 2, 0, b'h', b'i'])).unwrap();
+        write_frame(&mut stream, &Frame(vec![0x69])).unwrap();
+        let cancelled = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            cancelled.0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 0]
         );
 
         game.shutdown().unwrap();
