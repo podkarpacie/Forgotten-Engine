@@ -39,6 +39,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "generate-key" => generate_key(required_path(&arguments, 1)?),
         "backup" => backup(required_path(&arguments, 1)?),
         "command" => command_line(&arguments),
+        "account" => account_command(&arguments),
+        "player" => player_command(&arguments),
         "compatibility" => compatibility(),
         "version" | "--version" | "-V" => version(),
         "help" | "--help" | "-h" => {
@@ -445,6 +447,83 @@ fn command_line(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     }
 }
 
+fn account_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let action = arguments
+        .get(1)
+        .map(String::as_str)
+        .ok_or("an account action is required")?;
+    match action {
+        "create" => {
+            let directory = required_path(arguments, 2)?;
+            let account_name = arguments
+                .get(3)
+                .map(String::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("an account name is required")?;
+            let password = arguments
+                .get(4)
+                .map(String::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or("an account password is required")?;
+            if arguments.len() != 5 {
+                return Err("usage: account create <directory> <account-name> <password>".into());
+            }
+            let config = load(&directory)?;
+            let database = EngineDatabase::open(&config.database_path)?;
+            let account_id =
+                database.create_account_with_password(account_name.trim(), password)?;
+            println!(
+                "created local account name={} native-account-id={account_id}",
+                account_name.trim()
+            );
+            Ok(())
+        }
+        unsupported => Err(format!("unsupported account action `{unsupported}`").into()),
+    }
+}
+
+fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let action = arguments
+        .get(1)
+        .map(String::as_str)
+        .ok_or("a player action is required")?;
+    match action {
+        "create" => {
+            let directory = required_path(arguments, 2)?;
+            let account_id: u32 = arguments
+                .get(3)
+                .ok_or("a numeric native account ID is required")?
+                .parse()
+                .map_err(|_| "account ID must be an unsigned 32-bit integer")?;
+            let player_name = arguments
+                .get(4)
+                .map(String::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("a character name is required")?;
+            if arguments.len() != 5 {
+                return Err(
+                    "usage: player create <directory> <account-id> <character-name>".into(),
+                );
+            }
+            let config = load(&directory)?;
+            let database = EngineDatabase::open(&config.database_path)?;
+            let player = database.create_player_for_account(account_id, player_name)?;
+            println!(
+                "created character name={} player-id={} account-id={} position={},{},{} level={}",
+                player.name,
+                player.id,
+                account_id,
+                player.position.x,
+                player.position.y,
+                player.position.z,
+                player.level
+            );
+            Ok(())
+        }
+        unsupported => Err(format!("unsupported player action `{unsupported}`").into()),
+    }
+}
+
 fn compatibility() -> Result<(), Box<dyn std::error::Error>> {
     for profile in COMPATIBILITY_PROFILES {
         println!(
@@ -467,7 +546,10 @@ fn compatibility() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn version() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Forgotten Engine compatibility profiles:");
+    println!(
+        "Forgotten Engine build {}\nCompatibility profiles:",
+        env!("CARGO_PKG_VERSION")
+    );
     for profile in COMPATIBILITY_PROFILES {
         println!(
             "  FE {} — {} / Tibia {}",
@@ -478,7 +560,7 @@ fn version() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_help() {
-    println!("Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (official client service not yet implemented)\n  fe-8.0  — Tibia 8.0 (official client service not yet implemented)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (official client service not yet implemented)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  run <directory>\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  command <directory> broadcast <message>\n  compatibility\n  version");
+    println!("Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)\n  fe-8.0  — Tibia 8.0 (protocol foundation)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  run <directory>\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  account create <directory> <account-name> <password>\n  player create <directory> <account-id> <character-name>\n  command <directory> broadcast <message>\n  compatibility\n  version");
 }
 
 #[cfg(test)]
@@ -513,6 +595,44 @@ mod tests {
         let config = load(&directory).unwrap();
         assert!(config.rsa_private_key_path.exists());
         assert!(LegacyRsaPrivateKey::load_pem(&config.rsa_private_key_path).is_ok());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn provisions_a_native_test_account_and_character_without_sql_console_access() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("forgotten-engine-provision-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+
+        account_command(&[
+            "account".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "test-account".into(),
+            "test-password".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "Knight".into(),
+        ])
+        .unwrap();
+
+        let config = load(&directory).unwrap();
+        let database = EngineDatabase::open(&config.database_path).unwrap();
+        let account = database
+            .authenticate_account_id(1, "test-password")
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.name, "test-account");
+        assert_eq!(account.characters[0].name, "Knight");
         let _ = fs::remove_dir_all(directory);
     }
 }

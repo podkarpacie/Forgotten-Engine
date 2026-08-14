@@ -181,6 +181,50 @@ impl EngineDatabase {
         Ok(())
     }
 
+    pub fn create_player_for_account(
+        &self,
+        account_id: u32,
+        name: &str,
+    ) -> Result<LoginCharacter, PersistenceError> {
+        if name.trim().is_empty() || name.len() > 32 {
+            return Err(PersistenceError::InvalidPlayerName);
+        }
+        let account_exists = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1)",
+            params![account_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !account_exists {
+            return Err(PersistenceError::UnknownAccount(account_id));
+        }
+
+        let position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        self.connection.execute(
+            "INSERT INTO players (account_id, name, x, y, z, level, experience, skill_points)\
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                account_id as i64,
+                name.trim(),
+                position.x as i64,
+                position.y as i64,
+                position.z as i64,
+                8_i64,
+                0_i64,
+                0_i64,
+            ],
+        )?;
+        Ok(LoginCharacter {
+            id: self.connection.last_insert_rowid() as u64,
+            name: name.trim().to_owned(),
+            level: 8,
+            position,
+        })
+    }
+
     pub fn update_player_position(
         &self,
         player_id: u64,
@@ -287,6 +331,8 @@ pub enum PersistenceError {
     Io(std::io::Error),
     Sql(rusqlite::Error),
     PasswordHash(String),
+    InvalidPlayerName,
+    UnknownAccount(u32),
     UnknownPlayer(u64),
 }
 
@@ -416,6 +462,40 @@ mod tests {
                 .x,
             101
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn provisions_a_default_native_test_character_for_an_existing_account() {
+        let path = temporary_path("provisioning");
+        let database = EngineDatabase::open(&path).unwrap();
+        assert!(matches!(
+            database.create_player_for_account(42, "Knight"),
+            Err(PersistenceError::UnknownAccount(42))
+        ));
+        let account_id = database
+            .create_account_with_password("test-account", "test-password")
+            .unwrap();
+        let character = database
+            .create_player_for_account(account_id.try_into().unwrap(), "Knight")
+            .unwrap();
+        assert_eq!(character.name, "Knight");
+        assert_eq!(character.level, 8);
+        assert_eq!(
+            character.position,
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            }
+        );
+        assert!(database
+            .authenticate_account_id(account_id.try_into().unwrap(), "test-password")
+            .unwrap()
+            .unwrap()
+            .characters
+            .iter()
+            .any(|entry| entry.name == "Knight"));
         let _ = fs::remove_file(path);
     }
 }
