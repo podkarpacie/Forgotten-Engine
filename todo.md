@@ -15,3 +15,6 @@
 - [ ] Remove the invalid zero extended-outfit player creature from the asset-free native map diagnostic fixture.
 - [ ] Correct remaining native 740 game-start packet sequencing after map-only initialization still returns to character selection.
 - [ ] Treat Windows nonblocking `WouldBlock` during a native session as a transient condition rather than a rejected game session.
+- [x] Send the native 740 player bootstrap packets required for non-negative HUD statistics and the local-player identity.
+- [x] Restore a visible, profile-selected empty-world player/map diagnostic fixture without bundling client assets.
+- [x] Keep a native 740 active session alive by replying to the real client keepalive sequence.

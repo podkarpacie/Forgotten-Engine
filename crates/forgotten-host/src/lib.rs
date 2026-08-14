@@ -16,9 +16,9 @@ use forgotten_protocol::{
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
     encode_native_otclient_game_initialization, encode_native_otclient_game_login_error,
-    encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
-    encode_native_otclient_move_creature, encode_status_binary, encode_status_xml,
-    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    encode_native_otclient_game_ping, encode_native_otclient_game_ping_back,
+    encode_native_otclient_login_error, encode_native_otclient_move_creature, encode_status_binary,
+    encode_status_xml, generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
     CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
     Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientCardinalDirection,
     NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPosition,
@@ -39,6 +39,7 @@ pub const PROBE_ERROR_MAGIC: &[u8; 4] = b"FEER";
 pub const PROBE_VERSION: u8 = 1;
 const MAX_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
 const MAX_NATIVE_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
+const NATIVE_OTCLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct HostConfig {
@@ -724,6 +725,7 @@ fn handle_native_otclient_game(
         player_id,
         player_name: character.name.clone(),
         player_position: native_position(character.position),
+        player_level: character.level.try_into().unwrap_or(u16::MAX),
         ground_thing_id: empty_world.ground_thing_id,
         player_look_type: empty_world.player_look_type,
         player_speed: empty_world.player_speed,
@@ -733,6 +735,7 @@ fn handle_native_otclient_game(
         encode_native_otclient_game_initialization(&config.client_profile, &snapshot)
             .map_err(HostError::Protocol)?;
     write_frame(stream, &initialization)?;
+    stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
     eprintln!(
         "> Native OTCv8 init sent peer={peer} player={} record-bytes={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
         character.name,
@@ -756,12 +759,21 @@ fn handle_native_otclient_game(
         })
         .map_err(HostError::Core)?;
     let initial_position = character.position;
-    for _ in 0..MAX_NATIVE_EMPTY_WORLD_MOVES_PER_SESSION {
+    let mut remaining_moves = MAX_NATIVE_EMPTY_WORLD_MOVES_PER_SESSION;
+    loop {
         let request = match read_frame(stream) {
             Ok(request) => request,
-            Err(HostError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut => break,
-            Err(HostError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
+            Err(HostError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                write_frame(
+                    stream,
+                    &encode_native_otclient_game_ping(&config.client_profile)
+                        .map_err(HostError::Protocol)?,
+                )?;
                 continue;
             }
             Err(error) => return Err(error),
@@ -783,6 +795,9 @@ fn handle_native_otclient_game(
             | NativeOtClientGameAction::EnterGame
             | NativeOtClientGameAction::ChangeFightModes => {}
             NativeOtClientGameAction::CardinalMove(direction) => {
+                if remaining_moves == 0 {
+                    break;
+                }
                 let (_, destination) = world
                     .move_player_cardinal(character.id, native_cardinal_direction(direction))
                     .map_err(HostError::Core)?;
@@ -805,6 +820,7 @@ fn handle_native_otclient_game(
                     )
                     .map_err(HostError::Protocol)?,
                 )?;
+                remaining_moves -= 1;
             }
         }
     }
@@ -1672,7 +1688,23 @@ mod tests {
             .0
             .windows(6)
             .any(|window| window == b"Knight"));
+        assert!(initialization
+            .0
+            .contains(&forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_STATS));
+        assert!(initialization
+            .0
+            .contains(&forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_SKILLS));
 
+        let heartbeat = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            heartbeat.0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_PING]
+        );
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING_BACK]),
+        )
+        .unwrap();
         write_frame(&mut stream, &Frame(vec![0xa0, 1, 0, 1])).unwrap();
         write_frame(&mut stream, &Frame(vec![0x1d])).unwrap();
         let ping_back = read_frame(&mut stream).unwrap();

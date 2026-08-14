@@ -783,6 +783,10 @@ pub const NATIVE_OTCLIENT_GAME_LOGIN_STATE: u8 = 0x0a;
 pub const NATIVE_OTCLIENT_GAME_FULL_MAP: u8 = 0x64;
 pub const NATIVE_OTCLIENT_GAME_MOVE_CREATURE: u8 = 0x6d;
 pub const NATIVE_OTCLIENT_GAME_PING_BACK: u8 = 0x1d;
+pub const NATIVE_OTCLIENT_GAME_PING: u8 = 0x1e;
+pub const NATIVE_OTCLIENT_GAME_PLAYER_STATS: u8 = 0xa0;
+pub const NATIVE_OTCLIENT_GAME_PLAYER_SKILLS: u8 = 0xa1;
+pub const NATIVE_OTCLIENT_GAME_PLAYER_STATE: u8 = 0xa2;
 pub const NATIVE_OTCLIENT_ENTER_GAME: u8 = 0x0f;
 pub const NATIVE_OTCLIENT_CLIENT_PING: u8 = 0x1d;
 pub const NATIVE_OTCLIENT_CLIENT_PING_BACK: u8 = 0x1e;
@@ -853,6 +857,7 @@ pub struct NativeOtClientEmptyWorldSnapshot {
     pub player_id: u32,
     pub player_name: String,
     pub player_position: NativeOtClientPosition,
+    pub player_level: u16,
     pub ground_thing_id: u16,
     pub player_look_type: u8,
     pub player_speed: u16,
@@ -1003,7 +1008,42 @@ pub fn encode_native_otclient_game_initialization(
 ) -> Result<Frame, ProtocolError> {
     let mut payload = encode_native_otclient_game_login_state(profile, snapshot)?.0;
     payload.extend_from_slice(&encode_native_otclient_empty_world_map(profile, snapshot)?.0);
+    payload.extend_from_slice(&encode_native_otclient_player_bootstrap(profile, snapshot)?.0);
     Ok(Frame(payload))
+}
+
+/// Encodes the fixed-width 7.x local-player records expected immediately after map delivery.
+///
+/// The diagnostic world does not yet persist all of these values. The baseline values keep the
+/// stock client HUD usable until full persistent player state is implemented.
+pub fn encode_native_otclient_player_bootstrap(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+) -> Result<Frame, ProtocolError> {
+    validate_native_empty_world_snapshot(profile, snapshot)?;
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_PLAYER_STATS);
+    writer.u16(150);
+    writer.u16(150);
+    writer.u16(40_000);
+    writer.u32(0);
+    writer.u16(snapshot.player_level.max(1));
+    writer.byte(0);
+    writer.u16(50);
+    writer.u16(50);
+    writer.byte(0);
+    writer.byte(0);
+    writer.byte(0);
+
+    writer.byte(NATIVE_OTCLIENT_GAME_PLAYER_SKILLS);
+    for _ in 0..7 {
+        writer.byte(10);
+        writer.byte(0);
+    }
+
+    writer.byte(NATIVE_OTCLIENT_GAME_PLAYER_STATE);
+    writer.byte(0);
+    Ok(Frame(writer.finish()))
 }
 
 pub fn encode_native_otclient_empty_world_map(
@@ -1085,6 +1125,15 @@ pub fn encode_native_otclient_game_ping_back(
         return Err(ProtocolError::UnsupportedNativeClientProfile);
     }
     Ok(Frame(vec![NATIVE_OTCLIENT_GAME_PING_BACK]))
+}
+
+pub fn encode_native_otclient_game_ping(
+    profile: &NativeOtClientProfile,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    Ok(Frame(vec![NATIVE_OTCLIENT_GAME_PING]))
 }
 
 pub fn encode_native_otclient_move_creature(
@@ -1654,6 +1703,7 @@ mod tests {
                 y: 100,
                 z: 7,
             },
+            player_level: 8,
             ground_thing_id: 102,
             player_look_type: 128,
             player_speed: 220,
@@ -1708,7 +1758,27 @@ mod tests {
             initialization.0[login.0.len()],
             NATIVE_OTCLIENT_GAME_FULL_MAP
         );
-        assert_eq!(&initialization.0[login.0.len()..], map.0.as_slice());
+        assert_eq!(
+            &initialization.0[login.0.len()..login.0.len() + map.0.len()],
+            map.0.as_slice()
+        );
+        let bootstrap = encode_native_otclient_player_bootstrap(&profile, &snapshot).unwrap();
+        assert_eq!(bootstrap.0[0], NATIVE_OTCLIENT_GAME_PLAYER_STATS);
+        assert_eq!(
+            u16::from_le_bytes(bootstrap.0[1..3].try_into().unwrap()),
+            150
+        );
+        assert_eq!(
+            u16::from_le_bytes(bootstrap.0[11..13].try_into().unwrap()),
+            snapshot.player_level
+        );
+        assert_eq!(bootstrap.0[21], NATIVE_OTCLIENT_GAME_PLAYER_SKILLS);
+        assert_eq!(bootstrap.0[36], NATIVE_OTCLIENT_GAME_PLAYER_STATE);
+        assert_eq!(bootstrap.0[37], 0);
+        assert_eq!(
+            &initialization.0[login.0.len() + map.0.len()..],
+            bootstrap.0.as_slice()
+        );
 
         assert_eq!(
             decode_native_otclient_cardinal_move_request(&Frame(vec![0x66]), &profile).unwrap(),
@@ -1738,6 +1808,10 @@ mod tests {
         assert_eq!(
             encode_native_otclient_game_ping_back(&profile).unwrap().0,
             vec![NATIVE_OTCLIENT_GAME_PING_BACK]
+        );
+        assert_eq!(
+            encode_native_otclient_game_ping(&profile).unwrap().0,
+            vec![NATIVE_OTCLIENT_GAME_PING]
         );
         let movement = encode_native_otclient_move_creature(
             &profile,
