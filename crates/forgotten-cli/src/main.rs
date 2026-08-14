@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const CONFIG_TEMPLATE: &str = "[server]\nname = \"My Forgotten Server\"\nip = \"127.0.0.1\"\nport = 7172\nprotocol = \"8.0\"\n\n[database]\ndriver = \"sqlite\"\npath = \"data/server.db\"\n\n[world]\nmap = \"content/maps/world.otbm\"\npvp = true\n\n[experience]\nrate = 1\n\n[logging]\nlevel = \"info\"\n";
+const CONFIG_TEMPLATE: &str = "[server]\nname = \"My Forgotten Server\"\nip = \"127.0.0.1\"\nport = 7172\nengine_version = \"1.2.0\"\ntfs_reference = \"1.2\"\nprotocol = \"10.98\"\n\n[database]\ndriver = \"sqlite\"\npath = \"data/server.db\"\n\n[world]\nmap = \"content/maps/world.otbm\"\npvp = true\n\n[experience]\nrate = 1\n\n[logging]\nlevel = \"info\"\n";
 
 fn main() {
     if let Err(error) = run() {
@@ -24,6 +24,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "backup" => backup(required_path(&arguments, 1)?),
         "command" => command_line(&arguments),
         "compatibility" => compatibility(),
+        "version" | "--version" | "-V" => version(),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -45,6 +46,7 @@ fn required_path(
 fn init(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(directory.join("content/maps"))?;
     fs::create_dir_all(directory.join("backups"))?;
+    fs::create_dir_all(directory.join("data"))?;
     let config = directory.join("server.toml");
     if config.exists() {
         return Err(format!("{} already exists; refusing to overwrite", config.display()).into());
@@ -65,8 +67,18 @@ fn validate(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let contents =
         fs::read_to_string(&config).map_err(|_| format!("missing {}", config.display()))?;
     let mut failures = Vec::new();
-    if !contents.contains("protocol = \"8.0\"") {
-        failures.push("protocol must be Tibia 8.0");
+    if !has_config_value(&contents, "protocol", forgotten_protocol::TARGET_PROTOCOL) {
+        failures.push("protocol must be Tibia 10.98 for FE 1.2.0");
+    }
+    if !has_config_value(&contents, "engine_version", forgotten_protocol::FE_RELEASE) {
+        failures.push("engine_version must match FE 1.2.0");
+    }
+    if !has_config_value(
+        &contents,
+        "tfs_reference",
+        forgotten_protocol::TFS_REFERENCE,
+    ) {
+        failures.push("tfs_reference must be 1.2");
     }
     if !contents.contains("driver = \"sqlite\"") {
         failures.push("MVP requires embedded SQLite");
@@ -80,8 +92,10 @@ fn validate(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     }
     if failures.is_empty() {
         println!(
-            "diagnostics: database=ok config=ok map-directory=ok protocol={}",
-            forgotten_protocol::TARGET_PROTOCOL
+            "diagnostics: database=ok config=ok map-directory=ok fe={} tfs={} protocol={}",
+            forgotten_protocol::FE_RELEASE,
+            forgotten_protocol::TFS_REFERENCE,
+            forgotten_protocol::TARGET_PROTOCOL,
         );
         Ok(())
     } else {
@@ -97,8 +111,10 @@ fn run_local(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         .apply(LifecycleCommand::Ready)?;
     database.record_event("info", "local engine runtime started")?;
     println!(
-        "status={} protocol={} events={}",
+        "status={} fe={} tfs={} protocol={} events={}",
         status.as_str(),
+        forgotten_protocol::FE_RELEASE,
+        forgotten_protocol::TFS_REFERENCE,
         forgotten_protocol::TARGET_PROTOCOL,
         database.event_count()?
     );
@@ -109,10 +125,12 @@ fn run_local(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 fn status(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let database = EngineDatabase::open(database_path(&directory))?;
     println!(
-        "database={} schema={} events={} target_protocol={}",
+        "database={} schema={} events={} fe={} tfs={} target_protocol={}",
         database.path().display(),
         database.schema_version()?,
         database.event_count()?,
+        forgotten_protocol::FE_RELEASE,
+        forgotten_protocol::TFS_REFERENCE,
         forgotten_protocol::TARGET_PROTOCOL
     );
     Ok(())
@@ -150,6 +168,13 @@ fn command_line(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 fn compatibility() -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "FE {}\tTFS {}\tTibia {}\tcomplete-emulation={}",
+        forgotten_protocol::FE_1_2_PROFILE.fe_release,
+        forgotten_protocol::FE_1_2_PROFILE.tfs_reference,
+        forgotten_protocol::FE_1_2_PROFILE.tibia_protocol,
+        forgotten_protocol::FE_1_2_PROFILE.complete_protocol_emulation,
+    );
     for entry in forgotten_scripting::compatibility_matrix() {
         println!(
             "{}\t{}\t{}",
@@ -161,10 +186,25 @@ fn compatibility() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn version() -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "Forgotten Engine FE {} (TFS {} compatibility reference; Tibia {} target)",
+        forgotten_protocol::FE_RELEASE,
+        forgotten_protocol::TFS_REFERENCE,
+        forgotten_protocol::TARGET_PROTOCOL,
+    );
+    Ok(())
+}
+
+fn has_config_value(contents: &str, key: &str, expected: &str) -> bool {
+    let expected_line = format!("{key} = \"{expected}\"");
+    contents.lines().any(|line| line.trim() == expected_line)
+}
+
 fn database_path(directory: &Path) -> PathBuf {
     directory.join("data/server.db")
 }
 
 fn print_help() {
-    println!("Forgotten Engine 0.1\n\nCommands:\n  init <directory>\n  validate <directory>\n  run <directory>\n  status <directory>\n  backup <directory>\n  command <directory> broadcast <message>\n  compatibility");
+    println!("Forgotten Engine FE 1.2.0 (TFS 1.2 / Tibia 10.98 compatibility foundation)\n\nCommands:\n  init <directory>\n  validate <directory>\n  run <directory>\n  status <directory>\n  backup <directory>\n  command <directory> broadcast <message>\n  compatibility\n  version");
 }

@@ -1,7 +1,24 @@
-//! Bounded packet framing for future Tibia 8.0 protocol work.
+//! Bounded packet framing for the FE 1.2.0 Tibia 10.98 compatibility foundation.
 
 pub const MAX_FRAME_SIZE: usize = 8 * 1024;
-pub const TARGET_PROTOCOL: &str = "8.0";
+pub const TARGET_PROTOCOL: &str = "10.98";
+pub const FE_RELEASE: &str = "1.2.0";
+pub const TFS_REFERENCE: &str = "1.2";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompatibilityProfile {
+    pub fe_release: &'static str,
+    pub tfs_reference: &'static str,
+    pub tibia_protocol: &'static str,
+    pub complete_protocol_emulation: bool,
+}
+
+pub const FE_1_2_PROFILE: CompatibilityProfile = CompatibilityProfile {
+    fe_release: FE_RELEASE,
+    tfs_reference: TFS_REFERENCE,
+    tibia_protocol: TARGET_PROTOCOL,
+    complete_protocol_emulation: false,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame(pub Vec<u8>);
@@ -65,5 +82,18 @@ mod tests {
             decode(&[0, 0, 1]),
             Err(ProtocolError::InvalidLength(0))
         ));
+    }
+
+    #[test]
+    fn exposes_an_explicit_and_limited_tfs_1_2_profile() {
+        assert_eq!(FE_1_2_PROFILE.fe_release, "1.2.0");
+        assert_eq!(FE_1_2_PROFILE.tfs_reference, "1.2");
+        assert_eq!(FE_1_2_PROFILE.tibia_protocol, "10.98");
+        assert!(!FE_1_2_PROFILE.complete_protocol_emulation);
+    }
+
+    #[test]
+    fn rejects_truncated_frame_payloads() {
+        assert!(matches!(decode(&[1, 0]), Err(ProtocolError::Truncated)));
     }
 }
