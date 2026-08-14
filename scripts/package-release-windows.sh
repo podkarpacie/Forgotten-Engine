@@ -21,15 +21,12 @@ rm -rf "$staging_dir"
 mkdir -p "$staging_dir"
 
 cp "$executable" "$staging_dir/forgotten-engine.exe"
-cp README.md VERSIONING.md RELEASE_ASSETS.md "$staging_dir/"
 cat > "$staging_dir/INSTALL.txt" <<'EOF'
 Forgotten Engine precompiled Windows archive
 
-1. Run: .\forgotten-engine.exe init .\my-world --profile fe-7.4
-2. Run: .\forgotten-engine.exe validate .\my-world
-3. Run: .\forgotten-engine.exe version
+Run .\forgotten-engine.exe help for local commands.
 
-This archive contains no Tibia client assets, maps, item databases, or game content.
+This package contains the executable only. Documentation will be maintained in the Forgotten Engine GitBook.
 EOF
 
 mkdir -p dist
