@@ -2,6 +2,8 @@
 
 Forgotten Engine publishes executable archives for a specific tagged source revision. Archives contain the `forgotten-engine` executable, a profile matrix, installation instructions, and a SHA-256 checksum manifest. They do not contain Tibia client assets, maps, item databases, or copyrighted game content.
 
+> **Readiness notice:** The archives are local compatibility foundations, not network-ready Tibia servers. The executable does not currently bind a login/game port or accept a Tibia client. See [RUNTIME_READINESS.md](RUNTIME_READINESS.md) before deploying an archive.
+
 ## FE 7.4.0 asset matrix
 
 | Archive | Build environment | Executable | Compatibility profiles in the binary | Verification |
@@ -20,5 +22,7 @@ Extract the archive, then initialize a local world with an explicit profile:
 ```
 
 On Windows, use `forgotten-engine.exe` in PowerShell or Command Prompt. The generated `forgotten-engine.toml` names the chosen profile, compatibility reference, protocol target, and SQLite data location.
+
+The Windows archive needs no bundled Boost, OpenSSL, MariaDB/MySQL, zlib, bz2, pugixml, or SQLite DLLs. It does retain normal Windows operating-system imports, including `KERNEL32.dll`, `msvcrt.dll`, and `WS2_32.dll`; these are supplied by Windows rather than the archive.
 
 > An executable archive is a reproducible compatibility foundation, not a full production multiplayer server. Do not treat the binary as claiming complete client protocol, game content, map, scripting, combat, or login encryption compatibility.

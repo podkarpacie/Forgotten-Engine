@@ -21,3 +21,7 @@
 - [x] Build and smoke-test a native Linux precompiled archive for FE 7.4.0.
 - [x] Build and structurally verify a reproducible local Windows precompiled ZIP from the same source revision.
 - [x] Attach the validated precompiled archives and checksum manifest to the FE 7.4.0 GitHub release.
+- [x] Inspect the FE 7.4 Windows executable imports and verify whether any redistributable DLLs are required at runtime.
+- [x] Compare the shipped executable’s implemented behavior with the requirements of a real connectable Tibia server.
+- [x] Correct release documentation and metadata to distinguish a local compatibility foundation from a network-ready server binary.
+- [x] Document the runtime dependencies, current limitations, and implementation milestones required for a playable network server.
