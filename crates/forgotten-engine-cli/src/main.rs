@@ -1,13 +1,17 @@
-use forgotten_core::{LifecycleCommand, ServerStatus};
+use forgotten_config::{ensure_content_skeleton, load, validate_content, write_template};
+use forgotten_host::{start, HostConfig};
 use forgotten_persistence::{create_backup, EngineDatabase};
 use forgotten_protocol::{profile_by_id, CompatibilityProfile, COMPATIBILITY_PROFILES};
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::thread;
+use std::time::Duration;
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("error: {error}");
+        eprintln!("ERROR: {error}");
         std::process::exit(1);
     }
 }
@@ -21,7 +25,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             selected_profile(&arguments, 2)?,
         ),
         "validate" => validate(required_path(&arguments, 1)?),
-        "run" => run_local(required_path(&arguments, 1)?),
+        "run" => run_host(required_path(&arguments, 1)?),
         "status" => status(required_path(&arguments, 1)?),
         "backup" => backup(required_path(&arguments, 1)?),
         "command" => command_line(&arguments),
@@ -62,125 +66,114 @@ fn selected_profile(
     })
 }
 
-fn config_template(profile: CompatibilityProfile) -> String {
-    format!(
-        "[forgotten_engine]\nname = \"My Forgotten Engine World\"\nip = \"127.0.0.1\"\nport = 7172\ncompatibility_profile = \"{}\"\nengine_version = \"{}\"\ncompatibility_reference = \"{}\"\nprotocol = \"{}\"\n\n[database]\ndriver = \"sqlite\"\npath = \"data/world.db\"\n\n[world]\nmap = \"content/maps/world.otbm\"\npvp = true\n\n[experience]\nrate = 1\n\n[logging]\nlevel = \"info\"\n",
-        profile.id, profile.fe_release, profile.compatibility_reference, profile.tibia_protocol
-    )
-}
-
 fn init(
     directory: PathBuf,
     profile: CompatibilityProfile,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    fs::create_dir_all(directory.join("content/maps"))?;
-    fs::create_dir_all(directory.join("backups"))?;
-    fs::create_dir_all(directory.join("data"))?;
-    let config = directory.join("forgotten-engine.toml");
-    if config.exists() {
-        return Err(format!("{} already exists; refusing to overwrite", config.display()).into());
-    }
-    fs::write(&config, config_template(profile))?;
-    let database = EngineDatabase::open(database_path(&directory))?;
+    fs::create_dir_all(&directory)?;
+    write_template(&directory, profile)?;
+    ensure_content_skeleton(&directory)?;
+    let config = load(&directory)?;
+    let database = EngineDatabase::open(&config.database_path)?;
     database.record_event("info", "Forgotten Engine world initialized")?;
     println!(
-        "initialized {} with {} / {} / Tibia {} and SQLite schema {}",
-        directory.display(),
-        profile.id,
-        profile.compatibility_reference,
-        profile.tibia_protocol,
+        "Forgotten Engine world initialized\n> config.lua profile={} protocol={}\n> content={}\n> database={} schema={}",
+        config.profile.id,
+        config.profile.tibia_protocol,
+        config.content_directory.display(),
+        database.path().display(),
         database.schema_version()?
     );
     Ok(())
 }
 
-fn profile_from_config(contents: &str) -> Result<CompatibilityProfile, Box<dyn std::error::Error>> {
-    let selector = config_value(contents, "compatibility_profile")
-        .ok_or("missing compatibility_profile in forgotten-engine.toml")?;
-    profile_by_id(selector)
-        .ok_or_else(|| format!("unsupported compatibility_profile `{selector}`").into())
-}
-
 fn validate(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let config = directory.join("forgotten-engine.toml");
-    let contents =
-        fs::read_to_string(&config).map_err(|_| format!("missing {}", config.display()))?;
-    let profile = profile_from_config(&contents)?;
-    let mut failures = Vec::new();
-    for (key, expected) in [
-        ("engine_version", profile.fe_release),
-        ("compatibility_reference", profile.compatibility_reference),
-        ("protocol", profile.tibia_protocol),
-    ] {
-        if !has_config_value(&contents, key, expected) {
-            failures.push(format!("{key} must be `{expected}` for {}", profile.id));
-        }
-    }
-    if !has_config_value(&contents, "driver", "sqlite") {
-        failures.push("this compatibility foundation requires embedded SQLite".to_owned());
-    }
-    if !directory.join("content/maps").exists() {
-        failures.push("content/maps directory is missing".to_owned());
-    }
-    let database = EngineDatabase::open(database_path(&directory))?;
+    println!(">> Loading config");
+    let config = load(&directory)?;
+    println!(">> Validating data content");
+    let content = validate_content(&directory)?;
+    println!(">> Opening database");
+    let database = EngineDatabase::open(&config.database_path)?;
     if database.schema_version()? < 1 {
-        failures.push("database schema is not migrated".to_owned());
+        return Err("database schema is not migrated".into());
     }
-    if failures.is_empty() {
-        println!(
-            "diagnostics: database=ok config=ok map-directory=ok profile={} reference={} protocol={}",
-            profile.id, profile.compatibility_reference, profile.tibia_protocol
-        );
-        Ok(())
-    } else {
-        Err(format!("validation failed: {}", failures.join("; ")).into())
-    }
+    println!(
+        "> Validation complete: profile={} protocol={} game-port={} status-port={} data={} database={}",
+        config.profile.id,
+        config.profile.tibia_protocol,
+        config.game_protocol_port,
+        config.status_protocol_port,
+        content.data_directory.display(),
+        database.path().display()
+    );
+    Ok(())
 }
 
-fn run_local(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Forgotten Engine - {}", env!("CARGO_PKG_VERSION"));
     validate(directory.clone())?;
-    let profile = read_profile(&directory)?;
-    let database = EngineDatabase::open(database_path(&directory))?;
-    let status = ServerStatus::Offline
-        .apply(LifecycleCommand::Start)?
-        .apply(LifecycleCommand::Ready)?;
-    database.record_event("info", "Forgotten Engine local runtime started")?;
+    let config = load(&directory)?;
+    let database = EngineDatabase::open(&config.database_path)?;
+    database.record_event("info", "Forgotten Engine host startup requested")?;
+
+    println!(">> Registering services");
+    let host = start(
+        HostConfig {
+            bind_addr: config.game_socket_addr(),
+            profile: config.profile,
+            max_connections: config.max_connections(),
+            session_timeout: Duration::from_secs(5),
+        },
+        &config.database_path,
+    )?;
+    let shutdown = host.shutdown_signal();
+    ctrlc::set_handler({
+        let shutdown = shutdown.clone();
+        move || shutdown.store(true, Ordering::SeqCst)
+    })?;
+
     println!(
-        "status={} profile={} reference={} protocol={} events={}",
-        status.as_str(),
-        profile.id,
-        profile.compatibility_reference,
-        profile.tibia_protocol,
-        database.event_count()?
+        "> FE diagnostic service running on {} for {} / Tibia {}",
+        host.local_addr(),
+        config.profile.compatibility_reference,
+        config.profile.tibia_protocol
     );
-    println!("network listener is intentionally not enabled in this compatibility foundation; use this command to verify local configuration and persistence.");
+    println!(
+        "> Status port {} reserved; status protocol is not implemented in this milestone.",
+        config.status_protocol_port
+    );
+    println!(
+        "> Official Tibia login/game services are feature-gated pending independently tested version-specific codecs."
+    );
+    println!("> Server host online. Press Ctrl+C for an orderly shutdown.");
+
+    while !shutdown.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(100));
+    }
+    host.shutdown()?;
+    println!("> Server host stopped.");
     Ok(())
 }
 
 fn status(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let profile = read_profile(&directory)?;
-    let database = EngineDatabase::open(database_path(&directory))?;
+    let config = load(&directory)?;
+    let database = EngineDatabase::open(&config.database_path)?;
     println!(
-        "database={} schema={} events={} profile={} reference={} target_protocol={}",
+        "serverName={} profile={} reference={} targetProtocol={} database={} schema={} events={}",
+        config.server_name,
+        config.profile.id,
+        config.profile.compatibility_reference,
+        config.profile.tibia_protocol,
         database.path().display(),
         database.schema_version()?,
-        database.event_count()?,
-        profile.id,
-        profile.compatibility_reference,
-        profile.tibia_protocol
+        database.event_count()?
     );
     Ok(())
 }
 
-fn read_profile(directory: &Path) -> Result<CompatibilityProfile, Box<dyn std::error::Error>> {
-    let config = directory.join("forgotten-engine.toml");
-    let contents =
-        fs::read_to_string(&config).map_err(|_| format!("missing {}", config.display()))?;
-    profile_from_config(&contents)
-}
-
 fn backup(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let artifact = create_backup(database_path(&directory), directory.join("backups"))?;
+    let config = load(&directory)?;
+    let artifact = create_backup(&config.database_path, directory.join("backups"))?;
     println!(
         "backup={} manifest={}",
         artifact.database_copy.display(),
@@ -201,7 +194,8 @@ fn command_line(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             if message.trim().is_empty() {
                 return Err("broadcast message is required".into());
             }
-            let database = EngineDatabase::open(database_path(&directory))?;
+            let config = load(&directory)?;
+            let database = EngineDatabase::open(&config.database_path)?;
             database.record_event("command", &format!("broadcast: {message}"))?;
             println!("recorded Forgotten Engine broadcast command");
             Ok(())
@@ -213,7 +207,7 @@ fn command_line(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 fn compatibility() -> Result<(), Box<dyn std::error::Error>> {
     for profile in COMPATIBILITY_PROFILES {
         println!(
-            "FE {}\t{}\tTibia {}\tcomplete-emulation={}",
+            "FE {}\t{}\tTibia {}\tofficial-client={}",
             profile.fe_release,
             profile.compatibility_reference,
             profile.tibia_protocol,
@@ -242,37 +236,13 @@ fn version() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn config_value<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
-    let prefix = format!("{key} = ");
-    contents.lines().find_map(|line| {
-        let value = line.trim().strip_prefix(&prefix)?;
-        value.strip_prefix('"')?.strip_suffix('"')
-    })
-}
-
-fn has_config_value(contents: &str, key: &str, expected: &str) -> bool {
-    config_value(contents, key) == Some(expected)
-}
-
-fn database_path(directory: &Path) -> PathBuf {
-    directory.join("data/world.db")
-}
-
 fn print_help() {
-    println!("Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4\n  fe-8.0  — Tibia 8.0\n  fe-1.2  — TFS 1.2 / Tibia 10.98\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  run <directory>\n  status <directory>\n  backup <directory>\n  command <directory> broadcast <message>\n  compatibility\n  version");
+    println!("Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (official client service not yet implemented)\n  fe-8.0  — Tibia 8.0 (official client service not yet implemented)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (official client service not yet implemented)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  run <directory>\n  status <directory>\n  backup <directory>\n  command <directory> broadcast <message>\n  compatibility\n  version");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn selects_tibia_8_profile_by_direct_selector() {
-        let arguments = vec!["init".to_owned(), "world".to_owned(), "fe-8.0".to_owned()];
-        let profile = selected_profile(&arguments, 2).unwrap();
-        assert_eq!(profile.id, "fe-8.0");
-        assert_eq!(profile.tibia_protocol, "8.0");
-    }
 
     #[test]
     fn selects_tibia_7_4_profile_by_direct_selector() {
@@ -283,11 +253,8 @@ mod tests {
     }
 
     #[test]
-    fn configuration_validation_is_profile_specific() {
-        let config = config_template(forgotten_protocol::FE_8_0_PROFILE);
-        let profile = profile_from_config(&config).unwrap();
-        assert_eq!(profile, forgotten_protocol::FE_8_0_PROFILE);
-        assert!(has_config_value(&config, "protocol", "8.0"));
-        assert!(!has_config_value(&config, "protocol", "10.98"));
+    fn rejects_unknown_profile_by_direct_selector() {
+        let arguments = vec!["init".to_owned(), "world".to_owned(), "unknown".to_owned()];
+        assert!(selected_profile(&arguments, 2).is_err());
     }
 }

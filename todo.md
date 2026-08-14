@@ -25,3 +25,19 @@
 - [x] Compare the shipped executable’s implemented behavior with the requirements of a real connectable Tibia server.
 - [x] Correct release documentation and metadata to distinguish a local compatibility foundation from a network-ready server binary.
 - [x] Document the runtime dependencies, current limitations, and implementation milestones required for a playable network server.
+- [x] Define the initial network-capable vertical slice, including a non-production protocol handshake and explicit compatibility limits.
+- [x] Add configuration-driven host/port settings, a persistent TCP listener, graceful shutdown, connection limits, and structured session logging.
+- [x] Implement a bounded diagnostic-session handshake without claiming official Tibia 7.4 packet compatibility.
+- [ ] Implement independently specified account and character-list services after the version-specific 7.4 login codec is defined and tested.
+- [x] Add TCP integration tests for accepted connections, malformed input, protocol framing, and orderly shutdown.
+- [x] Update runtime documentation to identify exactly what a test client can connect to and what still prevents official Tibia-client interoperability.
+- [x] Validate, commit, and push the tested network-host milestone with no misleading "playable server" claim.
+- [x] Create a clean-room TFS compatibility matrix from the official upstream repository’s observable startup, configuration, service, scripting, data, and protocol interfaces.
+- [x] Replace the current custom-only initialization path with TFS-style `config.lua` discovery, required configuration diagnostics, and an equivalent startup sequence without copying upstream code.
+- [x] Define original Rust contracts for service registration, Lua-script discovery, map/content validation, database initialization, and graceful no-service shutdown behavior.
+- [x] Implement and test the first TFS-style Rust startup milestone, including accurate console diagnostics and explicit feature-gate messages for unimplemented gameplay services.
+- [x] Publish a parity-roadmap document that distinguishes implemented behavior from planned TFS-compatible behavior for each target version.
+- [ ] Map upstream repository automation, CMake/presets, Docker, Visual Studio/vcpkg, environment examples, and licensing/attribution files to Rust-native build and distribution equivalents.
+- [ ] Map the upstream `data/` tree, Lua configuration/scripts, schema, keys, and runtime files to clean-room FE content, configuration, schema, and credential contracts.
+- [ ] Map upstream `src/` service, protocol, scheduler, game, database, Lua, map-serialization, and script-manager boundaries to original Rust crates and acceptance tests.
+- [x] Define compatibility status for each mapped project-surface item as implemented, in progress, planned, reference-only, or intentionally not applicable.

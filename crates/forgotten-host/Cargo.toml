@@ -1,0 +1,13 @@
+[package]
+name = "forgotten-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+forgotten-persistence = { path = "../forgotten-persistence" }
+forgotten-protocol = { path = "../forgotten-protocol" }
+
+[lints]
+workspace = true

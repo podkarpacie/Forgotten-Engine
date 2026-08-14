@@ -117,7 +117,7 @@ mod tests {
         assert_eq!(FE_1_2_PROFILE.fe_release, "1.2.0");
         assert_eq!(FE_1_2_PROFILE.compatibility_reference, "TFS 1.2");
         assert_eq!(FE_1_2_PROFILE.tibia_protocol, "10.98");
-        assert!(!FE_1_2_PROFILE.complete_protocol_emulation);
+        assert!(!profile_by_id("fe-1.2").unwrap().complete_protocol_emulation);
     }
 
     #[test]

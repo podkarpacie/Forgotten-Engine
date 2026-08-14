@@ -5,6 +5,8 @@ members = [
   "crates/forgotten-persistence",
   "crates/forgotten-protocol",
   "crates/forgotten-scripting",
+  "crates/forgotten-config",
+  "crates/forgotten-host",
   "crates/forgotten-engine-cli",
 ]
 

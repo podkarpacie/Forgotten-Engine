@@ -10,10 +10,13 @@ name = "forgotten-engine"
 path = "src/main.rs"
 
 [dependencies]
+forgotten-config = { path = "../forgotten-config" }
 forgotten-core = { path = "../forgotten-core" }
+forgotten-host = { path = "../forgotten-host" }
 forgotten-persistence = { path = "../forgotten-persistence" }
 forgotten-protocol = { path = "../forgotten-protocol" }
 forgotten-scripting = { path = "../forgotten-scripting" }
+ctrlc = "3.4"
 
 [lints]
 workspace = true
