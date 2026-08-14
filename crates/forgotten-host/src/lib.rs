@@ -15,16 +15,17 @@ use forgotten_protocol::{
     encode_fe_otclient_world_tick, encode_legacy_74_character_list,
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
-    encode_native_otclient_game_cancel_walk, encode_native_otclient_game_initialization,
+    encode_native_otclient_game_cancel_walk_facing, encode_native_otclient_game_initialization,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
-    encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
-    encode_native_otclient_move_creature_at, encode_status_binary, encode_status_xml,
-    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
-    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientCardinalDirection,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPosition,
-    NativeOtClientProfile, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
-    StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
+    encode_native_otclient_game_ping_back, encode_native_otclient_game_status_message,
+    encode_native_otclient_login_error, encode_native_otclient_move_creature_at,
+    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
+    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
+    NativeOtClientCardinalDirection, NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction,
+    NativeOtClientPosition, NativeOtClientProfile, OtClientEndpoint, ProtocolError, StatusPlayer,
+    StatusRequest, StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_PLAYER_ID_END,
+    NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -41,6 +42,7 @@ pub const PROBE_VERSION: u8 = 1;
 const MAX_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
 const MAX_NATIVE_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
 const NATIVE_OTCLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const NATIVE_OTCLIENT_AUTOWALK_STEP_DELAY: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone)]
 pub struct HostConfig {
@@ -761,6 +763,7 @@ fn handle_native_otclient_game(
         .map_err(HostError::Core)?;
     let initial_position = character.position;
     let mut player_position = initial_position;
+    let mut facing = NativeOtClientCardinalDirection::South;
     let mut remaining_moves = MAX_NATIVE_EMPTY_WORLD_MOVES_PER_SESSION;
     loop {
         let request = match read_frame(stream) {
@@ -795,16 +798,37 @@ fn handle_native_otclient_game(
             )?,
             NativeOtClientGameAction::PingBack
             | NativeOtClientGameAction::EnterGame
-            | NativeOtClientGameAction::ChangeFightModes
-            | NativeOtClientGameAction::Talk => {}
+            | NativeOtClientGameAction::ChangeFightModes => {}
+            NativeOtClientGameAction::Talk(message) => write_frame(
+                stream,
+                &encode_native_otclient_game_status_message(
+                    &config.client_profile,
+                    &native_chat_acknowledgement(&message),
+                )
+                .map_err(HostError::Protocol)?,
+            )?,
             NativeOtClientGameAction::LeaveGame => break,
             NativeOtClientGameAction::Stop => write_frame(
                 stream,
-                &encode_native_otclient_game_cancel_walk(&config.client_profile)
-                    .map_err(HostError::Protocol)?,
+                &encode_native_otclient_game_cancel_walk_facing(
+                    &config.client_profile,
+                    facing.protocol_direction(),
+                )
+                .map_err(HostError::Protocol)?,
             )?,
+            NativeOtClientGameAction::Turn(direction) => {
+                facing = direction;
+                write_frame(
+                    stream,
+                    &encode_native_otclient_game_cancel_walk_facing(
+                        &config.client_profile,
+                        facing.protocol_direction(),
+                    )
+                    .map_err(HostError::Protocol)?,
+                )?;
+            }
             NativeOtClientGameAction::AutoWalk(path) => {
-                for direction in path {
+                'auto_walk: for direction in path {
                     for cardinal in direction.cardinal_steps() {
                         if !move_native_empty_world_player(
                             stream,
@@ -814,11 +838,13 @@ fn handle_native_otclient_game(
                             character.id,
                             initial_position,
                             &mut player_position,
+                            &mut facing,
                             &mut remaining_moves,
                             *cardinal,
                         )? {
-                            break;
+                            break 'auto_walk;
                         }
+                        thread::sleep(NATIVE_OTCLIENT_AUTOWALK_STEP_DELAY);
                     }
                 }
             }
@@ -831,6 +857,7 @@ fn handle_native_otclient_game(
                     character.id,
                     initial_position,
                     &mut player_position,
+                    &mut facing,
                     &mut remaining_moves,
                     direction,
                 )?;
@@ -857,13 +884,15 @@ fn move_native_empty_world_player(
     character_id: u64,
     initial_position: Position,
     player_position: &mut Position,
+    facing: &mut NativeOtClientCardinalDirection,
     remaining_moves: &mut usize,
     direction: NativeOtClientCardinalDirection,
 ) -> Result<bool, HostError> {
     if *remaining_moves == 0 {
         write_frame(
             stream,
-            &encode_native_otclient_game_cancel_walk(profile).map_err(HostError::Protocol)?,
+            &encode_native_otclient_game_cancel_walk_facing(profile, facing.protocol_direction())
+                .map_err(HostError::Protocol)?,
         )?;
         return Ok(false);
     }
@@ -873,7 +902,8 @@ fn move_native_empty_world_player(
     if !native_empty_world_position_is_visible(initial_position, destination) {
         write_frame(
             stream,
-            &encode_native_otclient_game_cancel_walk(profile).map_err(HostError::Protocol)?,
+            &encode_native_otclient_game_cancel_walk_facing(profile, facing.protocol_direction())
+                .map_err(HostError::Protocol)?,
         )?;
         return Ok(false);
     }
@@ -892,8 +922,22 @@ fn move_native_empty_world_player(
         .map_err(HostError::Protocol)?,
     )?;
     *player_position = destination;
+    *facing = direction;
     *remaining_moves -= 1;
     Ok(true)
+}
+
+fn native_chat_acknowledgement(message: &str) -> String {
+    const PREFIX: &str = "You say: ";
+    const MAX_BYTES: usize = 255;
+    let mut acknowledgement = String::from(PREFIX);
+    for character in message.chars() {
+        if acknowledgement.len() + character.len_utf8() > MAX_BYTES {
+            break;
+        }
+        acknowledgement.push(character);
+    }
+    acknowledgement
 }
 
 fn native_player_id(character_id: u64) -> Result<u32, HostError> {
@@ -1802,10 +1846,37 @@ mod tests {
 
         write_frame(&mut stream, &Frame(vec![0x96, 1, 2, 0, b'h', b'i'])).unwrap();
         write_frame(&mut stream, &Frame(vec![0x69])).unwrap();
+        let chat_status = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            chat_status.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
+                30,
+                11,
+                0,
+                b'Y',
+                b'o',
+                b'u',
+                b' ',
+                b's',
+                b'a',
+                b'y',
+                b':',
+                b' ',
+                b'h',
+                b'i',
+            ]
+        );
         let cancelled = read_frame(&mut stream).unwrap();
         assert_eq!(
             cancelled.0,
-            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 0]
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 1]
+        );
+        write_frame(&mut stream, &Frame(vec![0x71])).unwrap();
+        let turned = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            turned.0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 2]
         );
 
         game.shutdown().unwrap();

@@ -22,3 +22,7 @@
 - [x] Decode and safely acknowledge classic 740 chat traffic without dropping the session.
 - [x] Preserve the local player’s mapped creature identity when sending cardinal movement updates.
 - [x] Stream a replacement map viewport or reject the move cleanly before a native empty-world boundary causes a client disconnect.
+- [x] Pace native click-to-walk updates so OTCv8 visibly walks the path rather than appearing to teleport.
+- [x] Decode classic Ctrl-turn client opcodes and preserve the requested facing direction without disconnecting.
+- [x] Display a bounded diagnostic acknowledgement for accepted 740 chat input.
+- [x] Preserve the current facing direction when canceling a boundary walk.

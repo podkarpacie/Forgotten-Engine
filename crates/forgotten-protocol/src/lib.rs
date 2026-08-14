@@ -795,6 +795,10 @@ pub const NATIVE_OTCLIENT_CLIENT_PING: u8 = 0x1d;
 pub const NATIVE_OTCLIENT_CLIENT_PING_BACK: u8 = 0x1e;
 pub const NATIVE_OTCLIENT_CLIENT_AUTO_WALK: u8 = 0x64;
 pub const NATIVE_OTCLIENT_CLIENT_STOP: u8 = 0x69;
+pub const NATIVE_OTCLIENT_CLIENT_TURN_NORTH: u8 = 0x6f;
+pub const NATIVE_OTCLIENT_CLIENT_TURN_EAST: u8 = 0x70;
+pub const NATIVE_OTCLIENT_CLIENT_TURN_SOUTH: u8 = 0x71;
+pub const NATIVE_OTCLIENT_CLIENT_TURN_WEST: u8 = 0x72;
 pub const NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES: u8 = 0xa0;
 pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_UNKNOWN_CREATURE: u16 = 0x0061;
@@ -888,6 +892,25 @@ impl NativeOtClientCardinalDirection {
             _ => None,
         }
     }
+
+    fn from_turn_opcode(opcode: u8) -> Option<Self> {
+        match opcode {
+            NATIVE_OTCLIENT_CLIENT_TURN_NORTH => Some(Self::North),
+            NATIVE_OTCLIENT_CLIENT_TURN_EAST => Some(Self::East),
+            NATIVE_OTCLIENT_CLIENT_TURN_SOUTH => Some(Self::South),
+            NATIVE_OTCLIENT_CLIENT_TURN_WEST => Some(Self::West),
+            _ => None,
+        }
+    }
+
+    pub fn protocol_direction(self) -> u8 {
+        match self {
+            Self::North => 0,
+            Self::East => 1,
+            Self::South => 2,
+            Self::West => 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -951,7 +974,8 @@ pub enum NativeOtClientGameAction {
     PingBack,
     Stop,
     AutoWalk(Vec<NativeOtClientAutoWalkDirection>),
-    Talk,
+    Talk(String),
+    Turn(NativeOtClientCardinalDirection),
     ChangeFightModes,
     CardinalMove(NativeOtClientCardinalDirection),
 }
@@ -1182,10 +1206,19 @@ pub fn decode_native_otclient_game_action(
             NativeOtClientGameAction::AutoWalk(path)
         }
         NATIVE_OTCLIENT_CLIENT_TALK => {
-            reader.byte()?;
-            let remaining = reader.remaining();
-            reader.take(remaining)?;
-            NativeOtClientGameAction::Talk
+            let mode = reader.byte()?;
+            let message = match mode {
+                4 | 11 => {
+                    reader.string(MAX_LOGIN_STRING_BYTES)?;
+                    reader.string(MAX_LOGIN_STRING_BYTES)?
+                }
+                5 | 6 | 7 | 8 | 10 | 12 => {
+                    reader.u16()?;
+                    reader.string(MAX_LOGIN_STRING_BYTES)?
+                }
+                _ => reader.string(MAX_LOGIN_STRING_BYTES)?,
+            };
+            NativeOtClientGameAction::Talk(message)
         }
         NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES => {
             reader.byte()?;
@@ -1195,6 +1228,10 @@ pub fn decode_native_otclient_game_action(
         }
         opcode => NativeOtClientCardinalDirection::from_client_opcode(opcode)
             .map(NativeOtClientGameAction::CardinalMove)
+            .or_else(|| {
+                NativeOtClientCardinalDirection::from_turn_opcode(opcode)
+                    .map(NativeOtClientGameAction::Turn)
+            })
             .ok_or(ProtocolError::InvalidNativeGameRequest)?,
     };
     if !reader.done() {
@@ -1224,10 +1261,17 @@ pub fn encode_native_otclient_game_ping(
 pub fn encode_native_otclient_game_cancel_walk(
     profile: &NativeOtClientProfile,
 ) -> Result<Frame, ProtocolError> {
+    encode_native_otclient_game_cancel_walk_facing(profile, 0)
+}
+
+pub fn encode_native_otclient_game_cancel_walk_facing(
+    profile: &NativeOtClientProfile,
+    direction: u8,
+) -> Result<Frame, ProtocolError> {
     if !profile.supports_current_native_foundation() {
         return Err(ProtocolError::UnsupportedNativeClientProfile);
     }
-    Ok(Frame(vec![NATIVE_OTCLIENT_GAME_CANCEL_WALK, 0]))
+    Ok(Frame(vec![NATIVE_OTCLIENT_GAME_CANCEL_WALK, direction]))
 }
 
 pub fn encode_native_otclient_game_status_message(
@@ -1952,12 +1996,24 @@ mod tests {
                 &profile,
             )
             .unwrap(),
-            NativeOtClientGameAction::Talk
+            NativeOtClientGameAction::Talk("hi".into())
         );
         assert_eq!(
             decode_native_otclient_game_action(&Frame(vec![NATIVE_OTCLIENT_CLIENT_STOP]), &profile)
                 .unwrap(),
             NativeOtClientGameAction::Stop
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_TURN_SOUTH]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::Turn(NativeOtClientCardinalDirection::South)
+        );
+        assert_eq!(
+            NativeOtClientCardinalDirection::West.protocol_direction(),
+            3
         );
         assert_eq!(
             decode_native_otclient_game_action(&Frame(vec![NATIVE_OTCLIENT_LEAVE_GAME]), &profile)
@@ -2009,6 +2065,15 @@ mod tests {
         assert_eq!(
             encode_native_otclient_game_cancel_walk(&profile).unwrap().0,
             vec![NATIVE_OTCLIENT_GAME_CANCEL_WALK, 0]
+        );
+        assert_eq!(
+            encode_native_otclient_game_cancel_walk_facing(
+                &profile,
+                NativeOtClientCardinalDirection::South.protocol_direction(),
+            )
+            .unwrap()
+            .0,
+            vec![NATIVE_OTCLIENT_GAME_CANCEL_WALK, 2]
         );
 
         let asset_free_snapshot = NativeOtClientEmptyWorldSnapshot {
