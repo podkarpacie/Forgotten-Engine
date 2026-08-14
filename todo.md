@@ -12,3 +12,4 @@
 - [ ] Correct the native 740 game-login request decoder after the live client exposed `StringTooLong(1536)` before initialization.
 - [ ] Correct the native 740 game-start transition after the client receives login/map frames but returns to character selection.
 - [ ] Correct the outbound native 740 initialization stream after the real client emits no post-map control frame.
+- [ ] Remove the invalid zero extended-outfit player creature from the asset-free native map diagnostic fixture.

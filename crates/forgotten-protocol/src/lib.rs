@@ -1014,6 +1014,7 @@ pub fn encode_native_otclient_empty_world_map(
     let mut writer = Writer::default();
     writer.byte(NATIVE_OTCLIENT_GAME_FULL_MAP);
     write_native_otclient_position(&mut writer, snapshot.player_position);
+    let asset_free = snapshot.ground_thing_id == 0 && snapshot.player_look_type == 0;
 
     for z in (0..NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS as u8).rev() {
         for x in 0..NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH {
@@ -1024,7 +1025,7 @@ pub fn encode_native_otclient_empty_world_map(
                 let is_player_tile = z == snapshot.player_position.z
                     && x == NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH / 2 - 1
                     && y == NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT / 2 - 1;
-                if is_player_tile {
+                if is_player_tile && !asset_free {
                     write_native_otclient_unknown_player(&mut writer, snapshot);
                 }
                 writer.u16(NATIVE_OTCLIENT_TILE_END);
@@ -1767,10 +1768,14 @@ mod tests {
         let asset_free_map =
             encode_native_otclient_empty_world_map(&profile, &asset_free_snapshot).unwrap();
         assert_eq!(asset_free_map.0[0], NATIVE_OTCLIENT_GAME_FULL_MAP);
-        assert_eq!(asset_free_map.0.len(), 1 + 5 + cells * 2 + 29);
+        assert_eq!(asset_free_map.0.len(), 1 + 5 + cells * 2);
         assert_eq!(
             u16::from_le_bytes(asset_free_map.0[6..8].try_into().unwrap()),
             NATIVE_OTCLIENT_TILE_END
         );
+        assert!(!asset_free_map
+            .0
+            .windows(asset_free_snapshot.player_name.len())
+            .any(|bytes| bytes == asset_free_snapshot.player_name.as_bytes()));
     }
 }
