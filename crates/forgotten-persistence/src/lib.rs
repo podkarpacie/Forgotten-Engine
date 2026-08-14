@@ -143,6 +143,26 @@ impl EngineDatabase {
         Ok(())
     }
 
+    pub fn update_player_position(
+        &self,
+        player_id: u64,
+        position: Position,
+    ) -> Result<(), PersistenceError> {
+        let affected = self.connection.execute(
+            "UPDATE players SET x = ?1, y = ?2, z = ?3 WHERE id = ?4",
+            params![
+                position.x as i64,
+                position.y as i64,
+                position.z as i64,
+                player_id as i64,
+            ],
+        )?;
+        if affected == 0 {
+            return Err(PersistenceError::UnknownPlayer(player_id));
+        }
+        Ok(())
+    }
+
     pub fn record_event(&self, level: &str, message: &str) -> Result<(), PersistenceError> {
         self.connection.execute(
             "INSERT INTO engine_events (level, message, created_at) VALUES (?1, ?2, ?3)",
@@ -229,6 +249,7 @@ pub enum PersistenceError {
     Io(std::io::Error),
     Sql(rusqlite::Error),
     PasswordHash(String),
+    UnknownPlayer(u64),
 }
 
 impl From<std::io::Error> for PersistenceError {
@@ -332,6 +353,22 @@ mod tests {
                 y: 100,
                 z: 7,
             }
+        );
+        database
+            .update_player_position(
+                7,
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0]
+                .position
+                .x,
+            101
         );
         let _ = fs::remove_file(path);
     }

@@ -6,11 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+forgotten-core = { path = "../forgotten-core" }
 forgotten-persistence = { path = "../forgotten-persistence" }
 forgotten-protocol = { path = "../forgotten-protocol" }
-
-[dev-dependencies]
-forgotten-core = { path = "../forgotten-core" }
 
 [lints]
 workspace = true

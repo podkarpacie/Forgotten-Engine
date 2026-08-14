@@ -98,6 +98,8 @@ fn init(
 fn validate(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!(">> Loading config");
     let config = load(&directory)?;
+    println!(">> Reconciling original content skeleton");
+    ensure_content_skeleton(&directory)?;
     println!(">> Validating data content");
     let content = validate_content(&directory)?;
     println!(">> Opening database");

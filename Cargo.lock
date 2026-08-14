@@ -229,6 +229,7 @@ dependencies = [
 name = "forgotten-protocol"
 version = "7.4.0"
 dependencies = [
+ "forgotten-core",
  "num-bigint-dig",
  "rand",
  "rsa",

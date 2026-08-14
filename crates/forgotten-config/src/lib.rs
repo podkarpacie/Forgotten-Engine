@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 pub const CONFIG_FILE_NAME: &str = "config.lua";
 pub const CONTENT_MANIFEST_NAME: &str = "fe-content.manifest";
+pub const EMPTY_WORLD_MANIFEST_NAME: &str = "fe-empty-world.manifest";
 pub const REQUIRED_CONTENT_DIRECTORIES: [&str; 15] = [
     "actions",
     "creaturescripts",
@@ -197,6 +198,14 @@ pub fn ensure_content_skeleton(world_directory: impl AsRef<Path>) -> Result<(), 
         )
         .map_err(ConfigError::Io)?;
     }
+    let empty_world = data.join("world").join(EMPTY_WORLD_MANIFEST_NAME);
+    if !empty_world.exists() {
+        fs::write(
+            empty_world,
+            "format=fe-empty-world-v1\nworld=empty\nviewport_radius_x=8\nviewport_radius_y=6\nsource=original-forgotten-engine-content-contract\n",
+        )
+        .map_err(ConfigError::Io)?;
+    }
     Ok(())
 }
 
@@ -225,10 +234,26 @@ pub fn validate_content(world_directory: impl AsRef<Path>) -> Result<ContentRepo
             manifest.display()
         )));
     }
+    let empty_world_manifest = data.join("world").join(EMPTY_WORLD_MANIFEST_NAME);
+    let empty_world_contents = fs::read_to_string(&empty_world_manifest).map_err(|_| {
+        ConfigError::InvalidContent(format!("missing {}", empty_world_manifest.display()))
+    })?;
+    for required_line in ["format=fe-empty-world-v1", "world=empty"] {
+        if !empty_world_contents
+            .lines()
+            .any(|line| line == required_line)
+        {
+            return Err(ConfigError::InvalidContent(format!(
+                "{} is not an FE empty-world manifest",
+                empty_world_manifest.display()
+            )));
+        }
+    }
     Ok(ContentReport {
         data_directory: data,
         missing_directories,
         manifest,
+        empty_world_manifest,
     })
 }
 
@@ -406,6 +431,7 @@ pub struct ContentReport {
     pub data_directory: PathBuf,
     pub missing_directories: Vec<String>,
     pub manifest: PathBuf,
+    pub empty_world_manifest: PathBuf,
 }
 
 #[derive(Debug)]
@@ -518,6 +544,13 @@ mod tests {
         ensure_content_skeleton(&world).unwrap();
         let report = validate_content(&world).unwrap();
         assert!(report.missing_directories.is_empty());
+        assert!(report.empty_world_manifest.is_file());
+        fs::remove_file(&report.empty_world_manifest).unwrap();
+        ensure_content_skeleton(&world).unwrap();
+        assert!(validate_content(&world)
+            .unwrap()
+            .empty_world_manifest
+            .is_file());
         let _ = fs::remove_dir_all(world);
     }
 }

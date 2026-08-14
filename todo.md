@@ -64,3 +64,10 @@
 - [x] Integrate custom-client negotiation and initial-world initialization into the opt-in game-session listener with encrypted TCP fixtures.
 - [x] Update operator documentation with OTClient connection expectations and safe endpoint/IP redirection guidance.
 - [x] Validate formatting, all tests, strict linting, optimized builds, and Windows cross-compilation before publication approval for the OTClient milestone.
+- [x] Inspect the current FE world model, persisted character positions, and custom-client session path for empty-world extension points.
+- [x] Define tested original contracts for an empty-world content manifest, viewport payload, deterministic tick, and cardinal movement acknowledgement.
+- [x] Implement a bounded original empty-world map model and deterministic world tick with no copied maps, items, or client data.
+- [x] Implement encrypted FE custom-client viewport, tick, and movement request/acknowledgement codecs.
+- [x] Integrate bounded custom-client movement into the opt-in game-session listener and preserve persisted player position safely.
+- [x] Document the new empty-world rendering/movement scope and the remaining map, item, and gameplay feature gates.
+- [x] Validate formatting, all tests, strict linting, optimized builds, and Windows cross-compilation before publication approval for the empty-world milestone.

@@ -2,6 +2,7 @@
 //!
 //! The legacy 7.4 types below are a tested foundation, not a claim of official-client support.
 
+use forgotten_core::{CardinalDirection, EmptyWorldViewport, Position};
 use rand::{rngs::OsRng, RngCore};
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
 use rsa::pkcs8::DecodePrivateKey;
@@ -618,6 +619,7 @@ pub fn encode_legacy_74_game_session_error(message: &str) -> Frame {
 /// this is not a general Tibia-client compatibility claim.
 pub const FE_OTCLIENT_EXTENDED_OPCODE: u8 = 0x32;
 pub const FE_OTCLIENT_CAPABILITY_SUBOPCODE: u8 = 0xf0;
+pub const FE_OTCLIENT_WORLD_SUBOPCODE: u8 = 0xf1;
 pub const FE_OTCLIENT_CAPABILITY_ACK: &str = "fe.otclient.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -633,6 +635,13 @@ pub struct InitialWorldSnapshot {
     pub start_y: u16,
     pub start_z: u8,
     pub endpoint: OtClientEndpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmptyWorldMovementAck {
+    pub tick: u64,
+    pub from: Position,
+    pub to: Position,
 }
 
 pub fn encode_fe_otclient_capability_offer(endpoint: &OtClientEndpoint) -> Frame {
@@ -672,6 +681,67 @@ pub fn encode_fe_otclient_initial_world(snapshot: &InitialWorldSnapshot) -> Fram
         snapshot.endpoint.port
     );
     encode_fe_otclient_extended(FE_OTCLIENT_CAPABILITY_SUBOPCODE, payload.as_bytes())
+}
+
+pub fn encode_fe_otclient_empty_viewport(viewport: &EmptyWorldViewport) -> Frame {
+    let payload = format!(
+        "fe.viewport.v1;tick={};center={},{},{};manifest={};radius={},{};world=empty",
+        viewport.tick,
+        viewport.center.x,
+        viewport.center.y,
+        viewport.center.z,
+        viewport.manifest.identifier,
+        viewport.manifest.viewport_radius_x,
+        viewport.manifest.viewport_radius_y
+    );
+    encode_fe_otclient_extended(FE_OTCLIENT_WORLD_SUBOPCODE, payload.as_bytes())
+}
+
+pub fn encode_fe_otclient_world_tick(tick: u64) -> Frame {
+    encode_fe_otclient_extended(
+        FE_OTCLIENT_WORLD_SUBOPCODE,
+        format!("fe.tick.v1;tick={tick}").as_bytes(),
+    )
+}
+
+pub fn encode_fe_otclient_movement_ack(ack: &EmptyWorldMovementAck) -> Frame {
+    let payload = format!(
+        "fe.move.ack.v1;tick={};from={},{},{};to={},{},{};world=empty",
+        ack.tick, ack.from.x, ack.from.y, ack.from.z, ack.to.x, ack.to.y, ack.to.z
+    );
+    encode_fe_otclient_extended(FE_OTCLIENT_WORLD_SUBOPCODE, payload.as_bytes())
+}
+
+pub fn encode_fe_otclient_move_request_for_harness(direction: CardinalDirection) -> Frame {
+    encode_fe_otclient_extended(
+        FE_OTCLIENT_WORLD_SUBOPCODE,
+        format!("fe.move.v1;direction={}", direction_name(direction)).as_bytes(),
+    )
+}
+
+pub fn decode_fe_otclient_move_request(frame: &Frame) -> Result<CardinalDirection, ProtocolError> {
+    let (subopcode, payload) = decode_fe_otclient_extended(frame)?;
+    if subopcode != FE_OTCLIENT_WORLD_SUBOPCODE {
+        return Err(ProtocolError::InvalidOtClientMessage);
+    }
+    let payload =
+        std::str::from_utf8(&payload).map_err(|_| ProtocolError::InvalidOtClientMessage)?;
+    match payload {
+        "fe.move.v1;direction=north" => Ok(CardinalDirection::North),
+        "fe.move.v1;direction=east" => Ok(CardinalDirection::East),
+        "fe.move.v1;direction=south" => Ok(CardinalDirection::South),
+        "fe.move.v1;direction=west" => Ok(CardinalDirection::West),
+        _ => Err(ProtocolError::InvalidOtClientMessage),
+    }
+}
+
+fn direction_name(direction: CardinalDirection) -> &'static str {
+    match direction {
+        CardinalDirection::North => "north",
+        CardinalDirection::East => "east",
+        CardinalDirection::South => "south",
+        CardinalDirection::West => "west",
+    }
 }
 
 fn encode_fe_otclient_extended(subopcode: u8, payload: &[u8]) -> Frame {
@@ -749,6 +819,7 @@ pub enum ProtocolError {
     UnsupportedGameSessionVersion(u16),
     ChallengeMismatch,
     InvalidOtClientCapabilityAck,
+    InvalidOtClientMessage,
     TooManyCharacters,
     UnsupportedAddressFamily,
     StringTooLong(usize),
@@ -1033,5 +1104,50 @@ mod tests {
             .0
             .windows(b"fe.world.v1".len())
             .any(|window| window == b"fe.world.v1"));
+    }
+
+    #[test]
+    fn empty_world_viewport_tick_and_movement_contracts_are_explicit() {
+        let viewport = EmptyWorldViewport {
+            tick: 9,
+            center: Position {
+                x: 101,
+                y: 99,
+                z: 7,
+            },
+            manifest: forgotten_core::EmptyWorldManifest::default(),
+        };
+        let viewport = encode_fe_otclient_empty_viewport(&viewport);
+        assert!(viewport
+            .0
+            .windows(b"fe.viewport.v1;tick=9".len())
+            .any(|window| window == b"fe.viewport.v1;tick=9"));
+        let tick = encode_fe_otclient_world_tick(10);
+        assert!(tick
+            .0
+            .windows(b"fe.tick.v1;tick=10".len())
+            .any(|window| window == b"fe.tick.v1;tick=10"));
+        let move_request = encode_fe_otclient_move_request_for_harness(CardinalDirection::West);
+        assert_eq!(
+            decode_fe_otclient_move_request(&move_request).unwrap(),
+            CardinalDirection::West
+        );
+        let acknowledgement = encode_fe_otclient_movement_ack(&EmptyWorldMovementAck {
+            tick: 10,
+            from: Position {
+                x: 101,
+                y: 99,
+                z: 7,
+            },
+            to: Position {
+                x: 100,
+                y: 99,
+                z: 7,
+            },
+        });
+        assert!(acknowledgement
+            .0
+            .windows(b"fe.move.ack.v1;tick=10".len())
+            .any(|window| window == b"fe.move.ack.v1;tick=10"));
     }
 }

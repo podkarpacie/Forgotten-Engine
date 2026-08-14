@@ -75,6 +75,51 @@ impl Position {
             && self.y.abs_diff(other.y) <= 1
             && self != other
     }
+
+    pub fn step(self, direction: CardinalDirection) -> Result<Self, CoreError> {
+        let (x, y) = match direction {
+            CardinalDirection::North => (Some(self.x), self.y.checked_sub(1)),
+            CardinalDirection::East => (self.x.checked_add(1), Some(self.y)),
+            CardinalDirection::South => (Some(self.x), self.y.checked_add(1)),
+            CardinalDirection::West => (self.x.checked_sub(1), Some(self.y)),
+        };
+        match (x, y) {
+            (Some(x), Some(y)) => Ok(Self { x, y, z: self.z }),
+            _ => Err(CoreError::MapBoundary { position: self }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardinalDirection {
+    North,
+    East,
+    South,
+    West,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmptyWorldManifest {
+    pub identifier: String,
+    pub viewport_radius_x: u8,
+    pub viewport_radius_y: u8,
+}
+
+impl Default for EmptyWorldManifest {
+    fn default() -> Self {
+        Self {
+            identifier: "fe.empty-world.v1".into(),
+            viewport_radius_x: 8,
+            viewport_radius_y: 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmptyWorldViewport {
+    pub tick: u64,
+    pub center: Position,
+    pub manifest: EmptyWorldManifest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,8 +151,9 @@ impl WorldState {
         self.tick
     }
 
-    pub fn advance_tick(&mut self) {
+    pub fn advance_tick(&mut self) -> u64 {
         self.tick = self.tick.saturating_add(1);
+        self.tick
     }
 
     pub fn add_player(&mut self, player: Player) -> Result<(), CoreError> {
@@ -139,6 +185,33 @@ impl WorldState {
         player.position = destination;
         Ok(())
     }
+
+    pub fn move_player_cardinal(
+        &mut self,
+        id: u64,
+        direction: CardinalDirection,
+    ) -> Result<(Position, Position), CoreError> {
+        let from = self
+            .player(id)
+            .ok_or(CoreError::UnknownPlayer(id))?
+            .position;
+        let to = from.step(direction)?;
+        self.move_player(id, to)?;
+        Ok((from, to))
+    }
+
+    pub fn empty_world_viewport(
+        &self,
+        id: u64,
+        manifest: EmptyWorldManifest,
+    ) -> Result<EmptyWorldViewport, CoreError> {
+        let player = self.player(id).ok_or(CoreError::UnknownPlayer(id))?;
+        Ok(EmptyWorldViewport {
+            tick: self.tick,
+            center: player.position,
+            manifest,
+        })
+    }
 }
 
 pub fn level_for_experience(experience: u64) -> u32 {
@@ -153,6 +226,9 @@ pub enum CoreError {
     InvalidMovement {
         from: Position,
         to: Position,
+    },
+    MapBoundary {
+        position: Position,
     },
     InvalidTransition {
         state: ServerStatus,
@@ -226,6 +302,33 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn empty_world_tick_viewport_and_cardinal_movement_are_deterministic() {
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        assert_eq!(world.advance_tick(), 1);
+        let (from, to) = world
+            .move_player_cardinal(7, CardinalDirection::East)
+            .unwrap();
+        assert_eq!(from.x, 100);
+        assert_eq!(to.x, 101);
+        let viewport = world
+            .empty_world_viewport(7, EmptyWorldManifest::default())
+            .unwrap();
+        assert_eq!(viewport.tick, 1);
+        assert_eq!(viewport.center, to);
+        assert_eq!(viewport.manifest.identifier, "fe.empty-world.v1");
+    }
+
+    #[test]
+    fn cardinal_movement_rejects_a_map_boundary() {
+        let position = Position { x: 0, y: 0, z: 7 };
+        assert!(matches!(
+            position.step(CardinalDirection::North),
+            Err(CoreError::MapBoundary { .. })
+        ));
     }
 
     #[test]

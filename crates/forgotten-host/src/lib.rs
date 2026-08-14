@@ -2,18 +2,21 @@
 //!
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
+use forgotten_core::{EmptyWorldManifest, Player, WorldState};
 use forgotten_persistence::EngineDatabase;
 use forgotten_protocol::{
-    decode, decode_fe_otclient_capability_ack, decode_legacy_74_envelope,
-    decode_legacy_74_game_session_bootstrap_plaintext, decode_legacy_74_game_session_envelope,
-    decode_legacy_74_login_plaintext, decode_status_request, encode,
-    encode_fe_otclient_capability_offer, encode_fe_otclient_initial_world,
+    decode, decode_fe_otclient_capability_ack, decode_fe_otclient_move_request,
+    decode_legacy_74_envelope, decode_legacy_74_game_session_bootstrap_plaintext,
+    decode_legacy_74_game_session_envelope, decode_legacy_74_login_plaintext,
+    decode_status_request, encode, encode_fe_otclient_capability_offer,
+    encode_fe_otclient_empty_viewport, encode_fe_otclient_initial_world,
+    encode_fe_otclient_movement_ack, encode_fe_otclient_world_tick,
     encode_legacy_74_character_list, encode_legacy_74_game_challenge,
     encode_legacy_74_game_session_error, encode_legacy_74_game_session_ready, encode_login_error,
     encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
-    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, OtClientEndpoint, ProtocolError, StatusPlayer,
-    StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
+    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey, OtClientEndpoint,
+    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
 };
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -27,6 +30,7 @@ pub const PROBE_MAGIC: &[u8; 4] = b"FEHS";
 pub const PROBE_RESPONSE_MAGIC: &[u8; 4] = b"FEOK";
 pub const PROBE_ERROR_MAGIC: &[u8; 4] = b"FEER";
 pub const PROBE_VERSION: u8 = 1;
+const MAX_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct HostConfig {
@@ -483,6 +487,76 @@ fn handle_game_session(
             endpoint: config.advertised_endpoint.clone(),
         }),
     )?;
+    let mut world = WorldState::default();
+    world
+        .add_player(Player {
+            id: character.id,
+            account_id: account.id as u64,
+            name: character.name.clone(),
+            position: character.position,
+            level: character.level,
+            experience: 0,
+            skill_points: 0,
+        })
+        .map_err(HostError::Core)?;
+    let manifest = EmptyWorldManifest::default();
+    let viewport = world
+        .empty_world_viewport(character.id, manifest.clone())
+        .map_err(HostError::Core)?;
+    write_game_session_response(
+        stream,
+        bootstrap.xtea_key,
+        &encode_fe_otclient_empty_viewport(&viewport),
+    )?;
+    for _ in 0..MAX_EMPTY_WORLD_MOVES_PER_SESSION {
+        let request = match read_frame(stream) {
+            Ok(request) => request,
+            Err(HostError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        let request = forgotten_protocol::xtea_decrypt_packet(&request.0, bootstrap.xtea_key)
+            .map_err(HostError::Protocol)?;
+        let direction =
+            decode_fe_otclient_move_request(&Frame(request)).map_err(HostError::Protocol)?;
+        let (from, to) = match world.move_player_cardinal(character.id, direction) {
+            Ok(movement) => movement,
+            Err(error) => {
+                send_game_session_error(
+                    stream,
+                    bootstrap.xtea_key,
+                    "Movement rejected by empty-world bounds.",
+                )?;
+                return Err(HostError::Core(error));
+            }
+        };
+        let tick = world.advance_tick();
+        database.update_player_position(character.id, to)?;
+        write_game_session_response(
+            stream,
+            bootstrap.xtea_key,
+            &encode_fe_otclient_movement_ack(&EmptyWorldMovementAck { tick, from, to }),
+        )?;
+        write_game_session_response(
+            stream,
+            bootstrap.xtea_key,
+            &encode_fe_otclient_world_tick(tick),
+        )?;
+        let viewport = world
+            .empty_world_viewport(character.id, manifest.clone())
+            .map_err(HostError::Core)?;
+        write_game_session_response(
+            stream,
+            bootstrap.xtea_key,
+            &encode_fe_otclient_empty_viewport(&viewport),
+        )?;
+    }
     let feature_gate = Legacy74GameSessionState::FeatureGated {
         character_name: bootstrap.request.character_name,
     };
@@ -707,6 +781,7 @@ fn record_event(database_path: &Path, level: &str, message: &str) {
 
 #[derive(Debug)]
 pub enum HostError {
+    Core(forgotten_core::CoreError),
     Io(std::io::Error),
     Protocol(ProtocolError),
     Persistence(forgotten_persistence::PersistenceError),
@@ -719,6 +794,7 @@ pub enum HostError {
 impl HostError {
     fn code(&self) -> &'static [u8] {
         match self {
+            Self::Core(_) => b"world-error",
             Self::InvalidProbe(_) => b"invalid-probe",
             Self::Protocol(_) => b"invalid-frame",
             Self::Persistence(_) => b"persistence-error",
@@ -1005,6 +1081,46 @@ mod tests {
         assert!(world
             .windows(b"empty-gated".len())
             .any(|window| window == b"empty-gated"));
+        let initial_viewport = read_frame(&mut stream).unwrap();
+        let initial_viewport =
+            forgotten_protocol::xtea_decrypt_packet(&initial_viewport.0, bootstrap.xtea_key)
+                .unwrap();
+        assert!(initial_viewport
+            .windows(b"fe.viewport.v1;tick=0".len())
+            .any(|window| window == b"fe.viewport.v1;tick=0"));
+        let movement = forgotten_protocol::encode_fe_otclient_move_request_for_harness(
+            forgotten_core::CardinalDirection::East,
+        );
+        let movement =
+            forgotten_protocol::xtea_encrypt_packet(&movement.0, bootstrap.xtea_key).unwrap();
+        write_frame(&mut stream, &Frame(movement)).unwrap();
+        let acknowledgement = read_frame(&mut stream).unwrap();
+        let acknowledgement =
+            forgotten_protocol::xtea_decrypt_packet(&acknowledgement.0, bootstrap.xtea_key)
+                .unwrap();
+        assert!(acknowledgement
+            .windows(b"fe.move.ack.v1;tick=1".len())
+            .any(|window| window == b"fe.move.ack.v1;tick=1"));
+        assert!(acknowledgement
+            .windows(b"to=101,100,7".len())
+            .any(|window| window == b"to=101,100,7"));
+        let tick = read_frame(&mut stream).unwrap();
+        let tick = forgotten_protocol::xtea_decrypt_packet(&tick.0, bootstrap.xtea_key).unwrap();
+        assert!(tick
+            .windows(b"fe.tick.v1;tick=1".len())
+            .any(|window| window == b"fe.tick.v1;tick=1"));
+        let viewport = read_frame(&mut stream).unwrap();
+        let viewport =
+            forgotten_protocol::xtea_decrypt_packet(&viewport.0, bootstrap.xtea_key).unwrap();
+        assert!(viewport
+            .windows(b"center=101,100,7".len())
+            .any(|window| window == b"center=101,100,7"));
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0]
+                .position
+                .x,
+            101
+        );
         host.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }

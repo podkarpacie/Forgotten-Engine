@@ -41,16 +41,25 @@ After the existing challenge-bound RSA/XTEA bootstrap and account-owned characte
 | 4 | FE → custom client | Extended opcode `0x32`, subopcode `0xf0` | Capability offer: `fe.capabilities.v1`. |
 | 5 | Custom client → FE | XTEA-wrapped extended opcode | Required acknowledgement string: `fe.otclient.v1`. |
 | 6 | FE → custom client | Extended opcode `0x32`, subopcode `0xf0` | Text payload: `fe.world.v1`, character identity, start position, advertised endpoint, and `world=empty-gated`. |
+| 7 | FE → custom client | Extended opcode `0x32`, subopcode `0xf1` | `fe.viewport.v1` carrying the deterministic tick, player-centered empty-world viewport, and original manifest identifier. |
+| 8 | Custom client → FE | XTEA-wrapped extended opcode | `fe.move.v1;direction=north|east|south|west`. |
+| 9 | FE → custom client | Extended opcode `0x32`, subopcode `0xf1` | `fe.move.ack.v1`, `fe.tick.v1`, and refreshed `fe.viewport.v1`; the validated player position is persisted. |
 
-> The initial-world payload deliberately reports an empty, feature-gated world. It is not a Tibia map window, a creature list, movement stream, or world-state synchronization packet.
+> FE now supplies an original **empty-world viewport and movement contract**, not a Tibia map window. The custom module must render the `fe.viewport.v1` center and manifest intentionally; there are no copied maps, tiles, items, creatures, or standard Tibia rendering packets.
+
+## Empty-world content contract
+
+Every initialized FE world contains `data/world/fe-empty-world.manifest`. The manifest is FE-owned, has format `fe-empty-world-v1`, and defines an empty world with an `8 × 6` viewport radius. CLI validation safely reconciles this non-destructive manifest into worlds initialized by an earlier FE build.
+
+The world model advances a deterministic counter only after a successful cardinal move. A movement request is rejected at coordinate boundaries, and a successful request produces an acknowledgement, one tick update, and a new player-centered viewport. FE persists the position only after the move is validated by the original world model.
 
 ## Custom module requirement
 
-The OTClient-derived build must explicitly recognize the FE session endpoint and implement the acknowledgement above. A module should only treat the connection as established after it validates the `fe.capabilities.v1` offer and receives `fe.world.v1`. Any unknown FE payload should produce a visible module error rather than silently assuming gameplay compatibility.
+The OTClient-derived build must explicitly recognize the FE session endpoint and implement the acknowledgement above. A module should only treat the connection as established after it validates the `fe.capabilities.v1` offer and receives `fe.world.v1` followed by `fe.viewport.v1`. It must send only the documented cardinal movement request while this empty-world foundation is active. Any unknown FE payload should produce a visible module error rather than silently assuming gameplay compatibility.
 
 ## Current limits
 
-The implemented path proves a bounded encrypted session flow in FE’s Rust integration tests. It does **not** yet provide a normal Tibia game protocol login, actual map serialization, tiles, creatures, movement, chat, combat, Lua game content, or a packaged OTClient module. Those are subsequent engineering milestones.
+The implemented path proves a bounded encrypted session flow, empty-world viewport, deterministic tick, one-step cardinal movement, and persisted-position update in FE’s Rust integration tests. It does **not** yet provide a normal Tibia game protocol login, actual map serialization, tiles, items, creatures, normal movement packets, chat, combat, Lua game content, or a packaged OTClient module. Those are subsequent engineering milestones.
 
 ## References
 

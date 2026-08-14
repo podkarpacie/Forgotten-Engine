@@ -9,6 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+forgotten-core = { path = "../forgotten-core" }
 num-bigint-dig = "0.8"
 rand = "0.8"
 rsa = { version = "0.9", features = ["pem"] }
