@@ -766,32 +766,37 @@ fn handle_native_otclient_game(
     let mut player_position = initial_position;
     let mut facing = NativeOtClientCardinalDirection::South;
     let mut remaining_moves = MAX_NATIVE_EMPTY_WORLD_MOVES_PER_SESSION;
+    let mut pending_action = None;
     loop {
-        let request = match read_frame(stream) {
-            Ok(request) => request,
-            Err(HostError::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                write_frame(
-                    stream,
-                    &encode_native_otclient_game_ping(&config.client_profile)
-                        .map_err(HostError::Protocol)?,
-                )?;
-                continue;
-            }
-            Err(error) => return Err(error),
+        let action = if let Some(action) = pending_action.take() {
+            action
+        } else {
+            let request = match read_frame(stream) {
+                Ok(request) => request,
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    write_frame(
+                        stream,
+                        &encode_native_otclient_game_ping(&config.client_profile)
+                            .map_err(HostError::Protocol)?,
+                    )?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let opcode = request.0.first().copied().unwrap_or_default();
+            eprintln!(
+                "> Native OTCv8 frame peer={peer} opcode=0x{opcode:02x} len={}",
+                request.0.len()
+            );
+            decode_native_otclient_game_action(&request, &config.client_profile)
+                .map_err(HostError::Protocol)?
         };
-        let opcode = request.0.first().copied().unwrap_or_default();
-        eprintln!(
-            "> Native OTCv8 frame peer={peer} opcode=0x{opcode:02x} len={}",
-            request.0.len()
-        );
-        match decode_native_otclient_game_action(&request, &config.client_profile)
-            .map_err(HostError::Protocol)?
-        {
+        match action {
             NativeOtClientGameAction::Ping => write_frame(
                 stream,
                 &encode_native_otclient_game_ping_back(&config.client_profile)
@@ -799,7 +804,8 @@ fn handle_native_otclient_game(
             )?,
             NativeOtClientGameAction::PingBack
             | NativeOtClientGameAction::EnterGame
-            | NativeOtClientGameAction::ChangeFightModes => {}
+            | NativeOtClientGameAction::ChangeFightModes
+            | NativeOtClientGameAction::UseItem => {}
             NativeOtClientGameAction::Talk(message) => write_frame(
                 stream,
                 &encode_native_otclient_game_status_message(
@@ -845,10 +851,14 @@ fn handle_native_otclient_game(
                         )? {
                             break 'auto_walk;
                         }
-                        thread::sleep(native_autowalk_step_delay(
-                            snapshot.player_speed,
-                            snapshot.server_beat,
-                        ));
+                        if let Some(action) = read_native_autowalk_interrupt(
+                            stream,
+                            &config.client_profile,
+                            native_autowalk_step_delay(snapshot.player_speed, snapshot.server_beat),
+                        )? {
+                            pending_action = Some(action);
+                            break 'auto_walk;
+                        }
                     }
                 }
             }
@@ -942,6 +952,52 @@ fn native_chat_acknowledgement(message: &str) -> String {
         acknowledgement.push(character);
     }
     acknowledgement
+}
+
+fn read_native_autowalk_interrupt(
+    stream: &mut TcpStream,
+    profile: &NativeOtClientProfile,
+    delay: Duration,
+) -> Result<Option<NativeOtClientGameAction>, HostError> {
+    let deadline = Instant::now() + delay;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
+            return Ok(None);
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        match read_frame(stream) {
+            Ok(frame) => {
+                let action = decode_native_otclient_game_action(&frame, profile)
+                    .map_err(HostError::Protocol)?;
+                match action {
+                    NativeOtClientGameAction::Ping => {
+                        write_frame(
+                            stream,
+                            &encode_native_otclient_game_ping_back(profile)
+                                .map_err(HostError::Protocol)?,
+                        )?;
+                    }
+                    NativeOtClientGameAction::PingBack => {}
+                    other => {
+                        stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
+                        return Ok(Some(other));
+                    }
+                }
+            }
+            Err(HostError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn native_autowalk_step_delay(player_speed: u16, server_beat: u16) -> Duration {
@@ -1832,9 +1888,10 @@ mod tests {
         let auto_walk_east = read_frame(&mut stream).unwrap();
         assert_eq!(&auto_walk_east.0[1..7], &[100, 0, 100, 0, 7, 1]);
         assert_eq!(&auto_walk_east.0[7..12], &[101, 0, 100, 0, 7]);
-        let auto_walk_north = read_frame(&mut stream).unwrap();
-        assert_eq!(&auto_walk_north.0[1..7], &[101, 0, 100, 0, 7, 1]);
-        assert_eq!(&auto_walk_north.0[7..12], &[101, 0, 99, 0, 7]);
+        write_frame(&mut stream, &Frame(vec![0x67])).unwrap();
+        let manual_movement = read_frame(&mut stream).unwrap();
+        assert_eq!(&manual_movement.0[1..7], &[101, 0, 100, 0, 7, 1]);
+        assert_eq!(&manual_movement.0[7..12], &[101, 0, 101, 0, 7]);
 
         write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
         let movement = read_frame(&mut stream).unwrap();
@@ -1842,8 +1899,8 @@ mod tests {
             movement.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
         );
-        assert_eq!(&movement.0[1..7], &[101, 0, 99, 0, 7, 1]);
-        assert_eq!(&movement.0[7..12], &[102, 0, 99, 0, 7]);
+        assert_eq!(&movement.0[1..7], &[101, 0, 101, 0, 7, 1]);
+        assert_eq!(&movement.0[7..12], &[102, 0, 101, 0, 7]);
         assert_eq!(
             database.characters_for_account(account_id).unwrap()[0]
                 .position
@@ -1854,7 +1911,7 @@ mod tests {
             database.characters_for_account(account_id).unwrap()[0]
                 .position
                 .y,
-            99
+            101
         );
 
         write_frame(&mut stream, &Frame(vec![0x96, 1, 2, 0, b'h', b'i'])).unwrap();
@@ -1864,7 +1921,7 @@ mod tests {
             chat_status.0,
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
-                30,
+                17,
                 11,
                 0,
                 b'Y',

@@ -28,3 +28,9 @@
 - [x] Preserve the current facing direction when canceling a boundary walk.
 - [x] Replace fixed native auto-walk delay with speed-derived timing from the player/configured movement speed.
 - [x] Add regression coverage proving faster configured speed shortens the native auto-walk interval while retaining safe bounds.
+- [x] Cancel an active native auto-walk path when a manual cardinal move, turn, stop, or leave frame arrives.
+- [x] Prevent queued auto-walk steps from racing later client input or causing apparent teleporting.
+- [ ] Emit accepted 740 chat through a client-visible message mode and verify it is rendered by OTCv8.
+- [x] Accept stock 740 right-click use/look frames without terminating the native session.
+- [x] Replace the invalid `0xff` text-message mode with a mode OTCv8 740 renders in its console.
+- [x] Cancel and discard an in-flight auto-walk when a newer manual client action arrives.

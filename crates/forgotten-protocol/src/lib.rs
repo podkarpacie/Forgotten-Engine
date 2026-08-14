@@ -801,6 +801,7 @@ pub const NATIVE_OTCLIENT_CLIENT_TURN_SOUTH: u8 = 0x71;
 pub const NATIVE_OTCLIENT_CLIENT_TURN_WEST: u8 = 0x72;
 pub const NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES: u8 = 0xa0;
 pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
+pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM: u8 = 0x82;
 pub const NATIVE_OTCLIENT_UNKNOWN_CREATURE: u16 = 0x0061;
 pub const NATIVE_OTCLIENT_MAPPED_CREATURE: u16 = 0xffff;
 pub const NATIVE_OTCLIENT_TILE_END: u16 = 0xff00;
@@ -975,6 +976,7 @@ pub enum NativeOtClientGameAction {
     Stop,
     AutoWalk(Vec<NativeOtClientAutoWalkDirection>),
     Talk(String),
+    UseItem,
     Turn(NativeOtClientCardinalDirection),
     ChangeFightModes,
     CardinalMove(NativeOtClientCardinalDirection),
@@ -1205,6 +1207,10 @@ pub fn decode_native_otclient_game_action(
             }
             NativeOtClientGameAction::AutoWalk(path)
         }
+        NATIVE_OTCLIENT_CLIENT_USE_ITEM => {
+            reader.take(9)?;
+            NativeOtClientGameAction::UseItem
+        }
         NATIVE_OTCLIENT_CLIENT_TALK => {
             let mode = reader.byte()?;
             let message = match mode {
@@ -1283,7 +1289,7 @@ pub fn encode_native_otclient_game_status_message(
     }
     let mut writer = Writer::default();
     writer.byte(NATIVE_OTCLIENT_GAME_TEXT_MESSAGE);
-    writer.byte(30);
+    writer.byte(17);
     writer.string(message);
     Ok(Frame(writer.finish()))
 }
@@ -1990,6 +1996,25 @@ mod tests {
             &profile,
         )
         .is_err());
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![
+                    NATIVE_OTCLIENT_CLIENT_USE_ITEM,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::UseItem
+        );
         assert_eq!(
             decode_native_otclient_game_action(
                 &Frame(vec![NATIVE_OTCLIENT_CLIENT_TALK, 1, 2, 0, b'h', b'i']),
