@@ -786,6 +786,7 @@ pub const NATIVE_OTCLIENT_GAME_PING_BACK: u8 = 0x1d;
 pub const NATIVE_OTCLIENT_ENTER_GAME: u8 = 0x0f;
 pub const NATIVE_OTCLIENT_CLIENT_PING: u8 = 0x1d;
 pub const NATIVE_OTCLIENT_CLIENT_PING_BACK: u8 = 0x1e;
+pub const NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES: u8 = 0xa0;
 pub const NATIVE_OTCLIENT_UNKNOWN_CREATURE: u16 = 0x0061;
 pub const NATIVE_OTCLIENT_MAPPED_CREATURE: u16 = 0xffff;
 pub const NATIVE_OTCLIENT_TILE_END: u16 = 0xff00;
@@ -883,6 +884,7 @@ pub enum NativeOtClientGameAction {
     EnterGame,
     Ping,
     PingBack,
+    ChangeFightModes,
     CardinalMove(NativeOtClientCardinalDirection),
 }
 
@@ -1050,6 +1052,12 @@ pub fn decode_native_otclient_game_action(
         NATIVE_OTCLIENT_ENTER_GAME => NativeOtClientGameAction::EnterGame,
         NATIVE_OTCLIENT_CLIENT_PING => NativeOtClientGameAction::Ping,
         NATIVE_OTCLIENT_CLIENT_PING_BACK => NativeOtClientGameAction::PingBack,
+        NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES => {
+            reader.byte()?;
+            reader.byte()?;
+            reader.byte()?;
+            NativeOtClientGameAction::ChangeFightModes
+        }
         opcode => NativeOtClientCardinalDirection::from_client_opcode(opcode)
             .map(NativeOtClientGameAction::CardinalMove)
             .ok_or(ProtocolError::InvalidNativeGameRequest)?,
@@ -1699,6 +1707,14 @@ mod tests {
             decode_native_otclient_game_action(&Frame(vec![NATIVE_OTCLIENT_ENTER_GAME]), &profile)
                 .unwrap(),
             NativeOtClientGameAction::EnterGame
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES, 1, 0, 1]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::ChangeFightModes
         );
         assert_eq!(
             encode_native_otclient_game_ping_back(&profile).unwrap().0,

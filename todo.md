@@ -10,3 +10,4 @@
 - [ ] Diagnose and correct the native OTCv8 client-side `ERROR 2` after successful character selection and retained server listener state.
 - [ ] Add wire-level native game-session diagnostics and correct the remaining 740 post-selection initialization mismatch.
 - [ ] Correct the native 740 game-login request decoder after the live client exposed `StringTooLong(1536)` before initialization.
+- [ ] Correct the native 740 game-start transition after the client receives login/map frames but returns to character selection.

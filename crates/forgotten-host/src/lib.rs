@@ -785,7 +785,9 @@ fn handle_native_otclient_game(
                 &encode_native_otclient_game_ping_back(&config.client_profile)
                     .map_err(HostError::Protocol)?,
             )?,
-            NativeOtClientGameAction::PingBack | NativeOtClientGameAction::EnterGame => {}
+            NativeOtClientGameAction::PingBack
+            | NativeOtClientGameAction::EnterGame
+            | NativeOtClientGameAction::ChangeFightModes => {}
             NativeOtClientGameAction::CardinalMove(direction) => {
                 let (_, destination) = world
                     .move_player_cardinal(character.id, native_cardinal_direction(direction))
@@ -1672,6 +1674,7 @@ mod tests {
         assert_eq!(map.0[0], forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP);
         assert!(map.0.windows(6).any(|window| window == b"Knight"));
 
+        write_frame(&mut stream, &Frame(vec![0xa0, 1, 0, 1])).unwrap();
         write_frame(&mut stream, &Frame(vec![0x1d])).unwrap();
         let ping_back = read_frame(&mut stream).unwrap();
         assert_eq!(ping_back.0, vec![0x1d]);
