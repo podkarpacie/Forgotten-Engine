@@ -2,7 +2,7 @@
 
 FE 7.4.0 adds the direct Tibia 7.4 compatibility profile to Forgotten Engine. It preserves the distinct FE 8.0.0 / Tibia 8.0 and FE 1.2.0 / TFS 1.2 / Tibia 10.98 profile lines.
 
-The release adds the `fe-7.4` selector, profile-specific configuration and diagnostics, cross-profile regression coverage, and precompiled Linux and Windows release assets with SHA-256 checksums. The Linux asset is executed after packaging; the Windows asset is cross-compiled with the Rust GNU Windows target and MinGW-w64, then structurally verified as a 64-bit Windows PE executable. **The executable is not yet a connectable Tibia server:** it does not bind ports or implement the login/game protocol. See [RUNTIME_READINESS.md](RUNTIME_READINESS.md) for the dependency audit and missing network milestones.
+The release adds the `fe-7.4` selector, profile-specific configuration and diagnostics, cross-profile regression coverage, and precompiled Linux and Windows release assets with SHA-256 checksums. The Linux asset is executed after packaging; the Windows asset is cross-compiled with the Rust GNU Windows target and MinGW-w64, then structurally verified as a 64-bit Windows PE executable. **The executable is not yet a connectable Tibia server:** it does not bind ports or implement the login/game protocol. See [RUNTIME_READINESS.md](https://github.com/podkarpacie/Forgotten-Engine/blob/main/RUNTIME_READINESS.md) for the dependency audit and missing network milestones.
 
 ## Runtime readiness correction
 
