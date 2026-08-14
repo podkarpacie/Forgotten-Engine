@@ -1,0 +1,19 @@
+[package]
+name = "forgotten-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "forgotten"
+path = "src/main.rs"
+
+[dependencies]
+forgotten-core = { path = "../forgotten-core" }
+forgotten-persistence = { path = "../forgotten-persistence" }
+forgotten-protocol = { path = "../forgotten-protocol" }
+forgotten-scripting = { path = "../forgotten-scripting" }
+
+[lints]
+workspace = true

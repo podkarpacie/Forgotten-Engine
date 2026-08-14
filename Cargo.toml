@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/forgotten-core",
+  "crates/forgotten-persistence",
+  "crates/forgotten-protocol",
+  "crates/forgotten-scripting",
+  "crates/forgotten-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/podkarpacie/Forgotten-Engine"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,6 @@
+/target/
+/data/
+/backups/
+*.db
+*.db-shm
+*.db-wal
