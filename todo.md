@@ -41,3 +41,12 @@
 - [ ] Map the upstream `data/` tree, Lua configuration/scripts, schema, keys, and runtime files to clean-room FE content, configuration, schema, and credential contracts.
 - [ ] Map upstream `src/` service, protocol, scheduler, game, database, Lua, map-serialization, and script-manager boundaries to original Rust crates and acceptance tests.
 - [x] Define compatibility status for each mapped project-surface item as implemented, in progress, planned, reference-only, or intentionally not applicable.
+- [x] Inspect upstream status and legacy login protocol behavior as a clean-room interoperability reference, without copying its source or data.
+- [x] Define binary-contract tests for a bounded status response and the Tibia 7.4 login request/character-list foundation.
+- [x] Add configuration validation for the status listener, authentication policy, and private-key location while preserving backward-compatible defaults.
+- [x] Implement an original Rust status service with explicit version/profile metadata, uptime, player count, and server-name responses.
+- [x] Implement original Rust RSA-key loading, XTEA session-key handling, and bounded 7.4 login packet parsing/character-list encoding foundations.
+- [x] Register independent game, status, and login listeners with graceful lifecycle ownership and integration coverage.
+- [x] Add an offline command that generates an original 1024-bit RSA private key for the opt-in legacy-login foundation and cover an end-to-end encrypted character-list fixture.
+- [x] Update runtime and parity documentation to distinguish protocol foundations from completed official Tibia-client support.
+- [x] Validate formatting, tests, Clippy, optimized builds, and cross-compilation before requesting publication approval for the protocol milestone.

@@ -1,6 +1,6 @@
 # Forgotten Engine
 
-**Forgotten Engine** is an original Rust implementation pursuing versioned, clean-room behavioral and operational compatibility with The Forgotten Server. It currently provides original foundations for direct **Tibia 7.4** and **Tibia 8.0** targets and **TFS 1.2 / Tibia 10.98**, including TFS-style configuration discovery, content validation, embedded SQLite storage, a persistent diagnostic TCP host, migrations, diagnostics, backups, bounded framing, and a versioned parity roadmap.
+**Forgotten Engine** is an original Rust implementation pursuing versioned, clean-room behavioral and operational compatibility with The Forgotten Server. It currently provides original foundations for direct **Tibia 7.4** and **Tibia 8.0** targets and **TFS 1.2 / Tibia 10.98**, including TFS-style configuration discovery, content validation, embedded SQLite storage, persistent game/status listeners, migrations, diagnostics, backups, bounded protocol contracts, and a versioned parity roadmap.
 
 > This project is not a port or source translation of The Forgotten Server. It uses independently implemented Rust code and treats upstream projects only as behavior and terminology references. No Tibia client assets, maps, item databases, or copyrighted game data are included.
 
@@ -9,10 +9,10 @@
 | Area | Delivered foundation |
 |---|---|
 | TFS-style startup | World-local `config.lua` discovery, typed required-value diagnostics, original `data/` content-skeleton validation, database initialization, and startup phase output. |
-| Local server lifecycle | Persistent configuration-driven diagnostic TCP host with connection limits, timeouts, session logging, and orderly in-process shutdown. |
-| Persistence | SQLite auto-creation, migrations, account/player records, and event ledger. |
-| Operations | `init`, `validate`, `run`, `status`, `backup`, `command`, `compatibility`, and `version` commands via the `forgotten-engine` executable. |
-| Protocol | Explicit FE 7.4.0 / Tibia 7.4, FE 8.0.0 / Tibia 8.0, and FE 1.2.0 / TFS 1.2 / Tibia 10.98 profiles plus bounded framing and an FE diagnostic session probe. |
+| Local server lifecycle | Persistent configuration-driven game and status TCP listeners with connection limits, timeouts, session logging, and orderly in-process shutdown. |
+| Persistence | SQLite auto-creation, migrations, Argon2 account verification, account-owned character lookup, and an event ledger. |
+| Operations | `init`, `validate`, `run`, `status`, `generate-key`, `backup`, `command`, `compatibility`, and `version` commands via the `forgotten-engine` executable. |
+| Protocol | Explicit FE 7.4.0 / Tibia 7.4, FE 8.0.0 / Tibia 8.0, and FE 1.2.0 / TFS 1.2 / Tibia 10.98 profiles; an FE diagnostic probe; TFS-style XML/binary status queries; and a bounded opt-in 7.4 RSA/XTEA login/character-list contract. |
 | Scripting | Honest capability matrix for a narrow TFS 1.2 Lua compatibility surface. |
 | Safety | Content validation, backup manifests, structured diagnostics, and no unsafe Rust. |
 
@@ -21,14 +21,15 @@
 ```bash
 cargo run -p forgotten-engine-cli -- init ./my-engine-world --profile fe-7.4
 cargo run -p forgotten-engine-cli -- validate ./my-engine-world
+cargo run -p forgotten-engine-cli -- generate-key ./my-engine-world
 cargo run -p forgotten-engine-cli -- run ./my-engine-world
 cargo run -p forgotten-engine-cli -- command ./my-engine-world broadcast "Welcome to Forgotten Engine"
 cargo run -p forgotten-engine-cli -- backup ./my-engine-world
 ```
 
-The `init` command creates a world-local `config.lua`, an original TFS-style `data/` directory skeleton, and an embedded `data/forgotten-engine.db`. It defaults to `fe-1.2`; `--profile fe-8.0` selects direct Tibia 8.0, and `--profile fe-7.4` selects direct Tibia 7.4. `run` binds `gameProtocolPort` from `config.lua` and keeps the FE diagnostic host online until Ctrl+C.
+The `init` command creates a world-local `config.lua`, an original TFS-style `data/` directory skeleton, and an embedded `data/forgotten-engine.db`. It defaults to `fe-1.2`; `--profile fe-8.0` selects direct Tibia 8.0, and `--profile fe-7.4` selects direct Tibia 7.4. `run` binds `gameProtocolPort` and `statusProtocolPort` from `config.lua` and keeps both listeners online until Ctrl+C. `generate-key` writes an original local 1024-bit RSA key at the configured `rsaPrivateKey` path; to enable the bounded login foundation, an operator must also set `legacyLoginEnabled = true` for an `fe-7.4` world.
 
-> The FE diagnostic host is a real TCP service, but FE 7.4.0, FE 8.0.0, and FE 1.2.0 do **not** yet claim official-client interoperability or drop-in replacement status. Version-specific login/game codecs, encryption, character lists, map/datapack ingestion, Lua VM parity, combat, and world simulation are feature-gated pending independent specifications and acceptance tests.
+> The FE host and status endpoint are real TCP services, and the FE 7.4 login foundation has original RSA/XTEA, account-authentication, and character-list contracts. However, FE 7.4.0, FE 8.0.0, and FE 1.2.0 do **not** yet claim official-client interoperability or drop-in replacement status. Official packet acceptance, the game-session codec, map/datapack ingestion, Lua VM parity, combat, and world simulation remain feature-gated pending independent specifications and acceptance tests.
 
 ## Architecture
 

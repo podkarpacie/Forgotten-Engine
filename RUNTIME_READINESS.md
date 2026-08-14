@@ -17,20 +17,22 @@ The FE 7.4.0 Windows archive contains one program, `forgotten-engine.exe`, plus 
 
 The current binary can initialize a world-local TFS-style `config.lua`, create an original `data/` content skeleton, create its SQLite database, validate profile-specific configuration/content contracts, record lifecycle/administration events, create backups, and report the supported compatibility profiles. The `fe-7.4`, `fe-8.0`, and `fe-1.2` selectors produce different explicit configuration targets.
 
-The `run` command now binds the `gameProtocolPort` configured in `config.lua`, remains active until Ctrl+C, applies a connection cap and timeouts, and accepts a bounded FE diagnostic probe (`FEHS`). A valid probe gets a profile-specific response (`FEOK`). This is a real persistent TCP service and is covered by unit and CLI-level integration tests.
+The `run` command now binds both the configured `gameProtocolPort` and `statusProtocolPort`, remains active until Ctrl+C, applies connection caps and timeouts, and owns both listener lifecycles. The game endpoint accepts the bounded FE diagnostic probe (`FEHS`) and returns a profile-specific `FEOK` response. The status endpoint answers the TFS-style XML `info` request and the bounded binary basic/player/map/software query family with configured name, ports, uptime, and current foundation counters.
 
-It is **not** an official Tibia login/game service. It cannot accept an official Tibia client because it does not yet implement version-specific login or game packet codecs, RSA/XTEA negotiation, character lists, map/datapack loading, combat, scripting, or continuous world simulation.
+For the `fe-7.4` profile only, an operator may enable an **original, bounded legacy-login foundation** by setting `legacyLoginEnabled = true` and providing a locally generated 1024-bit RSA private key at `rsaPrivateKey`. The foundation validates a 7.4 version field, raw-RSA transport block, XTEA session key, bounded account/password strings, Argon2-backed account authentication, and an encrypted character-list-or-error response. These contracts are covered by Rust codec and persistence tests.
+
+It is still **not** an official Tibia login/game service. The login foundation does not yet establish that an official client emits the precise accepted packet sequence or accepts the current response sequence. It does not provide a game session, challenge, map/datapack loading, combat, scripting, or continuous world simulation.
 
 ## Path to a connectable server
 
 | Milestone | Required implementation | Current status |
 |---|---|---|
-| Long-running host | TCP listener, graceful shutdown, connection cap/timeouts, session logs, and `config.lua` port configuration. | Implemented for the FE diagnostic service; world tick loop remains planned. |
-| 7.4 login path | Login packet parsing, account/character-list response, and protocol tests based on an independently written specification. | Not implemented |
+| Long-running host/status | Game and status TCP listeners, graceful shutdown, connection caps/timeouts, session logs, `config.lua` port configuration, and status responses. | Implemented for the diagnostic game endpoint and TFS-style status query families; world tick loop remains planned. |
+| 7.4 login path | Login packet parsing, account/character-list response, RSA/XTEA boundary, and protocol tests based on an independently written specification. | Foundation implemented behind `legacyLoginEnabled`; authorized packet fixtures and official-client acceptance remain pending. |
 | 7.4 game path | Game-session handshake, bounded opcode decoding/encoding, movement, visibility, chat, and client-state synchronization. | Not implemented |
 | World content | Original-compatible map/item loaders, validation, spawn management, and data migration rules. | Not implemented |
 | Gameplay | Combat, conditions, creatures, inventories, NPC/monster behavior, and persistence transactions. | Not implemented |
 | Script/runtime integration | A deliberately specified Lua or alternative scripting API with capability tests. | Planned only |
 | Network release validation | Native Windows and Linux integration tests with a legal test client or synthetic protocol harness. | Linux synthetic probe host integration validated; native Windows execution remains pending. |
 
-The correct current description is **network-capable compatibility foundation**, not "ready Tibia server." See [NETWORK_MILESTONE.md](NETWORK_MILESTONE.md), [PARITY_ROADMAP.md](PARITY_ROADMAP.md), [RELEASE_ASSETS.md](RELEASE_ASSETS.md), and [VERSIONING.md](VERSIONING.md) for exact boundaries.
+The correct current description is **network-capable compatibility foundation with status and bounded 7.4 login contracts**, not "ready Tibia server." See [NETWORK_MILESTONE.md](NETWORK_MILESTONE.md), [PARITY_ROADMAP.md](PARITY_ROADMAP.md), [RELEASE_ASSETS.md](RELEASE_ASSETS.md), and [VERSIONING.md](VERSIONING.md) for exact boundaries.

@@ -9,5 +9,8 @@ license.workspace = true
 forgotten-persistence = { path = "../forgotten-persistence" }
 forgotten-protocol = { path = "../forgotten-protocol" }
 
+[dev-dependencies]
+forgotten-core = { path = "../forgotten-core" }
+
 [lints]
 workspace = true

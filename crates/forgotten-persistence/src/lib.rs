@@ -1,7 +1,12 @@
-//! SQLite persistence and backup primitives.
+//! SQLite persistence, secure account authentication, and backup primitives.
 
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use forgotten_core::Player;
-use rusqlite::{params, Connection};
+use rand::rngs::OsRng;
+use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,12 +42,78 @@ impl EngineDatabase {
         )?)
     }
 
+    /// Inserts an account whose hash has already been produced by an approved password provider.
     pub fn create_account(&self, name: &str, password_hash: &str) -> Result<i64, PersistenceError> {
         self.connection.execute(
             "INSERT INTO accounts (name, password_hash, created_at) VALUES (?1, ?2, ?3)",
             params![name, password_hash, unix_seconds()],
         )?;
         Ok(self.connection.last_insert_rowid())
+    }
+
+    /// Creates an account using an Argon2 password hash; plaintext is never persisted.
+    pub fn create_account_with_password(
+        &self,
+        name: &str,
+        password: &str,
+    ) -> Result<i64, PersistenceError> {
+        let salt = SaltString::generate(&mut OsRng);
+        let hash = Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map_err(|error| PersistenceError::PasswordHash(error.to_string()))?
+            .to_string();
+        self.create_account(name, &hash)
+    }
+
+    /// Authenticates an account and returns only its own character summaries.
+    pub fn authenticate_account(
+        &self,
+        name: &str,
+        password: &str,
+    ) -> Result<Option<LoginAccount>, PersistenceError> {
+        let record = self
+            .connection
+            .query_row(
+                "SELECT id, password_hash FROM accounts WHERE name = ?1",
+                params![name],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((id, password_hash)) = record else {
+            return Ok(None);
+        };
+        let parsed = PasswordHash::new(&password_hash)
+            .map_err(|error| PersistenceError::PasswordHash(error.to_string()))?;
+        if Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        Ok(Some(LoginAccount {
+            id,
+            name: name.to_owned(),
+            characters: self.characters_for_account(id)?,
+        }))
+    }
+
+    pub fn characters_for_account(
+        &self,
+        account_id: i64,
+    ) -> Result<Vec<LoginCharacter>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, name, level FROM players WHERE account_id = ?1 ORDER BY name COLLATE NOCASE",
+        )?;
+        let characters = statement
+            .query_map(params![account_id], |row| {
+                Ok(LoginCharacter {
+                    id: row.get::<_, i64>(0)? as u64,
+                    name: row.get(1)?,
+                    level: row.get::<_, i64>(2)? as u32,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(characters)
     }
 
     pub fn save_player(&self, player: &Player) -> Result<(), PersistenceError> {
@@ -126,6 +197,20 @@ pub struct BackupArtifact {
     pub created_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginAccount {
+    pub id: i64,
+    pub name: String,
+    pub characters: Vec<LoginCharacter>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginCharacter {
+    pub id: u64,
+    pub name: String,
+    pub level: u32,
+}
+
 fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -137,6 +222,7 @@ fn unix_seconds() -> u64 {
 pub enum PersistenceError {
     Io(std::io::Error),
     Sql(rusqlite::Error),
+    PasswordHash(String),
 }
 
 impl From<std::io::Error> for PersistenceError {
@@ -198,6 +284,41 @@ mod tests {
             .unwrap();
         database.record_event("info", "player saved").unwrap();
         assert_eq!(database.event_count().unwrap(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn authenticates_hashed_passwords_and_lists_own_characters() {
+        let path = temporary_path("authentication");
+        let database = EngineDatabase::open(&path).unwrap();
+        let account_id = database
+            .create_account_with_password("admin", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 7,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        assert!(database
+            .authenticate_account("admin", "wrong")
+            .unwrap()
+            .is_none());
+        let account = database
+            .authenticate_account("admin", "correct horse battery staple")
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.id, account_id);
+        assert_eq!(account.characters[0].name, "Knight");
         let _ = fs::remove_file(path);
     }
 }

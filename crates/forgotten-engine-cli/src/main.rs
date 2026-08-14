@@ -1,11 +1,14 @@
 use forgotten_config::{ensure_content_skeleton, load, validate_content, write_template};
-use forgotten_host::{start, HostConfig};
+use forgotten_host::{start, start_status, HostConfig, LegacyLoginConfig, StatusHostConfig};
 use forgotten_persistence::{create_backup, EngineDatabase};
-use forgotten_protocol::{profile_by_id, CompatibilityProfile, COMPATIBILITY_PROFILES};
+use forgotten_protocol::{
+    profile_by_id, CompatibilityProfile, LegacyRsaPrivateKey, COMPATIBILITY_PROFILES,
+};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -27,6 +30,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "validate" => validate(required_path(&arguments, 1)?),
         "run" => run_host(required_path(&arguments, 1)?),
         "status" => status(required_path(&arguments, 1)?),
+        "generate-key" => generate_key(required_path(&arguments, 1)?),
         "backup" => backup(required_path(&arguments, 1)?),
         "command" => command_line(&arguments),
         "compatibility" => compatibility(),
@@ -117,39 +121,83 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     database.record_event("info", "Forgotten Engine host startup requested")?;
 
     println!(">> Registering services");
+    let legacy_login = if config.legacy_login_enabled {
+        if config.profile.id != "fe-7.4" {
+            return Err(
+                "legacyLoginEnabled is currently available only for the fe-7.4 profile".into(),
+            );
+        }
+        println!(">> Loading legacy-login private key");
+        Some(LegacyLoginConfig {
+            rsa_private_key: Arc::new(LegacyRsaPrivateKey::load_pem(&config.rsa_private_key_path)?),
+            server_name: config.server_name.clone(),
+            message_of_the_day: format!("Welcome to {}", config.server_name),
+        })
+    } else {
+        None
+    };
     let host = start(
         HostConfig {
             bind_addr: config.game_socket_addr(),
             profile: config.profile,
             max_connections: config.max_connections(),
             session_timeout: Duration::from_secs(5),
+            legacy_login,
         },
         &config.database_path,
     )?;
-    let shutdown = host.shutdown_signal();
+    let status = match start_status(
+        StatusHostConfig {
+            bind_addr: config.status_socket_addr(),
+            profile: config.profile,
+            server_name: config.server_name.clone(),
+            map_name: config.map_name.clone(),
+            max_players: config.max_players,
+            max_connections: config.max_connections(),
+            session_timeout: Duration::from_secs(5),
+        },
+        &config.database_path,
+    ) {
+        Ok(status) => status,
+        Err(error) => {
+            host.shutdown()?;
+            return Err(Box::new(error));
+        }
+    };
+    let game_shutdown = host.shutdown_signal();
+    let status_shutdown = status.shutdown_signal();
     ctrlc::set_handler({
-        let shutdown = shutdown.clone();
-        move || shutdown.store(true, Ordering::SeqCst)
+        let game_shutdown = game_shutdown.clone();
+        let status_shutdown = status_shutdown.clone();
+        move || {
+            game_shutdown.store(true, Ordering::SeqCst);
+            status_shutdown.store(true, Ordering::SeqCst);
+        }
     })?;
 
     println!(
-        "> FE diagnostic service running on {} for {} / Tibia {}",
+        "> FE game endpoint running on {} for {} / Tibia {}",
         host.local_addr(),
         config.profile.compatibility_reference,
         config.profile.tibia_protocol
     );
     println!(
-        "> Status port {} reserved; status protocol is not implemented in this milestone.",
-        config.status_protocol_port
+        "> TFS-style status service running on {}",
+        status.local_addr()
     );
-    println!(
-        "> Official Tibia login/game services are feature-gated pending independently tested version-specific codecs."
-    );
+    if config.legacy_login_enabled {
+        println!("> Bounded 7.4 login/character-list foundation is enabled; official-client acceptance remains unverified.");
+    } else {
+        println!(
+            "> Diagnostic probe service is enabled; legacy login remains disabled in config.lua."
+        );
+    }
     println!("> Server host online. Press Ctrl+C for an orderly shutdown.");
 
-    while !shutdown.load(Ordering::SeqCst) {
+    while !game_shutdown.load(Ordering::SeqCst) && !status_shutdown.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(100));
     }
+    status.shutdown()?;
     host.shutdown()?;
     println!("> Server host stopped.");
     Ok(())
@@ -167,6 +215,29 @@ fn status(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         database.path().display(),
         database.schema_version()?,
         database.event_count()?
+    );
+    Ok(())
+}
+
+fn generate_key(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load(&directory)?;
+    if config.profile.id != "fe-7.4" {
+        return Err("generate-key is currently available only for the fe-7.4 profile".into());
+    }
+    if config.rsa_private_key_path.exists() {
+        return Err(format!(
+            "refusing to overwrite existing private key {}",
+            config.rsa_private_key_path.display()
+        )
+        .into());
+    }
+    if let Some(parent) = config.rsa_private_key_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    LegacyRsaPrivateKey::generate()?.write_pem(&config.rsa_private_key_path)?;
+    println!(
+        "generated original FE 1024-bit legacy-login private key at {}; set legacyLoginEnabled = true only when using the bounded 7.4 login foundation",
+        config.rsa_private_key_path.display()
     );
     Ok(())
 }
@@ -237,12 +308,13 @@ fn version() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_help() {
-    println!("Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (official client service not yet implemented)\n  fe-8.0  — Tibia 8.0 (official client service not yet implemented)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (official client service not yet implemented)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  run <directory>\n  status <directory>\n  backup <directory>\n  command <directory> broadcast <message>\n  compatibility\n  version");
+    println!("Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (official client service not yet implemented)\n  fe-8.0  — Tibia 8.0 (official client service not yet implemented)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (official client service not yet implemented)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  run <directory>\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  command <directory> broadcast <message>\n  compatibility\n  version");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn selects_tibia_7_4_profile_by_direct_selector() {
@@ -256,5 +328,21 @@ mod tests {
     fn rejects_unknown_profile_by_direct_selector() {
         let arguments = vec!["init".to_owned(), "world".to_owned(), "unknown".to_owned()];
         assert!(selected_profile(&arguments, 2).is_err());
+    }
+
+    #[test]
+    fn generates_an_original_legacy_key_for_a_7_4_world() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("forgotten-engine-key-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        generate_key(directory.clone()).unwrap();
+        let config = load(&directory).unwrap();
+        assert!(config.rsa_private_key_path.exists());
+        assert!(LegacyRsaPrivateKey::load_pem(&config.rsa_private_key_path).is_ok());
+        let _ = fs::remove_dir_all(directory);
     }
 }

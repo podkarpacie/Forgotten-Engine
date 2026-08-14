@@ -7,3 +7,8 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+num-bigint-dig = "0.8"
+rand = "0.8"
+rsa = { version = "0.9", features = ["pem"] }
