@@ -75,7 +75,7 @@
 - [x] Document the precise divergence between the current FE-specific custom-client endpoint and an unmodified OTClient-compatible path.
 - [x] Define clean-room binary fixtures for normal OTClient-understood 7.4 login, encryption, character selection, and initial game-world packets.
 - [x] Replace or gate FE-specific extended-opcode assumptions so a standard OTClient protocol path can be exercised without a custom module.
-- [ ] Implement original Rust normal-protocol framing, minimal map/creature/player initialization, and standard movement acknowledgements required by the selected OTClient target.
+- [x] Implement original Rust normal-protocol framing, minimal map/creature/player initialization, and standard movement acknowledgements required by the selected OTClient target.
 - [ ] Validate the normal OTClient-facing path with independent packet fixtures and, where lawfully available, an unmodified client interoperability harness.
 - [x] Update compatibility and operator documentation to state the exact unmodified OTClient version/profile, asset requirements, and remaining limits.
 - [ ] Validate formatting, all tests, strict linting, optimized builds, and Windows cross-compilation before publication approval for the unmodified-OTClient milestone.
@@ -85,3 +85,8 @@
 - [x] Refactor the native OTClientV8 path so protocol/version behavior is derived from the selected world profile and explicit client-profile configuration rather than hardcoded FE/Tibia version literals.
 - [x] Keep fe-7.4/Tibia 7.4 as an acceptance fixture only, while rejecting or feature-gating unsupported selected profile/client combinations with explicit diagnostics.
 - [x] Update compatibility and operator documentation to state the exact unmodified OTClientV8 740 profile, asset requirements, and remaining normal-map limits.
+- [x] Define a clean-room native OTCv8 740 empty-world login, full-map, tile-marker, and movement acknowledgement contract from public parser behavior.
+- [x] Implement and test profile-driven standard player-login and original empty-map serialization codecs without distributing item or client data.
+- [x] Integrate normal native player login, empty-world full-map delivery, and bounded cardinal movement responses into the OTCv8 game listener.
+- [x] Validate the native empty-world path with independent socket fixtures, strict linting, optimized Linux builds, and Windows cross-compilation.
+- [x] Document the exact renderable native-world scope and remaining entities, item-data, map-loading, scripting, and gameplay gates before publishing the milestone.

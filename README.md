@@ -12,7 +12,7 @@
 | Local server lifecycle | Persistent configuration-driven game, status, and opt-in session-foundation TCP listeners with connection limits, timeouts, session logging, and orderly in-process shutdown. |
 | Persistence | SQLite auto-creation, migrations, Argon2 account verification, account-owned character lookup, and an event ledger. |
 | Operations | `init`, `validate`, `run`, `status`, `generate-key`, `backup`, `command`, `compatibility`, and `version` commands via the `forgotten-engine` executable. |
-| Protocol | Explicit FE 7.4.0 / Tibia 7.4, FE 8.0.0 / Tibia 8.0, and FE 1.2.0 / TFS 1.2 / Tibia 10.98 profiles; an FE diagnostic probe; TFS-style XML/binary status queries; bounded opt-in 7.4 RSA/XTEA login/character-list contracts; a separate FE-aware OTClient endpoint with an original empty-world viewport, tick, and cardinal-movement contract; and a profile-driven normal OTClientV8 740 login/character-list path that requires no FE client module. |
+| Protocol | Explicit FE 7.4.0 / Tibia 7.4, FE 8.0.0 / Tibia 8.0, and FE 1.2.0 / TFS 1.2 / Tibia 10.98 profiles; an FE diagnostic probe; TFS-style XML/binary status queries; bounded opt-in 7.4 RSA/XTEA login/character-list contracts; a separate FE-aware OTClient endpoint with an original empty-world viewport, tick, and cardinal-movement contract; and a profile-driven normal OTClientV8 740 login/character-list/empty-world path that requires no FE client module. |
 | Scripting | Honest capability matrix for a narrow TFS 1.2 Lua compatibility surface. |
 | Safety | Content validation, backup manifests, structured diagnostics, and no unsafe Rust. |
 
@@ -39,11 +39,20 @@ otclientV8LoginPacketEncryption = false
 otclientV8ProtocolChecksum = false
 otclientV8ChallengeOnLogin = false
 advertisedOtClientV8Host = "203.0.113.24" -- public IPv4 address
+
+-- These are operator-owned identifiers from lawful matching 740 .dat/.spr data.
+otclientV8NativeEmptyWorldEnabled = true
+otclientV8EmptyWorldGroundThingId = 102
+otclientV8PlayerLookType = 128
+otclientV8PlayerSpeed = 220
+otclientV8ServerBeat = 50
 ```
 
-This starts native login and game listeners on ports `7174` and `7175` by default. A stock OTCv8 build configured for protocol `740` can authenticate with a numeric FE account ID and receive its ordinary legacy character list without an FE-specific module or extended opcode. Operators must supply lawful matching `.dat`/`.spr` thing data in their own OTCv8 installation; FE neither includes nor generates client assets. The selected character will currently receive an ordinary native game-login error because normal player state and full-map serialization are still pending. See [OTCLIENTV8_740_NATIVE_CONTRACT.md](OTCLIENTV8_740_NATIVE_CONTRACT.md) for the exact supported contract.
+This starts native login and game listeners on ports `7174` and `7175` by default. A stock OTCv8 build configured for protocol `740` can authenticate with a numeric FE account ID and receive its ordinary legacy character list without an FE-specific module or extended opcode. With the explicit empty-world values above, the selected character then receives normal player-login and full-map packets with a ground fixture, one visible local player, and bounded cardinal movement acknowledgements. Operators must supply lawful matching `.dat`/`.spr` thing data in their own OTCv8 installation; FE neither includes nor generates client assets. The example identifiers are configuration values, not FE-distributed game data, and must be replaced if they do not match the operator’s client data.
 
-> The FE host and status endpoint are real TCP services. The FE 7.4 foundations include original RSA/XTEA account authentication, character-list handling, challenge issuance, challenge-bound session authentication, an FE-aware custom OTClient capability acknowledgement, encrypted identity/start-position/advertised-endpoint metadata, a deterministic FE-owned empty-world viewport with cardinal movement acknowledgements, and a separate normal OTCv8 740 credential/character-selection service. However, FE 7.4.0, FE 8.0.0, and FE 1.2.0 do **not** yet claim playable-client interoperability or drop-in replacement status. Normal game-world initialization, full-map/tile/thing serialization, player creatures, map/datapack ingestion, items, creatures, Lua VM parity, combat, and broad world simulation remain feature-gated pending independent specifications and acceptance tests.
+> This is a renderable **fixture**, not a real map server. Movement is accepted only inside the initial 18×14 viewport; FE does not yet stream map rows, load maps, validate collision from item data, populate other creatures, or implement gameplay.
+
+> The FE host and status endpoint are real TCP services. The FE 7.4 foundations include original RSA/XTEA account authentication, character-list handling, challenge issuance, challenge-bound session authentication, an FE-aware custom OTClient capability acknowledgement, encrypted identity/start-position/advertised-endpoint metadata, a deterministic FE-owned empty-world viewport with cardinal movement acknowledgements, and a separate normal OTCv8 740 credential/character-selection/full-map fixture. However, FE 7.4.0, FE 8.0.0, and FE 1.2.0 do **not** yet claim broad playable-client interoperability or drop-in replacement status. Real maps and map deltas, item and creature systems, collision, Lua VM parity, combat, and broad world simulation remain feature-gated pending independent specifications and acceptance tests.
 
 ## Architecture
 

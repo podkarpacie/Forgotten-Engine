@@ -779,6 +779,17 @@ pub const NATIVE_OTCLIENT_PENDING_GAME: u8 = 0x0a;
 pub const NATIVE_OTCLIENT_LOGIN_ERROR: u8 = 0x0a;
 pub const NATIVE_OTCLIENT_LOGIN_CHARACTER_LIST: u8 = 0x64;
 pub const NATIVE_OTCLIENT_GAME_LOGIN_ERROR: u8 = 0x14;
+pub const NATIVE_OTCLIENT_GAME_LOGIN_STATE: u8 = 0x0a;
+pub const NATIVE_OTCLIENT_GAME_FULL_MAP: u8 = 0x64;
+pub const NATIVE_OTCLIENT_GAME_MOVE_CREATURE: u8 = 0x6d;
+pub const NATIVE_OTCLIENT_UNKNOWN_CREATURE: u16 = 0x0061;
+pub const NATIVE_OTCLIENT_MAPPED_CREATURE: u16 = 0xffff;
+pub const NATIVE_OTCLIENT_TILE_END: u16 = 0xff00;
+pub const NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH: usize = 18;
+pub const NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT: usize = 14;
+pub const NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS: usize = 8;
+pub const NATIVE_OTCLIENT_PLAYER_ID_START: u32 = 0x1000_0000;
+pub const NATIVE_OTCLIENT_PLAYER_ID_END: u32 = 0x4000_0000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeOtClientProfile {
@@ -823,6 +834,44 @@ pub struct NativeOtClientGameRequest {
     pub password: String,
     pub client_tag: String,
     pub client_build: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeOtClientPosition {
+    pub x: u16,
+    pub y: u16,
+    pub z: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeOtClientEmptyWorldSnapshot {
+    pub player_id: u32,
+    pub player_name: String,
+    pub player_position: NativeOtClientPosition,
+    pub ground_thing_id: u16,
+    pub player_look_type: u8,
+    pub player_speed: u16,
+    pub server_beat: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeOtClientCardinalDirection {
+    North,
+    East,
+    South,
+    West,
+}
+
+impl NativeOtClientCardinalDirection {
+    fn from_client_opcode(opcode: u8) -> Option<Self> {
+        match opcode {
+            0x65 => Some(Self::North),
+            0x66 => Some(Self::East),
+            0x67 => Some(Self::South),
+            0x68 => Some(Self::West),
+            _ => None,
+        }
+    }
 }
 
 pub fn decode_native_otclient_login_request(
@@ -914,6 +963,131 @@ pub fn encode_native_otclient_game_login_error(message: &str) -> Frame {
     writer.byte(NATIVE_OTCLIENT_GAME_LOGIN_ERROR);
     writer.string(message);
     Frame(writer.finish())
+}
+
+pub fn encode_native_otclient_game_login_state(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+) -> Result<Frame, ProtocolError> {
+    validate_native_empty_world_snapshot(profile, snapshot)?;
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_LOGIN_STATE);
+    writer.u32(snapshot.player_id);
+    writer.u16(snapshot.server_beat);
+    writer.byte(0);
+    Ok(Frame(writer.finish()))
+}
+
+pub fn encode_native_otclient_empty_world_map(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+) -> Result<Frame, ProtocolError> {
+    validate_native_empty_world_snapshot(profile, snapshot)?;
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_FULL_MAP);
+    write_native_otclient_position(&mut writer, snapshot.player_position);
+
+    for z in (0..NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS as u8).rev() {
+        for x in 0..NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH {
+            for y in 0..NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT {
+                writer.u16(snapshot.ground_thing_id);
+                let is_player_tile = z == snapshot.player_position.z
+                    && x == NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH / 2 - 1
+                    && y == NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT / 2 - 1;
+                if is_player_tile {
+                    write_native_otclient_unknown_player(&mut writer, snapshot);
+                }
+                writer.u16(NATIVE_OTCLIENT_TILE_END);
+            }
+        }
+    }
+
+    let frame = Frame(writer.finish());
+    if frame.0.len() > MAX_FRAME_SIZE {
+        return Err(ProtocolError::InvalidLength(frame.0.len()));
+    }
+    Ok(frame)
+}
+
+pub fn decode_native_otclient_cardinal_move_request(
+    frame: &Frame,
+    profile: &NativeOtClientProfile,
+) -> Result<NativeOtClientCardinalDirection, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut reader = Reader::new(&frame.0);
+    let direction = NativeOtClientCardinalDirection::from_client_opcode(reader.byte()?)
+        .ok_or(ProtocolError::InvalidNativeGameRequest)?;
+    if !reader.done() {
+        return Err(ProtocolError::InvalidNativeGameRequest);
+    }
+    Ok(direction)
+}
+
+pub fn encode_native_otclient_move_creature(
+    profile: &NativeOtClientProfile,
+    player_id: u32,
+    position: NativeOtClientPosition,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation()
+        || !(NATIVE_OTCLIENT_PLAYER_ID_START..NATIVE_OTCLIENT_PLAYER_ID_END).contains(&player_id)
+    {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_MOVE_CREATURE);
+    writer.u16(NATIVE_OTCLIENT_MAPPED_CREATURE);
+    writer.u32(player_id);
+    write_native_otclient_position(&mut writer, position);
+    Ok(Frame(writer.finish()))
+}
+
+fn validate_native_empty_world_snapshot(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+) -> Result<(), ProtocolError> {
+    if !profile.supports_current_native_foundation()
+        || !(NATIVE_OTCLIENT_PLAYER_ID_START..NATIVE_OTCLIENT_PLAYER_ID_END)
+            .contains(&snapshot.player_id)
+        || snapshot.player_position.z >= NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS as u8
+        || snapshot.ground_thing_id == 0
+        || snapshot.player_look_type == 0
+        || snapshot.player_speed == 0
+        || snapshot.server_beat == 0
+        || snapshot.player_name.len() > MAX_LOGIN_STRING_BYTES
+    {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    Ok(())
+}
+
+fn write_native_otclient_position(writer: &mut Writer, position: NativeOtClientPosition) {
+    writer.u16(position.x);
+    writer.u16(position.y);
+    writer.byte(position.z);
+}
+
+fn write_native_otclient_unknown_player(
+    writer: &mut Writer,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+) {
+    writer.u16(NATIVE_OTCLIENT_UNKNOWN_CREATURE);
+    writer.u32(0);
+    writer.u32(snapshot.player_id);
+    writer.string(&snapshot.player_name);
+    writer.byte(100);
+    writer.byte(2);
+    writer.byte(snapshot.player_look_type);
+    writer.byte(0);
+    writer.byte(0);
+    writer.byte(0);
+    writer.byte(0);
+    writer.byte(0);
+    writer.byte(0);
+    writer.u16(snapshot.player_speed);
+    writer.byte(0);
+    writer.byte(0);
 }
 
 #[cfg(test)]
@@ -1392,5 +1566,99 @@ mod tests {
             encode_native_otclient_game_login_error("Map initialization is pending.").0[0],
             NATIVE_OTCLIENT_GAME_LOGIN_ERROR
         );
+    }
+
+    #[test]
+    fn native_otclient_empty_world_packets_follow_the_selected_classic_profile() {
+        let profile = NativeOtClientProfile {
+            protocol_version: 740,
+            numeric_account_ids: true,
+            login_packet_encryption: false,
+            protocol_checksum: false,
+            challenge_on_login: false,
+            max_padding_bytes: 128,
+        };
+        let snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_id: NATIVE_OTCLIENT_PLAYER_ID_START + 42,
+            player_name: "Knight".into(),
+            player_position: NativeOtClientPosition {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            ground_thing_id: 102,
+            player_look_type: 128,
+            player_speed: 220,
+            server_beat: 50,
+        };
+
+        let login = encode_native_otclient_game_login_state(&profile, &snapshot).unwrap();
+        assert_eq!(login.0[0], NATIVE_OTCLIENT_GAME_LOGIN_STATE);
+        assert_eq!(
+            u32::from_le_bytes(login.0[1..5].try_into().unwrap()),
+            snapshot.player_id
+        );
+        assert_eq!(
+            u16::from_le_bytes(login.0[5..7].try_into().unwrap()),
+            snapshot.server_beat
+        );
+        assert_eq!(login.0[7], 0);
+
+        let map = encode_native_otclient_empty_world_map(&profile, &snapshot).unwrap();
+        assert_eq!(map.0[0], NATIVE_OTCLIENT_GAME_FULL_MAP);
+        assert_eq!(
+            &map.0[1..6],
+            &[100, 0, 100, 0, 7],
+            "map center uses x, y, z little-endian coordinates"
+        );
+        let cells = NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH
+            * NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT
+            * NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS;
+        assert_eq!(map.0.len(), 1 + 5 + cells * 4 + 31);
+        let player_tile = 1
+            + 5
+            + ((NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH / 2 - 1) * NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT
+                + (NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT / 2 - 1))
+                * 4;
+        assert_eq!(
+            u16::from_le_bytes(map.0[player_tile..player_tile + 2].try_into().unwrap()),
+            snapshot.ground_thing_id
+        );
+        assert_eq!(
+            u16::from_le_bytes(map.0[player_tile + 2..player_tile + 4].try_into().unwrap()),
+            NATIVE_OTCLIENT_UNKNOWN_CREATURE
+        );
+        assert!(map
+            .0
+            .windows(snapshot.player_name.len())
+            .any(|bytes| bytes == snapshot.player_name.as_bytes()));
+
+        assert_eq!(
+            decode_native_otclient_cardinal_move_request(&Frame(vec![0x66]), &profile).unwrap(),
+            NativeOtClientCardinalDirection::East
+        );
+        assert!(
+            decode_native_otclient_cardinal_move_request(&Frame(vec![0x66, 0]), &profile).is_err()
+        );
+        let movement = encode_native_otclient_move_creature(
+            &profile,
+            snapshot.player_id,
+            NativeOtClientPosition {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+        )
+        .unwrap();
+        assert_eq!(movement.0[0], NATIVE_OTCLIENT_GAME_MOVE_CREATURE);
+        assert_eq!(
+            u16::from_le_bytes(movement.0[1..3].try_into().unwrap()),
+            NATIVE_OTCLIENT_MAPPED_CREATURE
+        );
+        assert_eq!(
+            u32::from_le_bytes(movement.0[3..7].try_into().unwrap()),
+            snapshot.player_id
+        );
+        assert_eq!(&movement.0[7..12], &[101, 0, 100, 0, 7]);
     }
 }

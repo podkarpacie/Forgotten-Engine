@@ -52,6 +52,31 @@ The first native slice passes only when independent Rust fixtures prove the foll
 4. Before map serialization exists, FE emits a normal client-understood login-error message rather than an FE custom packet.
 5. The native port path does not require an FE client module or extended opcode.
 
+## Native empty-world extension contract
+
+The next native slice is intentionally a **data-free world-session fixture**, not a claim of general map compatibility. It is enabled only when the selected native profile is explicitly configured for the observed classic-world behavior and the operator supplies lawful matching client thing identifiers. FE does not ship the associated `.dat`, `.spr`, map, or item database.
+
+| Response or request | Normal opcode | Selected classic 740 layout | Initial FE boundary |
+|---|---:|---|---|
+| Player login | `0x0a` | Player ID `u32`, server beat `u16`, `canReportBugs` `u8`. | Uses the profile-selected no-new-speed-law layout. |
+| Full map | `0x64` | Center position, then floors 7 down to 0; each floor visits an 18×14 viewport in x-major/y-minor order. | Emits only operator-configured ground things and one local-player creature; no FE extended payload. |
+| Empty tile/thing boundary | `0xff00..0xffff` | A tile is finished by a classic marker; a marker also represents a run of following empty tiles. | Initial serializer may use a zero-run terminator per ground tile for clarity, while retaining an independently tested skip-marker codec. |
+| Player creature | `0x0061` | Remove ID `u32`, creature ID `u32`, name string, health, direction, classic outfit, light, speed, skull, shield. | Uses no later creature-emblem, add-on, new-walking, or walkthrough fields. |
+| Cardinal walk request | `0x65`–`0x68` | One normal opcode with no body. | Bounded to the original empty-world state. |
+| Creature move response | `0x6d` | Mapped creature (`0xffff`, player ID) and a new position. | Returns the normal classic layout with no new-walking duration field. |
+
+The first map fixture uses a configurable ground thing ID and a configurable player look type. These values are **operator-owned client-data identifiers**, not bundled Forgotten Engine data. The configuration must reject a world fixture that is enabled without nonzero values. A client whose installed thing data does not define the selected identifiers is outside this fixture’s acceptance boundary.
+
+The first movement response acknowledges cardinal movement only while the player remains within the initially described viewport. It deliberately does not claim map-row delta streaming, loading of a real map, collision derived from item data, creatures beyond the local player, or gameplay. Full standard viewport deltas and world-content loading are separate follow-on milestones.
+
+### Empty-world acceptance criteria
+
+1. Given the selected classic profile and operator-supplied thing IDs, FE emits normal `0x0a` player-login and `0x64` full-map frames after an owned-character selection.
+2. The full map contains exactly the selected classic viewport traversal, with no FE extended opcode or custom-client acknowledgement.
+3. The local player is represented by a normal unknown-creature fixture whose ID lies in the normal player-ID range and whose field layout matches the selected profile.
+4. FE decodes normal cardinal walk opcodes and replies with normal `0x6d` creature-move packets while the bounded fixture can safely maintain the described viewport.
+5. Independent Rust codec and socket fixtures prove byte order, map traversal, player placement, and movement response fields without relying on proprietary client assets.
+
 ## References
 
 [1]: https://github.com/OTCv8/otcv8-dev/tree/3d32139512cc4576b105682c3579f18fe0d534e4 "OTClientV8 development reference revision"
@@ -59,3 +84,5 @@ The first native slice passes only when independent Rust fixtures prove the foll
 [3]: https://github.com/OTCv8/otcv8-dev/blob/3d32139512cc4576b105682c3579f18fe0d534e4/modules/game_features/features.lua "OTClientV8 740 feature thresholds"
 [4]: https://github.com/OTCv8/otcv8-dev/blob/3d32139512cc4576b105682c3579f18fe0d534e4/src/client/protocolcodes.h "OTClientV8 normal opcode declarations"
 [5]: https://github.com/OTCv8/otcv8-dev/blob/3d32139512cc4576b105682c3579f18fe0d534e4/modules/gamelib/protocollogin.lua "OTClientV8 legacy character-list parser"
+[6]: https://github.com/OTCv8/otcv8-dev/blob/3d32139512cc4576b105682c3579f18fe0d534e4/modules/game_features/features.lua "OTClientV8 version feature thresholds"
+[7]: https://github.com/OTCv8/otcv8-dev/blob/3d32139512cc4576b105682c3579f18fe0d534e4/src/client/protocolgameparse.cpp "OTClientV8 public game packet parser"

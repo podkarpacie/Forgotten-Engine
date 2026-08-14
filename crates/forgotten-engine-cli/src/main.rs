@@ -1,8 +1,8 @@
 use forgotten_config::{ensure_content_skeleton, load, validate_content, write_template};
 use forgotten_host::{
     start, start_game_session, start_native_otclient_game, start_native_otclient_login,
-    start_status, GameSessionHostConfig, HostConfig, LegacyLoginConfig, NativeOtClientHostConfig,
-    StatusHostConfig,
+    start_status, GameSessionHostConfig, HostConfig, LegacyLoginConfig,
+    NativeOtClientEmptyWorldConfig, NativeOtClientHostConfig, StatusHostConfig,
 };
 use forgotten_persistence::{create_backup, EngineDatabase};
 use forgotten_protocol::{
@@ -212,6 +212,19 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         let advertised_ip: IpAddr = config.advertised_otclient_v8_host.parse().map_err(|_| {
             "advertisedOtClientV8Host must be an IPv4 or IPv6 address for the native client path"
         })?;
+        let empty_world = if config.otclient_v8_native_empty_world_enabled {
+            Some(NativeOtClientEmptyWorldConfig {
+                ground_thing_id: config.otclient_v8_empty_world_ground_thing_id,
+                player_look_type: config
+                    .otclient_v8_player_look_type
+                    .try_into()
+                    .map_err(|_| "otclientV8PlayerLookType must fit the selected native profile")?,
+                player_speed: config.otclient_v8_player_speed,
+                server_beat: config.otclient_v8_server_beat,
+            })
+        } else {
+            None
+        };
         Some(NativeOtClientHostConfig {
             bind_addr: config.otclient_v8_login_socket_addr(),
             client_profile: config.otclient_v8_native_profile(),
@@ -222,6 +235,7 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             ),
             max_connections: config.max_connections(),
             session_timeout: Duration::from_secs(5),
+            empty_world,
         })
     } else {
         None
@@ -311,10 +325,11 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     }
     if let (Some(native_login), Some(native_game)) = (&native_login, &native_game) {
         println!(
-            "> Native OTClientV8 profile={} login={} game={} (normal map serialization remains feature-gated).",
+            "> Native OTClientV8 profile={} login={} game={} empty-world={}",
             config.otclient_v8_protocol_version,
             native_login.local_addr(),
             native_game.local_addr(),
+            config.otclient_v8_native_empty_world_enabled,
         );
     }
     if config.legacy_login_enabled {

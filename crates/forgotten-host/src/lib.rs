@@ -2,24 +2,28 @@
 //!
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
-use forgotten_core::{EmptyWorldManifest, Player, WorldState};
+use forgotten_core::{CardinalDirection, EmptyWorldManifest, Player, Position, WorldState};
 use forgotten_persistence::EngineDatabase;
 use forgotten_protocol::{
     decode, decode_fe_otclient_capability_ack, decode_fe_otclient_move_request,
     decode_legacy_74_envelope, decode_legacy_74_game_session_bootstrap_plaintext,
     decode_legacy_74_game_session_envelope, decode_legacy_74_login_plaintext,
-    decode_native_otclient_game_request, decode_native_otclient_login_request,
-    decode_status_request, encode, encode_fe_otclient_capability_offer,
-    encode_fe_otclient_empty_viewport, encode_fe_otclient_initial_world,
-    encode_fe_otclient_movement_ack, encode_fe_otclient_world_tick,
-    encode_legacy_74_character_list, encode_legacy_74_game_challenge,
-    encode_legacy_74_game_session_error, encode_legacy_74_game_session_ready, encode_login_error,
-    encode_native_otclient_character_list, encode_native_otclient_game_login_error,
-    encode_native_otclient_login_error, encode_status_binary, encode_status_xml,
+    decode_native_otclient_cardinal_move_request, decode_native_otclient_game_request,
+    decode_native_otclient_login_request, decode_status_request, encode,
+    encode_fe_otclient_capability_offer, encode_fe_otclient_empty_viewport,
+    encode_fe_otclient_initial_world, encode_fe_otclient_movement_ack,
+    encode_fe_otclient_world_tick, encode_legacy_74_character_list,
+    encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
+    encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
+    encode_native_otclient_empty_world_map, encode_native_otclient_game_login_error,
+    encode_native_otclient_game_login_state, encode_native_otclient_login_error,
+    encode_native_otclient_move_creature, encode_status_binary, encode_status_xml,
     generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
     CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientProfile, OtClientEndpoint,
-    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientCardinalDirection,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientPosition, NativeOtClientProfile,
+    OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -34,6 +38,7 @@ pub const PROBE_RESPONSE_MAGIC: &[u8; 4] = b"FEOK";
 pub const PROBE_ERROR_MAGIC: &[u8; 4] = b"FEER";
 pub const PROBE_VERSION: u8 = 1;
 const MAX_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
+const MAX_NATIVE_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct HostConfig {
@@ -80,6 +85,15 @@ pub struct NativeOtClientHostConfig {
     pub advertised_game_addr: SocketAddr,
     pub max_connections: usize,
     pub session_timeout: Duration,
+    pub empty_world: Option<NativeOtClientEmptyWorldConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeOtClientEmptyWorldConfig {
+    pub ground_thing_id: u16,
+    pub player_look_type: u8,
+    pub player_speed: u16,
+    pub server_beat: u16,
 }
 
 impl HostConfig {
@@ -149,6 +163,18 @@ impl NativeOtClientHostConfig {
             return Err(HostError::InvalidConfiguration(
                 "session_timeout must be greater than zero".into(),
             ));
+        }
+        if let Some(empty_world) = &self.empty_world {
+            if empty_world.ground_thing_id == 0
+                || empty_world.player_look_type == 0
+                || empty_world.player_speed == 0
+                || empty_world.server_beat == 0
+            {
+                return Err(HostError::InvalidConfiguration(
+                    "native empty-world fixture requires nonzero thing, look, speed, and beat values"
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -675,32 +701,155 @@ fn handle_native_otclient_game(
         )?;
         return Ok(());
     };
-    if !account
+    let Some(character) = account
         .characters
         .iter()
-        .any(|character| character.name == request.character_name)
-    {
+        .find(|character| character.name == request.character_name)
+    else {
         write_frame(
             stream,
             &encode_native_otclient_game_login_error("Character does not belong to this account."),
         )?;
         return Ok(());
-    }
+    };
+    let Some(empty_world) = &config.empty_world else {
+        write_frame(
+            stream,
+            &encode_native_otclient_game_login_error(
+                "Forgotten Engine native map initialization is not enabled for this selected client profile.",
+            ),
+        )?;
+        return Ok(());
+    };
+    let player_id = native_player_id(character.id)?;
+    let snapshot = NativeOtClientEmptyWorldSnapshot {
+        player_id,
+        player_name: character.name.clone(),
+        player_position: native_position(character.position),
+        ground_thing_id: empty_world.ground_thing_id,
+        player_look_type: empty_world.player_look_type,
+        player_speed: empty_world.player_speed,
+        server_beat: empty_world.server_beat,
+    };
     write_frame(
         stream,
-        &encode_native_otclient_game_login_error(
-            "Forgotten Engine native map initialization is not available for this selected client profile yet.",
-        ),
+        &encode_native_otclient_game_login_state(&config.client_profile, &snapshot)
+            .map_err(HostError::Protocol)?,
     )?;
+    write_frame(
+        stream,
+        &encode_native_otclient_empty_world_map(&config.client_profile, &snapshot)
+            .map_err(HostError::Protocol)?,
+    )?;
+
+    let account_id = u64::try_from(account.id).map_err(|_| {
+        HostError::InvalidConfiguration("native numeric account IDs must be non-negative".into())
+    })?;
+    let mut world = WorldState::default();
+    world
+        .add_player(Player {
+            id: character.id,
+            account_id,
+            name: character.name.clone(),
+            position: character.position,
+            level: character.level,
+            experience: 0,
+            skill_points: 0,
+        })
+        .map_err(HostError::Core)?;
+    let initial_position = character.position;
+    for _ in 0..MAX_NATIVE_EMPTY_WORLD_MOVES_PER_SESSION {
+        let request = match read_frame(stream) {
+            Ok(request) => request,
+            Err(HostError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        let direction =
+            decode_native_otclient_cardinal_move_request(&request, &config.client_profile)
+                .map_err(HostError::Protocol)?;
+        let (_, destination) = world
+            .move_player_cardinal(character.id, native_cardinal_direction(direction))
+            .map_err(HostError::Core)?;
+        if !native_empty_world_position_is_visible(initial_position, destination) {
+            write_frame(
+                stream,
+                &encode_native_otclient_game_login_error(
+                    "Native empty-world viewport boundary reached; map-row streaming is not available yet.",
+                ),
+            )?;
+            return Ok(());
+        }
+        database.update_player_position(character.id, destination)?;
+        write_frame(
+            stream,
+            &encode_native_otclient_move_creature(
+                &config.client_profile,
+                player_id,
+                native_position(destination),
+            )
+            .map_err(HostError::Protocol)?,
+        )?;
+    }
     record_event(
         database_path,
         "info",
         &format!(
-            "native client game selection validated peer={peer} account={} character={} protocol={} outcome=map-pending",
+            "native empty-world session completed peer={peer} account={} character={} protocol={}",
             account.id, request.character_name, request.protocol_version
         ),
     );
     Ok(())
+}
+
+fn native_player_id(character_id: u64) -> Result<u32, HostError> {
+    let character_id = u32::try_from(character_id).map_err(|_| {
+        HostError::InvalidConfiguration("character ID exceeds the native player-ID range".into())
+    })?;
+    let player_id = NATIVE_OTCLIENT_PLAYER_ID_START
+        .checked_add(character_id)
+        .ok_or_else(|| {
+            HostError::InvalidConfiguration(
+                "character ID exceeds the native player-ID range".into(),
+            )
+        })?;
+    if player_id >= NATIVE_OTCLIENT_PLAYER_ID_END {
+        return Err(HostError::InvalidConfiguration(
+            "character ID exceeds the native player-ID range".into(),
+        ));
+    }
+    Ok(player_id)
+}
+
+fn native_position(position: Position) -> NativeOtClientPosition {
+    NativeOtClientPosition {
+        x: position.x,
+        y: position.y,
+        z: position.z,
+    }
+}
+
+fn native_cardinal_direction(direction: NativeOtClientCardinalDirection) -> CardinalDirection {
+    match direction {
+        NativeOtClientCardinalDirection::North => CardinalDirection::North,
+        NativeOtClientCardinalDirection::East => CardinalDirection::East,
+        NativeOtClientCardinalDirection::South => CardinalDirection::South,
+        NativeOtClientCardinalDirection::West => CardinalDirection::West,
+    }
+}
+
+fn native_empty_world_position_is_visible(center: Position, position: Position) -> bool {
+    position.z == center.z
+        && position.x >= center.x.saturating_sub(8)
+        && position.x <= center.x.saturating_add(9)
+        && position.y >= center.y.saturating_sub(6)
+        && position.y <= center.y.saturating_add(7)
 }
 
 fn handle_game_session(
@@ -1206,7 +1355,19 @@ mod tests {
             advertised_game_addr: "127.0.0.1:7265".parse().unwrap(),
             max_connections: 2,
             session_timeout: Duration::from_millis(250),
+            empty_world: None,
         }
+    }
+
+    fn native_empty_world_config(bind_addr: SocketAddr) -> NativeOtClientHostConfig {
+        let mut config = native_otclient_config(bind_addr);
+        config.empty_world = Some(NativeOtClientEmptyWorldConfig {
+            ground_thing_id: 102,
+            player_look_type: 128,
+            player_speed: 220,
+            server_beat: 50,
+        });
+        config
     }
 
     fn add_string(payload: &mut Vec<u8>, value: &str) {
@@ -1435,16 +1596,81 @@ mod tests {
         assert!(game_gate
             .0
             .windows(
-                b"Forgotten Engine native map initialization is not available for this selected client profile yet."
+                b"Forgotten Engine native map initialization is not enabled for this selected client profile."
                     .len(),
             )
             .any(|window| {
                 window
-                    == b"Forgotten Engine native map initialization is not available for this selected client profile yet."
+                    == b"Forgotten Engine native map initialization is not enabled for this selected client profile."
             }));
 
         game.shutdown().unwrap();
         login.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn serves_a_native_empty_world_and_normal_cardinal_movement() {
+        let database_path = database_path("native-empty-world");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let login = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            login.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+        let map = read_frame(&mut stream).unwrap();
+        assert_eq!(map.0[0], forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP);
+        assert!(map.0.windows(6).any(|window| window == b"Knight"));
+
+        write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
+        let movement = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            movement.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
+        );
+        assert_eq!(&movement.0[7..12], &[101, 0, 100, 0, 7]);
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0]
+                .position
+                .x,
+            101
+        );
+
+        game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }
 
