@@ -1,6 +1,7 @@
 use forgotten_config::{ensure_content_skeleton, load, validate_content, write_template};
 use forgotten_host::{
-    start, start_game_session, start_status, GameSessionHostConfig, HostConfig, LegacyLoginConfig,
+    start, start_game_session, start_native_otclient_game, start_native_otclient_login,
+    start_status, GameSessionHostConfig, HostConfig, LegacyLoginConfig, NativeOtClientHostConfig,
     StatusHostConfig,
 };
 use forgotten_persistence::{create_backup, EngineDatabase};
@@ -10,6 +11,7 @@ use forgotten_protocol::{
 };
 use std::env;
 use std::fs;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -206,20 +208,87 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let native_config = if config.otclient_v8_native_enabled {
+        let advertised_ip: IpAddr = config.advertised_otclient_v8_host.parse().map_err(|_| {
+            "advertisedOtClientV8Host must be an IPv4 or IPv6 address for the native client path"
+        })?;
+        Some(NativeOtClientHostConfig {
+            bind_addr: config.otclient_v8_login_socket_addr(),
+            client_profile: config.otclient_v8_native_profile(),
+            server_name: config.server_name.clone(),
+            advertised_game_addr: SocketAddr::new(
+                advertised_ip,
+                config.advertised_otclient_v8_game_port,
+            ),
+            max_connections: config.max_connections(),
+            session_timeout: Duration::from_secs(5),
+        })
+    } else {
+        None
+    };
+    let native_login = if let Some(native_config) = &native_config {
+        match start_native_otclient_login(native_config.clone(), &config.database_path) {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                if let Some(game_session) = game_session {
+                    game_session.shutdown()?;
+                }
+                status.shutdown()?;
+                host.shutdown()?;
+                return Err(Box::new(error));
+            }
+        }
+    } else {
+        None
+    };
+    let native_game = if let Some(native_config) = native_config {
+        let mut native_game_config = native_config;
+        native_game_config.bind_addr = config.otclient_v8_game_socket_addr();
+        match start_native_otclient_game(native_game_config, &config.database_path) {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                if let Some(native_login) = native_login {
+                    native_login.shutdown()?;
+                }
+                if let Some(game_session) = game_session {
+                    game_session.shutdown()?;
+                }
+                status.shutdown()?;
+                host.shutdown()?;
+                return Err(Box::new(error));
+            }
+        }
+    } else {
+        None
+    };
     let game_shutdown = host.shutdown_signal();
     let status_shutdown = status.shutdown_signal();
     let game_session_shutdown = game_session
         .as_ref()
         .map(|session| session.shutdown_signal());
+    let native_login_shutdown = native_login
+        .as_ref()
+        .map(|listener| listener.shutdown_signal());
+    let native_game_shutdown = native_game
+        .as_ref()
+        .map(|listener| listener.shutdown_signal());
     ctrlc::set_handler({
         let game_shutdown = game_shutdown.clone();
         let status_shutdown = status_shutdown.clone();
         let game_session_shutdown = game_session_shutdown.clone();
+        let native_login_shutdown = native_login_shutdown.clone();
+        let native_game_shutdown = native_game_shutdown.clone();
         move || {
             game_shutdown.store(true, Ordering::SeqCst);
             status_shutdown.store(true, Ordering::SeqCst);
             if let Some(game_session_shutdown) = &game_session_shutdown {
                 game_session_shutdown.store(true, Ordering::SeqCst);
+            }
+            if let Some(native_login_shutdown) = &native_login_shutdown {
+                native_login_shutdown.store(true, Ordering::SeqCst);
+            }
+            if let Some(native_game_shutdown) = &native_game_shutdown {
+                native_game_shutdown.store(true, Ordering::SeqCst);
             }
         }
     })?;
@@ -240,6 +309,14 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             game_session.local_addr()
         );
     }
+    if let (Some(native_login), Some(native_game)) = (&native_login, &native_game) {
+        println!(
+            "> Native OTClientV8 profile={} login={} game={} (normal map serialization remains feature-gated).",
+            config.otclient_v8_protocol_version,
+            native_login.local_addr(),
+            native_game.local_addr(),
+        );
+    }
     if config.legacy_login_enabled {
         println!("> Bounded 7.4 login/character-list foundation is enabled; official-client acceptance remains unverified.");
     } else {
@@ -255,11 +332,25 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(|shutdown| !shutdown.load(Ordering::SeqCst))
             .unwrap_or(true)
+        && native_login_shutdown
+            .as_ref()
+            .map(|shutdown| !shutdown.load(Ordering::SeqCst))
+            .unwrap_or(true)
+        && native_game_shutdown
+            .as_ref()
+            .map(|shutdown| !shutdown.load(Ordering::SeqCst))
+            .unwrap_or(true)
     {
         thread::sleep(Duration::from_millis(100));
     }
     if let Some(game_session) = game_session {
         game_session.shutdown()?;
+    }
+    if let Some(native_game) = native_game {
+        native_game.shutdown()?;
+    }
+    if let Some(native_login) = native_login {
+        native_login.shutdown()?;
     }
     status.shutdown()?;
     host.shutdown()?;

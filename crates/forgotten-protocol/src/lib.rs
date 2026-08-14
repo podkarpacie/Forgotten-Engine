@@ -773,6 +773,181 @@ pub struct CharacterListEntry {
     pub address: IpAddr,
     pub port: u16,
 }
+
+pub const NATIVE_OTCLIENT_ENTER_ACCOUNT: u8 = 0x01;
+pub const NATIVE_OTCLIENT_PENDING_GAME: u8 = 0x0a;
+pub const NATIVE_OTCLIENT_LOGIN_ERROR: u8 = 0x0a;
+pub const NATIVE_OTCLIENT_LOGIN_CHARACTER_LIST: u8 = 0x64;
+pub const NATIVE_OTCLIENT_GAME_LOGIN_ERROR: u8 = 0x14;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeOtClientProfile {
+    pub protocol_version: u16,
+    pub numeric_account_ids: bool,
+    pub login_packet_encryption: bool,
+    pub protocol_checksum: bool,
+    pub challenge_on_login: bool,
+    pub max_padding_bytes: usize,
+}
+
+impl NativeOtClientProfile {
+    pub fn supports_current_native_foundation(&self) -> bool {
+        self.protocol_version != 0
+            && self.numeric_account_ids
+            && !self.login_packet_encryption
+            && !self.protocol_checksum
+            && !self.challenge_on_login
+            && self.max_padding_bytes <= MAX_FRAME_SIZE
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeOtClientLoginRequest {
+    pub operating_system: u16,
+    pub protocol_version: u16,
+    pub dat_signature: u32,
+    pub spr_signature: u32,
+    pub pic_signature: u32,
+    pub account_id: u32,
+    pub password: String,
+    pub client_tag: String,
+    pub client_build: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeOtClientGameRequest {
+    pub operating_system: u16,
+    pub protocol_version: u16,
+    pub account_id: u32,
+    pub character_name: String,
+    pub password: String,
+    pub client_tag: String,
+    pub client_build: u16,
+}
+
+pub fn decode_native_otclient_login_request(
+    frame: &Frame,
+    profile: &NativeOtClientProfile,
+) -> Result<NativeOtClientLoginRequest, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut reader = Reader::new(&frame.0);
+    if reader.byte()? != NATIVE_OTCLIENT_ENTER_ACCOUNT {
+        return Err(ProtocolError::InvalidNativeLoginRequest);
+    }
+    let request = NativeOtClientLoginRequest {
+        operating_system: reader.u16()?,
+        protocol_version: reader.u16()?,
+        dat_signature: reader.u32()?,
+        spr_signature: reader.u32()?,
+        pic_signature: reader.u32()?,
+        account_id: reader.u32()?,
+        password: reader.string(MAX_LOGIN_STRING_BYTES)?,
+        client_tag: reader.string(MAX_LOGIN_STRING_BYTES)?,
+        client_build: reader.u16()?,
+    };
+    if request.protocol_version != profile.protocol_version
+        || reader.remaining() > profile.max_padding_bytes
+    {
+        return Err(ProtocolError::InvalidNativeLoginRequest);
+    }
+    Ok(request)
+}
+
+pub fn decode_native_otclient_game_request(
+    frame: &Frame,
+    profile: &NativeOtClientProfile,
+) -> Result<NativeOtClientGameRequest, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut reader = Reader::new(&frame.0);
+    if reader.byte()? != NATIVE_OTCLIENT_PENDING_GAME {
+        return Err(ProtocolError::InvalidNativeGameRequest);
+    }
+    let request = NativeOtClientGameRequest {
+        operating_system: reader.u16()?,
+        protocol_version: reader.u16()?,
+        account_id: reader.u32()?,
+        character_name: reader.string(MAX_LOGIN_STRING_BYTES)?,
+        password: reader.string(MAX_LOGIN_STRING_BYTES)?,
+        client_tag: reader.string(MAX_LOGIN_STRING_BYTES)?,
+        client_build: reader.u16()?,
+    };
+    if request.protocol_version != profile.protocol_version
+        || reader.remaining() > profile.max_padding_bytes
+    {
+        return Err(ProtocolError::InvalidNativeGameRequest);
+    }
+    Ok(request)
+}
+
+pub fn encode_native_otclient_character_list(
+    entries: &[CharacterListEntry],
+) -> Result<Frame, ProtocolError> {
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_LOGIN_CHARACTER_LIST);
+    writer.byte(u8::try_from(entries.len()).map_err(|_| ProtocolError::TooManyCharacters)?);
+    for entry in entries {
+        writer.string(&entry.name);
+        writer.string(&entry.world_name);
+        let IpAddr::V4(address) = entry.address else {
+            return Err(ProtocolError::UnsupportedAddressFamily);
+        };
+        writer.bytes(&address.octets());
+        writer.u16(entry.port);
+    }
+    writer.u16(0);
+    Ok(Frame(writer.finish()))
+}
+
+pub fn encode_native_otclient_login_error(message: &str) -> Frame {
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_LOGIN_ERROR);
+    writer.string(message);
+    Frame(writer.finish())
+}
+
+pub fn encode_native_otclient_game_login_error(message: &str) -> Frame {
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_LOGIN_ERROR);
+    writer.string(message);
+    Frame(writer.finish())
+}
+
+#[cfg(test)]
+fn encode_native_otclient_login_request_for_harness(request: &NativeOtClientLoginRequest) -> Frame {
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_ENTER_ACCOUNT);
+    writer.u16(request.operating_system);
+    writer.u16(request.protocol_version);
+    writer.u32(request.dat_signature);
+    writer.u32(request.spr_signature);
+    writer.u32(request.pic_signature);
+    writer.u32(request.account_id);
+    writer.string(&request.password);
+    writer.string(&request.client_tag);
+    writer.u16(request.client_build);
+    writer.bytes(&[0; 8]);
+    Frame(writer.finish())
+}
+
+#[cfg(test)]
+fn encode_native_otclient_game_request_for_harness(request: &NativeOtClientGameRequest) -> Frame {
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_PENDING_GAME);
+    writer.u16(request.operating_system);
+    writer.u16(request.protocol_version);
+    writer.u32(request.account_id);
+    writer.string(&request.character_name);
+    writer.string(&request.password);
+    writer.string(&request.client_tag);
+    writer.u16(request.client_build);
+    writer.bytes(&[0; 8]);
+    Frame(writer.finish())
+}
+
 pub fn encode_legacy_74_character_list(
     motd: &str,
     entries: &[CharacterListEntry],
@@ -820,6 +995,9 @@ pub enum ProtocolError {
     ChallengeMismatch,
     InvalidOtClientCapabilityAck,
     InvalidOtClientMessage,
+    InvalidNativeLoginRequest,
+    InvalidNativeGameRequest,
+    UnsupportedNativeClientProfile,
     TooManyCharacters,
     UnsupportedAddressFamily,
     StringTooLong(usize),
@@ -909,6 +1087,9 @@ impl<'a> Reader<'a> {
     }
     fn done(&self) -> bool {
         self.position == self.bytes.len()
+    }
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.position)
     }
 }
 fn xml(value: &str) -> String {
@@ -1149,5 +1330,67 @@ mod tests {
             .0
             .windows(b"fe.move.ack.v1;tick=10".len())
             .any(|window| window == b"fe.move.ack.v1;tick=10"));
+    }
+
+    #[test]
+    fn native_otclient_login_character_list_and_game_selection_are_profile_driven() {
+        let profile = NativeOtClientProfile {
+            protocol_version: 740,
+            numeric_account_ids: true,
+            login_packet_encryption: false,
+            protocol_checksum: false,
+            challenge_on_login: false,
+            max_padding_bytes: LEGACY_RSA_BLOCK_SIZE,
+        };
+        let login = NativeOtClientLoginRequest {
+            operating_system: 2,
+            protocol_version: profile.protocol_version,
+            dat_signature: 0x1122_3344,
+            spr_signature: 0x5566_7788,
+            pic_signature: 0x99aa_bbcc,
+            account_id: 42,
+            password: "correct horse".into(),
+            client_tag: "OTCv8".into(),
+            client_build: 412,
+        };
+        assert_eq!(
+            decode_native_otclient_login_request(
+                &encode_native_otclient_login_request_for_harness(&login),
+                &profile,
+            )
+            .unwrap(),
+            login
+        );
+        let list = encode_native_otclient_character_list(&[CharacterListEntry {
+            name: "Knight".into(),
+            world_name: "Forgotten Engine".into(),
+            address: "127.0.0.1".parse().unwrap(),
+            port: 7172,
+        }])
+        .unwrap();
+        assert_eq!(list.0[0], NATIVE_OTCLIENT_LOGIN_CHARACTER_LIST);
+        assert_eq!(list.0[1], 1);
+        assert!(list.0.windows(4).any(|bytes| bytes == [127, 0, 0, 1]));
+        let game = NativeOtClientGameRequest {
+            operating_system: 2,
+            protocol_version: profile.protocol_version,
+            account_id: 42,
+            character_name: "Knight".into(),
+            password: "correct horse".into(),
+            client_tag: "OTCv8".into(),
+            client_build: 412,
+        };
+        assert_eq!(
+            decode_native_otclient_game_request(
+                &encode_native_otclient_game_request_for_harness(&game),
+                &profile,
+            )
+            .unwrap(),
+            game
+        );
+        assert_eq!(
+            encode_native_otclient_game_login_error("Map initialization is pending.").0[0],
+            NATIVE_OTCLIENT_GAME_LOGIN_ERROR
+        );
     }
 }

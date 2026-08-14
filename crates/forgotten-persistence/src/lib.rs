@@ -97,6 +97,44 @@ impl EngineDatabase {
         }))
     }
 
+    /// Authenticates a legacy numeric account identifier for native protocol profiles.
+    pub fn authenticate_account_id(
+        &self,
+        account_id: u32,
+        password: &str,
+    ) -> Result<Option<LoginAccount>, PersistenceError> {
+        let record = self
+            .connection
+            .query_row(
+                "SELECT id, name, password_hash FROM accounts WHERE id = ?1",
+                params![account_id as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, name, password_hash)) = record else {
+            return Ok(None);
+        };
+        let parsed = PasswordHash::new(&password_hash)
+            .map_err(|error| PersistenceError::PasswordHash(error.to_string()))?;
+        if Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        Ok(Some(LoginAccount {
+            id,
+            name,
+            characters: self.characters_for_account(id)?,
+        }))
+    }
+
     pub fn characters_for_account(
         &self,
         account_id: i64,
@@ -345,6 +383,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(account.id, account_id);
+        assert_eq!(
+            database
+                .authenticate_account_id(account_id as u32, "correct horse battery staple")
+                .unwrap()
+                .unwrap()
+                .name,
+            "admin"
+        );
         assert_eq!(account.characters[0].name, "Knight");
         assert_eq!(
             account.characters[0].position,

@@ -3,7 +3,7 @@
 //! The loader recognizes a deliberately limited `config.lua` assignment subset. It does not
 //! execute Lua; a sandboxed scripting runtime belongs to a later milestone.
 
-use forgotten_protocol::{profile_by_id, CompatibilityProfile};
+use forgotten_protocol::{profile_by_id, CompatibilityProfile, NativeOtClientProfile};
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
@@ -49,6 +49,16 @@ pub struct EngineConfig {
     pub game_session_port: u16,
     pub advertised_game_session_host: String,
     pub advertised_game_session_port: u16,
+    pub otclient_v8_native_enabled: bool,
+    pub otclient_v8_login_port: u16,
+    pub otclient_v8_game_port: u16,
+    pub advertised_otclient_v8_host: String,
+    pub advertised_otclient_v8_game_port: u16,
+    pub otclient_v8_protocol_version: u16,
+    pub otclient_v8_numeric_account_ids: bool,
+    pub otclient_v8_login_packet_encryption: bool,
+    pub otclient_v8_protocol_checksum: bool,
+    pub otclient_v8_challenge_on_login: bool,
 }
 
 impl EngineConfig {
@@ -62,6 +72,25 @@ impl EngineConfig {
 
     pub fn game_session_socket_addr(&self) -> SocketAddr {
         SocketAddr::new(self.bind_ip, self.game_session_port)
+    }
+
+    pub fn otclient_v8_login_socket_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.bind_ip, self.otclient_v8_login_port)
+    }
+
+    pub fn otclient_v8_game_socket_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.bind_ip, self.otclient_v8_game_port)
+    }
+
+    pub fn otclient_v8_native_profile(&self) -> NativeOtClientProfile {
+        NativeOtClientProfile {
+            protocol_version: self.otclient_v8_protocol_version,
+            numeric_account_ids: self.otclient_v8_numeric_account_ids,
+            login_packet_encryption: self.otclient_v8_login_packet_encryption,
+            protocol_checksum: self.otclient_v8_protocol_checksum,
+            challenge_on_login: self.otclient_v8_challenge_on_login,
+            max_padding_bytes: 128,
+        }
     }
 
     pub fn max_connections(&self) -> usize {
@@ -143,6 +172,39 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         optional_string_owned(&values, "advertisedGameSessionHost", bind_ip.to_string())?;
     let advertised_game_session_port =
         optional_u16(&values, "advertisedGameSessionPort", game_session_port)?;
+    let otclient_v8_login_port = optional_u16(&values, "otclientV8LoginPort", 7174)?;
+    let otclient_v8_game_port = optional_u16(&values, "otclientV8GamePort", 7175)?;
+    let advertised_otclient_v8_host =
+        optional_string_owned(&values, "advertisedOtClientV8Host", bind_ip.to_string())?;
+    let advertised_otclient_v8_game_port = optional_u16(
+        &values,
+        "advertisedOtClientV8GamePort",
+        otclient_v8_game_port,
+    )?;
+    let otclient_v8_native_enabled = optional_boolean(&values, "otclientV8NativeEnabled", false)?;
+    let otclient_v8_protocol_version = optional_u16(&values, "otclientV8ProtocolVersion", 0)?;
+    let otclient_v8_numeric_account_ids =
+        optional_boolean(&values, "otclientV8NumericAccountIds", true)?;
+    let otclient_v8_login_packet_encryption =
+        optional_boolean(&values, "otclientV8LoginPacketEncryption", false)?;
+    let otclient_v8_protocol_checksum =
+        optional_boolean(&values, "otclientV8ProtocolChecksum", false)?;
+    let otclient_v8_challenge_on_login =
+        optional_boolean(&values, "otclientV8ChallengeOnLogin", false)?;
+    let native_profile = NativeOtClientProfile {
+        protocol_version: otclient_v8_protocol_version,
+        numeric_account_ids: otclient_v8_numeric_account_ids,
+        login_packet_encryption: otclient_v8_login_packet_encryption,
+        protocol_checksum: otclient_v8_protocol_checksum,
+        challenge_on_login: otclient_v8_challenge_on_login,
+        max_padding_bytes: 128,
+    };
+    if otclient_v8_native_enabled && !native_profile.supports_current_native_foundation() {
+        return Err(ConfigError::InvalidValue {
+            key: "otclientV8NativeEnabled",
+            message: "requires a selected plain numeric-account native client profile".into(),
+        });
+    }
 
     Ok(EngineConfig {
         bind_ip,
@@ -170,6 +232,16 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         game_session_port,
         advertised_game_session_host,
         advertised_game_session_port,
+        otclient_v8_native_enabled,
+        otclient_v8_login_port,
+        otclient_v8_game_port,
+        advertised_otclient_v8_host,
+        advertised_otclient_v8_game_port,
+        otclient_v8_protocol_version,
+        otclient_v8_numeric_account_ids,
+        otclient_v8_login_packet_encryption,
+        otclient_v8_protocol_checksum,
+        otclient_v8_challenge_on_login,
     })
 }
 
@@ -259,7 +331,7 @@ pub fn validate_content(world_directory: impl AsRef<Path>) -> Result<ContentRepo
 
 pub fn template(profile: CompatibilityProfile) -> String {
     format!(
-        "-- Forgotten Engine configuration\n-- TFS-style layout; parsed as a bounded assignment subset during P0.\n\n-- Connection Config\nip = \"127.0.0.1\"\ngameProtocolPort = 7172\nstatusProtocolPort = 7171\nmaxPlayers = 0\nserverName = \"Forgotten Engine\"\n\n-- Legacy login foundation\n-- Set true only after providing an original 1024-bit RSA private key.\nlegacyLoginEnabled = false\nrsaPrivateKey = \"key.pem\"\n\n-- Legacy game-session foundation\n-- Separate opt-in port until official session compatibility is proven.\ngameSessionEnabled = false\ngameSessionPort = 7173\n-- Public endpoint advertised to a custom OTClient module; may be a proxy/domain/IP-changing endpoint.\nadvertisedGameSessionHost = \"127.0.0.1\"\nadvertisedGameSessionPort = 7173\n\n-- Map\nmapName = \"forgotten\"\nworldType = \"pvp\"\n\n-- MySQL compatibility contract (SQLite remains the current storage backend)\nmysqlHost = \"127.0.0.1\"\nmysqlUser = \"forgottenengine\"\nmysqlDatabase = \"forgottenengine\"\n\n-- Forgotten Engine profile\nfeProfile = \"{}\"\ntibiaProtocol = \"{}\"\n",
+        "-- Forgotten Engine configuration\n-- TFS-style layout; parsed as a bounded assignment subset during P0.\n\n-- Connection Config\nip = \"127.0.0.1\"\ngameProtocolPort = 7172\nstatusProtocolPort = 7171\nmaxPlayers = 0\nserverName = \"Forgotten Engine\"\n\n-- Legacy login foundation\n-- Set true only after providing an original 1024-bit RSA private key.\nlegacyLoginEnabled = false\nrsaPrivateKey = \"key.pem\"\n\n-- Legacy game-session foundation\n-- Separate opt-in port until official session compatibility is proven.\ngameSessionEnabled = false\ngameSessionPort = 7173\n-- Public endpoint advertised to a custom OTClient module; may be a proxy/domain/IP-changing endpoint.\nadvertisedGameSessionHost = \"127.0.0.1\"\nadvertisedGameSessionPort = 7173\n\n-- Native stock OTClientV8 foundation\n-- Select the compatible protocol and feature switches for this world; do not assume FE release versions.\notclientV8NativeEnabled = false\notclientV8LoginPort = 7174\notclientV8GamePort = 7175\notclientV8ProtocolVersion = 0\notclientV8NumericAccountIds = true\notclientV8LoginPacketEncryption = false\notclientV8ProtocolChecksum = false\notclientV8ChallengeOnLogin = false\n-- Address returned in the native legacy character list.\nadvertisedOtClientV8Host = \"127.0.0.1\"\nadvertisedOtClientV8GamePort = 7175\n\n-- Map\nmapName = \"forgotten\"\nworldType = \"pvp\"\n\n-- MySQL compatibility contract (SQLite remains the current storage backend)\nmysqlHost = \"127.0.0.1\"\nmysqlUser = \"forgottenengine\"\nmysqlDatabase = \"forgottenengine\"\n\n-- Forgotten Engine profile\nfeProfile = \"{}\"\ntibiaProtocol = \"{}\"\n",
         profile.id, profile.tibia_protocol
     )
 }
@@ -516,6 +588,54 @@ mod tests {
         assert_eq!(config.game_session_port, 7183);
         assert_eq!(config.advertised_game_session_host, "fe.example.test");
         assert_eq!(config.advertised_game_session_port, 443);
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn loads_a_profile_driven_native_otclient_endpoint() {
+        let world = temporary_world("native-otclient");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}otclientV8NativeEnabled = true\notclientV8LoginPort = 7264\notclientV8GamePort = 7265\nadvertisedOtClientV8Host = \"203.0.113.24\"\nadvertisedOtClientV8GamePort = 7265\notclientV8ProtocolVersion = 740\notclientV8NumericAccountIds = true\notclientV8LoginPacketEncryption = false\notclientV8ProtocolChecksum = false\notclientV8ChallengeOnLogin = false\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+
+        let config = load(&world).unwrap();
+        assert!(config.otclient_v8_native_enabled);
+        assert_eq!(config.otclient_v8_login_socket_addr().port(), 7264);
+        assert_eq!(config.otclient_v8_game_socket_addr().port(), 7265);
+        assert_eq!(config.advertised_otclient_v8_host, "203.0.113.24");
+        assert_eq!(config.advertised_otclient_v8_game_port, 7265);
+        assert!(config
+            .otclient_v8_native_profile()
+            .supports_current_native_foundation());
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn rejects_an_incomplete_enabled_native_otclient_profile() {
+        let world = temporary_world("incomplete-native-otclient");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}otclientV8NativeEnabled = true\notclientV8ProtocolVersion = 740\notclientV8LoginPacketEncryption = true\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            load(&world),
+            Err(ConfigError::InvalidValue {
+                key: "otclientV8NativeEnabled",
+                ..
+            })
+        ));
         let _ = fs::remove_dir_all(world);
     }
 

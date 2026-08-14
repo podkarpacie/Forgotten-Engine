@@ -8,18 +8,21 @@ use forgotten_protocol::{
     decode, decode_fe_otclient_capability_ack, decode_fe_otclient_move_request,
     decode_legacy_74_envelope, decode_legacy_74_game_session_bootstrap_plaintext,
     decode_legacy_74_game_session_envelope, decode_legacy_74_login_plaintext,
+    decode_native_otclient_game_request, decode_native_otclient_login_request,
     decode_status_request, encode, encode_fe_otclient_capability_offer,
     encode_fe_otclient_empty_viewport, encode_fe_otclient_initial_world,
     encode_fe_otclient_movement_ack, encode_fe_otclient_world_tick,
     encode_legacy_74_character_list, encode_legacy_74_game_challenge,
     encode_legacy_74_game_session_error, encode_legacy_74_game_session_ready, encode_login_error,
-    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
-    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
-    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey, OtClientEndpoint,
+    encode_native_otclient_character_list, encode_native_otclient_game_login_error,
+    encode_native_otclient_login_error, encode_status_binary, encode_status_xml,
+    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientProfile, OtClientEndpoint,
     ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
 };
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -69,6 +72,16 @@ pub struct GameSessionHostConfig {
     pub session_timeout: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct NativeOtClientHostConfig {
+    pub bind_addr: SocketAddr,
+    pub client_profile: NativeOtClientProfile,
+    pub server_name: String,
+    pub advertised_game_addr: SocketAddr,
+    pub max_connections: usize,
+    pub session_timeout: Duration,
+}
+
 impl HostConfig {
     pub fn validate(&self) -> Result<(), HostError> {
         if self.max_connections == 0 {
@@ -105,6 +118,27 @@ impl GameSessionHostConfig {
     pub fn validate(&self) -> Result<(), HostError> {
         if self.profile.id != "fe-7.4" {
             return Err(HostError::LegacyLoginUnavailable);
+        }
+        if self.max_connections == 0 {
+            return Err(HostError::InvalidConfiguration(
+                "max_connections must be greater than zero".into(),
+            ));
+        }
+        if self.session_timeout.is_zero() {
+            return Err(HostError::InvalidConfiguration(
+                "session_timeout must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl NativeOtClientHostConfig {
+    pub fn validate(&self) -> Result<(), HostError> {
+        if !self.client_profile.supports_current_native_foundation() {
+            return Err(HostError::InvalidConfiguration(
+                "selected native client profile is not supported by the current foundation".into(),
+            ));
         }
         if self.max_connections == 0 {
             return Err(HostError::InvalidConfiguration(
@@ -213,6 +247,62 @@ pub fn start_game_session(
     let thread_shutdown = Arc::clone(&shutdown);
     let thread = thread::spawn(move || {
         serve_game_session(
+            listener,
+            config,
+            database_path,
+            thread_shutdown,
+            active_connections,
+        )
+    });
+    Ok(HostHandle {
+        local_addr,
+        shutdown,
+        thread: Some(thread),
+    })
+}
+
+pub fn start_native_otclient_login(
+    config: NativeOtClientHostConfig,
+    database_path: impl AsRef<Path>,
+) -> Result<HostHandle, HostError> {
+    config.validate()?;
+    let listener = TcpListener::bind(config.bind_addr)?;
+    listener.set_nonblocking(true)?;
+    let local_addr = listener.local_addr()?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let database_path = database_path.as_ref().to_path_buf();
+    let thread_shutdown = Arc::clone(&shutdown);
+    let thread = thread::spawn(move || {
+        serve_native_otclient_login(
+            listener,
+            config,
+            database_path,
+            thread_shutdown,
+            active_connections,
+        )
+    });
+    Ok(HostHandle {
+        local_addr,
+        shutdown,
+        thread: Some(thread),
+    })
+}
+
+pub fn start_native_otclient_game(
+    config: NativeOtClientHostConfig,
+    database_path: impl AsRef<Path>,
+) -> Result<HostHandle, HostError> {
+    config.validate()?;
+    let listener = TcpListener::bind(config.bind_addr)?;
+    listener.set_nonblocking(true)?;
+    let local_addr = listener.local_addr()?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let database_path = database_path.as_ref().to_path_buf();
+    let thread_shutdown = Arc::clone(&shutdown);
+    let thread = thread::spawn(move || {
+        serve_native_otclient_game(
             listener,
             config,
             database_path,
@@ -393,6 +483,223 @@ fn serve_game_session(
         }
     }
     record_event(&database_path, "info", "game session foundation stopped");
+    Ok(())
+}
+
+fn serve_native_otclient_login(
+    listener: TcpListener,
+    config: NativeOtClientHostConfig,
+    database_path: PathBuf,
+    shutdown: Arc<AtomicBool>,
+    active_connections: Arc<AtomicUsize>,
+) -> Result<(), HostError> {
+    record_event(
+        &database_path,
+        "info",
+        &format!(
+            "native client login service started addr={} protocol={}",
+            listener.local_addr()?,
+            config.client_profile.protocol_version
+        ),
+    );
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((mut stream, peer)) => {
+                let active = active_connections.fetch_add(1, Ordering::SeqCst);
+                if active >= config.max_connections {
+                    active_connections.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+                let session_config = config.clone();
+                let session_database_path = database_path.clone();
+                let session_connections = Arc::clone(&active_connections);
+                thread::spawn(move || {
+                    let result = handle_native_otclient_login(
+                        &mut stream,
+                        peer,
+                        &session_config,
+                        &session_database_path,
+                    );
+                    if let Err(error) = result {
+                        record_event(
+                            &session_database_path,
+                            "warn",
+                            &format!("native login rejected peer={peer} reason={error}"),
+                        );
+                    }
+                    session_connections.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(HostError::Io(error)),
+        }
+    }
+    record_event(
+        &database_path,
+        "info",
+        "native client login service stopped",
+    );
+    Ok(())
+}
+
+fn serve_native_otclient_game(
+    listener: TcpListener,
+    config: NativeOtClientHostConfig,
+    database_path: PathBuf,
+    shutdown: Arc<AtomicBool>,
+    active_connections: Arc<AtomicUsize>,
+) -> Result<(), HostError> {
+    record_event(
+        &database_path,
+        "info",
+        &format!(
+            "native client game service started addr={} protocol={}",
+            listener.local_addr()?,
+            config.client_profile.protocol_version
+        ),
+    );
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((mut stream, peer)) => {
+                let active = active_connections.fetch_add(1, Ordering::SeqCst);
+                if active >= config.max_connections {
+                    active_connections.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+                let session_config = config.clone();
+                let session_database_path = database_path.clone();
+                let session_connections = Arc::clone(&active_connections);
+                thread::spawn(move || {
+                    let result = handle_native_otclient_game(
+                        &mut stream,
+                        peer,
+                        &session_config,
+                        &session_database_path,
+                    );
+                    if let Err(error) = result {
+                        record_event(
+                            &session_database_path,
+                            "warn",
+                            &format!("native game rejected peer={peer} reason={error}"),
+                        );
+                    }
+                    session_connections.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(HostError::Io(error)),
+        }
+    }
+    record_event(&database_path, "info", "native client game service stopped");
+    Ok(())
+}
+
+fn handle_native_otclient_login(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    config: &NativeOtClientHostConfig,
+    database_path: &Path,
+) -> Result<(), HostError> {
+    stream.set_read_timeout(Some(config.session_timeout))?;
+    stream.set_write_timeout(Some(config.session_timeout))?;
+    let request =
+        decode_native_otclient_login_request(&read_frame(stream)?, &config.client_profile)
+            .map_err(HostError::Protocol)?;
+    let database = EngineDatabase::open(database_path).map_err(HostError::Persistence)?;
+    let Some(account) = database
+        .authenticate_account_id(request.account_id, &request.password)
+        .map_err(HostError::Persistence)?
+    else {
+        write_frame(
+            stream,
+            &encode_native_otclient_login_error("Account name or password is not correct."),
+        )?;
+        return Ok(());
+    };
+    let IpAddr::V4(address) = config.advertised_game_addr.ip() else {
+        write_frame(
+            stream,
+            &encode_native_otclient_login_error(
+                "This native client profile requires an IPv4 game endpoint.",
+            ),
+        )?;
+        return Ok(());
+    };
+    let entries = account
+        .characters
+        .iter()
+        .map(|character| CharacterListEntry {
+            name: character.name.clone(),
+            world_name: config.server_name.clone(),
+            address: IpAddr::V4(address),
+            port: config.advertised_game_addr.port(),
+        })
+        .collect::<Vec<_>>();
+    write_frame(
+        stream,
+        &encode_native_otclient_character_list(&entries).map_err(HostError::Protocol)?,
+    )?;
+    record_event(
+        database_path,
+        "info",
+        &format!(
+            "native client login accepted peer={peer} account={} protocol={}",
+            account.id, request.protocol_version
+        ),
+    );
+    Ok(())
+}
+
+fn handle_native_otclient_game(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    config: &NativeOtClientHostConfig,
+    database_path: &Path,
+) -> Result<(), HostError> {
+    stream.set_read_timeout(Some(config.session_timeout))?;
+    stream.set_write_timeout(Some(config.session_timeout))?;
+    let request = decode_native_otclient_game_request(&read_frame(stream)?, &config.client_profile)
+        .map_err(HostError::Protocol)?;
+    let database = EngineDatabase::open(database_path).map_err(HostError::Persistence)?;
+    let Some(account) = database
+        .authenticate_account_id(request.account_id, &request.password)
+        .map_err(HostError::Persistence)?
+    else {
+        write_frame(
+            stream,
+            &encode_native_otclient_game_login_error("Account name or password is not correct."),
+        )?;
+        return Ok(());
+    };
+    if !account
+        .characters
+        .iter()
+        .any(|character| character.name == request.character_name)
+    {
+        write_frame(
+            stream,
+            &encode_native_otclient_game_login_error("Character does not belong to this account."),
+        )?;
+        return Ok(());
+    }
+    write_frame(
+        stream,
+        &encode_native_otclient_game_login_error(
+            "Forgotten Engine native map initialization is not available for this selected client profile yet.",
+        ),
+    )?;
+    record_event(
+        database_path,
+        "info",
+        &format!(
+            "native client game selection validated peer={peer} account={} character={} protocol={} outcome=map-pending",
+            account.id, request.character_name, request.protocol_version
+        ),
+    );
     Ok(())
 }
 
@@ -884,6 +1191,55 @@ mod tests {
         }
     }
 
+    fn native_otclient_config(bind_addr: SocketAddr) -> NativeOtClientHostConfig {
+        NativeOtClientHostConfig {
+            bind_addr,
+            client_profile: NativeOtClientProfile {
+                protocol_version: 740,
+                numeric_account_ids: true,
+                login_packet_encryption: false,
+                protocol_checksum: false,
+                challenge_on_login: false,
+                max_padding_bytes: 128,
+            },
+            server_name: "Forgotten Engine Test".into(),
+            advertised_game_addr: "127.0.0.1:7265".parse().unwrap(),
+            max_connections: 2,
+            session_timeout: Duration::from_millis(250),
+        }
+    }
+
+    fn add_string(payload: &mut Vec<u8>, value: &str) {
+        payload.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        payload.extend_from_slice(value.as_bytes());
+    }
+
+    fn native_login_request(account_id: u32, password: &str) -> Frame {
+        let mut payload = vec![forgotten_protocol::NATIVE_OTCLIENT_ENTER_ACCOUNT];
+        payload.extend_from_slice(&2_u16.to_le_bytes());
+        payload.extend_from_slice(&740_u16.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&account_id.to_le_bytes());
+        add_string(&mut payload, password);
+        add_string(&mut payload, "otcv8-test");
+        payload.extend_from_slice(&1_u16.to_le_bytes());
+        Frame(payload)
+    }
+
+    fn native_game_request(account_id: u32, character_name: &str, password: &str) -> Frame {
+        let mut payload = vec![forgotten_protocol::NATIVE_OTCLIENT_PENDING_GAME];
+        payload.extend_from_slice(&2_u16.to_le_bytes());
+        payload.extend_from_slice(&740_u16.to_le_bytes());
+        payload.extend_from_slice(&account_id.to_le_bytes());
+        add_string(&mut payload, character_name);
+        add_string(&mut payload, password);
+        add_string(&mut payload, "otcv8-test");
+        payload.extend_from_slice(&1_u16.to_le_bytes());
+        Frame(payload)
+    }
+
     #[test]
     fn accepts_a_bounded_probe_and_returns_the_selected_profile() {
         let database = database_path("probe");
@@ -1001,6 +1357,94 @@ mod tests {
         assert_eq!(response[0], 0x64);
         assert!(response.windows(6).any(|window| window == b"Knight"));
         host.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn serves_a_profile_driven_native_otclient_character_list_and_game_gate() {
+        let database_path = database_path("native-otclient");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let login = start_native_otclient_login(
+            native_otclient_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+        let game = start_native_otclient_game(
+            native_otclient_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+
+        let mut login_stream = TcpStream::connect(login.local_addr()).unwrap();
+        write_frame(
+            &mut login_stream,
+            &native_login_request(
+                account_id.try_into().unwrap(),
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let character_list = read_frame(&mut login_stream).unwrap();
+        assert_eq!(
+            character_list.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_LOGIN_CHARACTER_LIST
+        );
+        assert!(character_list
+            .0
+            .windows(6)
+            .any(|window| window == b"Knight"));
+        assert!(character_list
+            .0
+            .windows(4)
+            .any(|window| window == [127, 0, 0, 1]));
+
+        let mut game_stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut game_stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let game_gate = read_frame(&mut game_stream).unwrap();
+        assert_eq!(
+            game_gate.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_ERROR
+        );
+        assert!(game_gate
+            .0
+            .windows(
+                b"Forgotten Engine native map initialization is not available for this selected client profile yet."
+                    .len(),
+            )
+            .any(|window| {
+                window
+                    == b"Forgotten Engine native map initialization is not available for this selected client profile yet."
+            }));
+
+        game.shutdown().unwrap();
+        login.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }
 

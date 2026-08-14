@@ -71,3 +71,17 @@
 - [x] Integrate bounded custom-client movement into the opt-in game-session listener and preserve persisted player position safely.
 - [x] Document the new empty-world rendering/movement scope and the remaining map, item, and gameplay feature gates.
 - [x] Validate formatting, all tests, strict linting, optimized builds, and Windows cross-compilation before publication approval for the empty-world milestone.
+- [x] Inspect the unmodified OTClient 7.4 connection, login, game-session, and first-world packet expectations using lawful public references only.
+- [x] Document the precise divergence between the current FE-specific custom-client endpoint and an unmodified OTClient-compatible path.
+- [x] Define clean-room binary fixtures for normal OTClient-understood 7.4 login, encryption, character selection, and initial game-world packets.
+- [x] Replace or gate FE-specific extended-opcode assumptions so a standard OTClient protocol path can be exercised without a custom module.
+- [ ] Implement original Rust normal-protocol framing, minimal map/creature/player initialization, and standard movement acknowledgements required by the selected OTClient target.
+- [ ] Validate the normal OTClient-facing path with independent packet fixtures and, where lawfully available, an unmodified client interoperability harness.
+- [x] Update compatibility and operator documentation to state the exact unmodified OTClient version/profile, asset requirements, and remaining limits.
+- [ ] Validate formatting, all tests, strict linting, optimized builds, and Windows cross-compilation before publication approval for the unmodified-OTClient milestone.
+- [x] Identify the precise unmodified OTClientV8 release/configuration and lawful 7.4 asset profile that will be FE’s first native-client acceptance target.
+- [x] Compare public OTClientV8 fe-7.4 login, game challenge, map, and movement expectations against FE’s current custom-client divergence without copying client code or assets.
+- [x] Update the native-client fixture specification to the selected OTClientV8 fe-7.4 profile before implementing standard packet codecs.
+- [x] Refactor the native OTClientV8 path so protocol/version behavior is derived from the selected world profile and explicit client-profile configuration rather than hardcoded FE/Tibia version literals.
+- [x] Keep fe-7.4/Tibia 7.4 as an acceptance fixture only, while rejecting or feature-gating unsupported selected profile/client combinations with explicit diagnostics.
+- [x] Update compatibility and operator documentation to state the exact unmodified OTClientV8 740 profile, asset requirements, and remaining normal-map limits.
