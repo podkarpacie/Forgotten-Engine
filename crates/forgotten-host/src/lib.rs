@@ -165,14 +165,9 @@ impl NativeOtClientHostConfig {
             ));
         }
         if let Some(empty_world) = &self.empty_world {
-            if empty_world.ground_thing_id == 0
-                || empty_world.player_look_type == 0
-                || empty_world.player_speed == 0
-                || empty_world.server_beat == 0
-            {
+            if empty_world.player_speed == 0 || empty_world.server_beat == 0 {
                 return Err(HostError::InvalidConfiguration(
-                    "native empty-world fixture requires nonzero thing, look, speed, and beat values"
-                        .into(),
+                    "native empty-world fixture requires nonzero speed and beat values".into(),
                 ));
             }
         }

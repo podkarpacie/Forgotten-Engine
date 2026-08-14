@@ -1002,7 +1002,9 @@ pub fn encode_native_otclient_empty_world_map(
     for z in (0..NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS as u8).rev() {
         for x in 0..NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH {
             for y in 0..NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT {
-                writer.u16(snapshot.ground_thing_id);
+                if snapshot.ground_thing_id != 0 {
+                    writer.u16(snapshot.ground_thing_id);
+                }
                 let is_player_tile = z == snapshot.player_position.z
                     && x == NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH / 2 - 1
                     && y == NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT / 2 - 1;
@@ -1088,8 +1090,6 @@ fn validate_native_empty_world_snapshot(
         || !(NATIVE_OTCLIENT_PLAYER_ID_START..NATIVE_OTCLIENT_PLAYER_ID_END)
             .contains(&snapshot.player_id)
         || snapshot.player_position.z >= NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS as u8
-        || snapshot.ground_thing_id == 0
-        || snapshot.player_look_type == 0
         || snapshot.player_speed == 0
         || snapshot.server_beat == 0
         || snapshot.player_name.len() > MAX_LOGIN_STRING_BYTES
@@ -1116,10 +1116,14 @@ fn write_native_otclient_unknown_player(
     writer.byte(100);
     writer.byte(2);
     writer.byte(snapshot.player_look_type);
-    writer.byte(0);
-    writer.byte(0);
-    writer.byte(0);
-    writer.byte(0);
+    if snapshot.player_look_type == 0 {
+        writer.u16(0);
+    } else {
+        writer.byte(0);
+        writer.byte(0);
+        writer.byte(0);
+        writer.byte(0);
+    }
     writer.byte(0);
     writer.byte(0);
     writer.u16(snapshot.player_speed);
@@ -1711,5 +1715,19 @@ mod tests {
             snapshot.player_id
         );
         assert_eq!(&movement.0[7..12], &[101, 0, 100, 0, 7]);
+
+        let asset_free_snapshot = NativeOtClientEmptyWorldSnapshot {
+            ground_thing_id: 0,
+            player_look_type: 0,
+            ..snapshot
+        };
+        let asset_free_map =
+            encode_native_otclient_empty_world_map(&profile, &asset_free_snapshot).unwrap();
+        assert_eq!(asset_free_map.0[0], NATIVE_OTCLIENT_GAME_FULL_MAP);
+        assert_eq!(asset_free_map.0.len(), 1 + 5 + cells * 2 + 29);
+        assert_eq!(
+            u16::from_le_bytes(asset_free_map.0[6..8].try_into().unwrap()),
+            NATIVE_OTCLIENT_TILE_END
+        );
     }
 }
