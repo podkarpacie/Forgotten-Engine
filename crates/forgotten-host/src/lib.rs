@@ -15,10 +15,10 @@ use forgotten_protocol::{
     encode_fe_otclient_world_tick, encode_legacy_74_character_list,
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
-    encode_native_otclient_empty_world_map, encode_native_otclient_game_login_error,
-    encode_native_otclient_game_login_state, encode_native_otclient_game_ping_back,
-    encode_native_otclient_login_error, encode_native_otclient_move_creature, encode_status_binary,
-    encode_status_xml, generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    encode_native_otclient_game_initialization, encode_native_otclient_game_login_error,
+    encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
+    encode_native_otclient_move_creature, encode_status_binary, encode_status_xml,
+    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
     CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
     Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientCardinalDirection,
     NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPosition,
@@ -727,19 +727,14 @@ fn handle_native_otclient_game(
         player_speed: empty_world.player_speed,
         server_beat: empty_world.server_beat,
     };
-    write_frame(
-        stream,
-        &encode_native_otclient_game_login_state(&config.client_profile, &snapshot)
-            .map_err(HostError::Protocol)?,
-    )?;
-    write_frame(
-        stream,
-        &encode_native_otclient_empty_world_map(&config.client_profile, &snapshot)
-            .map_err(HostError::Protocol)?,
-    )?;
+    let initialization =
+        encode_native_otclient_game_initialization(&config.client_profile, &snapshot)
+            .map_err(HostError::Protocol)?;
+    write_frame(stream, &initialization)?;
     eprintln!(
-        "> Native OTCv8 init sent peer={peer} player={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
+        "> Native OTCv8 init sent peer={peer} player={} record-bytes={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
         character.name,
+        initialization.0.len(),
         snapshot.ground_thing_id == 0 && snapshot.player_look_type == 0,
     );
 
@@ -1665,14 +1660,19 @@ mod tests {
             ),
         )
         .unwrap();
-        let login = read_frame(&mut stream).unwrap();
+        let initialization = read_frame(&mut stream).unwrap();
         assert_eq!(
-            login.0[0],
+            initialization.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
         );
-        let map = read_frame(&mut stream).unwrap();
-        assert_eq!(map.0[0], forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP);
-        assert!(map.0.windows(6).any(|window| window == b"Knight"));
+        assert_eq!(
+            initialization.0[8],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert!(initialization
+            .0
+            .windows(6)
+            .any(|window| window == b"Knight"));
 
         write_frame(&mut stream, &Frame(vec![0xa0, 1, 0, 1])).unwrap();
         write_frame(&mut stream, &Frame(vec![0x1d])).unwrap();

@@ -997,6 +997,15 @@ pub fn encode_native_otclient_game_login_state(
     Ok(Frame(writer.finish()))
 }
 
+pub fn encode_native_otclient_game_initialization(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+) -> Result<Frame, ProtocolError> {
+    let mut payload = encode_native_otclient_game_login_state(profile, snapshot)?.0;
+    payload.extend_from_slice(&encode_native_otclient_empty_world_map(profile, snapshot)?.0);
+    Ok(Frame(payload))
+}
+
 pub fn encode_native_otclient_empty_world_map(
     profile: &NativeOtClientProfile,
     snapshot: &NativeOtClientEmptyWorldSnapshot,
@@ -1690,6 +1699,15 @@ mod tests {
             .0
             .windows(snapshot.player_name.len())
             .any(|bytes| bytes == snapshot.player_name.as_bytes()));
+
+        let initialization =
+            encode_native_otclient_game_initialization(&profile, &snapshot).unwrap();
+        assert_eq!(&initialization.0[..login.0.len()], login.0.as_slice());
+        assert_eq!(
+            initialization.0[login.0.len()],
+            NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert_eq!(&initialization.0[login.0.len()..], map.0.as_slice());
 
         assert_eq!(
             decode_native_otclient_cardinal_move_request(&Frame(vec![0x66]), &profile).unwrap(),
