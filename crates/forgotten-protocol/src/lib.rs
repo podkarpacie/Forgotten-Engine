@@ -782,6 +782,10 @@ pub const NATIVE_OTCLIENT_GAME_LOGIN_ERROR: u8 = 0x14;
 pub const NATIVE_OTCLIENT_GAME_LOGIN_STATE: u8 = 0x0a;
 pub const NATIVE_OTCLIENT_GAME_FULL_MAP: u8 = 0x64;
 pub const NATIVE_OTCLIENT_GAME_MOVE_CREATURE: u8 = 0x6d;
+pub const NATIVE_OTCLIENT_GAME_PING_BACK: u8 = 0x1d;
+pub const NATIVE_OTCLIENT_ENTER_GAME: u8 = 0x0f;
+pub const NATIVE_OTCLIENT_CLIENT_PING: u8 = 0x1d;
+pub const NATIVE_OTCLIENT_CLIENT_PING_BACK: u8 = 0x1e;
 pub const NATIVE_OTCLIENT_UNKNOWN_CREATURE: u16 = 0x0061;
 pub const NATIVE_OTCLIENT_MAPPED_CREATURE: u16 = 0xffff;
 pub const NATIVE_OTCLIENT_TILE_END: u16 = 0xff00;
@@ -872,6 +876,14 @@ impl NativeOtClientCardinalDirection {
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeOtClientGameAction {
+    EnterGame,
+    Ping,
+    PingBack,
+    CardinalMove(NativeOtClientCardinalDirection),
 }
 
 pub fn decode_native_otclient_login_request(
@@ -1013,16 +1025,41 @@ pub fn decode_native_otclient_cardinal_move_request(
     frame: &Frame,
     profile: &NativeOtClientProfile,
 ) -> Result<NativeOtClientCardinalDirection, ProtocolError> {
+    match decode_native_otclient_game_action(frame, profile)? {
+        NativeOtClientGameAction::CardinalMove(direction) => Ok(direction),
+        _ => Err(ProtocolError::InvalidNativeGameRequest),
+    }
+}
+
+pub fn decode_native_otclient_game_action(
+    frame: &Frame,
+    profile: &NativeOtClientProfile,
+) -> Result<NativeOtClientGameAction, ProtocolError> {
     if !profile.supports_current_native_foundation() {
         return Err(ProtocolError::UnsupportedNativeClientProfile);
     }
     let mut reader = Reader::new(&frame.0);
-    let direction = NativeOtClientCardinalDirection::from_client_opcode(reader.byte()?)
-        .ok_or(ProtocolError::InvalidNativeGameRequest)?;
+    let action = match reader.byte()? {
+        NATIVE_OTCLIENT_ENTER_GAME => NativeOtClientGameAction::EnterGame,
+        NATIVE_OTCLIENT_CLIENT_PING => NativeOtClientGameAction::Ping,
+        NATIVE_OTCLIENT_CLIENT_PING_BACK => NativeOtClientGameAction::PingBack,
+        opcode => NativeOtClientCardinalDirection::from_client_opcode(opcode)
+            .map(NativeOtClientGameAction::CardinalMove)
+            .ok_or(ProtocolError::InvalidNativeGameRequest)?,
+    };
     if !reader.done() {
         return Err(ProtocolError::InvalidNativeGameRequest);
     }
-    Ok(direction)
+    Ok(action)
+}
+
+pub fn encode_native_otclient_game_ping_back(
+    profile: &NativeOtClientProfile,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    Ok(Frame(vec![NATIVE_OTCLIENT_GAME_PING_BACK]))
 }
 
 pub fn encode_native_otclient_move_creature(
@@ -1639,6 +1676,20 @@ mod tests {
         );
         assert!(
             decode_native_otclient_cardinal_move_request(&Frame(vec![0x66, 0]), &profile).is_err()
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(&Frame(vec![NATIVE_OTCLIENT_CLIENT_PING]), &profile)
+                .unwrap(),
+            NativeOtClientGameAction::Ping
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(&Frame(vec![NATIVE_OTCLIENT_ENTER_GAME]), &profile)
+                .unwrap(),
+            NativeOtClientGameAction::EnterGame
+        );
+        assert_eq!(
+            encode_native_otclient_game_ping_back(&profile).unwrap().0,
+            vec![NATIVE_OTCLIENT_GAME_PING_BACK]
         );
         let movement = encode_native_otclient_move_creature(
             &profile,

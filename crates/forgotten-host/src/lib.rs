@@ -8,7 +8,7 @@ use forgotten_protocol::{
     decode, decode_fe_otclient_capability_ack, decode_fe_otclient_move_request,
     decode_legacy_74_envelope, decode_legacy_74_game_session_bootstrap_plaintext,
     decode_legacy_74_game_session_envelope, decode_legacy_74_login_plaintext,
-    decode_native_otclient_cardinal_move_request, decode_native_otclient_game_request,
+    decode_native_otclient_game_action, decode_native_otclient_game_request,
     decode_native_otclient_login_request, decode_status_request, encode,
     encode_fe_otclient_capability_offer, encode_fe_otclient_empty_viewport,
     encode_fe_otclient_initial_world, encode_fe_otclient_movement_ack,
@@ -16,14 +16,14 @@ use forgotten_protocol::{
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
     encode_native_otclient_empty_world_map, encode_native_otclient_game_login_error,
-    encode_native_otclient_game_login_state, encode_native_otclient_login_error,
-    encode_native_otclient_move_creature, encode_status_binary, encode_status_xml,
-    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    encode_native_otclient_game_login_state, encode_native_otclient_game_ping_back,
+    encode_native_otclient_login_error, encode_native_otclient_move_creature, encode_status_binary,
+    encode_status_xml, generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
     CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
     Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientCardinalDirection,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientPosition, NativeOtClientProfile,
-    OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
-    NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPosition,
+    NativeOtClientProfile, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
+    StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -771,31 +771,40 @@ fn handle_native_otclient_game(
             }
             Err(error) => return Err(error),
         };
-        let direction =
-            decode_native_otclient_cardinal_move_request(&request, &config.client_profile)
-                .map_err(HostError::Protocol)?;
-        let (_, destination) = world
-            .move_player_cardinal(character.id, native_cardinal_direction(direction))
-            .map_err(HostError::Core)?;
-        if !native_empty_world_position_is_visible(initial_position, destination) {
-            write_frame(
+        match decode_native_otclient_game_action(&request, &config.client_profile)
+            .map_err(HostError::Protocol)?
+        {
+            NativeOtClientGameAction::Ping => write_frame(
                 stream,
-                &encode_native_otclient_game_login_error(
-                    "Native empty-world viewport boundary reached; map-row streaming is not available yet.",
-                ),
-            )?;
-            return Ok(());
+                &encode_native_otclient_game_ping_back(&config.client_profile)
+                    .map_err(HostError::Protocol)?,
+            )?,
+            NativeOtClientGameAction::PingBack | NativeOtClientGameAction::EnterGame => {}
+            NativeOtClientGameAction::CardinalMove(direction) => {
+                let (_, destination) = world
+                    .move_player_cardinal(character.id, native_cardinal_direction(direction))
+                    .map_err(HostError::Core)?;
+                if !native_empty_world_position_is_visible(initial_position, destination) {
+                    write_frame(
+                        stream,
+                        &encode_native_otclient_game_login_error(
+                            "Native empty-world viewport boundary reached; map-row streaming is not available yet.",
+                        ),
+                    )?;
+                    return Ok(());
+                }
+                database.update_player_position(character.id, destination)?;
+                write_frame(
+                    stream,
+                    &encode_native_otclient_move_creature(
+                        &config.client_profile,
+                        player_id,
+                        native_position(destination),
+                    )
+                    .map_err(HostError::Protocol)?,
+                )?;
+            }
         }
-        database.update_player_position(character.id, destination)?;
-        write_frame(
-            stream,
-            &encode_native_otclient_move_creature(
-                &config.client_profile,
-                player_id,
-                native_position(destination),
-            )
-            .map_err(HostError::Protocol)?,
-        )?;
     }
     record_event(
         database_path,
@@ -1655,6 +1664,10 @@ mod tests {
         let map = read_frame(&mut stream).unwrap();
         assert_eq!(map.0[0], forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP);
         assert!(map.0.windows(6).any(|window| window == b"Knight"));
+
+        write_frame(&mut stream, &Frame(vec![0x1d])).unwrap();
+        let ping_back = read_frame(&mut stream).unwrap();
+        assert_eq!(ping_back.0, vec![0x1d]);
 
         write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
         let movement = read_frame(&mut stream).unwrap();
