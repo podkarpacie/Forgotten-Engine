@@ -6,6 +6,7 @@
 mod items;
 mod legacy_xml;
 mod otbm;
+mod tfs_entities;
 mod tfs_registry;
 
 use forgotten_core::{
@@ -21,6 +22,7 @@ pub use items::{LegacyItemCatalog, LegacyItemDefinition};
 pub use legacy_xml::{
     LegacyHouse, LegacySpawnArea, LegacySpawnCreature, LegacySpawnKind, LegacyWorldCompanionData,
 };
+pub use tfs_entities::{TfsEntityCatalog, TfsEntityDefinition, TfsEntityKind, TfsSpawnResolution};
 pub use tfs_registry::{TfsContentInventory, TfsRegistryCategory, TfsRegistryInventory};
 
 pub const CONFIG_FILE_NAME: &str = "config.lua";
@@ -420,6 +422,17 @@ pub fn load_tfs_content_inventory(
     config: &EngineConfig,
 ) -> Result<TfsContentInventory, ConfigError> {
     tfs_registry::load_tfs_content_inventory(config)
+}
+
+pub fn load_tfs_entity_catalog(config: &EngineConfig) -> Result<TfsEntityCatalog, ConfigError> {
+    tfs_entities::load_tfs_entity_catalog(config)
+}
+
+pub fn resolve_tfs_spawn_references(
+    companions: &LegacyWorldCompanionData,
+    catalog: &TfsEntityCatalog,
+) -> TfsSpawnResolution {
+    tfs_entities::resolve_tfs_spawns(companions, catalog)
 }
 
 pub fn load_legacy_item_catalog(

@@ -66,3 +66,9 @@
 - [x] Extend `tfs-audit` with registry counts, missing-reference diagnostics, and deferred-runtime categories.
 - [x] Add self-contained XML registry and CLI audit fixtures without importing private game content.
 - [x] Package and publish the TFS registry-inventory release with Linux, Windows, and SHA-256 assets.
+- [x] Audit TFS monster and NPC definition XML contracts against existing TFS spawn records.
+- [x] Load bounded monster and NPC definition catalogs from safe registry references without executing Lua behavior.
+- [x] Cross-validate spawn records against loaded entity catalogs and report unresolved names or missing definitions.
+- [x] Extend `tfs-audit` with entity-catalog and spawn-resolution diagnostics.
+- [x] Add self-contained monster, NPC, and spawn-resolution fixtures without importing private game content.
+- [ ] Package and publish the TFS entity-catalog conversion release with Linux, Windows, and SHA-256 assets.

@@ -1,7 +1,7 @@
 use forgotten_config::{
     apply_legacy_item_metadata, ensure_content_skeleton, load, load_legacy_item_catalog,
-    load_tfs_content_inventory, load_world_companions, load_world_map, validate_content,
-    world_map_path, write_template,
+    load_tfs_content_inventory, load_tfs_entity_catalog, load_world_companions, load_world_map,
+    resolve_tfs_spawn_references, validate_content, world_map_path, write_template,
 };
 use forgotten_core::WorldMapSource;
 use forgotten_host::{
@@ -157,13 +157,15 @@ fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Er
     };
     let companions = load_world_companions(&config, &world_map)?;
     let registry_inventory = load_tfs_content_inventory(&config)?;
+    let entity_catalog = load_tfs_entity_catalog(&config)?;
+    let spawn_resolution = resolve_tfs_spawn_references(&companions, &entity_catalog);
     let map_kind = match raw_world_map.source() {
         WorldMapSource::Otbm(_) => "OTBM",
         WorldMapSource::FeMapV1 => "FE-native",
     };
 
     println!(
-        "TFS conversion readiness\n> config={} (FE profile={} protocol={})\n> map={} format={} tiles={} spawn={},{},{}\n> item-mappings={} spawns={} houses={} towns={} waypoints={}\n> registries={} entries={} references={} missing-references={} unsafe-references={}",
+        "TFS conversion readiness\n> config={} (FE profile={} protocol={})\n> map={} format={} tiles={} spawn={},{},{}\n> item-mappings={} spawns={} houses={} towns={} waypoints={}\n> registries={} entries={} references={} missing-references={} unsafe-references={}\n> entities={} monsters={} npcs={} missing-definitions={} missing-scripts={} unsafe-entity-references={}\n> spawn-creatures={} resolved-spawn-creatures={} unresolved-monsters={} unresolved-npcs={}",
         directory.join("config.lua").display(),
         config.profile.id,
         config.profile.tibia_protocol,
@@ -183,6 +185,16 @@ fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Er
         registry_inventory.reference_count(),
         registry_inventory.missing_reference_count(),
         registry_inventory.unsafe_reference_count(),
+        entity_catalog.entity_count(),
+        entity_catalog.monsters.len(),
+        entity_catalog.npcs.len(),
+        entity_catalog.missing_definitions.len(),
+        entity_catalog.missing_scripts.len(),
+        entity_catalog.unsafe_references.len(),
+        spawn_resolution.spawn_creature_count,
+        spawn_resolution.resolved_creature_count,
+        spawn_resolution.unresolved_monsters.len(),
+        spawn_resolution.unresolved_npcs.len(),
     );
     if matches!(raw_world_map.source(), WorldMapSource::Otbm(_)) {
         println!("> OTBM world data is importable by the current FE map pipeline.");
@@ -231,6 +243,66 @@ fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Er
     } else {
         println!(
             "> Registry entries were parsed for conversion inventory only. Referenced Lua scripts and creature definitions remain local and are not executed by this FE milestone."
+        );
+    }
+    if !entity_catalog.missing_definitions.is_empty() {
+        println!(
+            "> missing entity definitions (up to 3): {}",
+            entity_catalog
+                .missing_definitions
+                .iter()
+                .take(3)
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !entity_catalog.missing_scripts.is_empty() {
+        println!(
+            "> missing NPC script references (up to 3): {}",
+            entity_catalog
+                .missing_scripts
+                .iter()
+                .take(3)
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !entity_catalog.unsafe_references.is_empty() {
+        println!(
+            "> unsafe entity references (up to 3): {}",
+            entity_catalog
+                .unsafe_references
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !spawn_resolution.unresolved_monsters.is_empty() {
+        println!(
+            "> unresolved spawned monsters (up to 3): {}",
+            spawn_resolution
+                .unresolved_monsters
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !spawn_resolution.unresolved_npcs.is_empty() {
+        println!(
+            "> unresolved spawned NPCs (up to 3): {}",
+            spawn_resolution
+                .unresolved_npcs
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     if config.otclient_v8_native_enabled {
