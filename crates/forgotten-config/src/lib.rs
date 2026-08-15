@@ -3,18 +3,31 @@
 //! The loader recognizes a deliberately limited `config.lua` assignment subset. It does not
 //! execute Lua; a sandboxed scripting runtime belongs to a later milestone.
 
-use forgotten_core::{Position, WorldMap, WorldMapTile};
+mod items;
+mod legacy_xml;
+mod otbm;
+
+use forgotten_core::{
+    OtbmMapHeader, Position, WorldMap, WorldMapItem, WorldMapSource, WorldMapTile, WorldMapTown,
+};
 use forgotten_protocol::{profile_by_id, CompatibilityProfile, NativeOtClientProfile};
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+pub use items::{LegacyItemCatalog, LegacyItemDefinition};
+pub use legacy_xml::{
+    LegacyHouse, LegacySpawnArea, LegacySpawnCreature, LegacySpawnKind, LegacyWorldCompanionData,
+};
+
 pub const CONFIG_FILE_NAME: &str = "config.lua";
 pub const CONTENT_MANIFEST_NAME: &str = "fe-content.manifest";
 pub const EMPTY_WORLD_MANIFEST_NAME: &str = "fe-empty-world.manifest";
 pub const FE_MAP_EXTENSION: &str = "femap";
+pub const OTBM_MAP_EXTENSION: &str = "otbm";
 pub const FE_MAP_FORMAT: &str = "fe-map-v1";
+pub const FE_MAP_INTERCHANGE_FORMAT: &str = "fe-map-v2";
 pub const REQUIRED_CONTENT_DIRECTORIES: [&str; 15] = [
     "actions",
     "creaturescripts",
@@ -41,6 +54,7 @@ pub struct EngineConfig {
     pub max_players: u32,
     pub server_name: String,
     pub map_name: String,
+    pub map_format: WorldMapFormat,
     pub world_type: WorldType,
     pub mysql: MysqlConfig,
     pub profile: CompatibilityProfile,
@@ -132,6 +146,27 @@ impl WorldType {
             other => Err(ConfigError::InvalidValue {
                 key: "worldType",
                 message: format!("unsupported world type `{other}`"),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldMapFormat {
+    Auto,
+    FeMap,
+    Otbm,
+}
+
+impl WorldMapFormat {
+    fn parse(value: &str) -> Result<Self, ConfigError> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "femap" => Ok(Self::FeMap),
+            "otbm" => Ok(Self::Otbm),
+            other => Err(ConfigError::InvalidValue {
+                key: "mapFormat",
+                message: format!("unsupported map format `{other}`; expected auto, femap, or otbm"),
             }),
         }
     }
@@ -240,6 +275,7 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         max_players,
         server_name: required_string(&values, "serverName")?.to_owned(),
         map_name: required_string(&values, "mapName")?.to_owned(),
+        map_format: WorldMapFormat::parse(optional_string(&values, "mapFormat", "auto")?)?,
         world_type: WorldType::parse(required_string(&values, "worldType")?)?,
         mysql: MysqlConfig {
             host: required_string(&values, "mysqlHost")?.to_owned(),
@@ -333,29 +369,157 @@ pub fn world_map_path(config: &EngineConfig) -> Result<PathBuf, ConfigError> {
             "mapName must contain only ASCII letters, digits, underscores, or hyphens".into(),
         ));
     }
-    Ok(config
-        .content_directory
-        .join("world")
-        .join(format!("{}.{}", config.map_name, FE_MAP_EXTENSION)))
+    let world_directory = config.content_directory.join("world");
+    let femap = world_directory.join(format!("{}.{}", config.map_name, FE_MAP_EXTENSION));
+    let otbm = world_directory.join(format!("{}.{}", config.map_name, OTBM_MAP_EXTENSION));
+    match config.map_format {
+        WorldMapFormat::FeMap => Ok(femap),
+        WorldMapFormat::Otbm => Ok(otbm),
+        WorldMapFormat::Auto if otbm.is_file() => Ok(otbm),
+        WorldMapFormat::Auto => Ok(femap),
+    }
 }
 
 pub fn load_world_map(config: &EngineConfig) -> Result<WorldMap, ConfigError> {
     let path = world_map_path(config)?;
-    let source = fs::read_to_string(&path).map_err(|error| {
+    let bytes = fs::read(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             ConfigError::InvalidContent(format!(
-                "missing selected map {}; expected an original {} document",
+                "missing selected map {}; expected a {} or {} document selected by mapFormat",
                 path.display(),
-                FE_MAP_EXTENSION
+                FE_MAP_EXTENSION,
+                OTBM_MAP_EXTENSION
             ))
         } else {
             ConfigError::Io(error)
         }
     })?;
-    parse_world_map(&config.map_name, &source)
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(OTBM_MAP_EXTENSION) => otbm::parse_otbm_world_map(&config.map_name, &bytes),
+        Some(FE_MAP_EXTENSION) => {
+            let source = String::from_utf8(bytes)
+                .map_err(|_| ConfigError::InvalidContent("FE map document is not UTF-8".into()))?;
+            parse_world_map(&config.map_name, &source)
+        }
+        _ => Err(ConfigError::InvalidContent(format!(
+            "selected map {} has an unsupported extension",
+            path.display()
+        ))),
+    }
+}
+
+pub fn load_world_companions(
+    config: &EngineConfig,
+    world_map: &WorldMap,
+) -> Result<LegacyWorldCompanionData, ConfigError> {
+    legacy_xml::load_legacy_world_companions(config, world_map)
+}
+
+pub fn load_legacy_item_catalog(
+    config: &EngineConfig,
+    world_map: &WorldMap,
+) -> Result<Option<LegacyItemCatalog>, ConfigError> {
+    if !matches!(world_map.source(), WorldMapSource::Otbm(_)) {
+        return Ok(None);
+    }
+    let item_directory = config.content_directory.join("items");
+    let otb_path = item_directory.join("items.otb");
+    let xml_path = item_directory.join("items.xml");
+    let otb = fs::read(&otb_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ConfigError::InvalidContent(format!(
+                "selected OTBM world requires operator-supplied {}",
+                otb_path.display()
+            ))
+        } else {
+            ConfigError::Io(error)
+        }
+    })?;
+    let mut catalog = items::parse_items_otb(&otb)?;
+    if xml_path.is_file() {
+        items::apply_items_xml(&mut catalog, &fs::read(&xml_path).map_err(ConfigError::Io)?)?;
+    }
+    Ok(Some(catalog))
+}
+
+pub fn apply_legacy_item_metadata(
+    world_map: &WorldMap,
+    catalog: &LegacyItemCatalog,
+) -> Result<WorldMap, ConfigError> {
+    let mut normalized = world_map.clone();
+    for (position, tile) in world_map.tiles() {
+        let items = world_map.tile_items(position).unwrap_or_default();
+        let ground = if let Some(item) = items.first() {
+            catalog.definition(item.server_id).ok_or_else(|| {
+                ConfigError::InvalidContent(format!(
+                    "items.otb has no definition for map ground item {} at {},{},{}",
+                    item.server_id, position.x, position.y, position.z
+                ))
+            })?
+        } else if tile.ground_thing_id == 0 {
+            continue;
+        } else {
+            catalog.definition(tile.ground_thing_id).ok_or_else(|| {
+                ConfigError::InvalidContent(format!(
+                    "items.otb has no definition for map ground item {} at {},{},{}",
+                    tile.ground_thing_id, position.x, position.y, position.z
+                ))
+            })?
+        };
+        let blocks_movement = items.iter().try_fold(false, |blocked, item| {
+            catalog
+                .definition(item.server_id)
+                .map(|definition| blocked || definition.blocks_movement())
+                .ok_or_else(|| {
+                    ConfigError::InvalidContent(format!(
+                        "items.otb has no definition for map item {} at {},{},{}",
+                        item.server_id, position.x, position.y, position.z
+                    ))
+                })
+        })?;
+        let mapped_items = items
+            .iter()
+            .cloned()
+            .map(|mut item| {
+                item.client_thing_id = Some(
+                    catalog
+                        .definition(item.server_id)
+                        .expect("item definitions were validated above")
+                        .client_id,
+                );
+                item
+            })
+            .collect();
+        normalized
+            .set_tile_items(position, mapped_items)
+            .map_err(|error| {
+                ConfigError::InvalidContent(format!("normalized map items: {error}"))
+            })?;
+        normalized
+            .set_tile(
+                position,
+                WorldMapTile {
+                    ground_thing_id: ground.client_id,
+                    walkable: tile.walkable && !blocks_movement,
+                },
+            )
+            .map_err(|error| {
+                ConfigError::InvalidContent(format!("normalized map tile: {error}"))
+            })?;
+    }
+    normalized
+        .validate()
+        .map_err(|error| ConfigError::InvalidContent(format!("normalized map: {error}")))?;
+    Ok(normalized)
 }
 
 fn parse_world_map(identifier: &str, source: &str) -> Result<WorldMap, ConfigError> {
+    if source
+        .lines()
+        .any(|line| line.trim() == format!("format={FE_MAP_INTERCHANGE_FORMAT}"))
+    {
+        return parse_world_map_interchange(identifier, source);
+    }
     let mut format_seen = false;
     let mut spawn = None;
     let mut declarations = Vec::new();
@@ -442,6 +606,270 @@ fn parse_world_map(identifier: &str, source: &str) -> Result<WorldMap, ConfigErr
     Ok(map)
 }
 
+pub fn export_world_map_to_femap(map: &WorldMap) -> Result<String, ConfigError> {
+    map.validate().map_err(|error| {
+        ConfigError::InvalidContent(format!("cannot export invalid map: {error}"))
+    })?;
+    let mut output = format!(
+        "# Forgotten Engine original map interchange document\nformat={FE_MAP_INTERCHANGE_FORMAT}\n"
+    );
+    match map.source() {
+        WorldMapSource::FeMapV1 => output.push_str("source=femap\n"),
+        WorldMapSource::Otbm(header) => output.push_str(&format!(
+            "source=otbm,{},{},{},{},{}\n",
+            header.version,
+            header.width,
+            header.height,
+            header.item_major_version,
+            header.item_minor_version
+        )),
+    }
+    let spawn = map.spawn();
+    output.push_str(&format!("spawn={},{},{}\n", spawn.x, spawn.y, spawn.z));
+    for (position, tile) in map.tiles() {
+        output.push_str(&format!(
+            "tile={},{},{},{},{}\n",
+            position.x, position.y, position.z, tile.ground_thing_id, tile.walkable
+        ));
+    }
+    for (position, items) in map.tile_item_entries() {
+        for item in items {
+            if !item.children.is_empty()
+                || item.text.is_some()
+                || item.description.is_some()
+                || item.teleport_destination.is_some()
+                || item.duration.is_some()
+                || item.charges.is_some()
+            {
+                return Err(ConfigError::InvalidContent(format!(
+                    "cannot export rich item {} at {},{},{} to fe-map-v2 yet",
+                    item.server_id, position.x, position.y, position.z
+                )));
+            }
+            output.push_str(&format!(
+                "item={},{},{},{},{},{},{}\n",
+                position.x,
+                position.y,
+                position.z,
+                item.server_id,
+                item.count,
+                item.action_id.unwrap_or_default(),
+                item.unique_id.unwrap_or_default()
+            ));
+        }
+    }
+    for (position, flags) in map.tile_flag_entries() {
+        output.push_str(&format!(
+            "tileflags={},{},{},{}\n",
+            position.x, position.y, position.z, flags
+        ));
+    }
+    for (position, house_id) in map.house_tile_entries() {
+        output.push_str(&format!(
+            "house={},{},{},{}\n",
+            position.x, position.y, position.z, house_id
+        ));
+    }
+    for town in map.towns() {
+        if town.name.contains(',') || town.name.contains('\n') {
+            return Err(ConfigError::InvalidContent(
+                "cannot export a town name containing a comma or newline to fe-map-v2".into(),
+            ));
+        }
+        output.push_str(&format!(
+            "town={},{},{},{},{}\n",
+            town.id,
+            town.name,
+            town.temple_position.x,
+            town.temple_position.y,
+            town.temple_position.z
+        ));
+    }
+    for (name, position) in map.waypoints() {
+        if name.contains(',') || name.contains('\n') {
+            return Err(ConfigError::InvalidContent(
+                "cannot export a waypoint name containing a comma or newline to fe-map-v2".into(),
+            ));
+        }
+        output.push_str(&format!(
+            "waypoint={},{},{},{}\n",
+            name, position.x, position.y, position.z
+        ));
+    }
+    Ok(output)
+}
+
+fn parse_world_map_interchange(identifier: &str, source: &str) -> Result<WorldMap, ConfigError> {
+    let mut format_seen = false;
+    let mut spawn = None;
+    let mut source_metadata = None;
+    let mut map = None;
+    let mut pending_items = BTreeMap::<Position, Vec<WorldMapItem>>::new();
+    let mut pending_flags = Vec::new();
+    let mut pending_houses = Vec::new();
+    let mut towns = Vec::new();
+    let mut waypoints = Vec::new();
+    for (index, raw_line) in source.lines().enumerate() {
+        let line_number = index + 1;
+        let line = raw_line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            ConfigError::InvalidContent(format!("map line {line_number} must use key=value syntax"))
+        })?;
+        match key.trim() {
+            "format" if value.trim() == FE_MAP_INTERCHANGE_FORMAT => format_seen = true,
+            "format" => {
+                return Err(ConfigError::InvalidContent(format!(
+                    "map line {line_number} must declare format={FE_MAP_INTERCHANGE_FORMAT}"
+                )))
+            }
+            "source" => {
+                if source_metadata.is_some() {
+                    return Err(ConfigError::InvalidContent(
+                        "map declares source more than once".into(),
+                    ));
+                }
+                source_metadata = Some(parse_interchange_source(value.trim(), line_number)?);
+            }
+            "spawn" => {
+                if spawn.is_some() {
+                    return Err(ConfigError::InvalidContent(
+                        "map declares spawn more than once".into(),
+                    ));
+                }
+                spawn = Some(parse_position(value.trim(), line_number)?);
+            }
+            "tile" => {
+                let spawn = spawn.ok_or_else(|| {
+                    ConfigError::InvalidContent(
+                        "fe-map-v2 requires spawn before tile records".into(),
+                    )
+                })?;
+                let map_ref = map.get_or_insert_with(|| WorldMap::new(identifier, spawn));
+                let fields = split_map_fields(value, 5, line_number)?;
+                let position = parse_position_fields(&fields[0..3], line_number)?;
+                let tile = parse_tile_fields(&fields[3..5], line_number)?;
+                map_ref.set_tile(position, tile).map_err(|error| {
+                    ConfigError::InvalidContent(format!("map line {line_number}: {error}"))
+                })?;
+            }
+            "item" => {
+                let fields = split_map_fields(value, 7, line_number)?;
+                let position = parse_position_fields(&fields[0..3], line_number)?;
+                let item = WorldMapItem {
+                    server_id: parse_map_u16(fields[3], line_number, "serverId")?,
+                    client_thing_id: None,
+                    count: parse_map_u8(fields[4], line_number, "count")?.max(1),
+                    action_id: nonzero_u16(fields[5], line_number, "actionId")?,
+                    unique_id: nonzero_u16(fields[6], line_number, "uniqueId")?,
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                };
+                pending_items.entry(position).or_default().push(item);
+            }
+            "tileflags" => {
+                let fields = split_map_fields(value, 4, line_number)?;
+                pending_flags.push((
+                    parse_position_fields(&fields[0..3], line_number)?,
+                    parse_map_u32(fields[3], line_number, "flags")?,
+                ));
+            }
+            "house" => {
+                let fields = split_map_fields(value, 4, line_number)?;
+                pending_houses.push((
+                    parse_position_fields(&fields[0..3], line_number)?,
+                    parse_map_u32(fields[3], line_number, "houseId")?,
+                ));
+            }
+            "town" => {
+                let fields = split_map_fields(value, 5, line_number)?;
+                towns.push(WorldMapTown {
+                    id: parse_map_u32(fields[0], line_number, "townId")?,
+                    name: fields[1].to_owned(),
+                    temple_position: parse_position_fields(&fields[2..5], line_number)?,
+                });
+            }
+            "waypoint" => {
+                let fields = split_map_fields(value, 4, line_number)?;
+                waypoints.push((
+                    fields[0].to_owned(),
+                    parse_position_fields(&fields[1..4], line_number)?,
+                ));
+            }
+            other => {
+                return Err(ConfigError::InvalidContent(format!(
+                    "map line {line_number} has unsupported key `{other}`"
+                )))
+            }
+        }
+    }
+    if !format_seen {
+        return Err(ConfigError::InvalidContent(format!(
+            "map must declare format={FE_MAP_INTERCHANGE_FORMAT}"
+        )));
+    }
+    let spawn =
+        spawn.ok_or_else(|| ConfigError::InvalidContent("map must declare spawn=x,y,z".into()))?;
+    let mut map = map.unwrap_or_else(|| WorldMap::new(identifier, spawn));
+    if let Some(source_metadata) = source_metadata {
+        map.set_source(source_metadata);
+    }
+    for (position, items) in pending_items {
+        map.set_tile_items(position, items).map_err(|error| {
+            ConfigError::InvalidContent(format!("invalid fe-map-v2 item record: {error}"))
+        })?;
+    }
+    for (position, flags) in pending_flags {
+        map.set_tile_flags(position, flags);
+    }
+    for (position, house_id) in pending_houses {
+        map.set_house_tile(position, house_id).map_err(|error| {
+            ConfigError::InvalidContent(format!("invalid fe-map-v2 house record: {error}"))
+        })?;
+    }
+    for town in towns {
+        map.set_town(town).map_err(|error| {
+            ConfigError::InvalidContent(format!("invalid fe-map-v2 town record: {error}"))
+        })?;
+    }
+    for (name, position) in waypoints {
+        map.set_waypoint(name, position).map_err(|error| {
+            ConfigError::InvalidContent(format!("invalid fe-map-v2 waypoint record: {error}"))
+        })?;
+    }
+    map.validate()
+        .map_err(|error| ConfigError::InvalidContent(format!("invalid map: {error}")))?;
+    Ok(map)
+}
+
+fn parse_interchange_source(value: &str, line: usize) -> Result<WorldMapSource, ConfigError> {
+    if value == "femap" {
+        return Ok(WorldMapSource::FeMapV1);
+    }
+    let fields = split_map_fields(value, 6, line)?;
+    if fields[0] != "otbm" {
+        return Err(ConfigError::InvalidContent(format!(
+            "map line {line}: source must be femap or otbm,version,width,height,itemMajor,itemMinor"
+        )));
+    }
+    Ok(WorldMapSource::Otbm(OtbmMapHeader {
+        version: parse_map_u32(fields[1], line, "otbmVersion")?,
+        width: parse_map_u16(fields[2], line, "width")?,
+        height: parse_map_u16(fields[3], line, "height")?,
+        item_major_version: parse_map_u32(fields[4], line, "itemMajor")?,
+        item_minor_version: parse_map_u32(fields[5], line, "itemMinor")?,
+        description: None,
+        spawn_file: None,
+        house_file: None,
+    }))
+}
+
 fn split_map_fields(value: &str, expected: usize, line: usize) -> Result<Vec<&str>, ConfigError> {
     let fields = value.split(',').map(str::trim).collect::<Vec<_>>();
     if fields.len() != expected || fields.iter().any(|field| field.is_empty()) {
@@ -485,6 +913,17 @@ fn parse_map_u16(value: &str, line: usize, field: &str) -> Result<u16, ConfigErr
     value
         .parse::<u16>()
         .map_err(|_| ConfigError::InvalidContent(format!("map line {line}: {field} must be a u16")))
+}
+
+fn parse_map_u32(value: &str, line: usize, field: &str) -> Result<u32, ConfigError> {
+    value
+        .parse::<u32>()
+        .map_err(|_| ConfigError::InvalidContent(format!("map line {line}: {field} must be a u32")))
+}
+
+fn nonzero_u16(value: &str, line: usize, field: &str) -> Result<Option<u16>, ConfigError> {
+    let value = parse_map_u16(value, line, field)?;
+    Ok((value != 0).then_some(value))
 }
 
 fn parse_map_u8(value: &str, line: usize, field: &str) -> Result<u8, ConfigError> {
@@ -953,5 +1392,69 @@ mod tests {
             Err(ConfigError::InvalidContent(_))
         ));
         let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn round_trips_legacy_map_records_through_the_fe_interchange_document() {
+        let spawn = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let mut map = WorldMap::new("legacy-export", spawn);
+        map.set_tile(
+            spawn,
+            WorldMapTile {
+                ground_thing_id: 4526,
+                walkable: true,
+            },
+        )
+        .unwrap();
+        map.set_source(WorldMapSource::Otbm(OtbmMapHeader {
+            version: 2,
+            width: 512,
+            height: 512,
+            item_major_version: 57,
+            item_minor_version: 1098,
+            description: None,
+            spawn_file: None,
+            house_file: None,
+        }));
+        map.set_tile_items(
+            spawn,
+            vec![WorldMapItem {
+                server_id: 4526,
+                client_thing_id: Some(102),
+                count: 1,
+                action_id: Some(7),
+                unique_id: Some(9),
+                text: None,
+                description: None,
+                teleport_destination: None,
+                duration: None,
+                charges: None,
+                children: Vec::new(),
+            }],
+        )
+        .unwrap();
+        map.set_tile_flags(spawn, 1);
+        map.set_house_tile(spawn, 42).unwrap();
+        map.set_town(WorldMapTown {
+            id: 1,
+            name: "Thais".into(),
+            temple_position: spawn,
+        })
+        .unwrap();
+        map.set_waypoint("temple", spawn).unwrap();
+
+        let document = export_world_map_to_femap(&map).unwrap();
+        let parsed = parse_world_map("legacy-export", &document).unwrap();
+        assert_eq!(parsed.tile(spawn), map.tile(spawn));
+        assert_eq!(parsed.tile_items(spawn).unwrap()[0].action_id, Some(7));
+        assert_eq!(parsed.tile_flags(spawn), 1);
+        assert_eq!(parsed.house_tile_id(spawn), Some(42));
+        assert_eq!(parsed.towns().next().unwrap().name, "Thais");
+        assert_eq!(parsed.waypoint("temple"), Some(spawn));
+        assert!(matches!(parsed.source(), WorldMapSource::Otbm(_)));
     }
 }

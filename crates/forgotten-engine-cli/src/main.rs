@@ -1,5 +1,6 @@
 use forgotten_config::{
-    ensure_content_skeleton, load, load_world_map, validate_content, write_template,
+    apply_legacy_item_metadata, ensure_content_skeleton, load, load_legacy_item_catalog,
+    load_world_companions, load_world_map, validate_content, write_template,
 };
 use forgotten_host::{
     start, start_game_session, start_native_otclient_game, start_native_otclient_login,
@@ -108,14 +109,20 @@ fn validate(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     ensure_content_skeleton(&directory)?;
     println!(">> Validating data content");
     let content = validate_content(&directory)?;
-    let world_map = load_world_map(&config)?;
+    let raw_world_map = load_world_map(&config)?;
+    let item_catalog = load_legacy_item_catalog(&config, &raw_world_map)?;
+    let world_map = match &item_catalog {
+        Some(catalog) => apply_legacy_item_metadata(&raw_world_map, catalog)?,
+        None => raw_world_map,
+    };
+    let companions = load_world_companions(&config, &world_map)?;
     println!(">> Opening database");
     let database = EngineDatabase::open(&config.database_path)?;
     if database.schema_version()? < 1 {
         return Err("database schema is not migrated".into());
     }
     println!(
-        "> Validation complete: profile={} protocol={} game-port={} status-port={} map={} tiles={} spawn={},{},{} data={} database={}",
+        "> Validation complete: profile={} protocol={} game-port={} status-port={} map={} tiles={} spawn={},{},{} items={} spawns={} houses={} data={} database={}",
         config.profile.id,
         config.profile.tibia_protocol,
         config.game_protocol_port,
@@ -125,6 +132,9 @@ fn validate(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         world_map.spawn().x,
         world_map.spawn().y,
         world_map.spawn().z,
+        item_catalog.as_ref().map_or(0, |catalog| catalog.len()),
+        companions.spawns.len(),
+        companions.houses.len(),
         content.data_directory.display(),
         database.path().display()
     );
@@ -135,7 +145,12 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!("Forgotten Engine - {}", env!("CARGO_PKG_VERSION"));
     validate(directory.clone())?;
     let config = load(&directory)?;
-    let world_map = Arc::new(load_world_map(&config)?);
+    let raw_world_map = load_world_map(&config)?;
+    let item_catalog = load_legacy_item_catalog(&config, &raw_world_map)?;
+    let world_map = Arc::new(match &item_catalog {
+        Some(catalog) => apply_legacy_item_metadata(&raw_world_map, catalog)?,
+        None => raw_world_map,
+    });
     let database = EngineDatabase::open(&config.database_path)?;
     database.record_event("info", "Forgotten Engine host startup requested")?;
 

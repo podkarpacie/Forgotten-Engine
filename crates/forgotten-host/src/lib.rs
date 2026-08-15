@@ -20,14 +20,14 @@ use forgotten_protocol::{
     encode_native_otclient_character_list, encode_native_otclient_game_cancel_walk_facing,
     encode_native_otclient_game_initialization_with_map, encode_native_otclient_game_login_error,
     encode_native_otclient_game_ping, encode_native_otclient_game_ping_back,
-    encode_native_otclient_login_error, encode_native_otclient_move_creature_at,
-    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
-    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
-    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
-    NativeOtClientCardinalDirection, NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction,
-    NativeOtClientPosition, NativeOtClientProfile, OtClientEndpoint, ProtocolError, StatusPlayer,
-    StatusRequest, StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_PLAYER_ID_END,
-    NATIVE_OTCLIENT_PLAYER_ID_START,
+    encode_native_otclient_login_error, encode_native_otclient_map_viewport,
+    encode_native_otclient_move_creature_at, encode_status_binary, encode_status_xml,
+    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientCardinalDirection,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPosition,
+    NativeOtClientProfile, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
+    StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -875,6 +875,7 @@ fn handle_native_otclient_game(
                         if !move_native_map_player(
                             stream,
                             &config.client_profile,
+                            &snapshot,
                             &database,
                             &mut world,
                             character.id,
@@ -908,6 +909,7 @@ fn handle_native_otclient_game(
                 let _ = move_native_map_player(
                     stream,
                     &config.client_profile,
+                    &snapshot,
                     &database,
                     &mut world,
                     character.id,
@@ -934,6 +936,7 @@ fn handle_native_otclient_game(
 fn move_native_map_player(
     stream: &mut TcpStream,
     profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
     database: &EngineDatabase,
     world: &mut WorldState,
     character_id: u64,
@@ -966,6 +969,13 @@ fn move_native_map_player(
             native_position(destination),
         )
         .map_err(HostError::Protocol)?,
+    )?;
+    let mut refreshed_snapshot = snapshot.clone();
+    refreshed_snapshot.player_position = native_position(destination);
+    write_frame(
+        stream,
+        &encode_native_otclient_map_viewport(profile, &refreshed_snapshot, world_map)
+            .map_err(HostError::Protocol)?,
     )?;
     *player_position = destination;
     *facing = direction;
@@ -1934,6 +1944,12 @@ mod tests {
         let auto_walk_east = read_frame(&mut stream).unwrap();
         assert_eq!(&auto_walk_east.0[1..7], &[100, 0, 100, 0, 7, 1]);
         assert_eq!(&auto_walk_east.0[7..12], &[101, 0, 100, 0, 7]);
+        let auto_walk_viewport = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            auto_walk_viewport.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert_eq!(&auto_walk_viewport.0[1..6], &[101, 0, 100, 0, 7]);
         write_frame(&mut stream, &Frame(vec![0x67])).unwrap();
         let interrupted = read_frame(&mut stream).unwrap();
         assert_eq!(
@@ -1943,6 +1959,12 @@ mod tests {
         let manual_movement = read_frame(&mut stream).unwrap();
         assert_eq!(&manual_movement.0[1..7], &[101, 0, 100, 0, 7, 1]);
         assert_eq!(&manual_movement.0[7..12], &[101, 0, 101, 0, 7]);
+        let manual_viewport = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            manual_viewport.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert_eq!(&manual_viewport.0[1..6], &[101, 0, 101, 0, 7]);
 
         write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
         let movement = read_frame(&mut stream).unwrap();
@@ -1952,6 +1974,12 @@ mod tests {
         );
         assert_eq!(&movement.0[1..7], &[101, 0, 101, 0, 7, 1]);
         assert_eq!(&movement.0[7..12], &[102, 0, 101, 0, 7]);
+        let movement_viewport = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            movement_viewport.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert_eq!(&movement_viewport.0[1..6], &[102, 0, 101, 0, 7]);
         assert_eq!(
             database.characters_for_account(account_id).unwrap()[0]
                 .position

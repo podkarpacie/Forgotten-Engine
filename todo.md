@@ -47,3 +47,11 @@
 - [x] Enforce map walkability and emit safe streamed viewport updates when a player moves beyond the prior diagnostic rectangle.
 - [x] Add map-loading, walkability, and streamed-view regression coverage for the native 740 host.
 - [x] Select an original Rust world document through TFS-style `mapName` and `data/world/<mapName>.femap` conventions.
+- [x] Define a clean-room compatibility contract for operator-supplied TFS/OpenTibia OTBM, XML companion data, and item-definition versions.
+- [x] Extend the FE map model for ordered legacy tile items, map metadata, spawn areas, towns, and houses while retaining editable `.femap` support.
+- [x] Implement a bounded clean-room OTBM reader and an explicit FE import/export workflow without redistributing private map data.
+- [x] Load companion `spawns.xml` and `houses.xml` selected by the operator’s OTBM world configuration while preserving embedded OTBM towns.
+- [x] Load operator-supplied item-definition metadata needed for walkability and client-visible tile layers.
+- [x] Encode layered imported world tiles and movement semantics through the native OTCv8 740 map path.
+- [x] Add hand-authored compatibility fixtures and tests for OTBM, XML companion data, item metadata, import/export, viewport encoding, and walkability.
+- [ ] Package and publish the legacy TFS world-data compatibility release with Linux, Windows, and SHA-256 assets.

@@ -1,0 +1,616 @@
+use crate::ConfigError;
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::{Reader, XmlVersion};
+use std::collections::BTreeMap;
+
+const OTB_IDENTIFIER: &[u8; 4] = b"OTBI";
+const NODE_START: u8 = 0xfe;
+const NODE_END: u8 = 0xff;
+const NODE_ESCAPE: u8 = 0xfd;
+const ROOT_ATTR_VERSION: u8 = 1;
+const ITEM_ATTR_SERVER_ID: u8 = 0x10;
+const ITEM_ATTR_CLIENT_ID: u8 = 0x11;
+const FLAG_BLOCK_SOLID: u32 = 1 << 0;
+const FLAG_BLOCK_PATHFIND: u32 = 1 << 2;
+const MAX_OTB_BYTES: usize = 64 * 1024 * 1024;
+const MAX_OTB_NODES: usize = 300_000;
+const MAX_OTB_NODE_DEPTH: usize = 64;
+const MAX_ITEM_RANGE: usize = 16_384;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyItemCatalog {
+    pub otb_major_version: u32,
+    pub client_version: u32,
+    pub build_number: u32,
+    definitions: BTreeMap<u16, LegacyItemDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyItemDefinition {
+    pub server_id: u16,
+    pub client_id: u16,
+    pub flags: u32,
+    pub xml_blocks_solid: Option<bool>,
+    pub xml_blocks_pathfind: Option<bool>,
+}
+
+impl LegacyItemDefinition {
+    pub fn blocks_movement(&self) -> bool {
+        self.xml_blocks_solid
+            .unwrap_or((self.flags & FLAG_BLOCK_SOLID) != 0)
+            || self
+                .xml_blocks_pathfind
+                .unwrap_or((self.flags & FLAG_BLOCK_PATHFIND) != 0)
+    }
+}
+
+impl LegacyItemCatalog {
+    pub fn definition(&self, server_id: u16) -> Option<&LegacyItemDefinition> {
+        self.definitions.get(&server_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.definitions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.definitions.is_empty()
+    }
+}
+
+#[derive(Debug)]
+struct Node {
+    props: Vec<u8>,
+    children: Vec<Node>,
+}
+
+pub(crate) fn parse_items_otb(bytes: &[u8]) -> Result<LegacyItemCatalog, ConfigError> {
+    if bytes.len() > MAX_OTB_BYTES {
+        return Err(invalid("items.otb exceeds the configured 64 MiB limit"));
+    }
+    let framed = bytes
+        .strip_prefix(OTB_IDENTIFIER)
+        .ok_or_else(|| invalid("items.otb is missing its required OTBI identifier"))?;
+    let root = parse_tree(framed)?;
+    let (otb_major_version, client_version, build_number) = parse_root_version(&root.props)?;
+    let mut definitions = BTreeMap::new();
+    for node in &root.children {
+        if let Some(definition) = parse_item_node(&node.props)? {
+            if definitions
+                .insert(definition.server_id, definition)
+                .is_some()
+            {
+                return Err(invalid("items.otb contains duplicate server item IDs"));
+            }
+        }
+    }
+    if definitions.is_empty() {
+        return Err(invalid("items.otb does not contain any item definitions"));
+    }
+    Ok(LegacyItemCatalog {
+        otb_major_version,
+        client_version,
+        build_number,
+        definitions,
+    })
+}
+
+pub(crate) fn apply_items_xml(
+    catalog: &mut LegacyItemCatalog,
+    bytes: &[u8],
+) -> Result<(), ConfigError> {
+    if bytes.len() > MAX_OTB_BYTES {
+        return Err(invalid("items.xml exceeds the configured 64 MiB limit"));
+    }
+    let mut reader = Reader::from_reader(bytes);
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+    let mut active_ids = None::<Vec<u16>>;
+    let mut depth = 0usize;
+    loop {
+        match reader.read_event_into(&mut buffer).map_err(xml_error)? {
+            Event::Start(event) => {
+                depth += 1;
+                if depth > MAX_OTB_NODE_DEPTH {
+                    return Err(invalid("items.xml nesting exceeds the configured limit"));
+                }
+                if event.name().as_ref() == b"item" {
+                    active_ids = Some(item_ids(&event)?);
+                } else if event.name().as_ref() == b"attribute" {
+                    apply_xml_attribute(catalog, active_ids.as_deref(), &event)?;
+                }
+            }
+            Event::Empty(event) => {
+                if event.name().as_ref() == b"item" {
+                    let ids = item_ids(&event)?;
+                    apply_inline_item_attributes(catalog, &ids, &event)?;
+                } else if event.name().as_ref() == b"attribute" {
+                    apply_xml_attribute(catalog, active_ids.as_deref(), &event)?;
+                }
+            }
+            Event::End(event) => {
+                if event.name().as_ref() == b"item" {
+                    active_ids = None;
+                }
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| invalid("malformed items.xml depth"))?;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    if depth != 0 {
+        return Err(invalid("items.xml ended before all elements were closed"));
+    }
+    Ok(())
+}
+
+fn parse_tree(bytes: &[u8]) -> Result<Node, ConfigError> {
+    let mut index = 0;
+    let mut stack = Vec::<Node>::new();
+    let mut root = None;
+    let mut count = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            NODE_START => {
+                index += 1;
+                let _kind = read_framed_byte(bytes, &mut index)?;
+                count += 1;
+                if count > MAX_OTB_NODES {
+                    return Err(invalid("OTB node count exceeds the configured limit"));
+                }
+                if stack.len() >= MAX_OTB_NODE_DEPTH {
+                    return Err(invalid("OTB node depth exceeds the configured limit"));
+                }
+                stack.push(Node {
+                    props: Vec::new(),
+                    children: Vec::new(),
+                });
+            }
+            NODE_END => {
+                index += 1;
+                let node = stack
+                    .pop()
+                    .ok_or_else(|| invalid("OTB has an unmatched node end"))?;
+                if let Some(parent) = stack.last_mut() {
+                    parent.children.push(node);
+                } else if root.replace(node).is_some() {
+                    return Err(invalid("OTB contains more than one root node"));
+                }
+            }
+            NODE_ESCAPE => {
+                index += 1;
+                let value = bytes
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| invalid("OTB escape byte has no escaped value"))?;
+                index += 1;
+                stack
+                    .last_mut()
+                    .ok_or_else(|| invalid("OTB property data appears outside a node"))?
+                    .props
+                    .push(value);
+            }
+            value => {
+                index += 1;
+                stack
+                    .last_mut()
+                    .ok_or_else(|| invalid("OTB property data appears outside a node"))?
+                    .props
+                    .push(value);
+            }
+        }
+    }
+    if !stack.is_empty() {
+        return Err(invalid("OTB ended before every node was closed"));
+    }
+    root.ok_or_else(|| invalid("OTB does not contain a root node"))
+}
+
+fn read_framed_byte(bytes: &[u8], index: &mut usize) -> Result<u8, ConfigError> {
+    let value = bytes
+        .get(*index)
+        .copied()
+        .ok_or_else(|| invalid("OTB node start has no type"))?;
+    *index += 1;
+    if value == NODE_ESCAPE {
+        let escaped = bytes
+            .get(*index)
+            .copied()
+            .ok_or_else(|| invalid("OTB escaped node type has no value"))?;
+        *index += 1;
+        Ok(escaped)
+    } else if matches!(value, NODE_START | NODE_END) {
+        Err(invalid("OTB node type uses a reserved framing byte"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn parse_root_version(props: &[u8]) -> Result<(u32, u32, u32), ConfigError> {
+    let mut cursor = Cursor::new(props);
+    let _flags = cursor.read_u32()?;
+    if cursor.read_u8()? != ROOT_ATTR_VERSION {
+        return Err(invalid("items.otb root does not declare version data"));
+    }
+    let length = usize::from(cursor.read_u16()?);
+    if length != 140 {
+        return Err(invalid(
+            "items.otb version record must be exactly 140 bytes",
+        ));
+    }
+    let record = cursor.read_bytes(length)?;
+    if !cursor.is_empty() {
+        return Err(invalid("items.otb root contains unexpected trailing data"));
+    }
+    Ok((
+        u32::from_le_bytes([record[0], record[1], record[2], record[3]]),
+        u32::from_le_bytes([record[4], record[5], record[6], record[7]]),
+        u32::from_le_bytes([record[8], record[9], record[10], record[11]]),
+    ))
+}
+
+fn parse_item_node(props: &[u8]) -> Result<Option<LegacyItemDefinition>, ConfigError> {
+    let mut cursor = Cursor::new(props);
+    let flags = cursor.read_u32()?;
+    let mut server_id = None;
+    let mut client_id = None;
+    while !cursor.is_empty() {
+        let attribute = cursor.read_u8()?;
+        let length = usize::from(cursor.read_u16()?);
+        let value = cursor.read_bytes(length)?;
+        match attribute {
+            ITEM_ATTR_SERVER_ID if value.len() == 2 => {
+                server_id = Some(u16::from_le_bytes([value[0], value[1]]));
+            }
+            ITEM_ATTR_CLIENT_ID if value.len() == 2 => {
+                client_id = Some(u16::from_le_bytes([value[0], value[1]]));
+            }
+            ITEM_ATTR_SERVER_ID | ITEM_ATTR_CLIENT_ID => {
+                return Err(invalid("items.otb item ID attribute has an invalid length"));
+            }
+            _ => {}
+        }
+    }
+    match (server_id, client_id) {
+        (Some(server_id), Some(client_id)) if server_id != 0 && client_id != 0 => {
+            Ok(Some(LegacyItemDefinition {
+                server_id,
+                client_id,
+                flags,
+                xml_blocks_solid: None,
+                xml_blocks_pathfind: None,
+            }))
+        }
+        (None, None) => Ok(None),
+        _ => Err(invalid(
+            "items.otb item record has an incomplete server/client ID mapping",
+        )),
+    }
+}
+
+fn apply_inline_item_attributes(
+    catalog: &mut LegacyItemCatalog,
+    ids: &[u16],
+    event: &BytesStart<'_>,
+) -> Result<(), ConfigError> {
+    for (key, value) in [
+        (b"blockSolid".as_slice(), b"blocksolid".as_slice()),
+        (b"blockPathFind".as_slice(), b"blockpathfind".as_slice()),
+    ] {
+        if let Some(value) =
+            optional_attribute_string(event, key)?.or(optional_attribute_string(event, value)?)
+        {
+            set_block_attribute(catalog, ids, key, parse_bool(&value, key)?)?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_xml_attribute(
+    catalog: &mut LegacyItemCatalog,
+    ids: Option<&[u16]>,
+    event: &BytesStart<'_>,
+) -> Result<(), ConfigError> {
+    let Some(ids) = ids else {
+        return Ok(());
+    };
+    let key = attribute_string(event, b"key")?;
+    let value = attribute_string(event, b"value")?;
+    match key.as_str() {
+        "blockSolid" | "blocksolid" => set_block_attribute(
+            catalog,
+            ids,
+            b"blockSolid",
+            parse_bool(&value, b"blockSolid")?,
+        ),
+        "blockPathFind" | "blockpathfind" => set_block_attribute(
+            catalog,
+            ids,
+            b"blockPathFind",
+            parse_bool(&value, b"blockPathFind")?,
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn set_block_attribute(
+    catalog: &mut LegacyItemCatalog,
+    ids: &[u16],
+    key: &[u8],
+    value: bool,
+) -> Result<(), ConfigError> {
+    for id in ids {
+        if let Some(definition) = catalog.definitions.get_mut(id) {
+            if key == b"blockSolid" {
+                definition.xml_blocks_solid = Some(value);
+            } else {
+                definition.xml_blocks_pathfind = Some(value);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn item_ids(event: &BytesStart<'_>) -> Result<Vec<u16>, ConfigError> {
+    if let Some(id) = optional_attribute_string(event, b"id")? {
+        let values = id
+            .split(';')
+            .map(|part| {
+                part.trim().parse::<u16>().map_err(|_| {
+                    invalid("items.xml id must contain semicolon-separated u16 values")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if values.is_empty() || values.len() > MAX_ITEM_RANGE {
+            return Err(invalid("items.xml item ID list is empty or too large"));
+        }
+        return Ok(values);
+    }
+    let from = attribute_string(event, b"fromid")?
+        .parse::<u16>()
+        .map_err(|_| invalid("items.xml fromid must be a u16"))?;
+    let to = attribute_string(event, b"toid")?
+        .parse::<u16>()
+        .map_err(|_| invalid("items.xml toid must be a u16"))?;
+    if from > to || usize::from(to - from) + 1 > MAX_ITEM_RANGE {
+        return Err(invalid("items.xml item ID range is invalid or too large"));
+    }
+    Ok((from..=to).collect())
+}
+
+fn parse_bool(value: &str, key: &[u8]) -> Result<bool, ConfigError> {
+    match value {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(invalid(format!(
+            "items.xml attribute `{}` must be true, false, 1, or 0",
+            String::from_utf8_lossy(key)
+        ))),
+    }
+}
+
+fn attribute_string(event: &BytesStart<'_>, name: &[u8]) -> Result<String, ConfigError> {
+    event
+        .try_get_attribute(name)
+        .map_err(xml_error)?
+        .ok_or_else(|| {
+            invalid(format!(
+                "missing XML attribute `{}`",
+                String::from_utf8_lossy(name)
+            ))
+        })?
+        .decoded_and_normalized_value(XmlVersion::Implicit1_0, event.decoder())
+        .map_err(xml_error)
+        .map(|value| value.into_owned())
+}
+
+fn optional_attribute_string(
+    event: &BytesStart<'_>,
+    name: &[u8],
+) -> Result<Option<String>, ConfigError> {
+    event
+        .try_get_attribute(name)
+        .map_err(xml_error)?
+        .map(|attribute| {
+            attribute
+                .decoded_and_normalized_value(XmlVersion::Implicit1_0, event.decoder())
+                .map_err(xml_error)
+                .map(|value| value.into_owned())
+        })
+        .transpose()
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+
+    fn read_u8(&mut self) -> Result<u8, ConfigError> {
+        let value = self
+            .bytes
+            .get(self.offset)
+            .copied()
+            .ok_or_else(|| invalid("unexpected end of OTB data"))?;
+        self.offset += 1;
+        Ok(value)
+    }
+
+    fn read_u16(&mut self) -> Result<u16, ConfigError> {
+        let bytes = self.read_bytes(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, ConfigError> {
+        let bytes = self.read_bytes(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_bytes(&mut self, length: usize) -> Result<&'a [u8], ConfigError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| invalid("OTB property offset overflow"))?;
+        let bytes = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| invalid("unexpected end of OTB property"))?;
+        self.offset = end;
+        Ok(bytes)
+    }
+}
+
+fn xml_error(error: impl std::fmt::Display) -> ConfigError {
+    invalid(format!("items.xml parse error: {error}"))
+}
+
+fn invalid(message: impl Into<String>) -> ConfigError {
+    ConfigError::InvalidContent(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn framed_node(kind: u8, props: &[u8], children: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = vec![NODE_START, kind];
+        for byte in props {
+            if matches!(*byte, NODE_START | NODE_END | NODE_ESCAPE) {
+                bytes.push(NODE_ESCAPE);
+            }
+            bytes.push(*byte);
+        }
+        for child in children {
+            bytes.extend_from_slice(child);
+        }
+        bytes.push(NODE_END);
+        bytes
+    }
+
+    #[test]
+    fn parses_hand_authored_otb_mapping_and_xml_overrides() {
+        let mut root = 0u32.to_le_bytes().to_vec();
+        root.push(ROOT_ATTR_VERSION);
+        root.extend_from_slice(&140u16.to_le_bytes());
+        root.extend_from_slice(&3u32.to_le_bytes());
+        root.extend_from_slice(&57u32.to_le_bytes());
+        root.extend_from_slice(&1098u32.to_le_bytes());
+        root.extend([0u8; 128]);
+        let mut item = FLAG_BLOCK_SOLID.to_le_bytes().to_vec();
+        item.push(ITEM_ATTR_SERVER_ID);
+        item.extend_from_slice(&2u16.to_le_bytes());
+        item.extend_from_slice(&4526u16.to_le_bytes());
+        item.push(ITEM_ATTR_CLIENT_ID);
+        item.extend_from_slice(&2u16.to_le_bytes());
+        item.extend_from_slice(&102u16.to_le_bytes());
+        let mut bytes = OTB_IDENTIFIER.to_vec();
+        bytes.extend(framed_node(0, &root, &[framed_node(1, &item, &[])]));
+
+        let mut catalog = parse_items_otb(&bytes).unwrap();
+        assert_eq!(catalog.definition(4526).unwrap().client_id, 102);
+        assert!(catalog.definition(4526).unwrap().blocks_movement());
+        apply_items_xml(
+            &mut catalog,
+            br#"<items><item id="4526"><attribute key="blockSolid" value="0"/></item></items>"#,
+        )
+        .unwrap();
+        assert!(!catalog.definition(4526).unwrap().blocks_movement());
+    }
+
+    #[test]
+    fn rejects_missing_identifier_and_invalid_item_ranges() {
+        assert!(parse_items_otb(&[NODE_START, 0, NODE_END]).is_err());
+        let mut catalog = LegacyItemCatalog {
+            otb_major_version: 3,
+            client_version: 57,
+            build_number: 1,
+            definitions: BTreeMap::new(),
+        };
+        assert!(apply_items_xml(
+            &mut catalog,
+            br#"<items><item fromid="2" toid="1"/></items>"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn applies_server_to_client_mapping_and_blocking_flags_to_a_world_tile() {
+        let mut root = 0u32.to_le_bytes().to_vec();
+        root.push(ROOT_ATTR_VERSION);
+        root.extend_from_slice(&140u16.to_le_bytes());
+        root.extend_from_slice(&3u32.to_le_bytes());
+        root.extend_from_slice(&57u32.to_le_bytes());
+        root.extend_from_slice(&1098u32.to_le_bytes());
+        root.extend([0u8; 128]);
+        let mut item = FLAG_BLOCK_SOLID.to_le_bytes().to_vec();
+        item.push(ITEM_ATTR_SERVER_ID);
+        item.extend_from_slice(&2u16.to_le_bytes());
+        item.extend_from_slice(&4526u16.to_le_bytes());
+        item.push(ITEM_ATTR_CLIENT_ID);
+        item.extend_from_slice(&2u16.to_le_bytes());
+        item.extend_from_slice(&102u16.to_le_bytes());
+        let mut bytes = OTB_IDENTIFIER.to_vec();
+        bytes.extend(framed_node(0, &root, &[framed_node(1, &item, &[])]));
+        let catalog = parse_items_otb(&bytes).unwrap();
+
+        let spawn = forgotten_core::Position {
+            x: 99,
+            y: 100,
+            z: 7,
+        };
+        let position = forgotten_core::Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let mut map = forgotten_core::WorldMap::new("fixture", spawn);
+        map.set_tile(
+            spawn,
+            forgotten_core::WorldMapTile {
+                ground_thing_id: 0,
+                walkable: true,
+            },
+        )
+        .unwrap();
+        map.set_tile(
+            position,
+            forgotten_core::WorldMapTile {
+                ground_thing_id: 4526,
+                walkable: true,
+            },
+        )
+        .unwrap();
+        map.set_tile_items(
+            position,
+            vec![forgotten_core::WorldMapItem {
+                server_id: 4526,
+                client_thing_id: None,
+                count: 1,
+                action_id: None,
+                unique_id: None,
+                text: None,
+                description: None,
+                teleport_destination: None,
+                duration: None,
+                charges: None,
+                children: Vec::new(),
+            }],
+        )
+        .unwrap();
+
+        let normalized = crate::apply_legacy_item_metadata(&map, &catalog).unwrap();
+        assert_eq!(normalized.tile(position).unwrap().ground_thing_id, 102);
+        assert!(!normalized.is_walkable(position));
+    }
+}

@@ -91,6 +91,9 @@ impl Position {
 }
 
 pub const MAX_WORLD_MAP_TILES: usize = 65_536;
+pub const MAX_WORLD_MAP_ITEMS_PER_TILE: usize = 64;
+pub const MAX_WORLD_MAP_TOWNS: usize = 8_192;
+pub const MAX_WORLD_MAP_WAYPOINTS: usize = 8_192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorldMapTile {
@@ -99,10 +102,58 @@ pub struct WorldMapTile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldMapItem {
+    /// The operator-provided server item identifier, not a redistributed client asset.
+    pub server_id: u16,
+    /// The mapped client thing identifier, when the operator supplied an OTB definition.
+    pub client_thing_id: Option<u16>,
+    pub count: u8,
+    pub action_id: Option<u16>,
+    pub unique_id: Option<u16>,
+    pub text: Option<String>,
+    pub description: Option<String>,
+    pub teleport_destination: Option<Position>,
+    pub duration: Option<u32>,
+    pub charges: Option<u16>,
+    pub children: Vec<WorldMapItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtbmMapHeader {
+    pub version: u32,
+    pub width: u16,
+    pub height: u16,
+    pub item_major_version: u32,
+    pub item_minor_version: u32,
+    pub description: Option<String>,
+    pub spawn_file: Option<String>,
+    pub house_file: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldMapSource {
+    FeMapV1,
+    Otbm(OtbmMapHeader),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldMapTown {
+    pub id: u32,
+    pub name: String,
+    pub temple_position: Position,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorldMap {
     identifier: String,
     spawn: Position,
     tiles: BTreeMap<Position, WorldMapTile>,
+    source: WorldMapSource,
+    tile_items: BTreeMap<Position, Vec<WorldMapItem>>,
+    tile_flags: BTreeMap<Position, u32>,
+    house_tiles: BTreeMap<Position, u32>,
+    towns: BTreeMap<u32, WorldMapTown>,
+    waypoints: BTreeMap<String, Position>,
 }
 
 impl WorldMap {
@@ -111,6 +162,12 @@ impl WorldMap {
             identifier: identifier.into(),
             spawn,
             tiles: BTreeMap::new(),
+            source: WorldMapSource::FeMapV1,
+            tile_items: BTreeMap::new(),
+            tile_flags: BTreeMap::new(),
+            house_tiles: BTreeMap::new(),
+            towns: BTreeMap::new(),
+            waypoints: BTreeMap::new(),
         }
     }
 
@@ -122,8 +179,24 @@ impl WorldMap {
         self.spawn
     }
 
+    pub fn set_spawn(&mut self, spawn: Position) {
+        self.spawn = spawn;
+    }
+
+    pub fn source(&self) -> &WorldMapSource {
+        &self.source
+    }
+
+    pub fn set_source(&mut self, source: WorldMapSource) {
+        self.source = source;
+    }
+
     pub fn tile_count(&self) -> usize {
         self.tiles.len()
+    }
+
+    pub fn tiles(&self) -> impl Iterator<Item = (Position, WorldMapTile)> + '_ {
+        self.tiles.iter().map(|(position, tile)| (*position, *tile))
     }
 
     pub fn tile(&self, position: Position) -> Option<WorldMapTile> {
@@ -136,11 +209,120 @@ impl WorldMap {
             .unwrap_or(false)
     }
 
+    pub fn first_walkable_position(&self) -> Option<Position> {
+        self.tiles
+            .iter()
+            .find_map(|(position, tile)| tile.walkable.then_some(*position))
+    }
+
     pub fn set_tile(&mut self, position: Position, tile: WorldMapTile) -> Result<(), CoreError> {
         if !self.tiles.contains_key(&position) && self.tiles.len() >= MAX_WORLD_MAP_TILES {
             return Err(CoreError::MapTileLimit(MAX_WORLD_MAP_TILES));
         }
         self.tiles.insert(position, tile);
+        Ok(())
+    }
+
+    pub fn tile_items(&self, position: Position) -> Option<&[WorldMapItem]> {
+        self.tile_items.get(&position).map(Vec::as_slice)
+    }
+
+    pub fn tile_item_entries(&self) -> impl Iterator<Item = (Position, &[WorldMapItem])> + '_ {
+        self.tile_items
+            .iter()
+            .map(|(position, items)| (*position, items.as_slice()))
+    }
+
+    pub fn set_tile_items(
+        &mut self,
+        position: Position,
+        items: Vec<WorldMapItem>,
+    ) -> Result<(), CoreError> {
+        if items.len() > MAX_WORLD_MAP_ITEMS_PER_TILE {
+            return Err(CoreError::MapTileItemLimit(MAX_WORLD_MAP_ITEMS_PER_TILE));
+        }
+        self.tile_items.insert(position, items);
+        Ok(())
+    }
+
+    pub fn tile_flags(&self, position: Position) -> u32 {
+        self.tile_flags.get(&position).copied().unwrap_or_default()
+    }
+
+    pub fn tile_flag_entries(&self) -> impl Iterator<Item = (Position, u32)> + '_ {
+        self.tile_flags
+            .iter()
+            .map(|(position, flags)| (*position, *flags))
+    }
+
+    pub fn set_tile_flags(&mut self, position: Position, flags: u32) {
+        if flags == 0 {
+            self.tile_flags.remove(&position);
+        } else {
+            self.tile_flags.insert(position, flags);
+        }
+    }
+
+    pub fn house_tile_id(&self, position: Position) -> Option<u32> {
+        self.house_tiles.get(&position).copied()
+    }
+
+    pub fn house_tile_entries(&self) -> impl Iterator<Item = (Position, u32)> + '_ {
+        self.house_tiles
+            .iter()
+            .map(|(position, house_id)| (*position, *house_id))
+    }
+
+    pub fn set_house_tile(&mut self, position: Position, house_id: u32) -> Result<(), CoreError> {
+        if house_id == 0 {
+            return Err(CoreError::InvalidMap("house IDs must be nonzero".into()));
+        }
+        self.house_tiles.insert(position, house_id);
+        Ok(())
+    }
+
+    pub fn towns(&self) -> impl Iterator<Item = &WorldMapTown> {
+        self.towns.values()
+    }
+
+    pub fn set_town(&mut self, town: WorldMapTown) -> Result<(), CoreError> {
+        if town.id == 0 || town.name.trim().is_empty() {
+            return Err(CoreError::InvalidMap(
+                "town IDs must be nonzero and town names cannot be empty".into(),
+            ));
+        }
+        if !self.towns.contains_key(&town.id) && self.towns.len() >= MAX_WORLD_MAP_TOWNS {
+            return Err(CoreError::MapTownLimit(MAX_WORLD_MAP_TOWNS));
+        }
+        self.towns.insert(town.id, town);
+        Ok(())
+    }
+
+    pub fn waypoint(&self, name: &str) -> Option<Position> {
+        self.waypoints.get(name).copied()
+    }
+
+    pub fn waypoints(&self) -> impl Iterator<Item = (&str, Position)> + '_ {
+        self.waypoints
+            .iter()
+            .map(|(name, position)| (name.as_str(), *position))
+    }
+
+    pub fn set_waypoint(
+        &mut self,
+        name: impl Into<String>,
+        position: Position,
+    ) -> Result<(), CoreError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(CoreError::InvalidMap(
+                "waypoint names cannot be empty".into(),
+            ));
+        }
+        if !self.waypoints.contains_key(&name) && self.waypoints.len() >= MAX_WORLD_MAP_WAYPOINTS {
+            return Err(CoreError::MapWaypointLimit(MAX_WORLD_MAP_WAYPOINTS));
+        }
+        self.waypoints.insert(name, position);
         Ok(())
     }
 
@@ -159,6 +341,37 @@ impl WorldMap {
             return Err(CoreError::InvalidMap(
                 "map spawn must reference a walkable tile".into(),
             ));
+        }
+        for position in self.tile_items.keys() {
+            if !self.tiles.contains_key(position) {
+                return Err(CoreError::InvalidMap(format!(
+                    "tile item stack references missing tile at {},{},{}",
+                    position.x, position.y, position.z
+                )));
+            }
+        }
+        for position in self.tile_flags.keys() {
+            if !self.tiles.contains_key(position) {
+                return Err(CoreError::InvalidMap(format!(
+                    "tile flags reference missing tile at {},{},{}",
+                    position.x, position.y, position.z
+                )));
+            }
+        }
+        for position in self.house_tiles.keys() {
+            if !self.tiles.contains_key(position) {
+                return Err(CoreError::InvalidMap(format!(
+                    "house tile references missing tile at {},{},{}",
+                    position.x, position.y, position.z
+                )));
+            }
+        }
+        if let WorldMapSource::Otbm(header) = &self.source {
+            if !(1..=2).contains(&header.version) || header.width == 0 || header.height == 0 {
+                return Err(CoreError::InvalidMap(
+                    "OTBM source metadata has an unsupported version or empty dimensions".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -305,6 +518,9 @@ pub enum CoreError {
         position: Position,
     },
     MapTileLimit(usize),
+    MapTileItemLimit(usize),
+    MapTownLimit(usize),
+    MapWaypointLimit(usize),
     InvalidMap(String),
     InvalidTransition {
         state: ServerStatus,
@@ -412,5 +628,93 @@ mod tests {
         let mut value = player();
         value.add_experience(900);
         assert_eq!(value.level, 4);
+    }
+
+    #[test]
+    fn legacy_world_metadata_is_bounded_and_preserved() {
+        let spawn = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let mut map = WorldMap::new("legacy", spawn);
+        map.set_tile(
+            spawn,
+            WorldMapTile {
+                ground_thing_id: 4526,
+                walkable: true,
+            },
+        )
+        .unwrap();
+        map.set_source(WorldMapSource::Otbm(OtbmMapHeader {
+            version: 2,
+            width: 512,
+            height: 512,
+            item_major_version: 57,
+            item_minor_version: 1098,
+            description: Some("private operator map".into()),
+            spawn_file: Some("legacy-spawn.xml".into()),
+            house_file: Some("legacy-house.xml".into()),
+        }));
+        map.set_tile_items(
+            spawn,
+            vec![WorldMapItem {
+                server_id: 4526,
+                client_thing_id: Some(102),
+                count: 1,
+                action_id: None,
+                unique_id: None,
+                text: None,
+                description: None,
+                teleport_destination: None,
+                duration: None,
+                charges: None,
+                children: Vec::new(),
+            }],
+        )
+        .unwrap();
+        map.set_tile_flags(spawn, 1);
+        map.set_house_tile(spawn, 42).unwrap();
+        map.set_town(WorldMapTown {
+            id: 1,
+            name: "Thais".into(),
+            temple_position: spawn,
+        })
+        .unwrap();
+        map.set_waypoint("temple", spawn).unwrap();
+
+        assert_eq!(map.tile_items(spawn).unwrap()[0].server_id, 4526);
+        assert_eq!(map.tile_flags(spawn), 1);
+        assert_eq!(map.house_tile_id(spawn), Some(42));
+        assert_eq!(map.towns().next().unwrap().name, "Thais");
+        assert_eq!(map.waypoint("temple"), Some(spawn));
+        assert!(map.validate().is_ok());
+        assert!(map.set_waypoint("", spawn).is_err());
+        assert!(map.set_house_tile(spawn, 0).is_err());
+    }
+
+    #[test]
+    fn legacy_tile_metadata_requires_an_existing_tile() {
+        let spawn = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let missing = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let mut map = WorldMap::new("legacy", spawn);
+        map.set_tile(
+            spawn,
+            WorldMapTile {
+                ground_thing_id: 102,
+                walkable: true,
+            },
+        )
+        .unwrap();
+        map.set_tile_items(missing, Vec::new()).unwrap();
+        assert!(matches!(map.validate(), Err(CoreError::InvalidMap(_))));
     }
 }

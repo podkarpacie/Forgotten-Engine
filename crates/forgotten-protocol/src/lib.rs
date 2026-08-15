@@ -811,6 +811,7 @@ pub const NATIVE_OTCLIENT_TILE_END: u16 = 0xff00;
 pub const NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH: usize = 18;
 pub const NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT: usize = 14;
 pub const NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS: usize = 8;
+pub const NATIVE_OTCLIENT_MAX_EXTRA_TILE_ITEMS: usize = 8;
 pub const NATIVE_OTCLIENT_PLAYER_ID_START: u32 = 0x1000_0000;
 pub const NATIVE_OTCLIENT_PLAYER_ID_END: u32 = 0x4000_0000;
 pub const NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES: usize = 255;
@@ -1224,6 +1225,18 @@ pub fn encode_native_otclient_map_viewport(
                     .unwrap_or(snapshot.ground_thing_id);
                 if ground_thing_id != 0 {
                     writer.u16(ground_thing_id);
+                }
+                if let Some(items) = world_map.tile_items(position) {
+                    for item in items
+                        .iter()
+                        .skip(1)
+                        .take(NATIVE_OTCLIENT_MAX_EXTRA_TILE_ITEMS)
+                    {
+                        let thing_id = item.client_thing_id.unwrap_or(item.server_id);
+                        if thing_id != 0 {
+                            writer.u16(thing_id);
+                        }
+                    }
                 }
                 let is_player_tile = z == snapshot.player_position.z
                     && x == NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH / 2 - 1
@@ -2068,6 +2081,43 @@ mod tests {
                 },
             )
             .unwrap();
+        world_map
+            .set_tile_items(
+                Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                vec![
+                    forgotten_core::WorldMapItem {
+                        server_id: 4526,
+                        client_thing_id: Some(555),
+                        count: 1,
+                        action_id: None,
+                        unique_id: None,
+                        text: None,
+                        description: None,
+                        teleport_destination: None,
+                        duration: None,
+                        charges: None,
+                        children: Vec::new(),
+                    },
+                    forgotten_core::WorldMapItem {
+                        server_id: 4527,
+                        client_thing_id: Some(556),
+                        count: 1,
+                        action_id: None,
+                        unique_id: None,
+                        text: None,
+                        description: None,
+                        teleport_destination: None,
+                        duration: None,
+                        charges: None,
+                        children: Vec::new(),
+                    },
+                ],
+            )
+            .unwrap();
         let map_viewport =
             encode_native_otclient_map_viewport(&profile, &snapshot, &world_map).unwrap();
         assert_eq!(map_viewport.0[0], NATIVE_OTCLIENT_GAME_FULL_MAP);
@@ -2075,6 +2125,10 @@ mod tests {
             .0
             .windows(2)
             .any(|bytes| bytes == 555u16.to_le_bytes()));
+        assert!(map_viewport
+            .0
+            .windows(2)
+            .any(|bytes| bytes == 556u16.to_le_bytes()));
         let map_initialization =
             encode_native_otclient_game_initialization_with_map(&profile, &snapshot, &world_map)
                 .unwrap();

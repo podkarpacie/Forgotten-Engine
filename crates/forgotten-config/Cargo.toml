@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 forgotten-core = { path = "../forgotten-core" }
 forgotten-protocol = { path = "../forgotten-protocol" }
+quick-xml = "0.41.0"
 
 [lints]
 workspace = true
