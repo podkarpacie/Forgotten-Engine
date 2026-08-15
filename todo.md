@@ -93,3 +93,8 @@
 - [x] Emit safe native 740 visibility updates for server-driven static creature moves without adding AI behavior.
 - [x] Add self-contained authoritative movement and native visibility regression coverage.
 - [x] Package and publish the static creature movement foundation release with Linux, Windows, and SHA-256 assets.
+- [x] Audit authoritative static creature state, ticking, and native session boundaries for deterministic scheduling.
+- [x] Model an opt-in deterministic policy that selects only safe adjacent static creature steps without target selection or pathfinding.
+- [x] Integrate bounded scheduled static creature movement with authoritative native map visibility refreshes.
+- [x] Add self-contained decision-policy and native update regression coverage.
+- [x] Package and publish the deterministic static creature policy release with Linux, Windows, and SHA-256 assets.

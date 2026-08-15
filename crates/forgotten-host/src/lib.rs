@@ -3,8 +3,8 @@
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
 use forgotten_core::{
-    CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, Player, Position, WorldMap,
-    WorldState,
+    CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, Player, Position,
+    StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, WorldMap, WorldState,
 };
 use forgotten_persistence::EngineDatabase;
 use forgotten_protocol::{
@@ -979,6 +979,32 @@ pub fn move_native_static_creature_and_refresh(
         Some(&active_static_spawns),
     )
     .map_err(HostError::Protocol)
+}
+
+/// Applies a caller-triggered deterministic static creature policy and emits a native map refresh
+/// only if that policy made at least one move. It does not create an autonomous scheduler.
+pub fn apply_native_static_creature_policy_and_refresh(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    world: &mut WorldState,
+    world_map: &WorldMap,
+    policy: StaticCreatureDecisionPolicy,
+) -> Result<(StaticCreatureDecisionBatch, Option<Frame>), HostError> {
+    let batch = world
+        .apply_static_creature_policy(policy, world_map)
+        .map_err(HostError::Core)?;
+    if batch.decisions.is_empty() {
+        return Ok((batch, None));
+    }
+    let active_static_spawns = world.active_static_spawn_collection();
+    let frame = encode_native_otclient_map_viewport_with_static_spawns(
+        profile,
+        snapshot,
+        world_map,
+        Some(&active_static_spawns),
+    )
+    .map_err(HostError::Protocol)?;
+    Ok((batch, Some(frame)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2286,6 +2312,82 @@ mod tests {
                 z: 7,
             }
         );
+    }
+
+    #[test]
+    fn opt_in_static_creature_policy_moves_and_refreshes_native_visibility() {
+        let map = native_world_map();
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let creature = forgotten_core::FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut world = WorldState::default();
+        world
+            .install_static_creatures(&FeTfsStaticSpawnCollection::new(vec![creature]).unwrap())
+            .unwrap();
+        let snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_id: NATIVE_OTCLIENT_PLAYER_ID_START,
+            player_name: "Knight".into(),
+            player_position: NativeOtClientPosition {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            player_level: 8,
+            ground_thing_id: 102,
+            player_look_type: 128,
+            player_speed: 220,
+            server_beat: 50,
+        };
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+        let (batch, refresh) = apply_native_static_creature_policy_and_refresh(
+            &profile,
+            &snapshot,
+            &mut world,
+            &map,
+            StaticCreatureDecisionPolicy::ClockwiseAdjacent,
+        )
+        .unwrap();
+        assert_eq!(batch.decisions.len(), 1);
+        let refresh = refresh.expect("an applied move must refresh the map");
+        assert_eq!(
+            refresh.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert!(refresh.0.windows(3).any(|window| window == b"Rat"));
+        assert_eq!(
+            world.static_creature(creature_id).unwrap().position,
+            Position {
+                x: 102,
+                y: 100,
+                z: 7,
+            }
+        );
+        let (disabled, refresh) = apply_native_static_creature_policy_and_refresh(
+            &profile,
+            &snapshot,
+            &mut world,
+            &map,
+            StaticCreatureDecisionPolicy::Disabled,
+        )
+        .unwrap();
+        assert!(disabled.decisions.is_empty());
+        assert!(refresh.is_none());
     }
 
     #[test]

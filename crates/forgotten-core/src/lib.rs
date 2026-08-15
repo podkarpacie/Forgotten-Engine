@@ -161,6 +161,26 @@ pub struct StaticCreatureResetSummary {
     pub deferred_by_static_creature_occupancy: usize,
 }
 
+/// Selection policy for externally triggered static creature movement. It is never enabled by
+/// default and does not inspect targets, scripts, combat state, or pathfinding information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticCreatureDecisionPolicy {
+    Disabled,
+    ClockwiseAdjacent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticCreatureMoveDecision {
+    pub creature_id: u32,
+    pub direction: CardinalDirection,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StaticCreatureDecisionBatch {
+    pub decisions: Vec<StaticCreatureMoveDecision>,
+    pub skipped: usize,
+}
+
 #[derive(Debug, Clone)]
 struct StaticCreatureRuntime {
     entity: FeTfsStaticEntity,
@@ -616,6 +636,78 @@ impl WorldState {
                 .map(|runtime| runtime.entity.clone())
                 .collect(),
         }
+    }
+
+    /// Selects safe adjacent steps without mutating state. Direction preference rotates by the
+    /// stable creature ID and current world tick, while creature IDs provide a deterministic
+    /// serial order for contention. This is not target selection, AI, or pathfinding.
+    pub fn plan_static_creature_moves(
+        &self,
+        policy: StaticCreatureDecisionPolicy,
+        world_map: &WorldMap,
+    ) -> StaticCreatureDecisionBatch {
+        if policy == StaticCreatureDecisionPolicy::Disabled {
+            return StaticCreatureDecisionBatch::default();
+        }
+        let directions = [
+            CardinalDirection::North,
+            CardinalDirection::East,
+            CardinalDirection::South,
+            CardinalDirection::West,
+        ];
+        let player_positions: BTreeSet<Position> = self
+            .players
+            .values()
+            .map(|player| player.position)
+            .collect();
+        let mut occupied_positions = self.static_occupied_positions.clone();
+        let mut batch = StaticCreatureDecisionBatch::default();
+        for (id, runtime) in &self.static_creatures {
+            if !runtime.active {
+                continue;
+            }
+            let source = runtime.entity.position;
+            occupied_positions.remove(&source);
+            let direction_offset = ((*id as u64 + self.tick) % directions.len() as u64) as usize;
+            let selected = (0..directions.len()).find_map(|step| {
+                let direction = directions[(direction_offset + step) % directions.len()];
+                let destination = source.step(direction).ok()?;
+                (world_map.is_walkable(destination)
+                    && !player_positions.contains(&destination)
+                    && !occupied_positions.contains(&destination))
+                .then_some(direction)
+            });
+            if let Some(direction) = selected {
+                let destination = source.step(direction).expect("selected cardinal step");
+                occupied_positions.insert(destination);
+                batch.decisions.push(StaticCreatureMoveDecision {
+                    creature_id: *id,
+                    direction,
+                });
+            } else {
+                occupied_positions.insert(source);
+                batch.skipped += 1;
+            }
+        }
+        batch
+    }
+
+    /// Applies the complete current policy batch. The caller chooses when to invoke this method;
+    /// this foundation adds no autonomous thread, interval, target selection, or combat behavior.
+    pub fn apply_static_creature_policy(
+        &mut self,
+        policy: StaticCreatureDecisionPolicy,
+        world_map: &WorldMap,
+    ) -> Result<StaticCreatureDecisionBatch, CoreError> {
+        let batch = self.plan_static_creature_moves(policy, world_map);
+        for decision in &batch.decisions {
+            self.move_static_creature_cardinal(
+                decision.creature_id,
+                decision.direction,
+                world_map,
+            )?;
+        }
+        Ok(batch)
     }
 
     /// Marks a static creature inactive without moving it or scheduling any respawn behavior.
@@ -1239,6 +1331,121 @@ mod tests {
         assert_eq!(
             world.move_static_creature_cardinal(0x4000_0002, CardinalDirection::West, &map),
             Err(CoreError::InactiveStaticCreature(0x4000_0002))
+        );
+    }
+
+    #[test]
+    fn deterministic_static_creature_policy_selects_safe_adjacent_steps_only() {
+        let mut map = WorldMap::new(
+            "policy",
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+        );
+        for position in [
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            Position {
+                x: 102,
+                y: 100,
+                z: 7,
+            },
+            Position {
+                x: 101,
+                y: 101,
+                z: 7,
+            },
+        ] {
+            map.set_tile(
+                position,
+                WorldMapTile {
+                    ground_thing_id: 102,
+                    walkable: true,
+                },
+            )
+            .unwrap();
+        }
+        let creature_id = 0x4000_0001;
+        let creature = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut world = WorldState::default();
+        world
+            .install_static_creatures(&FeTfsStaticSpawnCollection::new(vec![creature]).unwrap())
+            .unwrap();
+        world
+            .add_player(Player {
+                id: 9,
+                account_id: 9,
+                name: "Blocker".into(),
+                position: Position {
+                    x: 102,
+                    y: 100,
+                    z: 7,
+                },
+                level: 1,
+                experience: 0,
+                skill_points: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            world.plan_static_creature_moves(StaticCreatureDecisionPolicy::Disabled, &map),
+            StaticCreatureDecisionBatch::default()
+        );
+        let expected = StaticCreatureDecisionBatch {
+            decisions: vec![StaticCreatureMoveDecision {
+                creature_id,
+                direction: CardinalDirection::South,
+            }],
+            skipped: 0,
+        };
+        assert_eq!(
+            world.plan_static_creature_moves(StaticCreatureDecisionPolicy::ClockwiseAdjacent, &map),
+            expected
+        );
+        assert_eq!(
+            world
+                .apply_static_creature_policy(StaticCreatureDecisionPolicy::ClockwiseAdjacent, &map)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            world.static_creature(creature_id).unwrap().position,
+            Position {
+                x: 101,
+                y: 101,
+                z: 7,
+            }
+        );
+        world.deactivate_static_creature(creature_id).unwrap();
+        assert_eq!(
+            world.plan_static_creature_moves(StaticCreatureDecisionPolicy::ClockwiseAdjacent, &map),
+            StaticCreatureDecisionBatch::default()
         );
     }
 
