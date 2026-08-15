@@ -1,7 +1,8 @@
 use forgotten_config::{
     apply_legacy_item_metadata, ensure_content_skeleton, load, load_legacy_item_catalog,
-    load_world_companions, load_world_map, validate_content, write_template,
+    load_world_companions, load_world_map, validate_content, world_map_path, write_template,
 };
+use forgotten_core::WorldMapSource;
 use forgotten_host::{
     start, start_game_session, start_native_otclient_game, start_native_otclient_login,
     start_status, GameSessionHostConfig, HostConfig, LegacyLoginConfig,
@@ -37,6 +38,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             selected_profile(&arguments, 2)?,
         ),
         "validate" => validate(required_path(&arguments, 1)?),
+        "tfs-audit" => audit_tfs_conversion(required_path(&arguments, 1)?),
         "run" => run_host(required_path(&arguments, 1)?),
         "status" => status(required_path(&arguments, 1)?),
         "generate-key" => generate_key(required_path(&arguments, 1)?),
@@ -138,6 +140,77 @@ fn validate(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         content.data_directory.display(),
         database.path().display()
     );
+    Ok(())
+}
+
+fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    println!(">> Loading TFS-style configuration without executing Lua");
+    let config = load(&directory)?;
+    let map_path = world_map_path(&config)?;
+    println!(">> Inspecting selected world data");
+    let raw_world_map = load_world_map(&config)?;
+    let item_catalog = load_legacy_item_catalog(&config, &raw_world_map)?;
+    let world_map = match &item_catalog {
+        Some(catalog) => apply_legacy_item_metadata(&raw_world_map, catalog)?,
+        None => raw_world_map.clone(),
+    };
+    let companions = load_world_companions(&config, &world_map)?;
+    let map_kind = match raw_world_map.source() {
+        WorldMapSource::Otbm(_) => "OTBM",
+        WorldMapSource::FeMapV1 => "FE-native",
+    };
+    let runtime_directories = [
+        "actions",
+        "creaturescripts",
+        "events",
+        "globalevents",
+        "lib",
+        "monster",
+        "movements",
+        "npc",
+        "spells",
+        "talkactions",
+        "weapons",
+    ]
+    .into_iter()
+    .filter(|name| config.content_directory.join(name).is_dir())
+    .collect::<Vec<_>>();
+
+    println!(
+        "TFS conversion readiness\n> config={} (FE profile={} protocol={})\n> map={} format={} tiles={} spawn={},{},{}\n> item-mappings={} spawns={} houses={} towns={} waypoints={}",
+        directory.join("config.lua").display(),
+        config.profile.id,
+        config.profile.tibia_protocol,
+        map_path.display(),
+        map_kind,
+        world_map.tile_count(),
+        world_map.spawn().x,
+        world_map.spawn().y,
+        world_map.spawn().z,
+        item_catalog.as_ref().map_or(0, |catalog| catalog.len()),
+        companions.spawns.len(),
+        companions.houses.len(),
+        world_map.towns().count(),
+        world_map.waypoints().count(),
+    );
+    if matches!(raw_world_map.source(), WorldMapSource::Otbm(_)) {
+        println!("> OTBM world data is importable by the current FE map pipeline.");
+    } else {
+        println!("> FE-native map selected; use mapFormat = \"otbm\" or auto with an .otbm file to audit legacy map data.");
+    }
+    if runtime_directories.is_empty() {
+        println!("> No standard TFS runtime directories were found beneath data/.");
+    } else {
+        println!(
+            "> Detected TFS runtime directories: {}. Their data remains local and untouched, but scripts, monsters, NPCs, spells, actions, and movements are not executed by this FE milestone.",
+            runtime_directories.join(", ")
+        );
+    }
+    if config.otclient_v8_native_enabled {
+        println!("> Native OTCv8 is enabled through the explicitly configured profile.");
+    } else {
+        println!("> Native OTCv8 is disabled. Configure it explicitly only after choosing a matching lawful client asset set.");
+    }
     Ok(())
 }
 
@@ -585,7 +658,7 @@ fn version() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_help() {
-    println!("Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)\n  fe-8.0  — Tibia 8.0 (protocol foundation)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  run <directory>\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  account create <directory> <account-name> <password>\n  player create <directory> <account-id> <character-name>\n  command <directory> broadcast <message>\n  compatibility\n  version");
+    println!("Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)\n  fe-8.0  — Tibia 8.0 (protocol foundation)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  tfs-audit <directory>\n  run <directory>\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  account create <directory> <account-name> <password>\n  player create <directory> <account-id> <character-name>\n  command <directory> broadcast <message>\n  compatibility\n  version");
 }
 
 #[cfg(test)]
@@ -620,6 +693,38 @@ mod tests {
         let config = load(&directory).unwrap();
         assert!(config.rsa_private_key_path.exists());
         assert!(LegacyRsaPrivateKey::load_pem(&config.rsa_private_key_path).is_ok());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn audits_a_tfs_style_world_without_fe_only_config_assignments() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("forgotten-engine-tfs-audit-{nonce}"));
+        ensure_content_skeleton(&directory).unwrap();
+        fs::write(
+            directory.join("config.lua"),
+            r#"worldType = "pvp"
+ip = "127.0.0.1"
+gameProtocolPort = 7172
+statusProtocolPort = 7171
+maxPlayers = 0
+serverName = "Private TFS"
+mapName = "forgotten"
+mysqlHost = "127.0.0.1"
+mysqlUser = "forgottenserver"
+mysqlDatabase = "forgottenserver"
+experienceStages = {
+  { minlevel = 1, multiplier = 7 }
+}
+"#,
+        )
+        .unwrap();
+
+        audit_tfs_conversion(directory.clone()).unwrap();
+        assert!(!directory.join("data/forgotten-engine.db").exists());
         let _ = fs::remove_dir_all(directory);
     }
 

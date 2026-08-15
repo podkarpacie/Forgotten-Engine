@@ -184,22 +184,21 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
     })?;
     let values = parse_assignments(&contents)?;
 
-    let bind_ip: IpAddr =
-        required_string(&values, "ip")?
-            .parse()
-            .map_err(|_| ConfigError::InvalidValue {
-                key: "ip",
-                message: "must be an IPv4 or IPv6 address".into(),
-            })?;
-    let game_protocol_port = required_u16(&values, "gameProtocolPort")?;
-    let status_protocol_port = required_u16(&values, "statusProtocolPort")?;
-    let max_players = required_u32(&values, "maxPlayers")?;
-    let profile_id = required_string(&values, "feProfile")?;
+    let bind_ip: IpAddr = optional_string(&values, "ip", "127.0.0.1")?
+        .parse()
+        .map_err(|_| ConfigError::InvalidValue {
+            key: "ip",
+            message: "must be an IPv4 or IPv6 address".into(),
+        })?;
+    let game_protocol_port = optional_u16(&values, "gameProtocolPort", 7172)?;
+    let status_protocol_port = optional_u16(&values, "statusProtocolPort", 7171)?;
+    let max_players = optional_u32(&values, "maxPlayers", 0)?;
+    let profile_id = optional_string(&values, "feProfile", "fe-7.4")?;
     let profile = profile_by_id(profile_id).ok_or_else(|| ConfigError::InvalidValue {
         key: "feProfile",
         message: format!("unknown Forgotten Engine profile `{profile_id}`"),
     })?;
-    let protocol = required_string(&values, "tibiaProtocol")?;
+    let protocol = optional_string(&values, "tibiaProtocol", profile.tibia_protocol)?;
     if protocol != profile.tibia_protocol {
         return Err(ConfigError::InvalidValue {
             key: "tibiaProtocol",
@@ -273,14 +272,14 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         game_protocol_port,
         status_protocol_port,
         max_players,
-        server_name: required_string(&values, "serverName")?.to_owned(),
-        map_name: required_string(&values, "mapName")?.to_owned(),
+        server_name: optional_string(&values, "serverName", "Forgotten Engine")?.to_owned(),
+        map_name: optional_string(&values, "mapName", "forgotten")?.to_owned(),
         map_format: WorldMapFormat::parse(optional_string(&values, "mapFormat", "auto")?)?,
-        world_type: WorldType::parse(required_string(&values, "worldType")?)?,
+        world_type: WorldType::parse(optional_string(&values, "worldType", "pvp")?)?,
         mysql: MysqlConfig {
-            host: required_string(&values, "mysqlHost")?.to_owned(),
-            user: required_string(&values, "mysqlUser")?.to_owned(),
-            database: required_string(&values, "mysqlDatabase")?.to_owned(),
+            host: optional_string(&values, "mysqlHost", "127.0.0.1")?.to_owned(),
+            user: optional_string(&values, "mysqlUser", "forgottenserver")?.to_owned(),
+            database: optional_string(&values, "mysqlDatabase", "forgottenserver")?.to_owned(),
         },
         profile,
         content_directory: world_directory.join("data"),
@@ -994,20 +993,19 @@ fn parse_assignments(contents: &str) -> Result<BTreeMap<String, Literal>, Config
         if line.is_empty() {
             continue;
         }
-        let (key, raw_value) = line.split_once('=').ok_or(ConfigError::Syntax {
-            line: index + 1,
-            message: "expected key = value".into(),
-        })?;
+        let Some((key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
         let key = key.trim();
         if key.is_empty()
             || !key
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || character == '_')
         {
-            return Err(ConfigError::Syntax {
-                line: index + 1,
-                message: "invalid key".into(),
-            });
+            continue;
+        }
+        if !is_recognized_config_key(key) {
+            continue;
         }
         let literal = Literal::parse(raw_value.trim()).map_err(|message| ConfigError::Syntax {
             line: index + 1,
@@ -1016,6 +1014,45 @@ fn parse_assignments(contents: &str) -> Result<BTreeMap<String, Literal>, Config
         values.insert(key.to_owned(), literal);
     }
     Ok(values)
+}
+
+fn is_recognized_config_key(key: &str) -> bool {
+    matches!(
+        key,
+        "ip" | "gameProtocolPort"
+            | "statusProtocolPort"
+            | "maxPlayers"
+            | "serverName"
+            | "mapName"
+            | "mapFormat"
+            | "worldType"
+            | "mysqlHost"
+            | "mysqlUser"
+            | "mysqlDatabase"
+            | "feProfile"
+            | "tibiaProtocol"
+            | "legacyLoginEnabled"
+            | "rsaPrivateKey"
+            | "gameSessionEnabled"
+            | "gameSessionPort"
+            | "advertisedGameSessionHost"
+            | "advertisedGameSessionPort"
+            | "otclientV8NativeEnabled"
+            | "otclientV8LoginPort"
+            | "otclientV8GamePort"
+            | "advertisedOtClientV8Host"
+            | "advertisedOtClientV8GamePort"
+            | "otclientV8ProtocolVersion"
+            | "otclientV8NumericAccountIds"
+            | "otclientV8LoginPacketEncryption"
+            | "otclientV8ProtocolChecksum"
+            | "otclientV8ChallengeOnLogin"
+            | "otclientV8NativeEmptyWorldEnabled"
+            | "otclientV8EmptyWorldGroundThingId"
+            | "otclientV8PlayerLookType"
+            | "otclientV8PlayerSpeed"
+            | "otclientV8ServerBeat"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1043,20 +1080,6 @@ impl Literal {
             .parse::<i64>()
             .map(Self::Integer)
             .map_err(|_| "expected quoted string, integer, or boolean literal".into())
-    }
-}
-
-fn required_string<'a>(
-    values: &'a BTreeMap<String, Literal>,
-    key: &'static str,
-) -> Result<&'a str, ConfigError> {
-    match values.get(key) {
-        Some(Literal::String(value)) => Ok(value),
-        Some(_) => Err(ConfigError::InvalidValue {
-            key,
-            message: "must be a quoted string".into(),
-        }),
-        None => Err(ConfigError::MissingValue(key)),
     }
 }
 
@@ -1125,15 +1148,11 @@ fn optional_u16(
     }
 }
 
-fn required_u16(values: &BTreeMap<String, Literal>, key: &'static str) -> Result<u16, ConfigError> {
-    let value = required_u32(values, key)?;
-    u16::try_from(value).map_err(|_| ConfigError::InvalidValue {
-        key,
-        message: "must be between 0 and 65535".into(),
-    })
-}
-
-fn required_u32(values: &BTreeMap<String, Literal>, key: &'static str) -> Result<u32, ConfigError> {
+fn optional_u32(
+    values: &BTreeMap<String, Literal>,
+    key: &'static str,
+    default: u32,
+) -> Result<u32, ConfigError> {
     match values.get(key) {
         Some(Literal::Integer(value)) => {
             u32::try_from(*value).map_err(|_| ConfigError::InvalidValue {
@@ -1145,7 +1164,7 @@ fn required_u32(values: &BTreeMap<String, Literal>, key: &'static str) -> Result
             key,
             message: "must be an integer".into(),
         }),
-        None => Err(ConfigError::MissingValue(key)),
+        None => Ok(default),
     }
 }
 
@@ -1269,6 +1288,44 @@ mod tests {
         assert!(config
             .otclient_v8_native_profile()
             .supports_current_native_foundation());
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn accepts_a_tfs_style_config_without_fe_only_assignments() {
+        let world = temporary_world("tfs-config");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            r#"-- A private TFS-style configuration with settings FE does not execute.
+worldType = "pvp"
+ip = "127.0.0.1"
+gameProtocolPort = 7172
+statusProtocolPort = 7171
+maxPlayers = 0
+serverName = "Private Forgotten"
+mapName = "myworld"
+mapAuthor = "Operator"
+mysqlHost = "127.0.0.1"
+mysqlUser = "forgottenserver"
+mysqlPass = "private"
+mysqlDatabase = "forgottenserver"
+timeToDecreaseFrags = 24 * 60 * 60
+experienceStages = {
+    { minlevel = 1, maxlevel = 8, multiplier = 7 },
+    { minlevel = 9, multiplier = 6 }
+}
+"#,
+        )
+        .unwrap();
+
+        let config = load(&world).unwrap();
+        assert_eq!(config.profile, FE_7_4_PROFILE);
+        assert_eq!(config.map_format, WorldMapFormat::Auto);
+        assert_eq!(config.server_name, "Private Forgotten");
+        assert_eq!(config.map_name, "myworld");
+        assert_eq!(config.game_protocol_port, 7172);
+        assert!(!config.otclient_v8_native_enabled);
         let _ = fs::remove_dir_all(world);
     }
 

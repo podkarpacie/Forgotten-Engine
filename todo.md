@@ -55,3 +55,8 @@
 - [x] Encode layered imported world tiles and movement semantics through the native OTCv8 740 map path.
 - [x] Add hand-authored compatibility fixtures and tests for OTBM, XML companion data, item metadata, import/export, viewport encoding, and walkability.
 - [x] Package and publish the legacy TFS world-data compatibility release with Linux, Windows, and SHA-256 assets.
+- [x] Audit a representative TFS server directory and `config.lua` contract against FE startup and native-profile requirements.
+- [x] Accept TFS-compatible configuration defaults and discover standard world, item, spawn, and house file locations without FE-only rewrites.
+- [x] Add an explicit CLI conversion-readiness audit that distinguishes importable content from unavailable FE runtime systems.
+- [x] Add self-contained representative TFS-layout fixtures covering config, OTBM, items, and companion-file discovery.
+- [ ] Package and publish the TFS conversion-readiness release with Linux, Windows, and SHA-256 assets.
