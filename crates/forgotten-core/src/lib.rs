@@ -149,6 +149,7 @@ impl FeTfsStaticSpawnCollection {
 pub struct StaticCreatureLifecycle {
     pub id: u32,
     pub spawn_position: Position,
+    pub position: Position,
     pub active: bool,
     pub activated_at_tick: u64,
 }
@@ -157,11 +158,13 @@ pub struct StaticCreatureLifecycle {
 pub struct StaticCreatureResetSummary {
     pub reactivated: usize,
     pub deferred_by_player_occupancy: usize,
+    pub deferred_by_static_creature_occupancy: usize,
 }
 
 #[derive(Debug, Clone)]
 struct StaticCreatureRuntime {
     entity: FeTfsStaticEntity,
+    spawn_position: Position,
     active: bool,
     activated_at_tick: u64,
 }
@@ -549,6 +552,7 @@ impl WorldState {
                     entity.id,
                     StaticCreatureRuntime {
                         entity: entity.clone(),
+                        spawn_position: entity.position,
                         active: true,
                         activated_at_tick: self.tick,
                     },
@@ -587,7 +591,8 @@ impl WorldState {
             .get(&id)
             .map(|runtime| StaticCreatureLifecycle {
                 id,
-                spawn_position: runtime.entity.position,
+                spawn_position: runtime.spawn_position,
+                position: runtime.entity.position,
                 active: runtime.active,
                 activated_at_tick: runtime.activated_at_tick,
             })
@@ -598,6 +603,19 @@ impl WorldState {
             .values()
             .filter(|runtime| runtime.active)
             .count()
+    }
+
+    /// Returns only active authoritative entities for a protocol viewport. This derives a
+    /// temporary immutable collection rather than exposing runtime mutation through the codec.
+    pub fn active_static_spawn_collection(&self) -> FeTfsStaticSpawnCollection {
+        FeTfsStaticSpawnCollection {
+            entities: self
+                .static_creatures
+                .values()
+                .filter(|runtime| runtime.active)
+                .map(|runtime| runtime.entity.clone())
+                .collect(),
+        }
     }
 
     /// Marks a static creature inactive without moving it or scheduling any respawn behavior.
@@ -624,21 +642,70 @@ impl WorldState {
         let mut summary = StaticCreatureResetSummary {
             reactivated: 0,
             deferred_by_player_occupancy: 0,
+            deferred_by_static_creature_occupancy: 0,
         };
+        let mut active_positions = self.static_occupied_positions.clone();
         for runtime in self.static_creatures.values_mut() {
             if runtime.active {
                 continue;
             }
-            if player_positions.contains(&runtime.entity.position) {
+            if player_positions.contains(&runtime.spawn_position) {
                 summary.deferred_by_player_occupancy += 1;
                 continue;
             }
+            if active_positions.contains(&runtime.spawn_position) {
+                summary.deferred_by_static_creature_occupancy += 1;
+                continue;
+            }
+            runtime.entity.position = runtime.spawn_position;
             runtime.active = true;
             runtime.activated_at_tick = self.tick;
+            active_positions.insert(runtime.entity.position);
             summary.reactivated += 1;
         }
         self.refresh_static_creature_occupancy();
         summary
+    }
+
+    /// Applies one explicitly requested cardinal step. Selection, pacing, AI, combat, scripts,
+    /// and autonomous movement remain outside this foundation.
+    pub fn move_static_creature_cardinal(
+        &mut self,
+        id: u32,
+        direction: CardinalDirection,
+        world_map: &WorldMap,
+    ) -> Result<(Position, Position), CoreError> {
+        let source = self
+            .static_creatures
+            .get(&id)
+            .ok_or(CoreError::UnknownStaticCreature(id))?;
+        if !source.active {
+            return Err(CoreError::InactiveStaticCreature(id));
+        }
+        let previous = source.entity.position;
+        let destination = previous.step(direction)?;
+        if !world_map.is_walkable(destination) {
+            return Err(CoreError::StaticCreatureMovementBlocked(destination));
+        }
+        if self
+            .players
+            .values()
+            .any(|player| player.position == destination)
+        {
+            return Err(CoreError::PlayerOccupiesStaticCreaturePosition(destination));
+        }
+        if self.static_creatures.iter().any(|(other_id, runtime)| {
+            *other_id != id && runtime.active && runtime.entity.position == destination
+        }) {
+            return Err(CoreError::StaticCreatureOccupiesPosition(destination));
+        }
+        let runtime = self
+            .static_creatures
+            .get_mut(&id)
+            .ok_or(CoreError::UnknownStaticCreature(id))?;
+        runtime.entity.position = destination;
+        self.refresh_static_creature_occupancy();
+        Ok((previous, destination))
     }
 
     pub fn is_static_creature_occupied(&self, position: Position) -> bool {
@@ -730,6 +797,8 @@ pub enum CoreError {
     StaticCreatureOccupiesPosition(Position),
     PlayerOccupiesStaticCreaturePosition(Position),
     UnknownStaticCreature(u32),
+    InactiveStaticCreature(u32),
+    StaticCreatureMovementBlocked(Position),
     InvalidMap(String),
     InvalidTransition {
         state: ServerStatus,
@@ -1032,6 +1101,7 @@ mod tests {
             Some(StaticCreatureLifecycle {
                 id: 0x4000_0001,
                 spawn_position,
+                position: spawn_position,
                 active: true,
                 activated_at_tick: 0,
             })
@@ -1052,6 +1122,7 @@ mod tests {
             StaticCreatureResetSummary {
                 reactivated: 0,
                 deferred_by_player_occupancy: 1,
+                deferred_by_static_creature_occupancy: 0,
             }
         );
         assert!(!world.is_static_creature_occupied(spawn_position));
@@ -1065,6 +1136,7 @@ mod tests {
             StaticCreatureResetSummary {
                 reactivated: 1,
                 deferred_by_player_occupancy: 0,
+                deferred_by_static_creature_occupancy: 0,
             }
         );
         assert!(world.is_static_creature_occupied(spawn_position));
@@ -1079,6 +1151,94 @@ mod tests {
         assert_eq!(
             world.deactivate_static_creature(0x4000_0002),
             Err(CoreError::UnknownStaticCreature(0x4000_0002))
+        );
+    }
+
+    #[test]
+    fn static_creature_moves_are_authoritative_bounded_and_render_active_only() {
+        let mut map = WorldMap::new(
+            "movement",
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+        );
+        for x in 100..=103 {
+            map.set_tile(
+                Position { x, y: 100, z: 7 },
+                WorldMapTile {
+                    ground_thing_id: 102,
+                    walkable: x != 103,
+                },
+            )
+            .unwrap();
+        }
+        let first = FeTfsStaticEntity {
+            id: 0x4000_0001,
+            name: "Rat".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let second = FeTfsStaticEntity {
+            id: 0x4000_0002,
+            name: "Snake".into(),
+            position: Position {
+                x: 102,
+                y: 100,
+                z: 7,
+            },
+            ..first.clone()
+        };
+        let mut world = WorldState::default();
+        world
+            .install_static_creatures(
+                &FeTfsStaticSpawnCollection::new(vec![first.clone(), second.clone()]).unwrap(),
+            )
+            .unwrap();
+        world.add_player(player()).unwrap();
+
+        assert_eq!(
+            world.move_static_creature_cardinal(0x4000_0001, CardinalDirection::East, &map),
+            Err(CoreError::StaticCreatureOccupiesPosition(second.position))
+        );
+        world.deactivate_static_creature(second.id).unwrap();
+        assert_eq!(
+            world
+                .move_static_creature_cardinal(0x4000_0001, CardinalDirection::East, &map)
+                .unwrap(),
+            (first.position, second.position)
+        );
+        assert!(!world.is_static_creature_occupied(first.position));
+        assert!(world.is_static_creature_occupied(second.position));
+        assert_eq!(world.active_static_spawn_collection().entities.len(), 1);
+        assert_eq!(
+            world.active_static_spawn_collection().entities[0].position,
+            second.position
+        );
+        assert_eq!(
+            world.move_static_creature_cardinal(0x4000_0001, CardinalDirection::East, &map),
+            Err(CoreError::StaticCreatureMovementBlocked(Position {
+                x: 103,
+                y: 100,
+                z: 7,
+            }))
+        );
+        assert_eq!(
+            world.move_static_creature_cardinal(0x4000_0002, CardinalDirection::West, &map),
+            Err(CoreError::InactiveStaticCreature(0x4000_0002))
         );
     }
 

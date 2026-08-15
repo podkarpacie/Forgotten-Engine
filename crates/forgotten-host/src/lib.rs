@@ -769,36 +769,6 @@ fn handle_native_otclient_game(
     if initial_position != character.position {
         database.update_player_position(character.id, initial_position)?;
     }
-    let player_id = native_player_id(character.id)?;
-    let snapshot = NativeOtClientEmptyWorldSnapshot {
-        player_id,
-        player_name: character.name.clone(),
-        player_position: native_position(initial_position),
-        player_level: character.level.try_into().unwrap_or(u16::MAX),
-        ground_thing_id: empty_world.ground_thing_id,
-        player_look_type: empty_world.player_look_type,
-        player_speed: empty_world.player_speed,
-        server_beat: empty_world.server_beat,
-    };
-    let initialization = encode_native_otclient_game_initialization_with_map_and_static_spawns(
-        &config.client_profile,
-        &snapshot,
-        world_map,
-        config.static_spawns.as_deref(),
-    )
-    .map_err(HostError::Protocol)?;
-    write_frame(stream, &initialization)?;
-    stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
-    eprintln!(
-        "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
-        character.name,
-        initialization.0.len(),
-        world_map.identifier(),
-        world_map.tile_count(),
-        config.static_spawns.as_ref().map_or(0, |spawns| spawns.entities.len()),
-        snapshot.ground_thing_id == 0 && snapshot.player_look_type == 0,
-    );
-
     let account_id = u64::try_from(account.id).map_err(|_| {
         HostError::InvalidConfiguration("native numeric account IDs must be non-negative".into())
     })?;
@@ -813,6 +783,37 @@ fn handle_native_otclient_game(
             skill_points: 0,
         })
         .map_err(HostError::Core)?;
+    let player_id = native_player_id(character.id)?;
+    let snapshot = NativeOtClientEmptyWorldSnapshot {
+        player_id,
+        player_name: character.name.clone(),
+        player_position: native_position(initial_position),
+        player_level: character.level.try_into().unwrap_or(u16::MAX),
+        ground_thing_id: empty_world.ground_thing_id,
+        player_look_type: empty_world.player_look_type,
+        player_speed: empty_world.player_speed,
+        server_beat: empty_world.server_beat,
+    };
+    let active_static_spawns = world.active_static_spawn_collection();
+    let initialization = encode_native_otclient_game_initialization_with_map_and_static_spawns(
+        &config.client_profile,
+        &snapshot,
+        world_map,
+        Some(&active_static_spawns),
+    )
+    .map_err(HostError::Protocol)?;
+    write_frame(stream, &initialization)?;
+    stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
+    eprintln!(
+        "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
+        character.name,
+        initialization.0.len(),
+        world_map.identifier(),
+        world_map.tile_count(),
+        active_static_spawns.entities.len(),
+        snapshot.ground_thing_id == 0 && snapshot.player_look_type == 0,
+    );
+
     let mut player_position = initial_position;
     let mut facing = NativeOtClientCardinalDirection::South;
     let mut pending_action = None;
@@ -956,6 +957,30 @@ fn handle_native_otclient_game(
     Ok(())
 }
 
+/// Applies one externally selected static-creature step and returns a full native map refresh.
+/// It deliberately makes no AI decision, schedules no autonomous movement, and performs no
+/// combat, Lua, spell, or action behavior.
+pub fn move_native_static_creature_and_refresh(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    world: &mut WorldState,
+    world_map: &WorldMap,
+    creature_id: u32,
+    direction: CardinalDirection,
+) -> Result<Frame, HostError> {
+    world
+        .move_static_creature_cardinal(creature_id, direction, world_map)
+        .map_err(HostError::Core)?;
+    let active_static_spawns = world.active_static_spawn_collection();
+    encode_native_otclient_map_viewport_with_static_spawns(
+        profile,
+        snapshot,
+        world_map,
+        Some(&active_static_spawns),
+    )
+    .map_err(HostError::Protocol)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn move_native_map_player(
     stream: &mut TcpStream,
@@ -965,7 +990,7 @@ fn move_native_map_player(
     world: &mut WorldState,
     character_id: u64,
     world_map: &WorldMap,
-    static_spawns: Option<&FeTfsStaticSpawnCollection>,
+    _static_spawns: Option<&FeTfsStaticSpawnCollection>,
     player_position: &mut Position,
     facing: &mut NativeOtClientCardinalDirection,
     direction: NativeOtClientCardinalDirection,
@@ -997,13 +1022,14 @@ fn move_native_map_player(
     )?;
     let mut refreshed_snapshot = snapshot.clone();
     refreshed_snapshot.player_position = native_position(destination);
+    let active_static_spawns = world.active_static_spawn_collection();
     write_frame(
         stream,
         &encode_native_otclient_map_viewport_with_static_spawns(
             profile,
             &refreshed_snapshot,
             world_map,
-            static_spawns,
+            Some(&active_static_spawns),
         )
         .map_err(HostError::Protocol)?,
     )?;
@@ -2193,6 +2219,73 @@ mod tests {
 
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn server_owned_static_creature_move_refreshes_native_visibility() {
+        let map = native_world_map();
+        let creature = forgotten_core::FeTfsStaticEntity {
+            id: NATIVE_OTCLIENT_PLAYER_ID_END + 1,
+            name: "Rat".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut world = WorldState::default();
+        world
+            .install_static_creatures(&FeTfsStaticSpawnCollection::new(vec![creature]).unwrap())
+            .unwrap();
+        let snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_id: NATIVE_OTCLIENT_PLAYER_ID_START,
+            player_name: "Knight".into(),
+            player_position: NativeOtClientPosition {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            player_level: 8,
+            ground_thing_id: 102,
+            player_look_type: 128,
+            player_speed: 220,
+            server_beat: 50,
+        };
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+        let frame = move_native_static_creature_and_refresh(
+            &profile,
+            &snapshot,
+            &mut world,
+            &map,
+            NATIVE_OTCLIENT_PLAYER_ID_END + 1,
+            CardinalDirection::East,
+        )
+        .unwrap();
+        assert_eq!(
+            frame.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert!(frame.0.windows(3).any(|window| window == b"Rat"));
+        assert_eq!(
+            world
+                .static_creature(NATIVE_OTCLIENT_PLAYER_ID_END + 1)
+                .unwrap()
+                .position,
+            Position {
+                x: 102,
+                y: 100,
+                z: 7,
+            }
+        );
     }
 
     #[test]

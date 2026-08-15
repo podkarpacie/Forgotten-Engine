@@ -88,3 +88,8 @@
 - [x] Integrate static creature lifecycle reset behavior with authoritative native world setup.
 - [x] Add self-contained lifecycle registration and reset regression coverage.
 - [x] Package and publish the static creature lifecycle policy release with Linux, Windows, and SHA-256 assets.
+- [x] Audit authoritative creature movement, occupancy, and native 740 map-update boundaries.
+- [x] Implement deterministic server-owned static creature movement with walkability, player occupancy, and creature occupancy safeguards.
+- [x] Emit safe native 740 visibility updates for server-driven static creature moves without adding AI behavior.
+- [x] Add self-contained authoritative movement and native visibility regression coverage.
+- [x] Package and publish the static creature movement foundation release with Linux, Windows, and SHA-256 assets.
