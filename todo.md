@@ -60,3 +60,9 @@
 - [x] Add an explicit CLI conversion-readiness audit that distinguishes importable content from unavailable FE runtime systems.
 - [x] Add self-contained representative TFS-layout fixtures covering config, OTBM, items, and companion-file discovery.
 - [x] Package and publish the TFS conversion-readiness release with Linux, Windows, and SHA-256 assets.
+- [x] Audit standard TFS XML registry formats and identify the safe FE runtime boundary for referenced script content.
+- [x] Load bounded TFS content registries and validate every referenced relative file path without executing scripts.
+- [x] Produce a typed conversion inventory that distinguishes parsed registry content from deferred FE gameplay systems.
+- [x] Extend `tfs-audit` with registry counts, missing-reference diagnostics, and deferred-runtime categories.
+- [x] Add self-contained XML registry and CLI audit fixtures without importing private game content.
+- [ ] Package and publish the TFS registry-inventory release with Linux, Windows, and SHA-256 assets.

@@ -1,6 +1,7 @@
 use forgotten_config::{
     apply_legacy_item_metadata, ensure_content_skeleton, load, load_legacy_item_catalog,
-    load_world_companions, load_world_map, validate_content, world_map_path, write_template,
+    load_tfs_content_inventory, load_world_companions, load_world_map, validate_content,
+    world_map_path, write_template,
 };
 use forgotten_core::WorldMapSource;
 use forgotten_host::{
@@ -155,29 +156,14 @@ fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Er
         None => raw_world_map.clone(),
     };
     let companions = load_world_companions(&config, &world_map)?;
+    let registry_inventory = load_tfs_content_inventory(&config)?;
     let map_kind = match raw_world_map.source() {
         WorldMapSource::Otbm(_) => "OTBM",
         WorldMapSource::FeMapV1 => "FE-native",
     };
-    let runtime_directories = [
-        "actions",
-        "creaturescripts",
-        "events",
-        "globalevents",
-        "lib",
-        "monster",
-        "movements",
-        "npc",
-        "spells",
-        "talkactions",
-        "weapons",
-    ]
-    .into_iter()
-    .filter(|name| config.content_directory.join(name).is_dir())
-    .collect::<Vec<_>>();
 
     println!(
-        "TFS conversion readiness\n> config={} (FE profile={} protocol={})\n> map={} format={} tiles={} spawn={},{},{}\n> item-mappings={} spawns={} houses={} towns={} waypoints={}",
+        "TFS conversion readiness\n> config={} (FE profile={} protocol={})\n> map={} format={} tiles={} spawn={},{},{}\n> item-mappings={} spawns={} houses={} towns={} waypoints={}\n> registries={} entries={} references={} missing-references={} unsafe-references={}",
         directory.join("config.lua").display(),
         config.profile.id,
         config.profile.tibia_protocol,
@@ -192,18 +178,59 @@ fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Er
         companions.houses.len(),
         world_map.towns().count(),
         world_map.waypoints().count(),
+        registry_inventory.present_registry_count(),
+        registry_inventory.entry_count(),
+        registry_inventory.reference_count(),
+        registry_inventory.missing_reference_count(),
+        registry_inventory.unsafe_reference_count(),
     );
     if matches!(raw_world_map.source(), WorldMapSource::Otbm(_)) {
         println!("> OTBM world data is importable by the current FE map pipeline.");
     } else {
         println!("> FE-native map selected; use mapFormat = \"otbm\" or auto with an .otbm file to audit legacy map data.");
     }
-    if runtime_directories.is_empty() {
-        println!("> No standard TFS runtime directories were found beneath data/.");
+    for registry in registry_inventory
+        .registries
+        .iter()
+        .filter(|registry| registry.present)
+    {
+        println!(
+            "> registry={} entries={} references={} missing={} unsafe={} status={}",
+            registry.category.label(),
+            registry.entry_count,
+            registry.reference_count,
+            registry.missing_references.len(),
+            registry.unsafe_references.len(),
+            registry.category.runtime_status(),
+        );
+        if !registry.missing_references.is_empty() {
+            let paths = registry
+                .missing_references
+                .iter()
+                .take(3)
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(">   missing references (up to 3): {paths}");
+        }
+        if !registry.unsafe_references.is_empty() {
+            println!(
+                ">   unsafe relative references (up to 3): {}",
+                registry
+                    .unsafe_references
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    if registry_inventory.present_registry_count() == 0 {
+        println!("> No standard TFS XML registries were found beneath data/.");
     } else {
         println!(
-            "> Detected TFS runtime directories: {}. Their data remains local and untouched, but scripts, monsters, NPCs, spells, actions, and movements are not executed by this FE milestone.",
-            runtime_directories.join(", ")
+            "> Registry entries were parsed for conversion inventory only. Referenced Lua scripts and creature definitions remain local and are not executed by this FE milestone."
         );
     }
     if config.otclient_v8_native_enabled {
@@ -720,6 +747,18 @@ experienceStages = {
   { minlevel = 1, multiplier = 7 }
 }
 "#,
+        )
+        .unwrap();
+
+        fs::create_dir_all(directory.join("data/actions/scripts")).unwrap();
+        fs::write(
+            directory.join("data/actions/actions.xml"),
+            r#"<actions><action itemid="100" script="scripts/rope.lua"/></actions>"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.join("data/actions/scripts/rope.lua"),
+            "-- private TFS action; inventory only",
         )
         .unwrap();
 

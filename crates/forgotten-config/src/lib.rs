@@ -6,6 +6,7 @@
 mod items;
 mod legacy_xml;
 mod otbm;
+mod tfs_registry;
 
 use forgotten_core::{
     OtbmMapHeader, Position, WorldMap, WorldMapItem, WorldMapSource, WorldMapTile, WorldMapTown,
@@ -20,6 +21,7 @@ pub use items::{LegacyItemCatalog, LegacyItemDefinition};
 pub use legacy_xml::{
     LegacyHouse, LegacySpawnArea, LegacySpawnCreature, LegacySpawnKind, LegacyWorldCompanionData,
 };
+pub use tfs_registry::{TfsContentInventory, TfsRegistryCategory, TfsRegistryInventory};
 
 pub const CONFIG_FILE_NAME: &str = "config.lua";
 pub const CONTENT_MANIFEST_NAME: &str = "fe-content.manifest";
@@ -412,6 +414,12 @@ pub fn load_world_companions(
     world_map: &WorldMap,
 ) -> Result<LegacyWorldCompanionData, ConfigError> {
     legacy_xml::load_legacy_world_companions(config, world_map)
+}
+
+pub fn load_tfs_content_inventory(
+    config: &EngineConfig,
+) -> Result<TfsContentInventory, ConfigError> {
+    tfs_registry::load_tfs_content_inventory(config)
 }
 
 pub fn load_legacy_item_catalog(
