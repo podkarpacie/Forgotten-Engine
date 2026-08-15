@@ -37,3 +37,5 @@
 - [x] Serialize rapid click/manual movement so only one authoritative native movement update is in flight at a time.
 - [x] Stop sending the parser-invalid 740 server text message until its exact supported layout is confirmed.
 - [x] Accept and safely handle the stock 740 outfit-window/change interaction frame.
+- [x] Encode a bounded stock 740 server-speech record that OTCv8 renders for local diagnostic chat.
+- [ ] Verify the visible chat echo with a real unmodified OTCv8 740 client without parser errors.

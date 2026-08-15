@@ -787,6 +787,7 @@ pub const NATIVE_OTCLIENT_GAME_PING: u8 = 0x1e;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATS: u8 = 0xa0;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_SKILLS: u8 = 0xa1;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATE: u8 = 0xa2;
+pub const NATIVE_OTCLIENT_GAME_ANIMATED_TEXT: u8 = 0x84;
 pub const NATIVE_OTCLIENT_GAME_TEXT_MESSAGE: u8 = 0xb4;
 pub const NATIVE_OTCLIENT_GAME_CANCEL_WALK: u8 = 0xb5;
 pub const NATIVE_OTCLIENT_ENTER_GAME: u8 = 0x0f;
@@ -811,6 +812,7 @@ pub const NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT: usize = 14;
 pub const NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS: usize = 8;
 pub const NATIVE_OTCLIENT_PLAYER_ID_START: u32 = 0x1000_0000;
 pub const NATIVE_OTCLIENT_PLAYER_ID_END: u32 = 0x4000_0000;
+pub const NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES: usize = 255;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeOtClientProfile {
@@ -1299,6 +1301,27 @@ pub fn encode_native_otclient_game_status_message(
     let mut writer = Writer::default();
     writer.byte(NATIVE_OTCLIENT_GAME_TEXT_MESSAGE);
     writer.byte(17);
+    writer.string(message);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes a classic map text effect. This avoids the version-specific generic text-message
+/// mode table, which OTCv8's protocol-740 profile does not populate.
+pub fn encode_native_otclient_animated_text(
+    profile: &NativeOtClientProfile,
+    position: NativeOtClientPosition,
+    message: &str,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation()
+        || message.is_empty()
+        || message.len() > NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES
+    {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_ANIMATED_TEXT);
+    write_native_otclient_position(&mut writer, position);
+    writer.byte(215);
     writer.string(message);
     Ok(Frame(writer.finish()))
 }
@@ -1962,6 +1985,27 @@ mod tests {
         assert_eq!(
             &initialization.0[login.0.len() + map.0.len()..],
             bootstrap.0.as_slice()
+        );
+        assert_eq!(
+            encode_native_otclient_animated_text(&profile, snapshot.player_position, "hi",)
+                .unwrap()
+                .0,
+            vec![
+                NATIVE_OTCLIENT_GAME_ANIMATED_TEXT,
+                100,
+                0,
+                100,
+                0,
+                7,
+                215,
+                2,
+                0,
+                b'h',
+                b'i'
+            ]
+        );
+        assert!(
+            encode_native_otclient_animated_text(&profile, snapshot.player_position, "",).is_err()
         );
 
         assert_eq!(

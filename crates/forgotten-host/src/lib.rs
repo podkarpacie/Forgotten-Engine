@@ -14,17 +14,18 @@ use forgotten_protocol::{
     encode_fe_otclient_initial_world, encode_fe_otclient_movement_ack,
     encode_fe_otclient_world_tick, encode_legacy_74_character_list,
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
-    encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
-    encode_native_otclient_game_cancel_walk_facing, encode_native_otclient_game_initialization,
-    encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
-    encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
-    encode_native_otclient_move_creature_at, encode_status_binary, encode_status_xml,
-    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
-    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientCardinalDirection,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPosition,
-    NativeOtClientProfile, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
-    StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
+    encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_animated_text,
+    encode_native_otclient_character_list, encode_native_otclient_game_cancel_walk_facing,
+    encode_native_otclient_game_initialization, encode_native_otclient_game_login_error,
+    encode_native_otclient_game_ping, encode_native_otclient_game_ping_back,
+    encode_native_otclient_login_error, encode_native_otclient_move_creature_at,
+    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
+    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
+    NativeOtClientCardinalDirection, NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction,
+    NativeOtClientPosition, NativeOtClientProfile, OtClientEndpoint, ProtocolError, StatusPlayer,
+    StatusRequest, StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_PLAYER_ID_END,
+    NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -808,6 +809,15 @@ fn handle_native_otclient_game(
             | NativeOtClientGameAction::ChangeOutfit => {}
             NativeOtClientGameAction::Talk(message) => {
                 eprintln!("> Native OTCv8 chat received bytes={}", message.len());
+                write_frame(
+                    stream,
+                    &encode_native_otclient_animated_text(
+                        &config.client_profile,
+                        native_position(player_position),
+                        &message,
+                    )
+                    .map_err(HostError::Protocol)?,
+                )?;
             }
             NativeOtClientGameAction::LeaveGame => break,
             NativeOtClientGameAction::Stop => write_frame(
@@ -1910,6 +1920,23 @@ mod tests {
         );
 
         write_frame(&mut stream, &Frame(vec![0x96, 1, 2, 0, b'h', b'i'])).unwrap();
+        let chat_echo = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            chat_echo.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_ANIMATED_TEXT,
+                102,
+                0,
+                101,
+                0,
+                7,
+                215,
+                2,
+                0,
+                b'h',
+                b'i',
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![0x78, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]),
