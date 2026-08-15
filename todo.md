@@ -54,4 +54,4 @@
 - [x] Load operator-supplied item-definition metadata needed for walkability and client-visible tile layers.
 - [x] Encode layered imported world tiles and movement semantics through the native OTCv8 740 map path.
 - [x] Add hand-authored compatibility fixtures and tests for OTBM, XML companion data, item metadata, import/export, viewport encoding, and walkability.
-- [ ] Package and publish the legacy TFS world-data compatibility release with Linux, Windows, and SHA-256 assets.
+- [x] Package and publish the legacy TFS world-data compatibility release with Linux, Windows, and SHA-256 assets.
