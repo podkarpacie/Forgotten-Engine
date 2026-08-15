@@ -65,4 +65,4 @@
 - [x] Produce a typed conversion inventory that distinguishes parsed registry content from deferred FE gameplay systems.
 - [x] Extend `tfs-audit` with registry counts, missing-reference diagnostics, and deferred-runtime categories.
 - [x] Add self-contained XML registry and CLI audit fixtures without importing private game content.
-- [ ] Package and publish the TFS registry-inventory release with Linux, Windows, and SHA-256 assets.
+- [x] Package and publish the TFS registry-inventory release with Linux, Windows, and SHA-256 assets.
