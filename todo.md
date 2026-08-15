@@ -32,5 +32,8 @@
 - [x] Prevent queued auto-walk steps from racing later client input or causing apparent teleporting.
 - [ ] Emit accepted 740 chat through a client-visible message mode and verify it is rendered by OTCv8.
 - [x] Accept stock 740 right-click use/look frames without terminating the native session.
-- [x] Replace the invalid `0xff` text-message mode with a mode OTCv8 740 renders in its console.
+- [ ] Establish and implement a verified OTCv8 740 client-visible chat layout without using an invalid generic text-message mode.
 - [x] Cancel and discard an in-flight auto-walk when a newer manual client action arrives.
+- [x] Serialize rapid click/manual movement so only one authoritative native movement update is in flight at a time.
+- [x] Stop sending the parser-invalid 740 server text message until its exact supported layout is confirmed.
+- [x] Accept and safely handle the stock 740 outfit-window/change interaction frame.

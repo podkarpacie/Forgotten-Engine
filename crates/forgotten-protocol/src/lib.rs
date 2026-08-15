@@ -802,6 +802,7 @@ pub const NATIVE_OTCLIENT_CLIENT_TURN_WEST: u8 = 0x72;
 pub const NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES: u8 = 0xa0;
 pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM: u8 = 0x82;
+pub const NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT: u8 = 0x78;
 pub const NATIVE_OTCLIENT_UNKNOWN_CREATURE: u16 = 0x0061;
 pub const NATIVE_OTCLIENT_MAPPED_CREATURE: u16 = 0xffff;
 pub const NATIVE_OTCLIENT_TILE_END: u16 = 0xff00;
@@ -977,6 +978,7 @@ pub enum NativeOtClientGameAction {
     AutoWalk(Vec<NativeOtClientAutoWalkDirection>),
     Talk(String),
     UseItem,
+    ChangeOutfit,
     Turn(NativeOtClientCardinalDirection),
     ChangeFightModes,
     CardinalMove(NativeOtClientCardinalDirection),
@@ -1210,6 +1212,13 @@ pub fn decode_native_otclient_game_action(
         NATIVE_OTCLIENT_CLIENT_USE_ITEM => {
             reader.take(9)?;
             NativeOtClientGameAction::UseItem
+        }
+        NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT => {
+            if reader.remaining() > 64 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            reader.take(reader.remaining())?;
+            NativeOtClientGameAction::ChangeOutfit
         }
         NATIVE_OTCLIENT_CLIENT_TALK => {
             let mode = reader.byte()?;
@@ -2014,6 +2023,30 @@ mod tests {
             )
             .unwrap(),
             NativeOtClientGameAction::UseItem
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![
+                    NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT,
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                ]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::ChangeOutfit
         );
         assert_eq!(
             decode_native_otclient_game_action(

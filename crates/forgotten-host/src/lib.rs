@@ -17,15 +17,14 @@ use forgotten_protocol::{
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
     encode_native_otclient_game_cancel_walk_facing, encode_native_otclient_game_initialization,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
-    encode_native_otclient_game_ping_back, encode_native_otclient_game_status_message,
-    encode_native_otclient_login_error, encode_native_otclient_move_creature_at,
-    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
-    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
-    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
-    NativeOtClientCardinalDirection, NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction,
-    NativeOtClientPosition, NativeOtClientProfile, OtClientEndpoint, ProtocolError, StatusPlayer,
-    StatusRequest, StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_PLAYER_ID_END,
-    NATIVE_OTCLIENT_PLAYER_ID_START,
+    encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
+    encode_native_otclient_move_creature_at, encode_status_binary, encode_status_xml,
+    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientCardinalDirection,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPosition,
+    NativeOtClientProfile, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
+    StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -805,15 +804,11 @@ fn handle_native_otclient_game(
             NativeOtClientGameAction::PingBack
             | NativeOtClientGameAction::EnterGame
             | NativeOtClientGameAction::ChangeFightModes
-            | NativeOtClientGameAction::UseItem => {}
-            NativeOtClientGameAction::Talk(message) => write_frame(
-                stream,
-                &encode_native_otclient_game_status_message(
-                    &config.client_profile,
-                    &native_chat_acknowledgement(&message),
-                )
-                .map_err(HostError::Protocol)?,
-            )?,
+            | NativeOtClientGameAction::UseItem
+            | NativeOtClientGameAction::ChangeOutfit => {}
+            NativeOtClientGameAction::Talk(message) => {
+                eprintln!("> Native OTCv8 chat received bytes={}", message.len());
+            }
             NativeOtClientGameAction::LeaveGame => break,
             NativeOtClientGameAction::Stop => write_frame(
                 stream,
@@ -856,6 +851,14 @@ fn handle_native_otclient_game(
                             &config.client_profile,
                             native_autowalk_step_delay(snapshot.player_speed, snapshot.server_beat),
                         )? {
+                            write_frame(
+                                stream,
+                                &encode_native_otclient_game_cancel_walk_facing(
+                                    &config.client_profile,
+                                    facing.protocol_direction(),
+                                )
+                                .map_err(HostError::Protocol)?,
+                            )?;
                             pending_action = Some(action);
                             break 'auto_walk;
                         }
@@ -939,19 +942,6 @@ fn move_native_empty_world_player(
     *facing = direction;
     *remaining_moves -= 1;
     Ok(true)
-}
-
-fn native_chat_acknowledgement(message: &str) -> String {
-    const PREFIX: &str = "You say: ";
-    const MAX_BYTES: usize = 255;
-    let mut acknowledgement = String::from(PREFIX);
-    for character in message.chars() {
-        if acknowledgement.len() + character.len_utf8() > MAX_BYTES {
-            break;
-        }
-        acknowledgement.push(character);
-    }
-    acknowledgement
 }
 
 fn read_native_autowalk_interrupt(
@@ -1889,6 +1879,11 @@ mod tests {
         assert_eq!(&auto_walk_east.0[1..7], &[100, 0, 100, 0, 7, 1]);
         assert_eq!(&auto_walk_east.0[7..12], &[101, 0, 100, 0, 7]);
         write_frame(&mut stream, &Frame(vec![0x67])).unwrap();
+        let interrupted = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            interrupted.0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 1]
+        );
         let manual_movement = read_frame(&mut stream).unwrap();
         assert_eq!(&manual_movement.0[1..7], &[101, 0, 100, 0, 7, 1]);
         assert_eq!(&manual_movement.0[7..12], &[101, 0, 101, 0, 7]);
@@ -1915,28 +1910,12 @@ mod tests {
         );
 
         write_frame(&mut stream, &Frame(vec![0x96, 1, 2, 0, b'h', b'i'])).unwrap();
+        write_frame(
+            &mut stream,
+            &Frame(vec![0x78, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]),
+        )
+        .unwrap();
         write_frame(&mut stream, &Frame(vec![0x69])).unwrap();
-        let chat_status = read_frame(&mut stream).unwrap();
-        assert_eq!(
-            chat_status.0,
-            vec![
-                forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
-                17,
-                11,
-                0,
-                b'Y',
-                b'o',
-                b'u',
-                b' ',
-                b's',
-                b'a',
-                b'y',
-                b':',
-                b' ',
-                b'h',
-                b'i',
-            ]
-        );
         let cancelled = read_frame(&mut stream).unwrap();
         assert_eq!(
             cancelled.0,
