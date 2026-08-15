@@ -807,6 +807,9 @@ fn handle_native_otclient_game(
             | NativeOtClientGameAction::ChangeFightModes
             | NativeOtClientGameAction::UseItem
             | NativeOtClientGameAction::ChangeOutfit => {}
+            NativeOtClientGameAction::IgnoredInteraction(opcode) => {
+                eprintln!("> Native OTCv8 compatibility action ignored opcode=0x{opcode:02x}");
+            }
             NativeOtClientGameAction::Talk(message) => {
                 eprintln!("> Native OTCv8 chat received bytes={}", message.len());
                 write_frame(
@@ -1942,6 +1945,7 @@ mod tests {
             &Frame(vec![0x78, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]),
         )
         .unwrap();
+        write_frame(&mut stream, &Frame(vec![0xa1, 1, 0, 0, 0])).unwrap();
         write_frame(&mut stream, &Frame(vec![0x69])).unwrap();
         let cancelled = read_frame(&mut stream).unwrap();
         assert_eq!(

@@ -39,3 +39,6 @@
 - [x] Accept and safely handle the stock 740 outfit-window/change interaction frame.
 - [x] Encode a bounded stock 740 server-speech record that OTCv8 renders for local diagnostic chat.
 - [ ] Verify the visible chat echo with a real unmodified OTCv8 740 client without parser errors.
+- [x] Audit currently reachable stock OTCv8 740 game actions for session-ending unsupported frames.
+- [x] Safely consume high-frequency selection, combat-target, follow, look, and inventory interaction frames until their full game semantics exist.
+- [x] Add compatibility regression coverage for all newly tolerated native action frames.
