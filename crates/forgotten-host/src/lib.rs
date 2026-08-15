@@ -745,11 +745,27 @@ fn handle_native_otclient_game(
         )?;
         return Ok(());
     };
-    let initial_position = if world_map.is_walkable(character.position) {
-        character.position
-    } else {
-        world_map.spawn()
-    };
+    let mut world = WorldState::default();
+    if let Some(static_spawns) = config.static_spawns.as_deref() {
+        world
+            .install_static_creatures(static_spawns)
+            .map_err(HostError::Core)?;
+    }
+    let initial_position = [character.position, world_map.spawn()]
+        .into_iter()
+        .find(|position| {
+            world_map.is_walkable(*position) && !world.is_static_creature_occupied(*position)
+        })
+        .or_else(|| {
+            world_map.tiles().find_map(|(position, tile)| {
+                (tile.walkable && !world.is_static_creature_occupied(position)).then_some(position)
+            })
+        })
+        .ok_or_else(|| {
+            HostError::InvalidConfiguration(
+                "native map has no walkable tile unoccupied by a static creature".into(),
+            )
+        })?;
     if initial_position != character.position {
         database.update_player_position(character.id, initial_position)?;
     }
@@ -786,7 +802,6 @@ fn handle_native_otclient_game(
     let account_id = u64::try_from(account.id).map_err(|_| {
         HostError::InvalidConfiguration("native numeric account IDs must be non-negative".into())
     })?;
-    let mut world = WorldState::default();
     world
         .add_player(Player {
             id: character.id,
@@ -958,7 +973,7 @@ fn move_native_map_player(
     let destination = player_position
         .step(native_cardinal_direction(direction))
         .map_err(HostError::Core)?;
-    if !world_map.is_walkable(destination) {
+    if !world_map.is_walkable(destination) || world.is_static_creature_occupied(destination) {
         write_frame(
             stream,
             &encode_native_otclient_game_cancel_walk_facing(profile, facing.protocol_direction())
@@ -1901,7 +1916,7 @@ mod tests {
                 name: "Rat".into(),
                 position: Position {
                     x: 101,
-                    y: 100,
+                    y: 102,
                     z: 7,
                 },
                 look_type: 21,
@@ -2083,6 +2098,97 @@ mod tests {
         assert_eq!(
             turned.0,
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 2]
+        );
+
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn static_creature_occupancy_cancels_native_player_movement() {
+        let database_path = database_path("native-static-occupancy");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.static_spawns = Some(Arc::new(
+            FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
+                id: NATIVE_OTCLIENT_PLAYER_ID_END + 1,
+                name: "Rat".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 100,
+                direction: 2,
+            }])
+            .unwrap(),
+        ));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let initialization = read_frame(&mut stream).unwrap();
+        assert!(initialization.0.windows(3).any(|window| window == b"Rat"));
+        let heartbeat = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            heartbeat.0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_PING]
+        );
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING_BACK]),
+        )
+        .unwrap();
+        write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
+        let blocked = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            blocked.0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 2]
+        );
+        let character = database
+            .characters_for_account(account_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            character.position,
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            }
         );
 
         game.shutdown().unwrap();

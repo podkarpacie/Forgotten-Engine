@@ -478,6 +478,8 @@ impl Player {
 #[derive(Debug, Default)]
 pub struct WorldState {
     players: BTreeMap<u64, Player>,
+    static_creatures: BTreeMap<u32, FeTfsStaticEntity>,
+    static_occupied_positions: std::collections::BTreeSet<Position>,
     tick: u64,
 }
 
@@ -498,8 +500,57 @@ impl WorldState {
         if self.players.contains_key(&player.id) {
             return Err(CoreError::DuplicatePlayer(player.id));
         }
+        if self.is_static_creature_occupied(player.position) {
+            return Err(CoreError::StaticCreatureOccupiesPosition(player.position));
+        }
         self.players.insert(player.id, player);
         Ok(())
+    }
+
+    /// Replaces the immutable display-only static creature set. This intentionally carries no
+    /// respawn, AI, combat, movement, script, or lifecycle scheduling behavior.
+    pub fn install_static_creatures(
+        &mut self,
+        collection: &FeTfsStaticSpawnCollection,
+    ) -> Result<(), CoreError> {
+        if collection.entities.len() > MAX_TFS_STATIC_SPAWNS {
+            return Err(CoreError::StaticSpawnLimit(MAX_TFS_STATIC_SPAWNS));
+        }
+        let mut creatures = BTreeMap::new();
+        let mut occupied_positions = std::collections::BTreeSet::new();
+        for entity in &collection.entities {
+            if entity.name.trim().is_empty() {
+                return Err(CoreError::EmptyStaticSpawnName);
+            }
+            if creatures.insert(entity.id, entity.clone()).is_some() {
+                return Err(CoreError::DuplicateStaticSpawnId(entity.id));
+            }
+            if self
+                .players
+                .values()
+                .any(|player| player.position == entity.position)
+            {
+                return Err(CoreError::PlayerOccupiesStaticCreaturePosition(
+                    entity.position,
+                ));
+            }
+            occupied_positions.insert(entity.position);
+        }
+        self.static_creatures = creatures;
+        self.static_occupied_positions = occupied_positions;
+        Ok(())
+    }
+
+    pub fn static_creature_count(&self) -> usize {
+        self.static_creatures.len()
+    }
+
+    pub fn static_creature(&self, id: u32) -> Option<&FeTfsStaticEntity> {
+        self.static_creatures.get(&id)
+    }
+
+    pub fn is_static_creature_occupied(&self, position: Position) -> bool {
+        self.static_occupied_positions.contains(&position)
     }
 
     pub fn player(&self, id: u64) -> Option<&Player> {
@@ -507,6 +558,9 @@ impl WorldState {
     }
 
     pub fn move_player(&mut self, id: u64, destination: Position) -> Result<(), CoreError> {
+        if self.is_static_creature_occupied(destination) {
+            return Err(CoreError::StaticCreatureOccupiesPosition(destination));
+        }
         let player = self
             .players
             .get_mut(&id)
@@ -572,6 +626,8 @@ pub enum CoreError {
     StaticSpawnLimit(usize),
     DuplicateStaticSpawnId(u32),
     EmptyStaticSpawnName,
+    StaticCreatureOccupiesPosition(Position),
+    PlayerOccupiesStaticCreaturePosition(Position),
     InvalidMap(String),
     InvalidTransition {
         state: ServerStatus,
@@ -799,5 +855,80 @@ mod tests {
             ]),
             Err(CoreError::DuplicateStaticSpawnId(0x4000_0001))
         );
+    }
+
+    #[test]
+    fn static_creatures_are_authoritative_occupants_without_runtime_behavior() {
+        let position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let creature = FeTfsStaticEntity {
+            id: 0x4000_0001,
+            name: "Rat".into(),
+            position,
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let collection = FeTfsStaticSpawnCollection::new(vec![creature.clone()]).unwrap();
+        let mut world = WorldState::default();
+        world.install_static_creatures(&collection).unwrap();
+        assert_eq!(world.static_creature_count(), 1);
+        assert_eq!(world.static_creature(creature.id), Some(&creature));
+        assert!(world.is_static_creature_occupied(position));
+
+        world.add_player(player()).unwrap();
+        assert_eq!(
+            world.move_player(
+                7,
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+            Err(CoreError::StaticCreatureOccupiesPosition(position))
+        );
+        assert_eq!(world.player(7).unwrap().position.x, 100);
+        assert_eq!(world.static_creature(creature.id), Some(&creature));
+    }
+
+    #[test]
+    fn static_creature_registration_rejects_existing_player_overlap() {
+        let position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        let collection = FeTfsStaticSpawnCollection::new(vec![FeTfsStaticEntity {
+            id: 0x4000_0001,
+            name: "Rat".into(),
+            position,
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        }])
+        .unwrap();
+        assert_eq!(
+            world.install_static_creatures(&collection),
+            Err(CoreError::PlayerOccupiesStaticCreaturePosition(position))
+        );
+        assert_eq!(world.static_creature_count(), 0);
     }
 }

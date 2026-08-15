@@ -78,3 +78,8 @@
 - [x] Thread static spawn entities through the native 740 world-initialization contract without claiming AI, combat, or Lua support.
 - [x] Add self-contained static-spawn, appearance, and native-map regression fixtures.
 - [x] Package and publish the static TFS spawn-runtime foundation release with Linux, Windows, and SHA-256 assets.
+- [x] Audit authoritative world-state and native map update boundaries for static creature occupancy.
+- [x] Model bounded resolved static creatures in FE world state without adding respawn, AI, combat, movement, or Lua behavior.
+- [x] Reject native player movement into occupied static creature tiles while preserving current map and player collision rules.
+- [x] Add self-contained authoritative occupancy and native movement regression coverage.
+- [x] Package and publish the static creature occupancy foundation release with Linux, Windows, and SHA-256 assets.
