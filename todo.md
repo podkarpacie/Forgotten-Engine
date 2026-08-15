@@ -140,3 +140,8 @@
 - [x] Apply rapid new click paths as latest intent only, without immediate movement, path accumulation, or cadence reset.
 - [x] Add deterministic TFS-style rapid-click, replacement, and manual-interruption regression coverage.
 - [x] Package and publish the TFS-style native click-walk scheduling patch release with Linux, Windows, and SHA-256 assets.
+- [x] Verify FE 7.4.36 repeated native click-path scheduling and default-console shared chat delivery through focused automated protocol/session tests, documenting the remaining live OTClientV8 visual confirmation.
+- [x] Audit TFS and classic client 7.4 public-chat packet behavior without copying upstream implementation code.
+- [x] Replace the currently broken native 740 shared public-chat encoder with a bounded TFS-compatible record.
+- [x] Add end-to-end native chat input, broadcast, and client-record regression coverage beyond a mode-only assertion.
+- [x] Package and publish the native 740 chat compatibility patch release with Linux, Windows, and SHA-256 assets.

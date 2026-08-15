@@ -22,18 +22,18 @@ use forgotten_protocol::{
     encode_native_otclient_game_cancel_walk_facing,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
-    encode_native_otclient_game_ping_back, encode_native_otclient_game_status_message,
-    encode_native_otclient_login_error,
+    encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
     encode_native_otclient_map_step_with_static_spawns_and_players,
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
-    encode_native_otclient_move_creature_at, encode_status_binary, encode_status_xml,
-    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
-    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
-    NativeOtClientCardinalDirection, NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction,
-    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
-    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    encode_native_otclient_move_creature_at, encode_native_otclient_public_say,
+    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
+    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
+    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPosition,
+    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
+    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -140,6 +140,8 @@ pub struct SharedNativeWorld {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SharedPublicChatEvent {
+    speaker_name: String,
+    speaker_position: NativeOtClientPosition,
     text: String,
 }
 
@@ -262,7 +264,9 @@ impl SharedNativeWorld {
             return Ok(0);
         }
         let event = SharedPublicChatEvent {
-            text: truncate_native_chat_text(&format!("{}: {body}", sender.name)),
+            speaker_name: sender.name,
+            speaker_position: native_position(sender.position),
+            text: truncate_native_chat_text(&body),
         };
         let mut recipients = self
             .chat_recipients
@@ -1337,8 +1341,13 @@ fn drain_shared_public_chat(
         match events.try_recv() {
             Ok(event) => write_frame(
                 stream,
-                &encode_native_otclient_game_status_message(profile, &event.text)
-                    .map_err(HostError::Protocol)?,
+                &encode_native_otclient_public_say(
+                    profile,
+                    &event.speaker_name,
+                    event.speaker_position,
+                    &event.text,
+                )
+                .map_err(HostError::Protocol)?,
             )?,
             Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return Ok(()),
         }
@@ -2540,7 +2549,9 @@ mod tests {
             2
         );
         let expected = SharedPublicChatEvent {
-            text: "Knight: hello world".into(),
+            speaker_name: "Knight".into(),
+            speaker_position: native_position(map.spawn()),
+            text: "hello world".into(),
         };
         assert_eq!(knight_events.try_recv().unwrap(), expected);
         assert_eq!(druid_events.try_recv().unwrap(), expected);
@@ -2552,15 +2563,13 @@ mod tests {
             2
         );
         let capped = knight_events.try_recv().unwrap();
-        assert!(capped.text.starts_with("Knight: "));
+        assert_eq!(capped.speaker_name, "Knight");
+        assert_eq!(capped.speaker_position, native_position(map.spawn()));
         assert_eq!(capped.text.len(), NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES);
         assert_eq!(druid_events.try_recv().unwrap(), capped);
         shared.unregister_public_chat_recipient(102);
         assert_eq!(shared.broadcast_public_chat(101, "again").unwrap(), 1);
-        assert_eq!(
-            knight_events.try_recv().unwrap().text,
-            "Knight: again".to_string()
-        );
+        assert_eq!(knight_events.try_recv().unwrap().text, "again".to_string());
         assert!(matches!(
             druid_events.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
@@ -3073,9 +3082,8 @@ mod tests {
         assert_eq!(
             chat_echo.0,
             vec![
-                forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
-                forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_CONSOLE_BLUE,
-                10,
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_TALK,
+                6,
                 0,
                 b'K',
                 b'n',
@@ -3083,8 +3091,14 @@ mod tests {
                 b'g',
                 b'h',
                 b't',
-                b':',
-                b' ',
+                forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_SAY,
+                101,
+                0,
+                100,
+                0,
+                7,
+                2,
+                0,
                 b'h',
                 b'i',
             ]
