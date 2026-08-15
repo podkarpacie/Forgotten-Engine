@@ -59,4 +59,4 @@
 - [x] Accept TFS-compatible configuration defaults and discover standard world, item, spawn, and house file locations without FE-only rewrites.
 - [x] Add an explicit CLI conversion-readiness audit that distinguishes importable content from unavailable FE runtime systems.
 - [x] Add self-contained representative TFS-layout fixtures covering config, OTBM, items, and companion-file discovery.
-- [ ] Package and publish the TFS conversion-readiness release with Linux, Windows, and SHA-256 assets.
+- [x] Package and publish the TFS conversion-readiness release with Linux, Windows, and SHA-256 assets.
