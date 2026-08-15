@@ -30,10 +30,10 @@ use forgotten_protocol::{
     encode_native_otclient_move_creature_at, encode_status_binary, encode_status_xml,
     generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
     CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientCardinalDirection,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPosition,
-    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
-    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
+    NativeOtClientCardinalDirection, NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction,
+    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
+    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -1229,6 +1229,22 @@ fn handle_native_otclient_game(
                     observed_visibility_epoch = shared_world.visibility_epoch();
                 }
             }
+            NativeOtClientGameAction::DiagonalMove(direction) => {
+                if move_native_map_player_diagonal(
+                    stream,
+                    &config.client_profile,
+                    &snapshot,
+                    &database,
+                    shared_world,
+                    character.id,
+                    world_map,
+                    &mut player_position,
+                    &mut facing,
+                    direction,
+                )? {
+                    observed_visibility_epoch = shared_world.visibility_epoch();
+                }
+            }
         }
     }
     record_event(
@@ -1409,6 +1425,96 @@ fn move_native_map_player(
         )
         .map_err(HostError::Protocol)?,
     )?;
+    *player_position = destination;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn move_native_map_player_diagonal(
+    stream: &mut TcpStream,
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    database: &EngineDatabase,
+    shared_world: &SharedNativeWorld,
+    character_id: u64,
+    world_map: &WorldMap,
+    player_position: &mut Position,
+    facing: &mut NativeOtClientCardinalDirection,
+    direction: NativeOtClientAutoWalkDirection,
+) -> Result<bool, HostError> {
+    let steps = direction.cardinal_steps();
+    debug_assert_eq!(steps.len(), 2);
+    let moved = {
+        let mut world = shared_world.lock()?;
+        let source = world
+            .player(character_id)
+            .ok_or(forgotten_core::CoreError::UnknownPlayer(character_id))
+            .map_err(HostError::Core)?
+            .position;
+        let intermediate = source
+            .step(native_cardinal_direction(steps[0]))
+            .map_err(HostError::Core)?;
+        let destination = intermediate
+            .step(native_cardinal_direction(steps[1]))
+            .map_err(HostError::Core)?;
+        let blocked = [intermediate, destination].into_iter().any(|position| {
+            !world_map.is_walkable(position)
+                || world.is_static_creature_occupied(position)
+                || world.is_player_occupied(position)
+        });
+        if blocked {
+            None
+        } else {
+            world
+                .move_player(character_id, destination)
+                .map_err(HostError::Core)?;
+            let active_static_spawns = world.active_static_spawn_collection();
+            Some((source, intermediate, destination, active_static_spawns))
+        }
+    };
+    let Some((previous, intermediate, destination, active_static_spawns)) = moved else {
+        write_frame(
+            stream,
+            &encode_native_otclient_game_cancel_walk_facing(profile, facing.protocol_direction())
+                .map_err(HostError::Protocol)?,
+        )?;
+        return Ok(false);
+    };
+    shared_world.mark_visibility_changed();
+    database.update_player_position(character_id, destination)?;
+    *facing = steps[1];
+    write_frame(
+        stream,
+        &encode_native_otclient_move_creature_at(
+            profile,
+            native_position(previous),
+            1,
+            native_position(destination),
+        )
+        .map_err(HostError::Protocol)?,
+    )?;
+    let visible_players = shared_world.visible_players(
+        character_id,
+        snapshot.player_look_type,
+        snapshot.player_speed,
+    )?;
+    for (step, position) in [(steps[0], intermediate), (steps[1], destination)] {
+        let mut refreshed_snapshot = snapshot.clone();
+        refreshed_snapshot.player_position = native_position(position);
+        refreshed_snapshot.player_direction = step.protocol_direction();
+        write_frame(
+            stream,
+            &encode_native_otclient_map_step_with_static_spawns_and_players(
+                profile,
+                &refreshed_snapshot,
+                world_map,
+                Some(&active_static_spawns),
+                Some(&visible_players),
+                step,
+            )
+            .map_err(HostError::Protocol)?,
+        )?;
+    }
     *player_position = destination;
     Ok(true)
 }
@@ -2744,6 +2850,20 @@ mod tests {
                 },
             )
             .unwrap();
+        Arc::get_mut(native_config.world_map.as_mut().unwrap())
+            .unwrap()
+            .set_tile(
+                Position {
+                    x: 101,
+                    y: 99,
+                    z: 7,
+                },
+                WorldMapTile {
+                    ground_thing_id: 102,
+                    walkable: false,
+                },
+            )
+            .unwrap();
         let game = start_native_otclient_game(native_config, &database_path).unwrap();
 
         let mut stream = TcpStream::connect(game.local_addr()).unwrap();
@@ -2867,6 +2987,44 @@ mod tests {
             102
         );
 
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_NORTH_WEST,
+            ]),
+        )
+        .unwrap();
+        let diagonal_movement = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            diagonal_movement.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
+        );
+        assert_eq!(&diagonal_movement.0[1..7], &[102, 0, 101, 0, 7, 1]);
+        assert_eq!(&diagonal_movement.0[7..12], &[101, 0, 100, 0, 7]);
+        let north_edge = read_frame(&mut stream).unwrap();
+        assert_eq!(north_edge.0[0], 0x65);
+        let west_edge = read_frame(&mut stream).unwrap();
+        assert_eq!(west_edge.0[0], 0x68);
+        let diagonal_position = database.characters_for_account(account_id).unwrap()[0].position;
+        assert_eq!(diagonal_position.x, 101);
+        assert_eq!(diagonal_position.y, 100);
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_NORTH_WEST,
+            ]),
+        )
+        .unwrap();
+        let blocked_diagonal = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            blocked_diagonal.0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 3]
+        );
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].position,
+            diagonal_position
+        );
+
         write_frame(&mut stream, &Frame(vec![0x96, 1, 2, 0, b'h', b'i'])).unwrap();
         let chat_echo = read_frame(&mut stream).unwrap();
         assert_eq!(
@@ -2898,7 +3056,7 @@ mod tests {
         let cancelled = read_frame(&mut stream).unwrap();
         assert_eq!(
             cancelled.0,
-            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 1]
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 3]
         );
         write_frame(&mut stream, &Frame(vec![0x71])).unwrap();
         let turned = read_frame(&mut stream).unwrap();

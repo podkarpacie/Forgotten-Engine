@@ -801,6 +801,10 @@ pub const NATIVE_OTCLIENT_CLIENT_PING: u8 = 0x1d;
 pub const NATIVE_OTCLIENT_CLIENT_PING_BACK: u8 = 0x1e;
 pub const NATIVE_OTCLIENT_CLIENT_AUTO_WALK: u8 = 0x64;
 pub const NATIVE_OTCLIENT_CLIENT_STOP: u8 = 0x69;
+pub const NATIVE_OTCLIENT_CLIENT_WALK_NORTH_EAST: u8 = 0x6a;
+pub const NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_EAST: u8 = 0x6b;
+pub const NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_WEST: u8 = 0x6c;
+pub const NATIVE_OTCLIENT_CLIENT_WALK_NORTH_WEST: u8 = 0x6d;
 pub const NATIVE_OTCLIENT_CLIENT_TURN_NORTH: u8 = 0x6f;
 pub const NATIVE_OTCLIENT_CLIENT_TURN_EAST: u8 = 0x70;
 pub const NATIVE_OTCLIENT_CLIENT_TURN_SOUTH: u8 = 0x71;
@@ -954,6 +958,16 @@ pub enum NativeOtClientAutoWalkDirection {
 }
 
 impl NativeOtClientAutoWalkDirection {
+    fn from_direct_diagonal_opcode(opcode: u8) -> Option<Self> {
+        match opcode {
+            NATIVE_OTCLIENT_CLIENT_WALK_NORTH_EAST => Some(Self::NorthEast),
+            NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_EAST => Some(Self::SouthEast),
+            NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_WEST => Some(Self::SouthWest),
+            NATIVE_OTCLIENT_CLIENT_WALK_NORTH_WEST => Some(Self::NorthWest),
+            _ => None,
+        }
+    }
+
     fn from_native_byte(byte: u8) -> Option<Self> {
         match byte {
             1 => Some(Self::East),
@@ -1012,6 +1026,7 @@ pub enum NativeOtClientGameAction {
     Turn(NativeOtClientCardinalDirection),
     ChangeFightModes,
     CardinalMove(NativeOtClientCardinalDirection),
+    DiagonalMove(NativeOtClientAutoWalkDirection),
 }
 
 pub fn decode_native_otclient_login_request(
@@ -1590,6 +1605,10 @@ pub fn decode_native_otclient_game_action(
         }
         opcode => NativeOtClientCardinalDirection::from_client_opcode(opcode)
             .map(NativeOtClientGameAction::CardinalMove)
+            .or_else(|| {
+                NativeOtClientAutoWalkDirection::from_direct_diagonal_opcode(opcode)
+                    .map(NativeOtClientGameAction::DiagonalMove)
+            })
             .or_else(|| {
                 NativeOtClientCardinalDirection::from_turn_opcode(opcode)
                     .map(NativeOtClientGameAction::Turn)
@@ -2783,6 +2802,39 @@ mod tests {
                 .unwrap(),
             NativeOtClientGameAction::Stop
         );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_WALK_NORTH_EAST]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::DiagonalMove(NativeOtClientAutoWalkDirection::NorthEast)
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_EAST]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::DiagonalMove(NativeOtClientAutoWalkDirection::SouthEast)
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_WEST]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::DiagonalMove(NativeOtClientAutoWalkDirection::SouthWest)
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_WALK_NORTH_WEST]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::DiagonalMove(NativeOtClientAutoWalkDirection::NorthWest)
+        );
+        assert!(decode_native_otclient_game_action(&Frame(vec![0x6e]), &profile,).is_err());
         assert_eq!(
             decode_native_otclient_game_action(
                 &Frame(vec![NATIVE_OTCLIENT_CLIENT_TURN_SOUTH]),

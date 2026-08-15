@@ -127,3 +127,7 @@
 - [x] Add an opt-in `run --ed` extended diagnostic mode with bounded native-session, movement, and disconnect metadata while never logging account credentials or packet bodies.
 - [x] Replace per-step full viewport movement refreshes that cause visible short-distance teleports during rapid click-to-walk input.
 - [x] Encode native 740 shared chat through the stock default console tab rather than the current animated-text fallback.
+- [x] Diagnose the native 740 disconnect caused by diagonal numpad movement input.
+- [x] Decode and apply bounded authoritative diagonal movement while preserving map bounds, walkability, and occupancy safeguards.
+- [x] Add diagonal input codec and native-session regression coverage.
+- [x] Package and publish the native 740 diagonal-input patch release with Linux, Windows, and SHA-256 assets.
