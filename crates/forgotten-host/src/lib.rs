@@ -1175,7 +1175,10 @@ fn handle_native_otclient_game(
                 )?;
             }
             NativeOtClientGameAction::AutoWalk(path) => {
-                'auto_walk: for direction in path {
+                let mut scheduled_path = path;
+                'auto_walk: while !scheduled_path.is_empty() {
+                    let direction = scheduled_path.remove(0);
+                    let mut replaced_path = false;
                     for cardinal in direction.cardinal_steps() {
                         if !move_native_map_player(
                             stream,
@@ -1192,11 +1195,37 @@ fn handle_native_otclient_game(
                             break 'auto_walk;
                         }
                         observed_visibility_epoch = shared_world.visibility_epoch();
-                        if let Some(action) = read_native_autowalk_interrupt(
-                            stream,
-                            &config.client_profile,
-                            native_autowalk_step_delay(snapshot.player_speed, snapshot.server_beat),
-                        )? {
+                        let step_deadline = Instant::now()
+                            + native_autowalk_step_delay(
+                                snapshot.player_speed,
+                                snapshot.server_beat,
+                            );
+                        loop {
+                            let remaining = step_deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            let Some(action) = read_native_autowalk_interrupt(
+                                stream,
+                                &config.client_profile,
+                                remaining,
+                            )?
+                            else {
+                                break;
+                            };
+                            if let NativeOtClientGameAction::AutoWalk(replacement) = action {
+                                write_frame(
+                                    stream,
+                                    &encode_native_otclient_game_cancel_walk_facing(
+                                        &config.client_profile,
+                                        facing.protocol_direction(),
+                                    )
+                                    .map_err(HostError::Protocol)?,
+                                )?;
+                                scheduled_path = replacement;
+                                replaced_path = true;
+                                continue;
+                            }
                             if !matches!(action, NativeOtClientGameAction::Stop) {
                                 write_frame(
                                     stream,
@@ -1209,6 +1238,9 @@ fn handle_native_otclient_game(
                             }
                             pending_action = Some(action);
                             break 'auto_walk;
+                        }
+                        if replaced_path {
+                            continue 'auto_walk;
                         }
                     }
                 }
@@ -2925,15 +2957,32 @@ mod tests {
             auto_walk_edge.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
         );
+        write_frame(&mut stream, &Frame(vec![0x64, 1, 7])).unwrap();
+        write_frame(&mut stream, &Frame(vec![0x64, 1, 5])).unwrap();
+        let first_replacement_cancel = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            first_replacement_cancel.0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 1]
+        );
+        let second_replacement_cancel = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            second_replacement_cancel.0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 1]
+        );
+        let latest_path_movement = read_frame(&mut stream).unwrap();
+        assert_eq!(&latest_path_movement.0[1..7], &[101, 0, 100, 0, 7, 1]);
+        assert_eq!(&latest_path_movement.0[7..12], &[100, 0, 100, 0, 7]);
+        let latest_path_edge = read_frame(&mut stream).unwrap();
+        assert_eq!(latest_path_edge.0[0], 0x68);
         write_frame(&mut stream, &Frame(vec![0x67])).unwrap();
         let interrupted = read_frame(&mut stream).unwrap();
         assert_eq!(
             interrupted.0,
-            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 1]
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 3]
         );
         let manual_movement = read_frame(&mut stream).unwrap();
-        assert_eq!(&manual_movement.0[1..7], &[101, 0, 100, 0, 7, 1]);
-        assert_eq!(&manual_movement.0[7..12], &[101, 0, 101, 0, 7]);
+        assert_eq!(&manual_movement.0[1..7], &[100, 0, 100, 0, 7, 1]);
+        assert_eq!(&manual_movement.0[7..12], &[100, 0, 101, 0, 7]);
         let manual_edge = read_frame(&mut stream).unwrap();
         assert_eq!(
             manual_edge.0[0],
@@ -2950,8 +2999,8 @@ mod tests {
             movement.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
         );
-        assert_eq!(&movement.0[1..7], &[101, 0, 101, 0, 7, 1]);
-        assert_eq!(&movement.0[7..12], &[102, 0, 101, 0, 7]);
+        assert_eq!(&movement.0[1..7], &[100, 0, 101, 0, 7, 1]);
+        assert_eq!(&movement.0[7..12], &[101, 0, 101, 0, 7]);
         let movement_edge = read_frame(&mut stream).unwrap();
         assert_eq!(
             movement_edge.0[0],
@@ -2965,7 +3014,7 @@ mod tests {
             database.characters_for_account(account_id).unwrap()[0]
                 .position
                 .x,
-            102
+            101
         );
         assert_eq!(
             database.characters_for_account(account_id).unwrap()[0]
@@ -2973,6 +3022,13 @@ mod tests {
                 .y,
             101
         );
+
+        write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
+        let second_east = read_frame(&mut stream).unwrap();
+        assert_eq!(&second_east.0[1..7], &[101, 0, 101, 0, 7, 1]);
+        assert_eq!(&second_east.0[7..12], &[102, 0, 101, 0, 7]);
+        let second_east_edge = read_frame(&mut stream).unwrap();
+        assert_eq!(second_east_edge.0[0], 0x66);
 
         write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
         let blocked_movement = read_frame(&mut stream).unwrap();

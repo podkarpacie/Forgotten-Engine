@@ -131,3 +131,7 @@
 - [x] Decode and apply bounded authoritative diagonal movement while preserving map bounds, walkability, and occupancy safeguards.
 - [x] Add diagonal input codec and native-session regression coverage.
 - [x] Package and publish the native 740 diagonal-input patch release with Linux, Windows, and SHA-256 assets.
+- [x] Diagnose rapid native 740 click-to-walk frame accumulation that accelerates movement and produces visible tile-by-tile teleporting.
+- [x] Replace stale click paths with the latest bounded movement intent while retaining one authoritative step per configured movement interval.
+- [x] Add rapid-click path replacement and movement-rate regression coverage.
+- [x] Package and publish the native 740 click-path scheduling patch release with Linux, Windows, and SHA-256 assets.
