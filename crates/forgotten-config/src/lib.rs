@@ -3,6 +3,7 @@
 //! The loader recognizes a deliberately limited `config.lua` assignment subset. It does not
 //! execute Lua; a sandboxed scripting runtime belongs to a later milestone.
 
+use forgotten_core::{Position, WorldMap, WorldMapTile};
 use forgotten_protocol::{profile_by_id, CompatibilityProfile, NativeOtClientProfile};
 use std::collections::BTreeMap;
 use std::fs;
@@ -12,6 +13,8 @@ use std::path::{Path, PathBuf};
 pub const CONFIG_FILE_NAME: &str = "config.lua";
 pub const CONTENT_MANIFEST_NAME: &str = "fe-content.manifest";
 pub const EMPTY_WORLD_MANIFEST_NAME: &str = "fe-empty-world.manifest";
+pub const FE_MAP_EXTENSION: &str = "femap";
+pub const FE_MAP_FORMAT: &str = "fe-map-v1";
 pub const REQUIRED_CONTENT_DIRECTORIES: [&str; 15] = [
     "actions",
     "creaturescripts",
@@ -307,7 +310,187 @@ pub fn ensure_content_skeleton(world_directory: impl AsRef<Path>) -> Result<(), 
         )
         .map_err(ConfigError::Io)?;
     }
+    let default_map = data
+        .join("world")
+        .join(format!("forgotten.{FE_MAP_EXTENSION}"));
+    if !default_map.exists() {
+        fs::write(
+            default_map,
+            "# Forgotten Engine original map document\nformat=fe-map-v1\nspawn=100,100,7\n# x1,y1,x2,y2,z,groundThingId,walkable\nfill=80,80,120,120,7,0,true\n",
+        )
+        .map_err(ConfigError::Io)?;
+    }
     Ok(())
+}
+
+pub fn world_map_path(config: &EngineConfig) -> Result<PathBuf, ConfigError> {
+    if config.map_name.is_empty()
+        || !config.map_name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
+    {
+        return Err(ConfigError::InvalidContent(
+            "mapName must contain only ASCII letters, digits, underscores, or hyphens".into(),
+        ));
+    }
+    Ok(config
+        .content_directory
+        .join("world")
+        .join(format!("{}.{}", config.map_name, FE_MAP_EXTENSION)))
+}
+
+pub fn load_world_map(config: &EngineConfig) -> Result<WorldMap, ConfigError> {
+    let path = world_map_path(config)?;
+    let source = fs::read_to_string(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ConfigError::InvalidContent(format!(
+                "missing selected map {}; expected an original {} document",
+                path.display(),
+                FE_MAP_EXTENSION
+            ))
+        } else {
+            ConfigError::Io(error)
+        }
+    })?;
+    parse_world_map(&config.map_name, &source)
+}
+
+fn parse_world_map(identifier: &str, source: &str) -> Result<WorldMap, ConfigError> {
+    let mut format_seen = false;
+    let mut spawn = None;
+    let mut declarations = Vec::new();
+    for (index, raw_line) in source.lines().enumerate() {
+        let line = raw_line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or(ConfigError::InvalidContent(format!(
+                "map line {} must use key=value syntax",
+                index + 1
+            )))?;
+        match key.trim() {
+            "format" if value.trim() == FE_MAP_FORMAT => format_seen = true,
+            "format" => {
+                return Err(ConfigError::InvalidContent(format!(
+                    "map line {} must declare format={FE_MAP_FORMAT}",
+                    index + 1
+                )))
+            }
+            "spawn" => {
+                if spawn.is_some() {
+                    return Err(ConfigError::InvalidContent(
+                        "map declares spawn more than once".into(),
+                    ));
+                }
+                spawn = Some(parse_position(value.trim(), index + 1)?);
+            }
+            "tile" | "fill" => declarations.push((key.trim(), value.trim(), index + 1)),
+            other => {
+                return Err(ConfigError::InvalidContent(format!(
+                    "map line {} has unsupported key `{other}`",
+                    index + 1
+                )))
+            }
+        }
+    }
+    if !format_seen {
+        return Err(ConfigError::InvalidContent(format!(
+            "map must declare format={FE_MAP_FORMAT}"
+        )));
+    }
+    let spawn =
+        spawn.ok_or_else(|| ConfigError::InvalidContent("map must declare spawn=x,y,z".into()))?;
+    let mut map = WorldMap::new(identifier, spawn);
+    for (kind, value, line) in declarations {
+        match kind {
+            "tile" => {
+                let fields = split_map_fields(value, 5, line)?;
+                let position = parse_position_fields(&fields[0..3], line)?;
+                let tile = parse_tile_fields(&fields[3..5], line)?;
+                map.set_tile(position, tile).map_err(|error| {
+                    ConfigError::InvalidContent(format!("map line {line}: {error}"))
+                })?;
+            }
+            "fill" => {
+                let fields = split_map_fields(value, 7, line)?;
+                let x_start = parse_map_u16(fields[0], line, "x1")?;
+                let y_start = parse_map_u16(fields[1], line, "y1")?;
+                let x_end = parse_map_u16(fields[2], line, "x2")?;
+                let y_end = parse_map_u16(fields[3], line, "y2")?;
+                let z = parse_map_u8(fields[4], line, "z")?;
+                if x_start > x_end || y_start > y_end {
+                    return Err(ConfigError::InvalidContent(format!(
+                        "map line {line}: fill bounds must be ascending"
+                    )));
+                }
+                let tile = parse_tile_fields(&fields[5..7], line)?;
+                for x in x_start..=x_end {
+                    for y in y_start..=y_end {
+                        map.set_tile(Position { x, y, z }, tile).map_err(|error| {
+                            ConfigError::InvalidContent(format!("map line {line}: {error}"))
+                        })?;
+                    }
+                }
+            }
+            _ => unreachable!("map declarations were validated"),
+        }
+    }
+    map.validate()
+        .map_err(|error| ConfigError::InvalidContent(format!("invalid map: {error}")))?;
+    Ok(map)
+}
+
+fn split_map_fields(value: &str, expected: usize, line: usize) -> Result<Vec<&str>, ConfigError> {
+    let fields = value.split(',').map(str::trim).collect::<Vec<_>>();
+    if fields.len() != expected || fields.iter().any(|field| field.is_empty()) {
+        return Err(ConfigError::InvalidContent(format!(
+            "map line {line}: expected {expected} comma-separated values"
+        )));
+    }
+    Ok(fields)
+}
+
+fn parse_position(value: &str, line: usize) -> Result<Position, ConfigError> {
+    let fields = split_map_fields(value, 3, line)?;
+    parse_position_fields(&fields, line)
+}
+
+fn parse_position_fields(fields: &[&str], line: usize) -> Result<Position, ConfigError> {
+    Ok(Position {
+        x: parse_map_u16(fields[0], line, "x")?,
+        y: parse_map_u16(fields[1], line, "y")?,
+        z: parse_map_u8(fields[2], line, "z")?,
+    })
+}
+
+fn parse_tile_fields(fields: &[&str], line: usize) -> Result<WorldMapTile, ConfigError> {
+    let walkable = match fields[1] {
+        "true" => true,
+        "false" => false,
+        _ => {
+            return Err(ConfigError::InvalidContent(format!(
+                "map line {line}: walkable must be true or false"
+            )))
+        }
+    };
+    Ok(WorldMapTile {
+        ground_thing_id: parse_map_u16(fields[0], line, "groundThingId")?,
+        walkable,
+    })
+}
+
+fn parse_map_u16(value: &str, line: usize, field: &str) -> Result<u16, ConfigError> {
+    value
+        .parse::<u16>()
+        .map_err(|_| ConfigError::InvalidContent(format!("map line {line}: {field} must be a u16")))
+}
+
+fn parse_map_u8(value: &str, line: usize, field: &str) -> Result<u8, ConfigError> {
+    value
+        .parse::<u8>()
+        .map_err(|_| ConfigError::InvalidContent(format!("map line {line}: {field} must be a u8")))
 }
 
 pub fn validate_content(world_directory: impl AsRef<Path>) -> Result<ContentReport, ConfigError> {
@@ -742,6 +925,33 @@ mod tests {
             .unwrap()
             .empty_world_manifest
             .is_file());
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn parses_the_generated_original_map_document_and_rejects_an_unwalkable_spawn() {
+        let world = temporary_world("map-document");
+        ensure_content_skeleton(&world).unwrap();
+        let source = fs::read_to_string(world.join("data/world/forgotten.femap")).unwrap();
+        let map = parse_world_map("forgotten", &source).unwrap();
+        assert_eq!(map.identifier(), "forgotten");
+        assert_eq!(
+            map.spawn(),
+            Position {
+                x: 100,
+                y: 100,
+                z: 7
+            }
+        );
+        assert!(map.is_walkable(map.spawn()));
+        assert!(map.tile_count() > 1_000);
+        assert!(matches!(
+            parse_world_map(
+                "invalid-spawn",
+                "format=fe-map-v1\nspawn=100,100,7\ntile=100,100,7,0,false\n"
+            ),
+            Err(ConfigError::InvalidContent(_))
+        ));
         let _ = fs::remove_dir_all(world);
     }
 }

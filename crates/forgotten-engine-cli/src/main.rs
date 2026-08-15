@@ -1,4 +1,6 @@
-use forgotten_config::{ensure_content_skeleton, load, validate_content, write_template};
+use forgotten_config::{
+    ensure_content_skeleton, load, load_world_map, validate_content, write_template,
+};
 use forgotten_host::{
     start, start_game_session, start_native_otclient_game, start_native_otclient_login,
     start_status, GameSessionHostConfig, HostConfig, LegacyLoginConfig,
@@ -106,17 +108,23 @@ fn validate(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     ensure_content_skeleton(&directory)?;
     println!(">> Validating data content");
     let content = validate_content(&directory)?;
+    let world_map = load_world_map(&config)?;
     println!(">> Opening database");
     let database = EngineDatabase::open(&config.database_path)?;
     if database.schema_version()? < 1 {
         return Err("database schema is not migrated".into());
     }
     println!(
-        "> Validation complete: profile={} protocol={} game-port={} status-port={} data={} database={}",
+        "> Validation complete: profile={} protocol={} game-port={} status-port={} map={} tiles={} spawn={},{},{} data={} database={}",
         config.profile.id,
         config.profile.tibia_protocol,
         config.game_protocol_port,
         config.status_protocol_port,
+        config.map_name,
+        world_map.tile_count(),
+        world_map.spawn().x,
+        world_map.spawn().y,
+        world_map.spawn().z,
         content.data_directory.display(),
         database.path().display()
     );
@@ -127,6 +135,7 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!("Forgotten Engine - {}", env!("CARGO_PKG_VERSION"));
     validate(directory.clone())?;
     let config = load(&directory)?;
+    let world_map = Arc::new(load_world_map(&config)?);
     let database = EngineDatabase::open(&config.database_path)?;
     database.record_event("info", "Forgotten Engine host startup requested")?;
 
@@ -238,6 +247,7 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             max_connections: config.max_connections(),
             session_timeout: Duration::from_secs(5),
             empty_world,
+            world_map: Some(Arc::clone(&world_map)),
         })
     } else {
         None

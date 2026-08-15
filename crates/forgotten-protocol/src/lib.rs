@@ -2,7 +2,7 @@
 //!
 //! The legacy 7.4 types below are a tested foundation, not a claim of official-client support.
 
-use forgotten_core::{CardinalDirection, EmptyWorldViewport, Position};
+use forgotten_core::{CardinalDirection, EmptyWorldViewport, Position, WorldMap};
 use rand::{rngs::OsRng, RngCore};
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
 use rsa::pkcs8::DecodePrivateKey;
@@ -1107,6 +1107,18 @@ pub fn encode_native_otclient_game_initialization(
     Ok(Frame(payload))
 }
 
+pub fn encode_native_otclient_game_initialization_with_map(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    world_map: &WorldMap,
+) -> Result<Frame, ProtocolError> {
+    let mut payload = encode_native_otclient_game_login_state(profile, snapshot)?.0;
+    payload
+        .extend_from_slice(&encode_native_otclient_map_viewport(profile, snapshot, world_map)?.0);
+    payload.extend_from_slice(&encode_native_otclient_player_bootstrap(profile, snapshot)?.0);
+    Ok(Frame(payload))
+}
+
 /// Encodes the fixed-width 7.x local-player records expected immediately after map delivery.
 ///
 /// The diagnostic world does not yet persist all of these values. The baseline values keep the
@@ -1156,6 +1168,62 @@ pub fn encode_native_otclient_empty_world_map(
             for y in 0..NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT {
                 if snapshot.ground_thing_id != 0 {
                     writer.u16(snapshot.ground_thing_id);
+                }
+                let is_player_tile = z == snapshot.player_position.z
+                    && x == NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH / 2 - 1
+                    && y == NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT / 2 - 1;
+                if is_player_tile && !asset_free {
+                    write_native_otclient_unknown_player(&mut writer, snapshot);
+                }
+                writer.u16(NATIVE_OTCLIENT_TILE_END);
+            }
+        }
+    }
+
+    let frame = Frame(writer.finish());
+    if frame.0.len() > MAX_FRAME_SIZE {
+        return Err(ProtocolError::InvalidLength(frame.0.len()));
+    }
+    Ok(frame)
+}
+
+/// Encodes an 18×14×8 classic viewport using original operator-supplied map data.
+/// A map tile with `ground_thing_id = 0` inherits the profile-configured fallback so a world
+/// document can remain portable across lawful client asset sets.
+pub fn encode_native_otclient_map_viewport(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    world_map: &WorldMap,
+) -> Result<Frame, ProtocolError> {
+    validate_native_empty_world_snapshot(profile, snapshot)?;
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_FULL_MAP);
+    write_native_otclient_position(&mut writer, snapshot.player_position);
+    let asset_free = snapshot.ground_thing_id == 0 && snapshot.player_look_type == 0;
+    let center_x = (NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH / 2 - 1) as i16;
+    let center_y = (NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT / 2 - 1) as i16;
+
+    for z in (0..NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS as u8).rev() {
+        for x in 0..NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH {
+            for y in 0..NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT {
+                let position = Position {
+                    x: snapshot
+                        .player_position
+                        .x
+                        .saturating_add_signed(x as i16 - center_x),
+                    y: snapshot
+                        .player_position
+                        .y
+                        .saturating_add_signed(y as i16 - center_y),
+                    z,
+                };
+                let ground_thing_id = world_map
+                    .tile(position)
+                    .map(|tile| tile.ground_thing_id)
+                    .filter(|ground_thing_id| *ground_thing_id != 0)
+                    .unwrap_or(snapshot.ground_thing_id);
+                if ground_thing_id != 0 {
+                    writer.u16(ground_thing_id);
                 }
                 let is_player_tile = z == snapshot.player_position.z
                     && x == NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH / 2 - 1
@@ -1978,6 +2046,43 @@ mod tests {
             .0
             .windows(snapshot.player_name.len())
             .any(|bytes| bytes == snapshot.player_name.as_bytes()));
+
+        let mut world_map = WorldMap::new(
+            "viewport-test",
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+        );
+        world_map
+            .set_tile(
+                Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                forgotten_core::WorldMapTile {
+                    ground_thing_id: 555,
+                    walkable: true,
+                },
+            )
+            .unwrap();
+        let map_viewport =
+            encode_native_otclient_map_viewport(&profile, &snapshot, &world_map).unwrap();
+        assert_eq!(map_viewport.0[0], NATIVE_OTCLIENT_GAME_FULL_MAP);
+        assert!(map_viewport
+            .0
+            .windows(2)
+            .any(|bytes| bytes == 555u16.to_le_bytes()));
+        let map_initialization =
+            encode_native_otclient_game_initialization_with_map(&profile, &snapshot, &world_map)
+                .unwrap();
+        assert_eq!(&map_initialization.0[..login.0.len()], login.0.as_slice());
+        assert_eq!(
+            &map_initialization.0[login.0.len()..login.0.len() + map_viewport.0.len()],
+            map_viewport.0.as_slice()
+        );
 
         let initialization =
             encode_native_otclient_game_initialization(&profile, &snapshot).unwrap();

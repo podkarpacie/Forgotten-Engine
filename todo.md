@@ -42,3 +42,8 @@
 - [x] Audit currently reachable stock OTCv8 740 game actions for session-ending unsupported frames.
 - [x] Safely consume high-frequency selection, combat-target, follow, look, and inventory interaction frames until their full game semantics exist.
 - [x] Add compatibility regression coverage for all newly tolerated native action frames.
+- [x] Define and validate a bounded operator-owned FE map document without redistributing map or client content.
+- [x] Load the selected map from the world data directory and use it to construct native 740 viewport tiles.
+- [x] Enforce map walkability and emit safe streamed viewport updates when a player moves beyond the prior diagnostic rectangle.
+- [x] Add map-loading, walkability, and streamed-view regression coverage for the native 740 host.
+- [x] Select an original Rust world document through TFS-style `mapName` and `data/world/<mapName>.femap` conventions.

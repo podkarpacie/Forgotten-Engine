@@ -90,6 +90,80 @@ impl Position {
     }
 }
 
+pub const MAX_WORLD_MAP_TILES: usize = 65_536;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorldMapTile {
+    pub ground_thing_id: u16,
+    pub walkable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldMap {
+    identifier: String,
+    spawn: Position,
+    tiles: BTreeMap<Position, WorldMapTile>,
+}
+
+impl WorldMap {
+    pub fn new(identifier: impl Into<String>, spawn: Position) -> Self {
+        Self {
+            identifier: identifier.into(),
+            spawn,
+            tiles: BTreeMap::new(),
+        }
+    }
+
+    pub fn identifier(&self) -> &str {
+        &self.identifier
+    }
+
+    pub fn spawn(&self) -> Position {
+        self.spawn
+    }
+
+    pub fn tile_count(&self) -> usize {
+        self.tiles.len()
+    }
+
+    pub fn tile(&self, position: Position) -> Option<WorldMapTile> {
+        self.tiles.get(&position).copied()
+    }
+
+    pub fn is_walkable(&self, position: Position) -> bool {
+        self.tile(position)
+            .map(|tile| tile.walkable)
+            .unwrap_or(false)
+    }
+
+    pub fn set_tile(&mut self, position: Position, tile: WorldMapTile) -> Result<(), CoreError> {
+        if !self.tiles.contains_key(&position) && self.tiles.len() >= MAX_WORLD_MAP_TILES {
+            return Err(CoreError::MapTileLimit(MAX_WORLD_MAP_TILES));
+        }
+        self.tiles.insert(position, tile);
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), CoreError> {
+        if self.identifier.trim().is_empty() {
+            return Err(CoreError::InvalidMap(
+                "map identifier cannot be empty".into(),
+            ));
+        }
+        if self.tiles.is_empty() {
+            return Err(CoreError::InvalidMap(
+                "map must contain at least one tile".into(),
+            ));
+        }
+        if !self.is_walkable(self.spawn) {
+            return Err(CoreError::InvalidMap(
+                "map spawn must reference a walkable tile".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardinalDirection {
     North,
@@ -230,6 +304,8 @@ pub enum CoreError {
     MapBoundary {
         position: Position,
     },
+    MapTileLimit(usize),
+    InvalidMap(String),
     InvalidTransition {
         state: ServerStatus,
         command: LifecycleCommand,

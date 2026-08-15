@@ -2,7 +2,9 @@
 //!
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
-use forgotten_core::{CardinalDirection, EmptyWorldManifest, Player, Position, WorldState};
+use forgotten_core::{
+    CardinalDirection, EmptyWorldManifest, Player, Position, WorldMap, WorldState,
+};
 use forgotten_persistence::EngineDatabase;
 use forgotten_protocol::{
     decode, decode_fe_otclient_capability_ack, decode_fe_otclient_move_request,
@@ -16,7 +18,7 @@ use forgotten_protocol::{
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_animated_text,
     encode_native_otclient_character_list, encode_native_otclient_game_cancel_walk_facing,
-    encode_native_otclient_game_initialization, encode_native_otclient_game_login_error,
+    encode_native_otclient_game_initialization_with_map, encode_native_otclient_game_login_error,
     encode_native_otclient_game_ping, encode_native_otclient_game_ping_back,
     encode_native_otclient_login_error, encode_native_otclient_move_creature_at,
     encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
@@ -40,7 +42,6 @@ pub const PROBE_RESPONSE_MAGIC: &[u8; 4] = b"FEOK";
 pub const PROBE_ERROR_MAGIC: &[u8; 4] = b"FEER";
 pub const PROBE_VERSION: u8 = 1;
 const MAX_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
-const MAX_NATIVE_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
 const NATIVE_OTCLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const NATIVE_OTCLIENT_DEFAULT_GROUND_SPEED: u64 = 150;
 const NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY: Duration = Duration::from_secs(2);
@@ -91,6 +92,7 @@ pub struct NativeOtClientHostConfig {
     pub max_connections: usize,
     pub session_timeout: Duration,
     pub empty_world: Option<NativeOtClientEmptyWorldConfig>,
+    pub world_map: Option<Arc<WorldMap>>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +175,11 @@ impl NativeOtClientHostConfig {
             if empty_world.player_speed == 0 || empty_world.server_beat == 0 {
                 return Err(HostError::InvalidConfiguration(
                     "native empty-world fixture requires nonzero speed and beat values".into(),
+                ));
+            }
+            if self.world_map.is_none() {
+                return Err(HostError::InvalidConfiguration(
+                    "native map initialization requires a loaded world map".into(),
                 ));
             }
         }
@@ -724,26 +731,48 @@ fn handle_native_otclient_game(
         )?;
         return Ok(());
     };
+    let Some(world_map) = &config.world_map else {
+        write_frame(
+            stream,
+            &encode_native_otclient_game_login_error(
+                "Forgotten Engine native map initialization requires a selected world map.",
+            ),
+        )?;
+        return Ok(());
+    };
+    let initial_position = if world_map.is_walkable(character.position) {
+        character.position
+    } else {
+        world_map.spawn()
+    };
+    if initial_position != character.position {
+        database.update_player_position(character.id, initial_position)?;
+    }
     let player_id = native_player_id(character.id)?;
     let snapshot = NativeOtClientEmptyWorldSnapshot {
         player_id,
         player_name: character.name.clone(),
-        player_position: native_position(character.position),
+        player_position: native_position(initial_position),
         player_level: character.level.try_into().unwrap_or(u16::MAX),
         ground_thing_id: empty_world.ground_thing_id,
         player_look_type: empty_world.player_look_type,
         player_speed: empty_world.player_speed,
         server_beat: empty_world.server_beat,
     };
-    let initialization =
-        encode_native_otclient_game_initialization(&config.client_profile, &snapshot)
-            .map_err(HostError::Protocol)?;
+    let initialization = encode_native_otclient_game_initialization_with_map(
+        &config.client_profile,
+        &snapshot,
+        world_map,
+    )
+    .map_err(HostError::Protocol)?;
     write_frame(stream, &initialization)?;
     stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
     eprintln!(
-        "> Native OTCv8 init sent peer={peer} player={} record-bytes={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
+        "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} map={} tiles={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
         character.name,
         initialization.0.len(),
+        world_map.identifier(),
+        world_map.tile_count(),
         snapshot.ground_thing_id == 0 && snapshot.player_look_type == 0,
     );
 
@@ -756,16 +785,14 @@ fn handle_native_otclient_game(
             id: character.id,
             account_id,
             name: character.name.clone(),
-            position: character.position,
+            position: initial_position,
             level: character.level,
             experience: 0,
             skill_points: 0,
         })
         .map_err(HostError::Core)?;
-    let initial_position = character.position;
     let mut player_position = initial_position;
     let mut facing = NativeOtClientCardinalDirection::South;
-    let mut remaining_moves = MAX_NATIVE_EMPTY_WORLD_MOVES_PER_SESSION;
     let mut pending_action = None;
     loop {
         let action = if let Some(action) = pending_action.take() {
@@ -845,16 +872,15 @@ fn handle_native_otclient_game(
             NativeOtClientGameAction::AutoWalk(path) => {
                 'auto_walk: for direction in path {
                     for cardinal in direction.cardinal_steps() {
-                        if !move_native_empty_world_player(
+                        if !move_native_map_player(
                             stream,
                             &config.client_profile,
                             &database,
                             &mut world,
                             character.id,
-                            initial_position,
+                            world_map,
                             &mut player_position,
                             &mut facing,
-                            &mut remaining_moves,
                             *cardinal,
                         )? {
                             break 'auto_walk;
@@ -879,16 +905,15 @@ fn handle_native_otclient_game(
                 }
             }
             NativeOtClientGameAction::CardinalMove(direction) => {
-                let _ = move_native_empty_world_player(
+                let _ = move_native_map_player(
                     stream,
                     &config.client_profile,
                     &database,
                     &mut world,
                     character.id,
-                    initial_position,
+                    world_map,
                     &mut player_position,
                     &mut facing,
-                    &mut remaining_moves,
                     direction,
                 )?;
             }
@@ -898,7 +923,7 @@ fn handle_native_otclient_game(
         database_path,
         "info",
         &format!(
-            "native empty-world session completed peer={peer} account={} character={} protocol={}",
+            "native map session completed peer={peer} account={} character={} protocol={}",
             account.id, request.character_name, request.protocol_version
         ),
     );
@@ -906,30 +931,21 @@ fn handle_native_otclient_game(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn move_native_empty_world_player(
+fn move_native_map_player(
     stream: &mut TcpStream,
     profile: &NativeOtClientProfile,
     database: &EngineDatabase,
     world: &mut WorldState,
     character_id: u64,
-    initial_position: Position,
+    world_map: &WorldMap,
     player_position: &mut Position,
     facing: &mut NativeOtClientCardinalDirection,
-    remaining_moves: &mut usize,
     direction: NativeOtClientCardinalDirection,
 ) -> Result<bool, HostError> {
-    if *remaining_moves == 0 {
-        write_frame(
-            stream,
-            &encode_native_otclient_game_cancel_walk_facing(profile, facing.protocol_direction())
-                .map_err(HostError::Protocol)?,
-        )?;
-        return Ok(false);
-    }
     let destination = player_position
         .step(native_cardinal_direction(direction))
         .map_err(HostError::Core)?;
-    if !native_empty_world_position_is_visible(initial_position, destination) {
+    if !world_map.is_walkable(destination) {
         write_frame(
             stream,
             &encode_native_otclient_game_cancel_walk_facing(profile, facing.protocol_direction())
@@ -953,7 +969,6 @@ fn move_native_empty_world_player(
     )?;
     *player_position = destination;
     *facing = direction;
-    *remaining_moves -= 1;
     Ok(true)
 }
 
@@ -1046,14 +1061,6 @@ fn native_cardinal_direction(direction: NativeOtClientCardinalDirection) -> Card
         NativeOtClientCardinalDirection::South => CardinalDirection::South,
         NativeOtClientCardinalDirection::West => CardinalDirection::West,
     }
-}
-
-fn native_empty_world_position_is_visible(center: Position, position: Position) -> bool {
-    position.z == center.z
-        && position.x >= center.x.saturating_sub(8)
-        && position.x <= center.x.saturating_add(9)
-        && position.y >= center.y.saturating_sub(6)
-        && position.y <= center.y.saturating_add(7)
 }
 
 fn handle_game_session(
@@ -1495,7 +1502,7 @@ impl std::error::Error for HostError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forgotten_core::{Player, Position};
+    use forgotten_core::{Player, Position, WorldMapTile};
     use forgotten_protocol::FE_7_4_PROFILE;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1560,7 +1567,31 @@ mod tests {
             max_connections: 2,
             session_timeout: Duration::from_millis(250),
             empty_world: None,
+            world_map: None,
         }
+    }
+
+    fn native_world_map() -> Arc<WorldMap> {
+        let spawn = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let mut map = WorldMap::new("native-test", spawn);
+        for x in 80..=120 {
+            for y in 80..=120 {
+                map.set_tile(
+                    Position { x, y, z: 7 },
+                    WorldMapTile {
+                        ground_thing_id: 102,
+                        walkable: true,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        map.validate().unwrap();
+        Arc::new(map)
     }
 
     fn native_empty_world_config(bind_addr: SocketAddr) -> NativeOtClientHostConfig {
@@ -1571,6 +1602,7 @@ mod tests {
             player_speed: 220,
             server_beat: 50,
         });
+        config.world_map = Some(native_world_map());
         config
     }
 
@@ -1836,11 +1868,22 @@ mod tests {
                 skill_points: 3,
             })
             .unwrap();
-        let game = start_native_otclient_game(
-            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
-            &database_path,
-        )
-        .unwrap();
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        Arc::get_mut(native_config.world_map.as_mut().unwrap())
+            .unwrap()
+            .set_tile(
+                Position {
+                    x: 103,
+                    y: 101,
+                    z: 7,
+                },
+                WorldMapTile {
+                    ground_thing_id: 102,
+                    walkable: false,
+                },
+            )
+            .unwrap();
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
 
         let mut stream = TcpStream::connect(game.local_addr()).unwrap();
         write_frame(
@@ -1920,6 +1963,19 @@ mod tests {
                 .position
                 .y,
             101
+        );
+
+        write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
+        let blocked_movement = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            blocked_movement.0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 1]
+        );
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0]
+                .position
+                .x,
+            102
         );
 
         write_frame(&mut stream, &Frame(vec![0x96, 1, 2, 0, b'h', b'i'])).unwrap();
