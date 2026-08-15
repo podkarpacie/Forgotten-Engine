@@ -83,3 +83,8 @@
 - [x] Reject native player movement into occupied static creature tiles while preserving current map and player collision rules.
 - [x] Add self-contained authoritative occupancy and native movement regression coverage.
 - [x] Package and publish the static creature occupancy foundation release with Linux, Windows, and SHA-256 assets.
+- [x] Audit static creature registration, authoritative reset, and native session-boundary behavior.
+- [x] Model deterministic static creature lifecycle metadata and safe reset semantics without timer-driven respawning, AI, combat, movement, or Lua execution.
+- [x] Integrate static creature lifecycle reset behavior with authoritative native world setup.
+- [x] Add self-contained lifecycle registration and reset regression coverage.
+- [x] Package and publish the static creature lifecycle policy release with Linux, Windows, and SHA-256 assets.
