@@ -109,3 +109,8 @@
 - [x] Deliver safe shared-player join, leave, and movement visibility updates without combat, chat synchronization, AI, or Lua.
 - [x] Add self-contained multi-player visibility and concurrent-session regression coverage.
 - [x] Package and publish the native multi-player visibility release with Linux, Windows, and SHA-256 assets.
+- [x] Audit native 740 chat encoding and shared-session delivery boundaries.
+- [x] Model bounded sanitized public-chat events and active-recipient registration without private messages or channels.
+- [x] Encode and deliver shared public chat to active native sessions without destabilizing heartbeat or visibility refresh behavior.
+- [x] Add self-contained shared chat broadcast and native session regression coverage.
+- [x] Package and publish the shared native chat release with Linux, Windows, and SHA-256 assets.
