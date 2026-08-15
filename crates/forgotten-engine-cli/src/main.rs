@@ -1,7 +1,8 @@
 use forgotten_config::{
     apply_legacy_item_metadata, ensure_content_skeleton, load, load_legacy_item_catalog,
     load_tfs_content_inventory, load_tfs_entity_catalog, load_world_companions, load_world_map,
-    resolve_tfs_spawn_references, validate_content, world_map_path, write_template,
+    materialize_tfs_static_spawns, resolve_tfs_spawn_references, validate_content, world_map_path,
+    write_template,
 };
 use forgotten_core::WorldMapSource;
 use forgotten_host::{
@@ -423,6 +424,15 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             None
         };
+        let companions = load_world_companions(&config, &world_map)?;
+        let entity_catalog = load_tfs_entity_catalog(&config)?;
+        let static_spawns = materialize_tfs_static_spawns(&companions, &entity_catalog)?;
+        if !static_spawns.entities.is_empty() {
+            println!(
+                "> Materialized {} display-only static TFS spawn entities; AI, combat, movement, and Lua remain deferred.",
+                static_spawns.entities.len()
+            );
+        }
         Some(NativeOtClientHostConfig {
             bind_addr: config.otclient_v8_login_socket_addr(),
             client_profile: config.otclient_v8_native_profile(),
@@ -435,6 +445,7 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             session_timeout: Duration::from_secs(5),
             empty_world,
             world_map: Some(Arc::clone(&world_map)),
+            static_spawns: (!static_spawns.entities.is_empty()).then(|| Arc::new(static_spawns)),
         })
     } else {
         None

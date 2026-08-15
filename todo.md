@@ -72,3 +72,9 @@
 - [x] Extend `tfs-audit` with entity-catalog and spawn-resolution diagnostics.
 - [x] Add self-contained monster, NPC, and spawn-resolution fixtures without importing private game content.
 - [x] Package and publish the TFS entity-catalog conversion release with Linux, Windows, and SHA-256 assets.
+- [x] Audit native FE world and OTCv8 creature-state boundaries for safe static TFS spawn materialization.
+- [x] Extract bounded entity identity and appearance metadata from private TFS monster and NPC definitions without loading behavior.
+- [x] Build deterministic static FE runtime entities from resolved private TFS spawn records.
+- [x] Thread static spawn entities through the native 740 world-initialization contract without claiming AI, combat, or Lua support.
+- [x] Add self-contained static-spawn, appearance, and native-map regression fixtures.
+- [x] Package and publish the static TFS spawn-runtime foundation release with Linux, Windows, and SHA-256 assets.

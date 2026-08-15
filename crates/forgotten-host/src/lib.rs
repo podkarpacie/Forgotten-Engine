@@ -3,7 +3,8 @@
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
 use forgotten_core::{
-    CardinalDirection, EmptyWorldManifest, Player, Position, WorldMap, WorldState,
+    CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, Player, Position, WorldMap,
+    WorldState,
 };
 use forgotten_persistence::EngineDatabase;
 use forgotten_protocol::{
@@ -18,9 +19,10 @@ use forgotten_protocol::{
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_animated_text,
     encode_native_otclient_character_list, encode_native_otclient_game_cancel_walk_facing,
-    encode_native_otclient_game_initialization_with_map, encode_native_otclient_game_login_error,
-    encode_native_otclient_game_ping, encode_native_otclient_game_ping_back,
-    encode_native_otclient_login_error, encode_native_otclient_map_viewport,
+    encode_native_otclient_game_initialization_with_map_and_static_spawns,
+    encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
+    encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
+    encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_move_creature_at, encode_status_binary, encode_status_xml,
     generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
     CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
@@ -93,6 +95,9 @@ pub struct NativeOtClientHostConfig {
     pub session_timeout: Duration,
     pub empty_world: Option<NativeOtClientEmptyWorldConfig>,
     pub world_map: Option<Arc<WorldMap>>,
+    /// Immutable display-only TFS spawn entities. No AI, combat, movement, or Lua behavior is
+    /// attached at this host boundary.
+    pub static_spawns: Option<Arc<FeTfsStaticSpawnCollection>>,
 }
 
 #[derive(Debug, Clone)]
@@ -759,20 +764,22 @@ fn handle_native_otclient_game(
         player_speed: empty_world.player_speed,
         server_beat: empty_world.server_beat,
     };
-    let initialization = encode_native_otclient_game_initialization_with_map(
+    let initialization = encode_native_otclient_game_initialization_with_map_and_static_spawns(
         &config.client_profile,
         &snapshot,
         world_map,
+        config.static_spawns.as_deref(),
     )
     .map_err(HostError::Protocol)?;
     write_frame(stream, &initialization)?;
     stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
     eprintln!(
-        "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} map={} tiles={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
+        "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
         character.name,
         initialization.0.len(),
         world_map.identifier(),
         world_map.tile_count(),
+        config.static_spawns.as_ref().map_or(0, |spawns| spawns.entities.len()),
         snapshot.ground_thing_id == 0 && snapshot.player_look_type == 0,
     );
 
@@ -880,6 +887,7 @@ fn handle_native_otclient_game(
                             &mut world,
                             character.id,
                             world_map,
+                            config.static_spawns.as_deref(),
                             &mut player_position,
                             &mut facing,
                             *cardinal,
@@ -914,6 +922,7 @@ fn handle_native_otclient_game(
                     &mut world,
                     character.id,
                     world_map,
+                    config.static_spawns.as_deref(),
                     &mut player_position,
                     &mut facing,
                     direction,
@@ -941,6 +950,7 @@ fn move_native_map_player(
     world: &mut WorldState,
     character_id: u64,
     world_map: &WorldMap,
+    static_spawns: Option<&FeTfsStaticSpawnCollection>,
     player_position: &mut Position,
     facing: &mut NativeOtClientCardinalDirection,
     direction: NativeOtClientCardinalDirection,
@@ -974,8 +984,13 @@ fn move_native_map_player(
     refreshed_snapshot.player_position = native_position(destination);
     write_frame(
         stream,
-        &encode_native_otclient_map_viewport(profile, &refreshed_snapshot, world_map)
-            .map_err(HostError::Protocol)?,
+        &encode_native_otclient_map_viewport_with_static_spawns(
+            profile,
+            &refreshed_snapshot,
+            world_map,
+            static_spawns,
+        )
+        .map_err(HostError::Protocol)?,
     )?;
     *player_position = destination;
     *facing = direction;
@@ -1578,6 +1593,7 @@ mod tests {
             session_timeout: Duration::from_millis(250),
             empty_world: None,
             world_map: None,
+            static_spawns: None,
         }
     }
 
@@ -1879,6 +1895,27 @@ mod tests {
             })
             .unwrap();
         let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.static_spawns = Some(Arc::new(
+            FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
+                id: NATIVE_OTCLIENT_PLAYER_ID_END + 1,
+                name: "Rat".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 220,
+                health_percent: 100,
+                direction: 2,
+            }])
+            .unwrap(),
+        ));
         Arc::get_mut(native_config.world_map.as_mut().unwrap())
             .unwrap()
             .set_tile(
@@ -1918,6 +1955,7 @@ mod tests {
             .0
             .windows(6)
             .any(|window| window == b"Knight"));
+        assert!(initialization.0.windows(3).any(|window| window == b"Rat"));
         assert!(initialization
             .0
             .contains(&forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_STATS));
@@ -1950,6 +1988,10 @@ mod tests {
             forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
         );
         assert_eq!(&auto_walk_viewport.0[1..6], &[101, 0, 100, 0, 7]);
+        assert!(auto_walk_viewport
+            .0
+            .windows(3)
+            .any(|window| window == b"Rat"));
         write_frame(&mut stream, &Frame(vec![0x67])).unwrap();
         let interrupted = read_frame(&mut stream).unwrap();
         assert_eq!(

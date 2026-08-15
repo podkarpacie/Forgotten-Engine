@@ -94,6 +94,54 @@ pub const MAX_WORLD_MAP_TILES: usize = 65_536;
 pub const MAX_WORLD_MAP_ITEMS_PER_TILE: usize = 64;
 pub const MAX_WORLD_MAP_TOWNS: usize = 8_192;
 pub const MAX_WORLD_MAP_WAYPOINTS: usize = 8_192;
+pub const MAX_TFS_STATIC_SPAWNS: usize = 65_536;
+
+/// A deterministic, display-only entity materialized from a verified private TFS spawn record.
+/// It intentionally excludes AI, combat, movement scheduling, Lua state, and lifecycle behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeTfsStaticEntity {
+    pub id: u32,
+    pub name: String,
+    pub position: Position,
+    pub look_type: u8,
+    pub head: u8,
+    pub body: u8,
+    pub legs: u8,
+    pub feet: u8,
+    pub addons: u8,
+    pub speed: u16,
+    pub health_percent: u8,
+    pub direction: u8,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeTfsStaticSpawnCollection {
+    pub entities: Vec<FeTfsStaticEntity>,
+}
+
+impl FeTfsStaticSpawnCollection {
+    pub fn new(entities: Vec<FeTfsStaticEntity>) -> Result<Self, CoreError> {
+        if entities.len() > MAX_TFS_STATIC_SPAWNS {
+            return Err(CoreError::StaticSpawnLimit(MAX_TFS_STATIC_SPAWNS));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for entity in &entities {
+            if entity.name.trim().is_empty() {
+                return Err(CoreError::EmptyStaticSpawnName);
+            }
+            if !ids.insert(entity.id) {
+                return Err(CoreError::DuplicateStaticSpawnId(entity.id));
+            }
+        }
+        Ok(Self { entities })
+    }
+
+    pub fn at(&self, position: Position) -> impl Iterator<Item = &FeTfsStaticEntity> {
+        self.entities
+            .iter()
+            .filter(move |entity| entity.position == position)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorldMapTile {
@@ -521,6 +569,9 @@ pub enum CoreError {
     MapTileItemLimit(usize),
     MapTownLimit(usize),
     MapWaypointLimit(usize),
+    StaticSpawnLimit(usize),
+    DuplicateStaticSpawnId(u32),
+    EmptyStaticSpawnName,
     InvalidMap(String),
     InvalidTransition {
         state: ServerStatus,
@@ -716,5 +767,37 @@ mod tests {
         .unwrap();
         map.set_tile_items(missing, Vec::new()).unwrap();
         assert!(matches!(map.validate(), Err(CoreError::InvalidMap(_))));
+    }
+
+    #[test]
+    fn static_tfs_spawn_collection_is_bounded_and_position_addressable() {
+        let position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let collection = FeTfsStaticSpawnCollection::new(vec![FeTfsStaticEntity {
+            id: 0x4000_0001,
+            name: "Rat".into(),
+            position,
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        }])
+        .unwrap();
+        assert_eq!(collection.at(position).count(), 1);
+        assert_eq!(
+            FeTfsStaticSpawnCollection::new(vec![
+                collection.entities[0].clone(),
+                collection.entities[0].clone(),
+            ]),
+            Err(CoreError::DuplicateStaticSpawnId(0x4000_0001))
+        );
     }
 }

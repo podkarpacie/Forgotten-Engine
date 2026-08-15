@@ -2,7 +2,10 @@
 //!
 //! The legacy 7.4 types below are a tested foundation, not a claim of official-client support.
 
-use forgotten_core::{CardinalDirection, EmptyWorldViewport, Position, WorldMap};
+use forgotten_core::{
+    CardinalDirection, EmptyWorldViewport, FeTfsStaticEntity, FeTfsStaticSpawnCollection, Position,
+    WorldMap,
+};
 use rand::{rngs::OsRng, RngCore};
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
 use rsa::pkcs8::DecodePrivateKey;
@@ -812,6 +815,7 @@ pub const NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH: usize = 18;
 pub const NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT: usize = 14;
 pub const NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS: usize = 8;
 pub const NATIVE_OTCLIENT_MAX_EXTRA_TILE_ITEMS: usize = 8;
+pub const NATIVE_OTCLIENT_MAX_STATIC_ENTITIES_PER_VIEWPORT: usize = 32;
 pub const NATIVE_OTCLIENT_PLAYER_ID_START: u32 = 0x1000_0000;
 pub const NATIVE_OTCLIENT_PLAYER_ID_END: u32 = 0x4000_0000;
 pub const NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES: usize = 255;
@@ -1113,9 +1117,27 @@ pub fn encode_native_otclient_game_initialization_with_map(
     snapshot: &NativeOtClientEmptyWorldSnapshot,
     world_map: &WorldMap,
 ) -> Result<Frame, ProtocolError> {
+    encode_native_otclient_game_initialization_with_map_and_static_spawns(
+        profile, snapshot, world_map, None,
+    )
+}
+
+pub fn encode_native_otclient_game_initialization_with_map_and_static_spawns(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    world_map: &WorldMap,
+    static_spawns: Option<&FeTfsStaticSpawnCollection>,
+) -> Result<Frame, ProtocolError> {
     let mut payload = encode_native_otclient_game_login_state(profile, snapshot)?.0;
-    payload
-        .extend_from_slice(&encode_native_otclient_map_viewport(profile, snapshot, world_map)?.0);
+    payload.extend_from_slice(
+        &encode_native_otclient_map_viewport_with_static_spawns(
+            profile,
+            snapshot,
+            world_map,
+            static_spawns,
+        )?
+        .0,
+    );
     payload.extend_from_slice(&encode_native_otclient_player_bootstrap(profile, snapshot)?.0);
     Ok(Frame(payload))
 }
@@ -1196,6 +1218,15 @@ pub fn encode_native_otclient_map_viewport(
     snapshot: &NativeOtClientEmptyWorldSnapshot,
     world_map: &WorldMap,
 ) -> Result<Frame, ProtocolError> {
+    encode_native_otclient_map_viewport_with_static_spawns(profile, snapshot, world_map, None)
+}
+
+pub fn encode_native_otclient_map_viewport_with_static_spawns(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    world_map: &WorldMap,
+    static_spawns: Option<&FeTfsStaticSpawnCollection>,
+) -> Result<Frame, ProtocolError> {
     validate_native_empty_world_snapshot(profile, snapshot)?;
     let mut writer = Writer::default();
     writer.byte(NATIVE_OTCLIENT_GAME_FULL_MAP);
@@ -1203,6 +1234,7 @@ pub fn encode_native_otclient_map_viewport(
     let asset_free = snapshot.ground_thing_id == 0 && snapshot.player_look_type == 0;
     let center_x = (NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH / 2 - 1) as i16;
     let center_y = (NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT / 2 - 1) as i16;
+    let mut static_entity_count = 0usize;
 
     for z in (0..NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS as u8).rev() {
         for x in 0..NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH {
@@ -1236,6 +1268,15 @@ pub fn encode_native_otclient_map_viewport(
                         if thing_id != 0 {
                             writer.u16(thing_id);
                         }
+                    }
+                }
+                if let Some(static_spawns) = static_spawns {
+                    for entity in static_spawns.at(position) {
+                        if static_entity_count >= NATIVE_OTCLIENT_MAX_STATIC_ENTITIES_PER_VIEWPORT {
+                            break;
+                        }
+                        write_native_otclient_unknown_static_entity(&mut writer, entity);
+                        static_entity_count += 1;
                     }
                 }
                 let is_player_tile = z == snapshot.player_position.z
@@ -1508,6 +1549,25 @@ fn write_native_otclient_unknown_player(
     writer.byte(0);
     writer.byte(0);
     writer.u16(snapshot.player_speed);
+    writer.byte(0);
+    writer.byte(0);
+}
+
+fn write_native_otclient_unknown_static_entity(writer: &mut Writer, entity: &FeTfsStaticEntity) {
+    writer.u16(NATIVE_OTCLIENT_UNKNOWN_CREATURE);
+    writer.u32(0);
+    writer.u32(entity.id);
+    writer.string(&entity.name);
+    writer.byte(entity.health_percent);
+    writer.byte(entity.direction);
+    writer.byte(entity.look_type);
+    writer.byte(entity.head);
+    writer.byte(entity.body);
+    writer.byte(entity.legs);
+    writer.byte(entity.feet);
+    writer.byte(entity.addons);
+    writer.byte(0);
+    writer.u16(entity.speed);
     writer.byte(0);
     writer.byte(0);
 }
@@ -2129,6 +2189,52 @@ mod tests {
             .0
             .windows(2)
             .any(|bytes| bytes == 556u16.to_le_bytes()));
+        let static_position = Position {
+            x: 99,
+            y: 100,
+            z: 7,
+        };
+        let static_spawns = FeTfsStaticSpawnCollection::new(vec![FeTfsStaticEntity {
+            id: NATIVE_OTCLIENT_PLAYER_ID_END + 1,
+            name: "Rat".into(),
+            position: static_position,
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 220,
+            health_percent: 100,
+            direction: 2,
+        }])
+        .unwrap();
+        let static_viewport = encode_native_otclient_map_viewport_with_static_spawns(
+            &profile,
+            &snapshot,
+            &world_map,
+            Some(&static_spawns),
+        )
+        .unwrap();
+        let static_tile_index = 7 * NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT + 6;
+        let static_tile_offset = 1 + 5 + static_tile_index * 4;
+        assert_eq!(
+            u16::from_le_bytes(
+                static_viewport.0[static_tile_offset + 2..static_tile_offset + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            NATIVE_OTCLIENT_UNKNOWN_CREATURE
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                static_viewport.0[static_tile_offset + 8..static_tile_offset + 12]
+                    .try_into()
+                    .unwrap()
+            ),
+            NATIVE_OTCLIENT_PLAYER_ID_END + 1
+        );
+        assert!(static_viewport.0.windows(3).any(|bytes| bytes == b"Rat"));
         let map_initialization =
             encode_native_otclient_game_initialization_with_map(&profile, &snapshot, &world_map)
                 .unwrap();

@@ -22,7 +22,10 @@ pub use items::{LegacyItemCatalog, LegacyItemDefinition};
 pub use legacy_xml::{
     LegacyHouse, LegacySpawnArea, LegacySpawnCreature, LegacySpawnKind, LegacyWorldCompanionData,
 };
-pub use tfs_entities::{TfsEntityCatalog, TfsEntityDefinition, TfsEntityKind, TfsSpawnResolution};
+pub use tfs_entities::{
+    materialize_tfs_static_spawns, TfsEntityAppearance, TfsEntityCatalog, TfsEntityDefinition,
+    TfsEntityKind, TfsSpawnResolution,
+};
 pub use tfs_registry::{TfsContentInventory, TfsRegistryCategory, TfsRegistryInventory};
 
 pub const CONFIG_FILE_NAME: &str = "config.lua";
