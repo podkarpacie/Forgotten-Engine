@@ -135,3 +135,8 @@
 - [x] Replace stale click paths with the latest bounded movement intent while retaining one authoritative step per configured movement interval.
 - [x] Add rapid-click path replacement and movement-rate regression coverage.
 - [x] Package and publish the native 740 click-path scheduling patch release with Linux, Windows, and SHA-256 assets.
+- [x] Audit classic TFS player movement scheduling and cancellation principles against FE’s current native click-walk loop without copying upstream implementation code.
+- [x] Replace the current nested native click-path loop with one authoritative active-walk task and a fixed next-step deadline.
+- [x] Apply rapid new click paths as latest intent only, without immediate movement, path accumulation, or cadence reset.
+- [x] Add deterministic TFS-style rapid-click, replacement, and manual-interruption regression coverage.
+- [x] Package and publish the TFS-style native click-walk scheduling patch release with Linux, Windows, and SHA-256 assets.

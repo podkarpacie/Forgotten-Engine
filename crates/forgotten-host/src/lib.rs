@@ -37,7 +37,7 @@ use forgotten_protocol::{
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -1056,13 +1056,21 @@ fn handle_native_otclient_game(
 
     let mut player_position = initial_position;
     let mut facing = NativeOtClientCardinalDirection::South;
-    let mut pending_action = None;
+    let mut active_click_walk: Option<NativeActiveClickWalk> = None;
     let mut observed_visibility_epoch = shared_world.visibility_epoch();
     loop {
         drain_shared_public_chat(stream, &config.client_profile, &chat_events)?;
-        let action = if let Some(action) = pending_action.take() {
-            action
-        } else {
+        let read_timeout = active_click_walk
+            .as_ref()
+            .map(|task| {
+                task.next_step_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL)
+                    .max(Duration::from_millis(1))
+            })
+            .unwrap_or(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL);
+        stream.set_read_timeout(Some(read_timeout))?;
+        let action = {
             let request = match read_frame(stream) {
                 Ok(request) => request,
                 Err(HostError::Io(error))
@@ -1088,6 +1096,42 @@ fn handle_native_otclient_game(
                             )?,
                         )?;
                         observed_visibility_epoch = visibility_epoch;
+                        continue;
+                    }
+                    if active_click_walk
+                        .as_ref()
+                        .is_some_and(|task| task.next_step_deadline <= Instant::now())
+                    {
+                        let next_step = active_click_walk
+                            .as_mut()
+                            .and_then(|task| task.queued_steps.pop_front());
+                        let Some(direction) = next_step else {
+                            active_click_walk = None;
+                            continue;
+                        };
+                        if move_native_map_player(
+                            stream,
+                            &config.client_profile,
+                            &snapshot,
+                            &database,
+                            shared_world,
+                            character.id,
+                            world_map,
+                            &mut player_position,
+                            &mut facing,
+                            direction,
+                        )? {
+                            observed_visibility_epoch = shared_world.visibility_epoch();
+                            if let Some(task) = active_click_walk.as_mut() {
+                                task.next_step_deadline = Instant::now()
+                                    + native_autowalk_step_delay(
+                                        snapshot.player_speed,
+                                        snapshot.server_beat,
+                                    );
+                            }
+                        } else {
+                            active_click_walk = None;
+                        }
                         continue;
                     }
                     write_frame(
@@ -1155,15 +1199,19 @@ fn handle_native_otclient_game(
                 drain_shared_public_chat(stream, &config.client_profile, &chat_events)?;
             }
             NativeOtClientGameAction::LeaveGame => break,
-            NativeOtClientGameAction::Stop => write_frame(
-                stream,
-                &encode_native_otclient_game_cancel_walk_facing(
-                    &config.client_profile,
-                    facing.protocol_direction(),
-                )
-                .map_err(HostError::Protocol)?,
-            )?,
+            NativeOtClientGameAction::Stop => {
+                active_click_walk = None;
+                write_frame(
+                    stream,
+                    &encode_native_otclient_game_cancel_walk_facing(
+                        &config.client_profile,
+                        facing.protocol_direction(),
+                    )
+                    .map_err(HostError::Protocol)?,
+                )?;
+            }
             NativeOtClientGameAction::Turn(direction) => {
+                active_click_walk = None;
                 facing = direction;
                 write_frame(
                     stream,
@@ -1175,12 +1223,22 @@ fn handle_native_otclient_game(
                 )?;
             }
             NativeOtClientGameAction::AutoWalk(path) => {
-                let mut scheduled_path = path;
-                'auto_walk: while !scheduled_path.is_empty() {
-                    let direction = scheduled_path.remove(0);
-                    let mut replaced_path = false;
-                    for cardinal in direction.cardinal_steps() {
-                        if !move_native_map_player(
+                if let Some(task) = active_click_walk.as_mut() {
+                    task.replace_path(path);
+                } else {
+                    let step_delay =
+                        native_autowalk_step_delay(snapshot.player_speed, snapshot.server_beat);
+                    let mut task =
+                        NativeActiveClickWalk::from_path(path, Instant::now() + step_delay);
+                    if task.queued_steps.is_empty() {
+                        continue;
+                    }
+                    if task.queued_steps.len() == 1 {
+                        let direction = task
+                            .queued_steps
+                            .pop_front()
+                            .expect("single queued click-walk step");
+                        if move_native_map_player(
                             stream,
                             &config.client_profile,
                             &snapshot,
@@ -1190,62 +1248,18 @@ fn handle_native_otclient_game(
                             world_map,
                             &mut player_position,
                             &mut facing,
-                            *cardinal,
+                            direction,
                         )? {
-                            break 'auto_walk;
+                            observed_visibility_epoch = shared_world.visibility_epoch();
+                            active_click_walk = Some(task);
                         }
-                        observed_visibility_epoch = shared_world.visibility_epoch();
-                        let step_deadline = Instant::now()
-                            + native_autowalk_step_delay(
-                                snapshot.player_speed,
-                                snapshot.server_beat,
-                            );
-                        loop {
-                            let remaining = step_deadline.saturating_duration_since(Instant::now());
-                            if remaining.is_zero() {
-                                break;
-                            }
-                            let Some(action) = read_native_autowalk_interrupt(
-                                stream,
-                                &config.client_profile,
-                                remaining,
-                            )?
-                            else {
-                                break;
-                            };
-                            if let NativeOtClientGameAction::AutoWalk(replacement) = action {
-                                write_frame(
-                                    stream,
-                                    &encode_native_otclient_game_cancel_walk_facing(
-                                        &config.client_profile,
-                                        facing.protocol_direction(),
-                                    )
-                                    .map_err(HostError::Protocol)?,
-                                )?;
-                                scheduled_path = replacement;
-                                replaced_path = true;
-                                continue;
-                            }
-                            if !matches!(action, NativeOtClientGameAction::Stop) {
-                                write_frame(
-                                    stream,
-                                    &encode_native_otclient_game_cancel_walk_facing(
-                                        &config.client_profile,
-                                        facing.protocol_direction(),
-                                    )
-                                    .map_err(HostError::Protocol)?,
-                                )?;
-                            }
-                            pending_action = Some(action);
-                            break 'auto_walk;
-                        }
-                        if replaced_path {
-                            continue 'auto_walk;
-                        }
+                    } else {
+                        active_click_walk = Some(task);
                     }
                 }
             }
             NativeOtClientGameAction::CardinalMove(direction) => {
+                active_click_walk = None;
                 if move_native_map_player(
                     stream,
                     &config.client_profile,
@@ -1262,6 +1276,7 @@ fn handle_native_otclient_game(
                 }
             }
             NativeOtClientGameAction::DiagonalMove(direction) => {
+                active_click_walk = None;
                 if move_native_map_player_diagonal(
                     stream,
                     &config.client_profile,
@@ -1551,52 +1566,6 @@ fn move_native_map_player_diagonal(
     Ok(true)
 }
 
-fn read_native_autowalk_interrupt(
-    stream: &mut TcpStream,
-    profile: &NativeOtClientProfile,
-    delay: Duration,
-) -> Result<Option<NativeOtClientGameAction>, HostError> {
-    let deadline = Instant::now() + delay;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
-            return Ok(None);
-        }
-        stream.set_read_timeout(Some(remaining))?;
-        match read_frame(stream) {
-            Ok(frame) => {
-                let action = decode_native_otclient_game_action(&frame, profile)
-                    .map_err(HostError::Protocol)?;
-                match action {
-                    NativeOtClientGameAction::Ping => {
-                        write_frame(
-                            stream,
-                            &encode_native_otclient_game_ping_back(profile)
-                                .map_err(HostError::Protocol)?,
-                        )?;
-                    }
-                    NativeOtClientGameAction::PingBack => {}
-                    other => {
-                        stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
-                        return Ok(Some(other));
-                    }
-                }
-            }
-            Err(HostError::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
 fn native_autowalk_step_delay(player_speed: u16, server_beat: u16) -> Duration {
     let speed = u64::from(player_speed).max(1);
     let server_beat = u64::from(server_beat).max(1);
@@ -1629,6 +1598,35 @@ fn native_player_id(character_id: u64) -> Result<u32, HostError> {
 enum NativePlayerInteractionKind {
     Target,
     Follow,
+}
+
+/// A single server-owned native click-walk task. Client paths may replace its queued directions,
+/// but never its next-step deadline. This mirrors the classic one-active-event behavior without
+/// importing implementation code from another server.
+struct NativeActiveClickWalk {
+    queued_steps: VecDeque<NativeOtClientCardinalDirection>,
+    next_step_deadline: Instant,
+}
+
+impl NativeActiveClickWalk {
+    fn from_path(path: Vec<NativeOtClientAutoWalkDirection>, next_step_deadline: Instant) -> Self {
+        Self {
+            queued_steps: native_click_walk_steps(path),
+            next_step_deadline,
+        }
+    }
+
+    fn replace_path(&mut self, path: Vec<NativeOtClientAutoWalkDirection>) {
+        self.queued_steps = native_click_walk_steps(path);
+    }
+}
+
+fn native_click_walk_steps(
+    path: Vec<NativeOtClientAutoWalkDirection>,
+) -> VecDeque<NativeOtClientCardinalDirection> {
+    path.into_iter()
+        .flat_map(|direction| direction.cardinal_steps().iter().copied())
+        .collect()
 }
 
 fn apply_native_player_interaction(
@@ -2944,8 +2942,10 @@ mod tests {
         let ping_back = read_frame(&mut stream).unwrap();
         assert_eq!(ping_back.0, vec![0x1d]);
 
+        let auto_walk_started = Instant::now();
         write_frame(&mut stream, &Frame(vec![0x64, 2, 1, 3])).unwrap();
         let auto_walk_east = read_frame(&mut stream).unwrap();
+        assert!(auto_walk_started.elapsed() >= Duration::from_millis(500));
         assert_eq!(&auto_walk_east.0[1..7], &[100, 0, 100, 0, 7, 1]);
         assert_eq!(&auto_walk_east.0[7..12], &[101, 0, 100, 0, 7]);
         let auto_walk_edge = read_frame(&mut stream).unwrap();
@@ -2957,29 +2957,16 @@ mod tests {
             auto_walk_edge.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
         );
+        let replacement_started = Instant::now();
         write_frame(&mut stream, &Frame(vec![0x64, 1, 7])).unwrap();
         write_frame(&mut stream, &Frame(vec![0x64, 1, 5])).unwrap();
-        let first_replacement_cancel = read_frame(&mut stream).unwrap();
-        assert_eq!(
-            first_replacement_cancel.0,
-            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 1]
-        );
-        let second_replacement_cancel = read_frame(&mut stream).unwrap();
-        assert_eq!(
-            second_replacement_cancel.0,
-            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 1]
-        );
         let latest_path_movement = read_frame(&mut stream).unwrap();
+        assert!(replacement_started.elapsed() >= Duration::from_millis(500));
         assert_eq!(&latest_path_movement.0[1..7], &[101, 0, 100, 0, 7, 1]);
         assert_eq!(&latest_path_movement.0[7..12], &[100, 0, 100, 0, 7]);
         let latest_path_edge = read_frame(&mut stream).unwrap();
         assert_eq!(latest_path_edge.0[0], 0x68);
         write_frame(&mut stream, &Frame(vec![0x67])).unwrap();
-        let interrupted = read_frame(&mut stream).unwrap();
-        assert_eq!(
-            interrupted.0,
-            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 3]
-        );
         let manual_movement = read_frame(&mut stream).unwrap();
         assert_eq!(&manual_movement.0[1..7], &[100, 0, 100, 0, 7, 1]);
         assert_eq!(&manual_movement.0[7..12], &[100, 0, 101, 0, 7]);
