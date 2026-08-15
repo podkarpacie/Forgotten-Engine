@@ -529,9 +529,18 @@ pub struct PlayerRenderSnapshot {
     pub level: u32,
 }
 
+/// Stored interaction intent only. It carries no attack resolution, automatic movement, combat,
+/// scripting, spell, or action behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayerInteractionIntent {
+    pub target_player_id: Option<u64>,
+    pub follow_player_id: Option<u64>,
+}
+
 #[derive(Debug, Default)]
 pub struct WorldState {
     players: BTreeMap<u64, Player>,
+    player_interactions: BTreeMap<u64, PlayerInteractionIntent>,
     static_creatures: BTreeMap<u32, StaticCreatureRuntime>,
     static_occupied_positions: BTreeSet<Position>,
     tick: u64,
@@ -569,7 +578,21 @@ impl WorldState {
     }
 
     pub fn remove_player(&mut self, id: u64) -> Result<Player, CoreError> {
-        self.players.remove(&id).ok_or(CoreError::UnknownPlayer(id))
+        let player = self
+            .players
+            .remove(&id)
+            .ok_or(CoreError::UnknownPlayer(id))?;
+        self.player_interactions.remove(&id);
+        self.player_interactions.retain(|_, intent| {
+            if intent.target_player_id == Some(id) {
+                intent.target_player_id = None;
+            }
+            if intent.follow_player_id == Some(id) {
+                intent.follow_player_id = None;
+            }
+            intent.target_player_id.is_some() || intent.follow_player_id.is_some()
+        });
+        Ok(player)
     }
 
     pub fn is_player_occupied(&self, position: Position) -> bool {
@@ -588,6 +611,36 @@ impl WorldState {
                 level: player.level,
             })
             .collect()
+    }
+
+    pub fn player_interaction_intent(
+        &self,
+        player_id: u64,
+    ) -> Result<PlayerInteractionIntent, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        Ok(self
+            .player_interactions
+            .get(&player_id)
+            .copied()
+            .unwrap_or_default())
+    }
+
+    pub fn set_player_target(
+        &mut self,
+        player_id: u64,
+        target_player_id: Option<u64>,
+    ) -> Result<PlayerInteractionIntent, CoreError> {
+        self.set_player_interaction(player_id, target_player_id, None, true)
+    }
+
+    pub fn set_player_follow(
+        &mut self,
+        player_id: u64,
+        follow_player_id: Option<u64>,
+    ) -> Result<PlayerInteractionIntent, CoreError> {
+        self.set_player_interaction(player_id, None, follow_player_id, false)
     }
 
     /// Replaces the immutable display-only static creature set. This intentionally carries no
@@ -898,6 +951,45 @@ impl WorldState {
             manifest,
         })
     }
+
+    fn set_player_interaction(
+        &mut self,
+        player_id: u64,
+        target_player_id: Option<u64>,
+        follow_player_id: Option<u64>,
+        replace_target: bool,
+    ) -> Result<PlayerInteractionIntent, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        let selected_player_id = if replace_target {
+            target_player_id
+        } else {
+            follow_player_id
+        };
+        if let Some(selected_player_id) = selected_player_id {
+            if selected_player_id == player_id {
+                return Err(CoreError::SelfInteractionNotAllowed(player_id));
+            }
+            if !self.players.contains_key(&selected_player_id) {
+                return Err(CoreError::UnknownPlayer(selected_player_id));
+            }
+        }
+
+        let intent = {
+            let intent = self.player_interactions.entry(player_id).or_default();
+            if replace_target {
+                intent.target_player_id = target_player_id;
+            } else {
+                intent.follow_player_id = follow_player_id;
+            }
+            *intent
+        };
+        if intent == PlayerInteractionIntent::default() {
+            self.player_interactions.remove(&player_id);
+        }
+        Ok(intent)
+    }
 }
 
 pub fn level_for_experience(experience: u64) -> u32 {
@@ -935,6 +1027,7 @@ pub enum CoreError {
         command: LifecycleCommand,
     },
     UnknownPlayer(u64),
+    SelfInteractionNotAllowed(u64),
 }
 
 impl std::fmt::Display for CoreError {
@@ -1038,6 +1131,62 @@ mod tests {
         world.remove_player(8).unwrap();
         assert!(world.player_render_snapshots().is_empty());
         assert_eq!(world.remove_player(7), Err(CoreError::UnknownPlayer(7)));
+    }
+
+    #[test]
+    fn player_interaction_intent_is_bounded_and_clears_when_a_selected_player_leaves() {
+        let mut world = WorldState::default();
+        let source = player();
+        let selected = Player {
+            id: 8,
+            account_id: 3,
+            name: "Druid".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            ..source.clone()
+        };
+        world.add_player(source.clone()).unwrap();
+        world.add_player(selected.clone()).unwrap();
+
+        assert_eq!(
+            world.player_interaction_intent(source.id),
+            Ok(PlayerInteractionIntent::default())
+        );
+        assert_eq!(
+            world.set_player_target(source.id, Some(selected.id)),
+            Ok(PlayerInteractionIntent {
+                target_player_id: Some(selected.id),
+                follow_player_id: None,
+            })
+        );
+        assert_eq!(
+            world.set_player_follow(source.id, Some(selected.id)),
+            Ok(PlayerInteractionIntent {
+                target_player_id: Some(selected.id),
+                follow_player_id: Some(selected.id),
+            })
+        );
+        assert_eq!(
+            world.set_player_target(source.id, Some(source.id)),
+            Err(CoreError::SelfInteractionNotAllowed(source.id))
+        );
+        assert_eq!(
+            world.set_player_follow(source.id, Some(9)),
+            Err(CoreError::UnknownPlayer(9))
+        );
+
+        world.remove_player(selected.id).unwrap();
+        assert_eq!(
+            world.player_interaction_intent(source.id),
+            Ok(PlayerInteractionIntent::default())
+        );
+        assert_eq!(
+            world.set_player_target(source.id, None),
+            Ok(PlayerInteractionIntent::default())
+        );
     }
 
     #[test]

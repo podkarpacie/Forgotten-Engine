@@ -114,3 +114,8 @@
 - [x] Encode and deliver shared public chat to active native sessions without destabilizing heartbeat or visibility refresh behavior.
 - [x] Add self-contained shared chat broadcast and native session regression coverage.
 - [x] Package and publish the shared native chat release with Linux, Windows, and SHA-256 assets.
+- [x] Audit native 740 target and follow request decoding against shared authoritative player-state boundaries.
+- [x] Model bounded shared target and follow intent state with validation and automatic cleanup on target departure.
+- [x] Decode and apply supported native target and follow selections without attack resolution or automatic movement.
+- [x] Add self-contained interaction-state and native session regression coverage.
+- [x] Package and publish the shared interaction-state release with Linux, Windows, and SHA-256 assets.

@@ -804,6 +804,8 @@ pub const NATIVE_OTCLIENT_CLIENT_TURN_EAST: u8 = 0x70;
 pub const NATIVE_OTCLIENT_CLIENT_TURN_SOUTH: u8 = 0x71;
 pub const NATIVE_OTCLIENT_CLIENT_TURN_WEST: u8 = 0x72;
 pub const NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES: u8 = 0xa0;
+pub const NATIVE_OTCLIENT_CLIENT_SELECT_TARGET: u8 = 0xa1;
+pub const NATIVE_OTCLIENT_CLIENT_SELECT_FOLLOW: u8 = 0xa2;
 pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM: u8 = 0x82;
 pub const NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT: u8 = 0x78;
@@ -998,6 +1000,8 @@ pub enum NativeOtClientGameAction {
     Talk(String),
     UseItem,
     ChangeOutfit,
+    SelectTarget(u32),
+    SelectFollow(u32),
     IgnoredInteraction(u8),
     Turn(NativeOtClientCardinalDirection),
     ChangeFightModes,
@@ -1430,6 +1434,12 @@ pub fn decode_native_otclient_game_action(
             reader.byte()?;
             NativeOtClientGameAction::ChangeFightModes
         }
+        NATIVE_OTCLIENT_CLIENT_SELECT_TARGET => {
+            NativeOtClientGameAction::SelectTarget(reader.u32()?)
+        }
+        NATIVE_OTCLIENT_CLIENT_SELECT_FOLLOW => {
+            NativeOtClientGameAction::SelectFollow(reader.u32()?)
+        }
         opcode if is_native_otclient_compatibility_interaction(opcode) => {
             if reader.remaining() > NATIVE_OTCLIENT_MAX_IGNORED_INTERACTION_BYTES {
                 return Err(ProtocolError::InvalidNativeGameRequest);
@@ -1457,7 +1467,7 @@ fn is_native_otclient_compatibility_interaction(opcode: u8) -> bool {
         0x77
             | 0x83..=0x8d
             | 0x97..=0x9f
-            | 0xa1..=0xad
+            | 0xa3..=0xad
             | 0xbe
             | 0xca
     )
@@ -2504,10 +2514,27 @@ mod tests {
             NativeOtClientGameAction::ChangeOutfit
         );
         assert_eq!(
-            decode_native_otclient_game_action(&Frame(vec![0xa1, 1, 0, 0, 0]), &profile).unwrap(),
-            NativeOtClientGameAction::IgnoredInteraction(0xa1)
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_SELECT_TARGET, 1, 0, 0, 0]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::SelectTarget(1)
         );
-        let mut oversized_interaction = vec![0xa1];
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_SELECT_FOLLOW, 2, 0, 0, 0]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::SelectFollow(2)
+        );
+        assert!(decode_native_otclient_game_action(
+            &Frame(vec![NATIVE_OTCLIENT_CLIENT_SELECT_TARGET, 0, 0, 0, 0, 0]),
+            &profile,
+        )
+        .is_err());
+        let mut oversized_interaction = vec![0xa3];
         oversized_interaction.extend(vec![0; NATIVE_OTCLIENT_MAX_IGNORED_INTERACTION_BYTES + 1]);
         assert!(
             decode_native_otclient_game_action(&Frame(oversized_interaction), &profile).is_err()

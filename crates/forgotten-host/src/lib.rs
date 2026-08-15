@@ -3,8 +3,9 @@
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
 use forgotten_core::{
-    CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, Player, Position,
-    StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, WorldMap, WorldState,
+    CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, Player,
+    PlayerInteractionIntent, Position, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy,
+    WorldMap, WorldState,
 };
 use forgotten_persistence::EngineDatabase;
 use forgotten_protocol::{
@@ -170,6 +171,35 @@ impl SharedNativeWorld {
 
     pub fn active_static_spawns(&self) -> Result<FeTfsStaticSpawnCollection, HostError> {
         Ok(self.lock()?.active_static_spawn_collection())
+    }
+
+    pub fn player_interaction_intent(
+        &self,
+        player_id: u64,
+    ) -> Result<PlayerInteractionIntent, HostError> {
+        self.lock()?
+            .player_interaction_intent(player_id)
+            .map_err(HostError::Core)
+    }
+
+    pub fn set_player_target(
+        &self,
+        player_id: u64,
+        target_player_id: Option<u64>,
+    ) -> Result<PlayerInteractionIntent, HostError> {
+        self.lock()?
+            .set_player_target(player_id, target_player_id)
+            .map_err(HostError::Core)
+    }
+
+    pub fn set_player_follow(
+        &self,
+        player_id: u64,
+        follow_player_id: Option<u64>,
+    ) -> Result<PlayerInteractionIntent, HostError> {
+        self.lock()?
+            .set_player_follow(player_id, follow_player_id)
+            .map_err(HostError::Core)
     }
 
     pub fn visible_players(
@@ -1085,6 +1115,22 @@ fn handle_native_otclient_game(
             NativeOtClientGameAction::IgnoredInteraction(opcode) => {
                 eprintln!("> Native OTCv8 compatibility action ignored opcode=0x{opcode:02x}");
             }
+            NativeOtClientGameAction::SelectTarget(native_selected_id) => {
+                apply_native_player_interaction(
+                    shared_world,
+                    character.id,
+                    native_selected_id,
+                    NativePlayerInteractionKind::Target,
+                )?;
+            }
+            NativeOtClientGameAction::SelectFollow(native_selected_id) => {
+                apply_native_player_interaction(
+                    shared_world,
+                    character.id,
+                    native_selected_id,
+                    NativePlayerInteractionKind::Follow,
+                )?;
+            }
             NativeOtClientGameAction::Talk(message) => {
                 let recipient_count = shared_world.broadcast_public_chat(character.id, &message)?;
                 eprintln!(
@@ -1420,6 +1466,58 @@ fn native_player_id(character_id: u64) -> Result<u32, HostError> {
         ));
     }
     Ok(player_id)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NativePlayerInteractionKind {
+    Target,
+    Follow,
+}
+
+fn apply_native_player_interaction(
+    shared_world: &SharedNativeWorld,
+    source_player_id: u64,
+    native_selected_id: u32,
+    kind: NativePlayerInteractionKind,
+) -> Result<(), HostError> {
+    let selected_player_id = if native_selected_id == 0 {
+        Some(None)
+    } else {
+        native_player_id_to_character_id(native_selected_id).map(Some)
+    };
+    let Some(selected_player_id) = selected_player_id else {
+        eprintln!(
+            "> Native OTCv8 {:?} selection deferred native-id={native_selected_id}",
+            kind
+        );
+        return Ok(());
+    };
+    let result = match kind {
+        NativePlayerInteractionKind::Target => {
+            shared_world.set_player_target(source_player_id, selected_player_id)
+        }
+        NativePlayerInteractionKind::Follow => {
+            shared_world.set_player_follow(source_player_id, selected_player_id)
+        }
+    };
+    match result {
+        Ok(_) => Ok(()),
+        Err(HostError::Core(forgotten_core::CoreError::UnknownPlayer(_)))
+        | Err(HostError::Core(forgotten_core::CoreError::SelfInteractionNotAllowed(_))) => {
+            eprintln!(
+                "> Native OTCv8 {:?} selection ignored native-id={native_selected_id}",
+                kind
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn native_player_id_to_character_id(native_id: u32) -> Option<u64> {
+    (NATIVE_OTCLIENT_PLAYER_ID_START..NATIVE_OTCLIENT_PLAYER_ID_END)
+        .contains(&native_id)
+        .then(|| u64::from(native_id - NATIVE_OTCLIENT_PLAYER_ID_START))
 }
 
 fn native_position(position: Position) -> NativeOtClientPosition {
@@ -2037,6 +2135,113 @@ mod tests {
         assert_eq!(recycled, first_position);
         shared.remove_player(102).unwrap();
         shared.remove_player(103).unwrap();
+    }
+
+    #[test]
+    fn shared_native_world_tracks_and_clears_player_interaction_intent() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        for (id, name) in [(101, "Knight"), (102, "Druid")] {
+            shared
+                .register_player_at_available_position(
+                    Player {
+                        id,
+                        account_id: id,
+                        name: name.into(),
+                        position: map.spawn(),
+                        level: 8,
+                        experience: 0,
+                        skill_points: 0,
+                    },
+                    &map,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            shared.set_player_target(101, Some(102)).unwrap(),
+            PlayerInteractionIntent {
+                target_player_id: Some(102),
+                follow_player_id: None,
+            }
+        );
+        assert_eq!(
+            shared.set_player_follow(101, Some(102)).unwrap(),
+            PlayerInteractionIntent {
+                target_player_id: Some(102),
+                follow_player_id: Some(102),
+            }
+        );
+        shared.remove_player(102).unwrap();
+        assert_eq!(
+            shared.player_interaction_intent(101).unwrap(),
+            PlayerInteractionIntent::default()
+        );
+    }
+
+    #[test]
+    fn native_player_interaction_ids_only_accept_the_reserved_player_range() {
+        assert_eq!(
+            native_player_id_to_character_id(NATIVE_OTCLIENT_PLAYER_ID_START + 101),
+            Some(101)
+        );
+        assert_eq!(native_player_id_to_character_id(0), None);
+        assert_eq!(
+            native_player_id_to_character_id(NATIVE_OTCLIENT_PLAYER_ID_END),
+            None
+        );
+    }
+
+    #[test]
+    fn native_player_interaction_application_preserves_follow_and_defers_non_players() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        for (id, name) in [(101, "Knight"), (102, "Druid")] {
+            shared
+                .register_player_at_available_position(
+                    Player {
+                        id,
+                        account_id: id,
+                        name: name.into(),
+                        position: map.spawn(),
+                        level: 8,
+                        experience: 0,
+                        skill_points: 0,
+                    },
+                    &map,
+                )
+                .unwrap();
+        }
+
+        apply_native_player_interaction(
+            &shared,
+            101,
+            NATIVE_OTCLIENT_PLAYER_ID_START + 102,
+            NativePlayerInteractionKind::Target,
+        )
+        .unwrap();
+        apply_native_player_interaction(
+            &shared,
+            101,
+            NATIVE_OTCLIENT_PLAYER_ID_START + 102,
+            NativePlayerInteractionKind::Follow,
+        )
+        .unwrap();
+        apply_native_player_interaction(&shared, 101, 0, NativePlayerInteractionKind::Target)
+            .unwrap();
+        apply_native_player_interaction(
+            &shared,
+            101,
+            NATIVE_OTCLIENT_PLAYER_ID_END,
+            NativePlayerInteractionKind::Follow,
+        )
+        .unwrap();
+        assert_eq!(
+            shared.player_interaction_intent(101).unwrap(),
+            PlayerInteractionIntent {
+                target_player_id: None,
+                follow_player_id: Some(102),
+            }
+        );
     }
 
     #[test]
