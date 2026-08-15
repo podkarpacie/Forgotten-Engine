@@ -546,11 +546,28 @@ impl WorldState {
         if self.players.contains_key(&player.id) {
             return Err(CoreError::DuplicatePlayer(player.id));
         }
+        if self
+            .players
+            .values()
+            .any(|existing| existing.position == player.position)
+        {
+            return Err(CoreError::PlayerOccupiesPosition(player.position));
+        }
         if self.is_static_creature_occupied(player.position) {
             return Err(CoreError::StaticCreatureOccupiesPosition(player.position));
         }
         self.players.insert(player.id, player);
         Ok(())
+    }
+
+    pub fn remove_player(&mut self, id: u64) -> Result<Player, CoreError> {
+        self.players.remove(&id).ok_or(CoreError::UnknownPlayer(id))
+    }
+
+    pub fn is_player_occupied(&self, position: Position) -> bool {
+        self.players
+            .values()
+            .any(|player| player.position == position)
     }
 
     /// Replaces the immutable display-only static creature set. This intentionally carries no
@@ -888,6 +905,7 @@ pub enum CoreError {
     EmptyStaticSpawnName,
     StaticCreatureOccupiesPosition(Position),
     PlayerOccupiesStaticCreaturePosition(Position),
+    PlayerOccupiesPosition(Position),
     UnknownStaticCreature(u32),
     InactiveStaticCreature(u32),
     StaticCreatureMovementBlocked(Position),
@@ -964,6 +982,27 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn shared_world_player_registration_is_exclusive_and_releases_on_removal() {
+        let mut world = WorldState::default();
+        let first = player();
+        world.add_player(first.clone()).unwrap();
+        let second = Player {
+            id: 8,
+            account_id: 3,
+            name: "Druid".into(),
+            ..first.clone()
+        };
+        assert_eq!(
+            world.add_player(second.clone()),
+            Err(CoreError::PlayerOccupiesPosition(first.position))
+        );
+        assert_eq!(world.remove_player(first.id), Ok(first));
+        world.add_player(second).unwrap();
+        assert!(world.player(8).is_some());
+        assert_eq!(world.remove_player(7), Err(CoreError::UnknownPlayer(7)));
     }
 
     #[test]

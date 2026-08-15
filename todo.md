@@ -98,3 +98,8 @@
 - [x] Integrate bounded scheduled static creature movement with authoritative native map visibility refreshes.
 - [x] Add self-contained decision-policy and native update regression coverage.
 - [x] Package and publish the deterministic static creature policy release with Linux, Windows, and SHA-256 assets.
+- [x] Audit current native session-local world ownership and safe shared-world synchronization boundaries.
+- [x] Model a synchronized shared authoritative world host with controlled ticks and bounded player lifecycle operations.
+- [x] Integrate native sessions with shared player occupancy and current-world map snapshots.
+- [x] Add self-contained shared-world synchronization and concurrent-session regression coverage.
+- [x] Package and publish the shared authoritative world host release with Linux, Windows, and SHA-256 assets.

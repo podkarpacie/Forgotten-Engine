@@ -35,7 +35,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -106,6 +106,96 @@ pub struct NativeOtClientEmptyWorldConfig {
     pub player_look_type: u8,
     pub player_speed: u16,
     pub server_beat: u16,
+}
+
+/// One synchronized authoritative world for all native game sessions started by a host. It owns
+/// no automatic scheduler: callers advance ticks and apply creature policy explicitly.
+#[derive(Debug, Clone)]
+pub struct SharedNativeWorld {
+    world: Arc<Mutex<WorldState>>,
+}
+
+impl SharedNativeWorld {
+    pub fn from_static_spawns(
+        static_spawns: Option<&FeTfsStaticSpawnCollection>,
+    ) -> Result<Self, HostError> {
+        let mut world = WorldState::default();
+        if let Some(static_spawns) = static_spawns {
+            world
+                .install_static_creatures(static_spawns)
+                .map_err(HostError::Core)?;
+        }
+        Ok(Self {
+            world: Arc::new(Mutex::new(world)),
+        })
+    }
+
+    pub fn advance_tick(&self) -> Result<u64, HostError> {
+        Ok(self.lock()?.advance_tick())
+    }
+
+    pub fn tick(&self) -> Result<u64, HostError> {
+        Ok(self.lock()?.tick())
+    }
+
+    pub fn active_static_spawns(&self) -> Result<FeTfsStaticSpawnCollection, HostError> {
+        Ok(self.lock()?.active_static_spawn_collection())
+    }
+
+    pub fn register_player_at_available_position(
+        &self,
+        mut player: Player,
+        world_map: &WorldMap,
+    ) -> Result<Position, HostError> {
+        let mut world = self.lock()?;
+        let position = [player.position, world_map.spawn()]
+            .into_iter()
+            .find(|position| {
+                world_map.is_walkable(*position)
+                    && !world.is_static_creature_occupied(*position)
+                    && !world.is_player_occupied(*position)
+            })
+            .or_else(|| {
+                world_map.tiles().find_map(|(position, tile)| {
+                    (tile.walkable
+                        && !world.is_static_creature_occupied(position)
+                        && !world.is_player_occupied(position))
+                    .then_some(position)
+                })
+            })
+            .ok_or_else(|| {
+                HostError::InvalidConfiguration(
+                    "native map has no walkable tile unoccupied by a player or static creature"
+                        .into(),
+                )
+            })?;
+        player.position = position;
+        world.add_player(player).map_err(HostError::Core)?;
+        Ok(position)
+    }
+
+    pub fn remove_player(&self, id: u64) -> Result<(), HostError> {
+        self.lock()?.remove_player(id).map_err(HostError::Core)?;
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, WorldState>, HostError> {
+        self.world
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)
+    }
+}
+
+#[derive(Debug)]
+struct SharedNativePlayerRegistration {
+    world: SharedNativeWorld,
+    player_id: u64,
+}
+
+impl Drop for SharedNativePlayerRegistration {
+    fn drop(&mut self) {
+        let _ = self.world.remove_player(self.player_id);
+    }
 }
 
 impl HostConfig {
@@ -338,6 +428,7 @@ pub fn start_native_otclient_game(
     let shutdown = Arc::new(AtomicBool::new(false));
     let active_connections = Arc::new(AtomicUsize::new(0));
     let database_path = database_path.as_ref().to_path_buf();
+    let shared_world = SharedNativeWorld::from_static_spawns(config.static_spawns.as_deref())?;
     let thread_shutdown = Arc::clone(&shutdown);
     let thread = thread::spawn(move || {
         serve_native_otclient_game(
@@ -346,6 +437,7 @@ pub fn start_native_otclient_game(
             database_path,
             thread_shutdown,
             active_connections,
+            shared_world,
         )
     });
     Ok(HostHandle {
@@ -588,6 +680,7 @@ fn serve_native_otclient_game(
     database_path: PathBuf,
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
+    shared_world: SharedNativeWorld,
 ) -> Result<(), HostError> {
     record_event(
         &database_path,
@@ -609,12 +702,14 @@ fn serve_native_otclient_game(
                 let session_config = config.clone();
                 let session_database_path = database_path.clone();
                 let session_connections = Arc::clone(&active_connections);
+                let session_world = shared_world.clone();
                 thread::spawn(move || {
                     let result = handle_native_otclient_game(
                         &mut stream,
                         peer,
                         &session_config,
                         &session_database_path,
+                        &session_world,
                     );
                     if let Err(error) = result {
                         eprintln!("> Native OTCv8 game session ended peer={peer} reason={error}");
@@ -699,6 +794,7 @@ fn handle_native_otclient_game(
     peer: SocketAddr,
     config: &NativeOtClientHostConfig,
     database_path: &Path,
+    shared_world: &SharedNativeWorld,
 ) -> Result<(), HostError> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(config.session_timeout))?;
@@ -745,44 +841,40 @@ fn handle_native_otclient_game(
         )?;
         return Ok(());
     };
-    let mut world = WorldState::default();
-    if let Some(static_spawns) = config.static_spawns.as_deref() {
-        world
-            .install_static_creatures(static_spawns)
-            .map_err(HostError::Core)?;
-    }
-    let initial_position = [character.position, world_map.spawn()]
-        .into_iter()
-        .find(|position| {
-            world_map.is_walkable(*position) && !world.is_static_creature_occupied(*position)
-        })
-        .or_else(|| {
-            world_map.tiles().find_map(|(position, tile)| {
-                (tile.walkable && !world.is_static_creature_occupied(position)).then_some(position)
-            })
-        })
-        .ok_or_else(|| {
-            HostError::InvalidConfiguration(
-                "native map has no walkable tile unoccupied by a static creature".into(),
-            )
-        })?;
-    if initial_position != character.position {
-        database.update_player_position(character.id, initial_position)?;
-    }
     let account_id = u64::try_from(account.id).map_err(|_| {
         HostError::InvalidConfiguration("native numeric account IDs must be non-negative".into())
     })?;
-    world
-        .add_player(Player {
+    let initial_position = match shared_world.register_player_at_available_position(
+        Player {
             id: character.id,
             account_id,
             name: character.name.clone(),
-            position: initial_position,
+            position: character.position,
             level: character.level,
             experience: 0,
             skill_points: 0,
-        })
-        .map_err(HostError::Core)?;
+        },
+        world_map,
+    ) {
+        Ok(position) => position,
+        Err(HostError::Core(forgotten_core::CoreError::DuplicatePlayer(_))) => {
+            write_frame(
+                stream,
+                &encode_native_otclient_game_login_error(
+                    "Character is already active in the shared world.",
+                ),
+            )?;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let _registration = SharedNativePlayerRegistration {
+        world: shared_world.clone(),
+        player_id: character.id,
+    };
+    if initial_position != character.position {
+        database.update_player_position(character.id, initial_position)?;
+    }
     let player_id = native_player_id(character.id)?;
     let snapshot = NativeOtClientEmptyWorldSnapshot {
         player_id,
@@ -794,7 +886,7 @@ fn handle_native_otclient_game(
         player_speed: empty_world.player_speed,
         server_beat: empty_world.server_beat,
     };
-    let active_static_spawns = world.active_static_spawn_collection();
+    let active_static_spawns = shared_world.active_static_spawns()?;
     let initialization = encode_native_otclient_game_initialization_with_map_and_static_spawns(
         &config.client_profile,
         &snapshot,
@@ -900,10 +992,9 @@ fn handle_native_otclient_game(
                             &config.client_profile,
                             &snapshot,
                             &database,
-                            &mut world,
+                            shared_world,
                             character.id,
                             world_map,
-                            config.static_spawns.as_deref(),
                             &mut player_position,
                             &mut facing,
                             *cardinal,
@@ -935,10 +1026,9 @@ fn handle_native_otclient_game(
                     &config.client_profile,
                     &snapshot,
                     &database,
-                    &mut world,
+                    shared_world,
                     character.id,
                     world_map,
-                    config.static_spawns.as_deref(),
                     &mut player_position,
                     &mut facing,
                     direction,
@@ -1013,28 +1103,44 @@ fn move_native_map_player(
     profile: &NativeOtClientProfile,
     snapshot: &NativeOtClientEmptyWorldSnapshot,
     database: &EngineDatabase,
-    world: &mut WorldState,
+    shared_world: &SharedNativeWorld,
     character_id: u64,
     world_map: &WorldMap,
-    _static_spawns: Option<&FeTfsStaticSpawnCollection>,
     player_position: &mut Position,
     facing: &mut NativeOtClientCardinalDirection,
     direction: NativeOtClientCardinalDirection,
 ) -> Result<bool, HostError> {
-    let destination = player_position
-        .step(native_cardinal_direction(direction))
-        .map_err(HostError::Core)?;
-    if !world_map.is_walkable(destination) || world.is_static_creature_occupied(destination) {
+    let moved = {
+        let mut world = shared_world.lock()?;
+        let source = world
+            .player(character_id)
+            .ok_or(forgotten_core::CoreError::UnknownPlayer(character_id))
+            .map_err(HostError::Core)?
+            .position;
+        let destination = source
+            .step(native_cardinal_direction(direction))
+            .map_err(HostError::Core)?;
+        if !world_map.is_walkable(destination)
+            || world.is_static_creature_occupied(destination)
+            || world.is_player_occupied(destination)
+        {
+            None
+        } else {
+            let (previous, destination) = world
+                .move_player_cardinal(character_id, native_cardinal_direction(direction))
+                .map_err(HostError::Core)?;
+            let active_static_spawns = world.active_static_spawn_collection();
+            Some((previous, destination, active_static_spawns))
+        }
+    };
+    let Some((previous, destination, active_static_spawns)) = moved else {
         write_frame(
             stream,
             &encode_native_otclient_game_cancel_walk_facing(profile, facing.protocol_direction())
                 .map_err(HostError::Protocol)?,
         )?;
         return Ok(false);
-    }
-    let (previous, destination) = world
-        .move_player_cardinal(character_id, native_cardinal_direction(direction))
-        .map_err(HostError::Core)?;
+    };
     database.update_player_position(character_id, destination)?;
     write_frame(
         stream,
@@ -1048,7 +1154,6 @@ fn move_native_map_player(
     )?;
     let mut refreshed_snapshot = snapshot.clone();
     refreshed_snapshot.player_position = native_position(destination);
-    let active_static_spawns = world.active_static_spawn_collection();
     write_frame(
         stream,
         &encode_native_otclient_map_viewport_with_static_spawns(
@@ -1546,6 +1651,7 @@ pub enum HostError {
     Persistence(forgotten_persistence::PersistenceError),
     InvalidConfiguration(String),
     InvalidProbe(&'static str),
+    SharedWorldUnavailable,
     LegacyLoginUnavailable,
     HostThreadPanicked,
 }
@@ -1559,6 +1665,7 @@ impl HostError {
             Self::Persistence(_) => b"persistence-error",
             Self::Io(_) => b"io-error",
             Self::InvalidConfiguration(_) => b"invalid-config",
+            Self::SharedWorldUnavailable => b"shared-world-unavailable",
             Self::LegacyLoginUnavailable => b"legacy-login-unavailable",
             Self::HostThreadPanicked => b"host-panic",
         }
@@ -1685,6 +1792,72 @@ mod tests {
         }
         map.validate().unwrap();
         Arc::new(map)
+    }
+
+    #[test]
+    fn shared_native_world_synchronizes_concurrent_player_registration_and_cleanup() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        let first_world = shared.clone();
+        let first_map = Arc::clone(&map);
+        let first = thread::spawn(move || {
+            first_world
+                .register_player_at_available_position(
+                    Player {
+                        id: 101,
+                        account_id: 1,
+                        name: "Knight".into(),
+                        position: first_map.spawn(),
+                        level: 8,
+                        experience: 0,
+                        skill_points: 0,
+                    },
+                    &first_map,
+                )
+                .unwrap()
+        });
+        let second_world = shared.clone();
+        let second_map = Arc::clone(&map);
+        let second = thread::spawn(move || {
+            second_world
+                .register_player_at_available_position(
+                    Player {
+                        id: 102,
+                        account_id: 2,
+                        name: "Druid".into(),
+                        position: second_map.spawn(),
+                        level: 8,
+                        experience: 0,
+                        skill_points: 0,
+                    },
+                    &second_map,
+                )
+                .unwrap()
+        });
+        let first_position = first.join().unwrap();
+        let second_position = second.join().unwrap();
+        assert_ne!(first_position, second_position);
+        assert_eq!(shared.tick().unwrap(), 0);
+        assert_eq!(shared.advance_tick().unwrap(), 1);
+        assert_eq!(shared.tick().unwrap(), 1);
+        shared.remove_player(101).unwrap();
+        let recycled = shared
+            .register_player_at_available_position(
+                Player {
+                    id: 103,
+                    account_id: 3,
+                    name: "Sorcerer".into(),
+                    position: first_position,
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        assert_eq!(recycled, first_position);
+        shared.remove_player(102).unwrap();
+        shared.remove_player(103).unwrap();
     }
 
     fn native_empty_world_config(bind_addr: SocketAddr) -> NativeOtClientHostConfig {
