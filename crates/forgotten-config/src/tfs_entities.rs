@@ -154,7 +154,11 @@ pub fn materialize_tfs_static_spawns(
                 legs: appearance.legs,
                 feet: appearance.feet,
                 addons: appearance.addons,
-                speed: appearance.speed.max(DEFAULT_STATIC_ENTITY_SPEED),
+                speed: if appearance.speed == 0 {
+                    DEFAULT_STATIC_ENTITY_SPEED
+                } else {
+                    appearance.speed
+                },
                 health_percent: u8::from(appearance.max_health > 0) * 100,
                 direction: creature.direction % 4,
             });
@@ -814,7 +818,7 @@ mod tests {
         assert_eq!(spawns.entities[0].id, STATIC_TFS_ENTITY_ID_START);
         assert_eq!(spawns.entities[0].name, "Rat");
         assert_eq!(spawns.entities[0].position, position);
-        assert_eq!(spawns.entities[0].speed, DEFAULT_STATIC_ENTITY_SPEED);
+        assert_eq!(spawns.entities[0].speed, 134);
         assert_eq!(spawns.entities[0].health_percent, 100);
         assert_eq!(spawns.entities[0].direction, 2);
     }
