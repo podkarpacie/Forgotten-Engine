@@ -793,6 +793,8 @@ pub const NATIVE_OTCLIENT_GAME_PLAYER_STATE: u8 = 0xa2;
 pub const NATIVE_OTCLIENT_GAME_ANIMATED_TEXT: u8 = 0x84;
 pub const NATIVE_OTCLIENT_GAME_TEXT_MESSAGE: u8 = 0xb4;
 pub const NATIVE_OTCLIENT_GAME_CANCEL_WALK: u8 = 0xb5;
+/// Classic 7.x status-console blue: a text-only message shown in the default client console.
+pub const NATIVE_OTCLIENT_MESSAGE_STATUS_CONSOLE_BLUE: u8 = 4;
 pub const NATIVE_OTCLIENT_ENTER_GAME: u8 = 0x0f;
 pub const NATIVE_OTCLIENT_LEAVE_GAME: u8 = 0x14;
 pub const NATIVE_OTCLIENT_CLIENT_PING: u8 = 0x1d;
@@ -809,6 +811,8 @@ pub const NATIVE_OTCLIENT_CLIENT_SELECT_FOLLOW: u8 = 0xa2;
 pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM: u8 = 0x82;
 pub const NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT: u8 = 0x78;
+pub const NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT: u8 = 0xd2;
+pub const NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT_STANDARD: u8 = 0xd3;
 pub const NATIVE_OTCLIENT_MAX_IGNORED_INTERACTION_BYTES: usize = 512;
 pub const NATIVE_OTCLIENT_UNKNOWN_CREATURE: u16 = 0x0061;
 pub const NATIVE_OTCLIENT_MAPPED_CREATURE: u16 = 0xffff;
@@ -883,6 +887,7 @@ pub struct NativeOtClientEmptyWorldSnapshot {
     pub player_level: u16,
     pub ground_thing_id: u16,
     pub player_look_type: u8,
+    pub player_direction: u8,
     pub player_speed: u16,
     pub server_beat: u16,
 }
@@ -999,6 +1004,7 @@ pub enum NativeOtClientGameAction {
     AutoWalk(Vec<NativeOtClientAutoWalkDirection>),
     Talk(String),
     UseItem,
+    RequestOutfit,
     ChangeOutfit,
     SelectTarget(u32),
     SelectFollow(u32),
@@ -1364,6 +1370,133 @@ pub fn encode_native_otclient_map_viewport_with_static_spawns_and_players(
     Ok(frame)
 }
 
+/// Encodes the single newly exposed classic viewport edge after one confirmed cardinal step.
+/// It is deliberately limited to map rendering; it does not add movement, combat, or AI behavior.
+pub fn encode_native_otclient_map_step_with_static_spawns_and_players(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    world_map: &WorldMap,
+    static_spawns: Option<&FeTfsStaticSpawnCollection>,
+    visible_players: Option<&[NativeOtClientVisiblePlayer]>,
+    direction: NativeOtClientCardinalDirection,
+) -> Result<Frame, ProtocolError> {
+    validate_native_empty_world_snapshot(profile, snapshot)?;
+    let mut writer = Writer::default();
+    let center_x = (NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH / 2 - 1) as i16;
+    let center_y = (NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT / 2 - 1) as i16;
+    let asset_free = snapshot.ground_thing_id == 0 && snapshot.player_look_type == 0;
+    let mut static_entity_count = 0usize;
+    let mut visible_player_count = 0usize;
+    let positions = match direction {
+        NativeOtClientCardinalDirection::North => (0..NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH)
+            .map(|x| Position {
+                x: snapshot
+                    .player_position
+                    .x
+                    .saturating_add_signed(x as i16 - center_x),
+                y: snapshot.player_position.y.saturating_add_signed(-center_y),
+                z: 0,
+            })
+            .collect::<Vec<_>>(),
+        NativeOtClientCardinalDirection::East => (0..NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT)
+            .map(|y| Position {
+                x: snapshot
+                    .player_position
+                    .x
+                    .saturating_add_signed(NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH as i16 - 1 - center_x),
+                y: snapshot
+                    .player_position
+                    .y
+                    .saturating_add_signed(y as i16 - center_y),
+                z: 0,
+            })
+            .collect::<Vec<_>>(),
+        NativeOtClientCardinalDirection::South => (0..NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH)
+            .map(|x| Position {
+                x: snapshot
+                    .player_position
+                    .x
+                    .saturating_add_signed(x as i16 - center_x),
+                y: snapshot.player_position.y.saturating_add_signed(
+                    NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT as i16 - 1 - center_y,
+                ),
+                z: 0,
+            })
+            .collect::<Vec<_>>(),
+        NativeOtClientCardinalDirection::West => (0..NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT)
+            .map(|y| Position {
+                x: snapshot.player_position.x.saturating_add_signed(-center_x),
+                y: snapshot
+                    .player_position
+                    .y
+                    .saturating_add_signed(y as i16 - center_y),
+                z: 0,
+            })
+            .collect::<Vec<_>>(),
+    };
+    writer.byte(match direction {
+        NativeOtClientCardinalDirection::North => 0x65,
+        NativeOtClientCardinalDirection::East => 0x66,
+        NativeOtClientCardinalDirection::South => 0x67,
+        NativeOtClientCardinalDirection::West => 0x68,
+    });
+    for z in (0..NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS as u8).rev() {
+        for position in &positions {
+            let position = Position { z, ..*position };
+            let ground_thing_id = world_map
+                .tile(position)
+                .map(|tile| tile.ground_thing_id)
+                .filter(|ground_thing_id| *ground_thing_id != 0)
+                .unwrap_or(snapshot.ground_thing_id);
+            if ground_thing_id != 0 {
+                writer.u16(ground_thing_id);
+            }
+            if let Some(items) = world_map.tile_items(position) {
+                for item in items
+                    .iter()
+                    .skip(1)
+                    .take(NATIVE_OTCLIENT_MAX_EXTRA_TILE_ITEMS)
+                {
+                    let thing_id = item.client_thing_id.unwrap_or(item.server_id);
+                    if thing_id != 0 {
+                        writer.u16(thing_id);
+                    }
+                }
+            }
+            if let Some(static_spawns) = static_spawns {
+                for entity in static_spawns.at(position) {
+                    if static_entity_count >= NATIVE_OTCLIENT_MAX_STATIC_ENTITIES_PER_VIEWPORT {
+                        break;
+                    }
+                    write_native_otclient_unknown_static_entity(&mut writer, entity);
+                    static_entity_count += 1;
+                }
+            }
+            if !asset_free {
+                if let Some(visible_players) = visible_players {
+                    for player in visible_players.iter().filter(|player| {
+                        player.position.x == position.x
+                            && player.position.y == position.y
+                            && player.position.z == position.z
+                    }) {
+                        if visible_player_count >= NATIVE_OTCLIENT_MAX_SHARED_PLAYERS_PER_VIEWPORT {
+                            break;
+                        }
+                        write_native_otclient_unknown_visible_player(&mut writer, player);
+                        visible_player_count += 1;
+                    }
+                }
+            }
+            writer.u16(NATIVE_OTCLIENT_TILE_END);
+        }
+    }
+    let frame = Frame(writer.finish());
+    if frame.0.len() > MAX_FRAME_SIZE {
+        return Err(ProtocolError::InvalidLength(frame.0.len()));
+    }
+    Ok(frame)
+}
+
 pub fn decode_native_otclient_cardinal_move_request(
     frame: &Frame,
     profile: &NativeOtClientProfile,
@@ -1408,6 +1541,14 @@ pub fn decode_native_otclient_game_action(
         }
         NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT => {
             if reader.remaining() > 64 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            reader.take(reader.remaining())?;
+            NativeOtClientGameAction::ChangeOutfit
+        }
+        NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT => NativeOtClientGameAction::RequestOutfit,
+        NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT_STANDARD => {
+            if !(5..=6).contains(&reader.remaining()) {
                 return Err(ProtocolError::InvalidNativeGameRequest);
             }
             reader.take(reader.remaining())?;
@@ -1511,12 +1652,15 @@ pub fn encode_native_otclient_game_status_message(
     profile: &NativeOtClientProfile,
     message: &str,
 ) -> Result<Frame, ProtocolError> {
-    if !profile.supports_current_native_foundation() || message.len() > MAX_LOGIN_STRING_BYTES {
+    if !profile.supports_current_native_foundation()
+        || message.is_empty()
+        || message.len() > NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES
+    {
         return Err(ProtocolError::UnsupportedNativeClientProfile);
     }
     let mut writer = Writer::default();
     writer.byte(NATIVE_OTCLIENT_GAME_TEXT_MESSAGE);
-    writer.byte(17);
+    writer.byte(NATIVE_OTCLIENT_MESSAGE_STATUS_CONSOLE_BLUE);
     writer.string(message);
     Ok(Frame(writer.finish()))
 }
@@ -1585,6 +1729,7 @@ fn validate_native_empty_world_snapshot(
         || !(NATIVE_OTCLIENT_PLAYER_ID_START..NATIVE_OTCLIENT_PLAYER_ID_END)
             .contains(&snapshot.player_id)
         || snapshot.player_position.z >= NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS as u8
+        || snapshot.player_direction > 3
         || snapshot.player_speed == 0
         || snapshot.server_beat == 0
         || snapshot.player_name.len() > MAX_LOGIN_STRING_BYTES
@@ -1609,7 +1754,7 @@ fn write_native_otclient_unknown_player(
     writer.u32(snapshot.player_id);
     writer.string(&snapshot.player_name);
     writer.byte(100);
-    writer.byte(2);
+    writer.byte(snapshot.player_direction);
     writer.byte(snapshot.player_look_type);
     if snapshot.player_look_type == 0 {
         writer.u16(0);
@@ -2173,6 +2318,7 @@ mod tests {
             player_level: 8,
             ground_thing_id: 102,
             player_look_type: 128,
+            player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
             player_speed: 220,
             server_beat: 50,
         };
@@ -2287,6 +2433,42 @@ mod tests {
             .0
             .windows(2)
             .any(|bytes| bytes == 556u16.to_le_bytes()));
+        world_map
+            .set_tile(
+                Position {
+                    x: 110,
+                    y: 100,
+                    z: 7,
+                },
+                forgotten_core::WorldMapTile {
+                    ground_thing_id: 777,
+                    walkable: true,
+                },
+            )
+            .unwrap();
+        let east_snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_position: NativeOtClientPosition {
+                x: 101,
+                ..snapshot.player_position
+            },
+            player_direction: NativeOtClientCardinalDirection::East.protocol_direction(),
+            ..snapshot.clone()
+        };
+        let east_edge = encode_native_otclient_map_step_with_static_spawns_and_players(
+            &profile,
+            &east_snapshot,
+            &world_map,
+            None,
+            None,
+            NativeOtClientCardinalDirection::East,
+        )
+        .unwrap();
+        assert_eq!(east_edge.0[0], 0x66);
+        assert!(east_edge
+            .0
+            .windows(2)
+            .any(|bytes| bytes == 777u16.to_le_bytes()));
+        assert!(east_edge.0.len() < map_viewport.0.len());
         let static_position = Position {
             x: 99,
             y: 100,
@@ -2428,6 +2610,20 @@ mod tests {
         assert!(
             encode_native_otclient_animated_text(&profile, snapshot.player_position, "",).is_err()
         );
+        assert_eq!(
+            encode_native_otclient_game_status_message(&profile, "hi")
+                .unwrap()
+                .0,
+            vec![
+                NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
+                NATIVE_OTCLIENT_MESSAGE_STATUS_CONSOLE_BLUE,
+                2,
+                0,
+                b'h',
+                b'i'
+            ]
+        );
+        assert!(encode_native_otclient_game_status_message(&profile, "").is_err());
 
         assert_eq!(
             decode_native_otclient_cardinal_move_request(&Frame(vec![0x66]), &profile).unwrap(),
@@ -2513,6 +2709,41 @@ mod tests {
             .unwrap(),
             NativeOtClientGameAction::ChangeOutfit
         );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::RequestOutfit
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![
+                    NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT_STANDARD,
+                    128,
+                    1,
+                    2,
+                    3,
+                    4,
+                    0,
+                ]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::ChangeOutfit
+        );
+        assert!(decode_native_otclient_game_action(
+            &Frame(vec![
+                NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT_STANDARD,
+                128,
+                1,
+                2,
+                3,
+            ]),
+            &profile,
+        )
+        .is_err());
         assert_eq!(
             decode_native_otclient_game_action(
                 &Frame(vec![NATIVE_OTCLIENT_CLIENT_SELECT_TARGET, 1, 0, 0, 0]),

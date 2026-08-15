@@ -41,7 +41,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ),
         "validate" => validate(required_path(&arguments, 1)?),
         "tfs-audit" => audit_tfs_conversion(required_path(&arguments, 1)?),
-        "run" => run_host(required_path(&arguments, 1)?),
+        "run" => {
+            let (directory, extended_diagnostics) = run_options(&arguments)?;
+            run_host(directory, extended_diagnostics)
+        }
         "status" => status(required_path(&arguments, 1)?),
         "generate-key" => generate_key(required_path(&arguments, 1)?),
         "backup" => backup(required_path(&arguments, 1)?),
@@ -66,6 +69,23 @@ fn required_path(
         .get(index)
         .map(PathBuf::from)
         .ok_or_else(|| "a Forgotten Engine world directory is required".into())
+}
+
+fn run_options(arguments: &[String]) -> Result<(PathBuf, bool), Box<dyn std::error::Error>> {
+    let directory = required_path(arguments, 1)?;
+    let mut extended_diagnostics = false;
+    for flag in &arguments[2..] {
+        match flag.as_str() {
+            "--ed" | "--extended-debug" => extended_diagnostics = true,
+            _ => {
+                return Err(format!(
+                    "unknown run option `{flag}`; use --ed for bounded extended diagnostics"
+                )
+                .into())
+            }
+        }
+    }
+    Ok((directory, extended_diagnostics))
 }
 
 fn selected_profile(
@@ -314,7 +334,10 @@ fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn run_host(
+    directory: PathBuf,
+    extended_diagnostics: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("Forgotten Engine - {}", env!("CARGO_PKG_VERSION"));
     validate(directory.clone())?;
     let config = load(&directory)?;
@@ -328,6 +351,11 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     database.record_event("info", "Forgotten Engine host startup requested")?;
 
     println!(">> Registering services");
+    if extended_diagnostics {
+        println!(
+            "> Extended diagnostics enabled: native session metadata is logged; credentials and packet bodies are excluded."
+        );
+    }
     let rsa_private_key = if config.legacy_login_enabled || config.game_session_enabled {
         if config.profile.id != "fe-7.4" {
             return Err(
@@ -443,6 +471,7 @@ fn run_host(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             ),
             max_connections: config.max_connections(),
             session_timeout: Duration::from_secs(5),
+            extended_diagnostics,
             empty_world,
             world_map: Some(Arc::clone(&world_map)),
             static_spawns: (!static_spawns.entities.is_empty()).then(|| Arc::new(static_spawns)),
@@ -768,7 +797,7 @@ fn version() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_help() {
-    println!("Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)\n  fe-8.0  — Tibia 8.0 (protocol foundation)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  tfs-audit <directory>\n  run <directory>\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  account create <directory> <account-name> <password>\n  player create <directory> <account-id> <character-name>\n  command <directory> broadcast <message>\n  compatibility\n  version");
+    println!("Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)\n  fe-8.0  — Tibia 8.0 (protocol foundation)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  tfs-audit <directory>\n  run <directory> [--ed]\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  account create <directory> <account-name> <password>\n  player create <directory> <account-id> <character-name>\n  command <directory> broadcast <message>\n  compatibility\n  version");
 }
 
 #[cfg(test)]
@@ -788,6 +817,34 @@ mod tests {
     fn rejects_unknown_profile_by_direct_selector() {
         let arguments = vec!["init".to_owned(), "world".to_owned(), "unknown".to_owned()];
         assert!(selected_profile(&arguments, 2).is_err());
+    }
+
+    #[test]
+    fn run_options_enable_only_the_explicit_extended_diagnostic_flags() {
+        let short = vec!["run".into(), "native-world".into(), "--ed".into()];
+        assert_eq!(
+            run_options(&short).unwrap(),
+            (PathBuf::from("native-world"), true)
+        );
+
+        let long = vec![
+            "run".into(),
+            "native-world".into(),
+            "--extended-debug".into(),
+        ];
+        assert_eq!(
+            run_options(&long).unwrap(),
+            (PathBuf::from("native-world"), true)
+        );
+
+        let ordinary = vec!["run".into(), "native-world".into()];
+        assert_eq!(
+            run_options(&ordinary).unwrap(),
+            (PathBuf::from("native-world"), false)
+        );
+
+        let invalid = vec!["run".into(), "native-world".into(), "--verbose".into()];
+        assert!(run_options(&invalid).is_err());
     }
 
     #[test]

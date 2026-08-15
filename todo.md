@@ -119,3 +119,11 @@
 - [x] Decode and apply supported native target and follow selections without attack resolution or automatic movement.
 - [x] Add self-contained interaction-state and native session regression coverage.
 - [x] Package and publish the shared interaction-state release with Linux, Windows, and SHA-256 assets.
+- [x] Diagnose and correct native 740 movement-facing resets during valid moves while retaining expected finite-map boundary rejection.
+- [x] Serialize rapid click-to-walk, stop, and manual movement input so native sessions do not lag or desynchronize under spammed input.
+- [x] Safely decode the live native 740 outfit-selection/change records without disconnecting or claiming persistent outfit support.
+- [x] Add regression coverage for live-client-informed movement, interruption, and outfit interaction frames.
+- [x] Package and publish the native 740 input stability patch release with Linux, Windows, and SHA-256 assets.
+- [x] Add an opt-in `run --ed` extended diagnostic mode with bounded native-session, movement, and disconnect metadata while never logging account credentials or packet bodies.
+- [x] Replace per-step full viewport movement refreshes that cause visible short-distance teleports during rapid click-to-walk input.
+- [x] Encode native 740 shared chat through the stock default console tab rather than the current animated-text fallback.

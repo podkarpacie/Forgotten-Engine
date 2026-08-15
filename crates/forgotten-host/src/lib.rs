@@ -18,11 +18,13 @@ use forgotten_protocol::{
     encode_fe_otclient_initial_world, encode_fe_otclient_movement_ack,
     encode_fe_otclient_world_tick, encode_legacy_74_character_list,
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
-    encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_animated_text,
-    encode_native_otclient_character_list, encode_native_otclient_game_cancel_walk_facing,
+    encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
+    encode_native_otclient_game_cancel_walk_facing,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
-    encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
+    encode_native_otclient_game_ping_back, encode_native_otclient_game_status_message,
+    encode_native_otclient_login_error,
+    encode_native_otclient_map_step_with_static_spawns_and_players,
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
     encode_native_otclient_move_creature_at, encode_status_binary, encode_status_xml,
@@ -110,6 +112,8 @@ pub struct NativeOtClientHostConfig {
     pub advertised_game_addr: SocketAddr,
     pub max_connections: usize,
     pub session_timeout: Duration,
+    /// Emits bounded session metadata only. Packet bodies and credentials are never logged.
+    pub extended_diagnostics: bool,
     pub empty_world: Option<NativeOtClientEmptyWorldConfig>,
     pub world_map: Option<Arc<WorldMap>>,
     /// Immutable display-only TFS spawn entities. No AI, combat, movement, or Lua behavior is
@@ -136,7 +140,6 @@ pub struct SharedNativeWorld {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SharedPublicChatEvent {
-    position: NativeOtClientPosition,
     text: String,
 }
 
@@ -259,7 +262,6 @@ impl SharedNativeWorld {
             return Ok(0);
         }
         let event = SharedPublicChatEvent {
-            position: native_position(sender.position),
             text: truncate_native_chat_text(&format!("{}: {body}", sender.name)),
         };
         let mut recipients = self
@@ -1019,6 +1021,7 @@ fn handle_native_otclient_game(
         player_level: character.level.try_into().unwrap_or(u16::MAX),
         ground_thing_id: empty_world.ground_thing_id,
         player_look_type: empty_world.player_look_type,
+        player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
         player_speed: empty_world.player_speed,
         server_beat: empty_world.server_beat,
     };
@@ -1039,15 +1042,17 @@ fn handle_native_otclient_game(
         .map_err(HostError::Protocol)?;
     write_frame(stream, &initialization)?;
     stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
-    eprintln!(
-        "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
-        character.name,
-        initialization.0.len(),
-        world_map.identifier(),
-        world_map.tile_count(),
-        active_static_spawns.entities.len(),
-        snapshot.ground_thing_id == 0 && snapshot.player_look_type == 0,
-    );
+    if config.extended_diagnostics {
+        eprintln!(
+            "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
+            character.name,
+            initialization.0.len(),
+            world_map.identifier(),
+            world_map.tile_count(),
+            active_static_spawns.entities.len(),
+            snapshot.ground_thing_id == 0 && snapshot.player_look_type == 0,
+        );
+    }
 
     let mut player_position = initial_position;
     let mut facing = NativeOtClientCardinalDirection::South;
@@ -1071,6 +1076,7 @@ fn handle_native_otclient_game(
                     if visibility_epoch != observed_visibility_epoch {
                         let mut refreshed_snapshot = snapshot.clone();
                         refreshed_snapshot.player_position = native_position(player_position);
+                        refreshed_snapshot.player_direction = facing.protocol_direction();
                         write_frame(
                             stream,
                             &encode_shared_native_world_viewport(
@@ -1094,10 +1100,12 @@ fn handle_native_otclient_game(
                 Err(error) => return Err(error),
             };
             let opcode = request.0.first().copied().unwrap_or_default();
-            eprintln!(
-                "> Native OTCv8 frame peer={peer} opcode=0x{opcode:02x} len={}",
-                request.0.len()
-            );
+            if config.extended_diagnostics {
+                eprintln!(
+                    "> Native OTCv8 frame peer={peer} opcode=0x{opcode:02x} len={}",
+                    request.0.len()
+                );
+            }
             decode_native_otclient_game_action(&request, &config.client_profile)
                 .map_err(HostError::Protocol)?
         };
@@ -1111,9 +1119,12 @@ fn handle_native_otclient_game(
             | NativeOtClientGameAction::EnterGame
             | NativeOtClientGameAction::ChangeFightModes
             | NativeOtClientGameAction::UseItem
+            | NativeOtClientGameAction::RequestOutfit
             | NativeOtClientGameAction::ChangeOutfit => {}
             NativeOtClientGameAction::IgnoredInteraction(opcode) => {
-                eprintln!("> Native OTCv8 compatibility action ignored opcode=0x{opcode:02x}");
+                if config.extended_diagnostics {
+                    eprintln!("> Native OTCv8 compatibility action ignored opcode=0x{opcode:02x}");
+                }
             }
             NativeOtClientGameAction::SelectTarget(native_selected_id) => {
                 apply_native_player_interaction(
@@ -1121,6 +1132,7 @@ fn handle_native_otclient_game(
                     character.id,
                     native_selected_id,
                     NativePlayerInteractionKind::Target,
+                    config.extended_diagnostics,
                 )?;
             }
             NativeOtClientGameAction::SelectFollow(native_selected_id) => {
@@ -1129,14 +1141,17 @@ fn handle_native_otclient_game(
                     character.id,
                     native_selected_id,
                     NativePlayerInteractionKind::Follow,
+                    config.extended_diagnostics,
                 )?;
             }
             NativeOtClientGameAction::Talk(message) => {
                 let recipient_count = shared_world.broadcast_public_chat(character.id, &message)?;
-                eprintln!(
-                    "> Native OTCv8 public chat received bytes={} recipients={recipient_count}",
-                    message.len()
-                );
+                if config.extended_diagnostics {
+                    eprintln!(
+                        "> Native OTCv8 public chat received bytes={} recipients={recipient_count}",
+                        message.len()
+                    );
+                }
                 drain_shared_public_chat(stream, &config.client_profile, &chat_events)?;
             }
             NativeOtClientGameAction::LeaveGame => break,
@@ -1182,14 +1197,16 @@ fn handle_native_otclient_game(
                             &config.client_profile,
                             native_autowalk_step_delay(snapshot.player_speed, snapshot.server_beat),
                         )? {
-                            write_frame(
-                                stream,
-                                &encode_native_otclient_game_cancel_walk_facing(
-                                    &config.client_profile,
-                                    facing.protocol_direction(),
-                                )
-                                .map_err(HostError::Protocol)?,
-                            )?;
+                            if !matches!(action, NativeOtClientGameAction::Stop) {
+                                write_frame(
+                                    stream,
+                                    &encode_native_otclient_game_cancel_walk_facing(
+                                        &config.client_profile,
+                                        facing.protocol_direction(),
+                                    )
+                                    .map_err(HostError::Protocol)?,
+                                )?;
+                            }
                             pending_action = Some(action);
                             break 'auto_walk;
                         }
@@ -1257,7 +1274,7 @@ fn drain_shared_public_chat(
         match events.try_recv() {
             Ok(event) => write_frame(
                 stream,
-                &encode_native_otclient_animated_text(profile, event.position, &event.text)
+                &encode_native_otclient_game_status_message(profile, &event.text)
                     .map_err(HostError::Protocol)?,
             )?,
             Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return Ok(()),
@@ -1361,6 +1378,7 @@ fn move_native_map_player(
     };
     shared_world.mark_visibility_changed();
     database.update_player_position(character_id, destination)?;
+    *facing = direction;
     write_frame(
         stream,
         &encode_native_otclient_move_creature_at(
@@ -1373,6 +1391,7 @@ fn move_native_map_player(
     )?;
     let mut refreshed_snapshot = snapshot.clone();
     refreshed_snapshot.player_position = native_position(destination);
+    refreshed_snapshot.player_direction = facing.protocol_direction();
     let visible_players = shared_world.visible_players(
         character_id,
         snapshot.player_look_type,
@@ -1380,17 +1399,17 @@ fn move_native_map_player(
     )?;
     write_frame(
         stream,
-        &encode_native_otclient_map_viewport_with_static_spawns_and_players(
+        &encode_native_otclient_map_step_with_static_spawns_and_players(
             profile,
             &refreshed_snapshot,
             world_map,
             Some(&active_static_spawns),
             Some(&visible_players),
+            direction,
         )
         .map_err(HostError::Protocol)?,
     )?;
     *player_position = destination;
-    *facing = direction;
     Ok(true)
 }
 
@@ -1479,6 +1498,7 @@ fn apply_native_player_interaction(
     source_player_id: u64,
     native_selected_id: u32,
     kind: NativePlayerInteractionKind,
+    extended_diagnostics: bool,
 ) -> Result<(), HostError> {
     let selected_player_id = if native_selected_id == 0 {
         Some(None)
@@ -1486,10 +1506,12 @@ fn apply_native_player_interaction(
         native_player_id_to_character_id(native_selected_id).map(Some)
     };
     let Some(selected_player_id) = selected_player_id else {
-        eprintln!(
-            "> Native OTCv8 {:?} selection deferred native-id={native_selected_id}",
-            kind
-        );
+        if extended_diagnostics {
+            eprintln!(
+                "> Native OTCv8 {:?} selection deferred native-id={native_selected_id}",
+                kind
+            );
+        }
         return Ok(());
     };
     let result = match kind {
@@ -1504,10 +1526,12 @@ fn apply_native_player_interaction(
         Ok(_) => Ok(()),
         Err(HostError::Core(forgotten_core::CoreError::UnknownPlayer(_)))
         | Err(HostError::Core(forgotten_core::CoreError::SelfInteractionNotAllowed(_))) => {
-            eprintln!(
-                "> Native OTCv8 {:?} selection ignored native-id={native_selected_id}",
-                kind
-            );
+            if extended_diagnostics {
+                eprintln!(
+                    "> Native OTCv8 {:?} selection ignored native-id={native_selected_id}",
+                    kind
+                );
+            }
             Ok(())
         }
         Err(error) => Err(error),
@@ -2042,6 +2066,7 @@ mod tests {
             advertised_game_addr: "127.0.0.1:7265".parse().unwrap(),
             max_connections: 2,
             session_timeout: Duration::from_millis(250),
+            extended_diagnostics: false,
             empty_world: None,
             world_map: None,
             static_spawns: None,
@@ -2217,6 +2242,7 @@ mod tests {
             101,
             NATIVE_OTCLIENT_PLAYER_ID_START + 102,
             NativePlayerInteractionKind::Target,
+            false,
         )
         .unwrap();
         apply_native_player_interaction(
@@ -2224,15 +2250,23 @@ mod tests {
             101,
             NATIVE_OTCLIENT_PLAYER_ID_START + 102,
             NativePlayerInteractionKind::Follow,
+            false,
         )
         .unwrap();
-        apply_native_player_interaction(&shared, 101, 0, NativePlayerInteractionKind::Target)
-            .unwrap();
+        apply_native_player_interaction(
+            &shared,
+            101,
+            0,
+            NativePlayerInteractionKind::Target,
+            false,
+        )
+        .unwrap();
         apply_native_player_interaction(
             &shared,
             101,
             NATIVE_OTCLIENT_PLAYER_ID_END,
             NativePlayerInteractionKind::Follow,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -2291,6 +2325,7 @@ mod tests {
             player_level: 8,
             ground_thing_id: 102,
             player_look_type: 128,
+            player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
             player_speed: 220,
             server_beat: 50,
         };
@@ -2328,7 +2363,7 @@ mod tests {
     fn shared_public_chat_broadcasts_sanitized_events_and_releases_recipients() {
         let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
         let map = native_world_map();
-        let knight_position = shared
+        let _knight_position = shared
             .register_player_at_available_position(
                 Player {
                     id: 101,
@@ -2369,7 +2404,6 @@ mod tests {
             2
         );
         let expected = SharedPublicChatEvent {
-            position: native_position(knight_position),
             text: "Knight: hello world".into(),
         };
         assert_eq!(knight_events.try_recv().unwrap(), expected);
@@ -2762,16 +2796,15 @@ mod tests {
         let auto_walk_east = read_frame(&mut stream).unwrap();
         assert_eq!(&auto_walk_east.0[1..7], &[100, 0, 100, 0, 7, 1]);
         assert_eq!(&auto_walk_east.0[7..12], &[101, 0, 100, 0, 7]);
-        let auto_walk_viewport = read_frame(&mut stream).unwrap();
+        let auto_walk_edge = read_frame(&mut stream).unwrap();
         assert_eq!(
-            auto_walk_viewport.0[0],
+            auto_walk_edge.0[0],
+            NativeOtClientCardinalDirection::East.protocol_direction() + 0x65
+        );
+        assert_ne!(
+            auto_walk_edge.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
         );
-        assert_eq!(&auto_walk_viewport.0[1..6], &[101, 0, 100, 0, 7]);
-        assert!(auto_walk_viewport
-            .0
-            .windows(3)
-            .any(|window| window == b"Rat"));
         write_frame(&mut stream, &Frame(vec![0x67])).unwrap();
         let interrupted = read_frame(&mut stream).unwrap();
         assert_eq!(
@@ -2781,12 +2814,15 @@ mod tests {
         let manual_movement = read_frame(&mut stream).unwrap();
         assert_eq!(&manual_movement.0[1..7], &[101, 0, 100, 0, 7, 1]);
         assert_eq!(&manual_movement.0[7..12], &[101, 0, 101, 0, 7]);
-        let manual_viewport = read_frame(&mut stream).unwrap();
+        let manual_edge = read_frame(&mut stream).unwrap();
         assert_eq!(
-            manual_viewport.0[0],
+            manual_edge.0[0],
+            NativeOtClientCardinalDirection::South.protocol_direction() + 0x65
+        );
+        assert_ne!(
+            manual_edge.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
         );
-        assert_eq!(&manual_viewport.0[1..6], &[101, 0, 101, 0, 7]);
 
         write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
         let movement = read_frame(&mut stream).unwrap();
@@ -2796,12 +2832,15 @@ mod tests {
         );
         assert_eq!(&movement.0[1..7], &[101, 0, 101, 0, 7, 1]);
         assert_eq!(&movement.0[7..12], &[102, 0, 101, 0, 7]);
-        let movement_viewport = read_frame(&mut stream).unwrap();
+        let movement_edge = read_frame(&mut stream).unwrap();
         assert_eq!(
-            movement_viewport.0[0],
+            movement_edge.0[0],
+            NativeOtClientCardinalDirection::East.protocol_direction() + 0x65
+        );
+        assert_ne!(
+            movement_edge.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
         );
-        assert_eq!(&movement_viewport.0[1..6], &[102, 0, 101, 0, 7]);
         assert_eq!(
             database.characters_for_account(account_id).unwrap()[0]
                 .position
@@ -2833,13 +2872,8 @@ mod tests {
         assert_eq!(
             chat_echo.0,
             vec![
-                forgotten_protocol::NATIVE_OTCLIENT_GAME_ANIMATED_TEXT,
-                102,
-                0,
-                101,
-                0,
-                7,
-                215,
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
+                forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_CONSOLE_BLUE,
                 10,
                 0,
                 b'K',
@@ -3004,6 +3038,7 @@ mod tests {
             player_level: 8,
             ground_thing_id: 102,
             player_look_type: 128,
+            player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
             player_speed: 220,
             server_beat: 50,
         };
@@ -3072,6 +3107,7 @@ mod tests {
             player_level: 8,
             ground_thing_id: 102,
             player_look_type: 128,
+            player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
             player_speed: 220,
             server_beat: 50,
         };
