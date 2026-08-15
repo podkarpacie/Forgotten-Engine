@@ -521,6 +521,14 @@ impl Player {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerRenderSnapshot {
+    pub id: u64,
+    pub name: String,
+    pub position: Position,
+    pub level: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct WorldState {
     players: BTreeMap<u64, Player>,
@@ -568,6 +576,18 @@ impl WorldState {
         self.players
             .values()
             .any(|player| player.position == position)
+    }
+
+    pub fn player_render_snapshots(&self) -> Vec<PlayerRenderSnapshot> {
+        self.players
+            .values()
+            .map(|player| PlayerRenderSnapshot {
+                id: player.id,
+                name: player.name.clone(),
+                position: player.position,
+                level: player.level,
+            })
+            .collect()
     }
 
     /// Replaces the immutable display-only static creature set. This intentionally carries no
@@ -1002,6 +1022,21 @@ mod tests {
         assert_eq!(world.remove_player(first.id), Ok(first));
         world.add_player(second).unwrap();
         assert!(world.player(8).is_some());
+        assert_eq!(
+            world.player_render_snapshots(),
+            vec![PlayerRenderSnapshot {
+                id: 8,
+                name: "Druid".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 1,
+            }]
+        );
+        world.remove_player(8).unwrap();
+        assert!(world.player_render_snapshots().is_empty());
         assert_eq!(world.remove_player(7), Err(CoreError::UnknownPlayer(7)));
     }
 

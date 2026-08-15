@@ -19,22 +19,24 @@ use forgotten_protocol::{
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_animated_text,
     encode_native_otclient_character_list, encode_native_otclient_game_cancel_walk_facing,
-    encode_native_otclient_game_initialization_with_map_and_static_spawns,
+    encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
     encode_native_otclient_map_viewport_with_static_spawns,
+    encode_native_otclient_map_viewport_with_static_spawns_and_players,
     encode_native_otclient_move_creature_at, encode_status_binary, encode_status_xml,
     generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
     CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
     Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientCardinalDirection,
     NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPosition,
-    NativeOtClientProfile, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
-    StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
+    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
+    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_PLAYER_ID_END,
+    NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -113,6 +115,7 @@ pub struct NativeOtClientEmptyWorldConfig {
 #[derive(Debug, Clone)]
 pub struct SharedNativeWorld {
     world: Arc<Mutex<WorldState>>,
+    visibility_epoch: Arc<AtomicU64>,
 }
 
 impl SharedNativeWorld {
@@ -127,6 +130,7 @@ impl SharedNativeWorld {
         }
         Ok(Self {
             world: Arc::new(Mutex::new(world)),
+            visibility_epoch: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -138,8 +142,34 @@ impl SharedNativeWorld {
         Ok(self.lock()?.tick())
     }
 
+    pub fn visibility_epoch(&self) -> u64 {
+        self.visibility_epoch.load(Ordering::SeqCst)
+    }
+
     pub fn active_static_spawns(&self) -> Result<FeTfsStaticSpawnCollection, HostError> {
         Ok(self.lock()?.active_static_spawn_collection())
+    }
+
+    pub fn visible_players(
+        &self,
+        observer_id: u64,
+        look_type: u8,
+        speed: u16,
+    ) -> Result<Vec<NativeOtClientVisiblePlayer>, HostError> {
+        self.lock()?
+            .player_render_snapshots()
+            .into_iter()
+            .filter(|player| player.id != observer_id)
+            .map(|player| {
+                Ok(NativeOtClientVisiblePlayer {
+                    player_id: native_player_id(player.id)?,
+                    name: player.name,
+                    position: native_position(player.position),
+                    look_type,
+                    speed,
+                })
+            })
+            .collect()
     }
 
     pub fn register_player_at_available_position(
@@ -171,12 +201,18 @@ impl SharedNativeWorld {
             })?;
         player.position = position;
         world.add_player(player).map_err(HostError::Core)?;
+        self.mark_visibility_changed();
         Ok(position)
     }
 
     pub fn remove_player(&self, id: u64) -> Result<(), HostError> {
         self.lock()?.remove_player(id).map_err(HostError::Core)?;
+        self.mark_visibility_changed();
         Ok(())
+    }
+
+    fn mark_visibility_changed(&self) {
+        self.visibility_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, WorldState>, HostError> {
@@ -887,13 +923,20 @@ fn handle_native_otclient_game(
         server_beat: empty_world.server_beat,
     };
     let active_static_spawns = shared_world.active_static_spawns()?;
-    let initialization = encode_native_otclient_game_initialization_with_map_and_static_spawns(
-        &config.client_profile,
-        &snapshot,
-        world_map,
-        Some(&active_static_spawns),
-    )
-    .map_err(HostError::Protocol)?;
+    let visible_players = shared_world.visible_players(
+        character.id,
+        empty_world.player_look_type,
+        empty_world.player_speed,
+    )?;
+    let initialization =
+        encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players(
+            &config.client_profile,
+            &snapshot,
+            world_map,
+            Some(&active_static_spawns),
+            Some(&visible_players),
+        )
+        .map_err(HostError::Protocol)?;
     write_frame(stream, &initialization)?;
     stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
     eprintln!(
@@ -909,6 +952,7 @@ fn handle_native_otclient_game(
     let mut player_position = initial_position;
     let mut facing = NativeOtClientCardinalDirection::South;
     let mut pending_action = None;
+    let mut observed_visibility_epoch = shared_world.visibility_epoch();
     loop {
         let action = if let Some(action) = pending_action.take() {
             action
@@ -921,6 +965,23 @@ fn handle_native_otclient_game(
                         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                     ) =>
                 {
+                    let visibility_epoch = shared_world.visibility_epoch();
+                    if visibility_epoch != observed_visibility_epoch {
+                        let mut refreshed_snapshot = snapshot.clone();
+                        refreshed_snapshot.player_position = native_position(player_position);
+                        write_frame(
+                            stream,
+                            &encode_shared_native_world_viewport(
+                                &config.client_profile,
+                                &refreshed_snapshot,
+                                world_map,
+                                shared_world,
+                                character.id,
+                            )?,
+                        )?;
+                        observed_visibility_epoch = visibility_epoch;
+                        continue;
+                    }
                     write_frame(
                         stream,
                         &encode_native_otclient_game_ping(&config.client_profile)
@@ -1001,6 +1062,7 @@ fn handle_native_otclient_game(
                         )? {
                             break 'auto_walk;
                         }
+                        observed_visibility_epoch = shared_world.visibility_epoch();
                         if let Some(action) = read_native_autowalk_interrupt(
                             stream,
                             &config.client_profile,
@@ -1021,7 +1083,7 @@ fn handle_native_otclient_game(
                 }
             }
             NativeOtClientGameAction::CardinalMove(direction) => {
-                let _ = move_native_map_player(
+                if move_native_map_player(
                     stream,
                     &config.client_profile,
                     &snapshot,
@@ -1032,7 +1094,9 @@ fn handle_native_otclient_game(
                     &mut player_position,
                     &mut facing,
                     direction,
-                )?;
+                )? {
+                    observed_visibility_epoch = shared_world.visibility_epoch();
+                }
             }
         }
     }
@@ -1045,6 +1109,29 @@ fn handle_native_otclient_game(
         ),
     );
     Ok(())
+}
+
+fn encode_shared_native_world_viewport(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    world_map: &WorldMap,
+    shared_world: &SharedNativeWorld,
+    observer_id: u64,
+) -> Result<Frame, HostError> {
+    let active_static_spawns = shared_world.active_static_spawns()?;
+    let visible_players = shared_world.visible_players(
+        observer_id,
+        snapshot.player_look_type,
+        snapshot.player_speed,
+    )?;
+    encode_native_otclient_map_viewport_with_static_spawns_and_players(
+        profile,
+        snapshot,
+        world_map,
+        Some(&active_static_spawns),
+        Some(&visible_players),
+    )
+    .map_err(HostError::Protocol)
 }
 
 /// Applies one externally selected static-creature step and returns a full native map refresh.
@@ -1141,6 +1228,7 @@ fn move_native_map_player(
         )?;
         return Ok(false);
     };
+    shared_world.mark_visibility_changed();
     database.update_player_position(character_id, destination)?;
     write_frame(
         stream,
@@ -1154,13 +1242,19 @@ fn move_native_map_player(
     )?;
     let mut refreshed_snapshot = snapshot.clone();
     refreshed_snapshot.player_position = native_position(destination);
+    let visible_players = shared_world.visible_players(
+        character_id,
+        snapshot.player_look_type,
+        snapshot.player_speed,
+    )?;
     write_frame(
         stream,
-        &encode_native_otclient_map_viewport_with_static_spawns(
+        &encode_native_otclient_map_viewport_with_static_spawns_and_players(
             profile,
             &refreshed_snapshot,
             world_map,
             Some(&active_static_spawns),
+            Some(&visible_players),
         )
         .map_err(HostError::Protocol)?,
     )?;
@@ -1858,6 +1952,86 @@ mod tests {
         assert_eq!(recycled, first_position);
         shared.remove_player(102).unwrap();
         shared.remove_player(103).unwrap();
+    }
+
+    #[test]
+    fn shared_player_visibility_tracks_join_move_and_leave() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        let knight_position = shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let druid_position = shared
+            .register_player_at_available_position(
+                Player {
+                    id: 102,
+                    account_id: 2,
+                    name: "Druid".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        assert_eq!(knight_position, map.spawn());
+        assert_eq!(druid_position.x, 101);
+        assert_eq!(shared.visibility_epoch(), 2);
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+        let snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_id: native_player_id(101).unwrap(),
+            player_name: "Knight".into(),
+            player_position: native_position(knight_position),
+            player_level: 8,
+            ground_thing_id: 102,
+            player_look_type: 128,
+            player_speed: 220,
+            server_beat: 50,
+        };
+        let joined =
+            encode_shared_native_world_viewport(&profile, &snapshot, &map, &shared, 101).unwrap();
+        assert!(joined.0.windows(5).any(|window| window == b"Druid"));
+        {
+            let mut world = shared.lock().unwrap();
+            world
+                .move_player_cardinal(102, CardinalDirection::East)
+                .unwrap();
+        }
+        shared.mark_visibility_changed();
+        assert_eq!(shared.visibility_epoch(), 3);
+        assert_eq!(
+            shared.visible_players(101, 128, 220).unwrap()[0].position,
+            native_position(Position {
+                x: 102,
+                y: 100,
+                z: 7,
+            })
+        );
+        let moved =
+            encode_shared_native_world_viewport(&profile, &snapshot, &map, &shared, 101).unwrap();
+        assert!(moved.0.windows(5).any(|window| window == b"Druid"));
+        shared.remove_player(102).unwrap();
+        assert_eq!(shared.visibility_epoch(), 4);
+        let left =
+            encode_shared_native_world_viewport(&profile, &snapshot, &map, &shared, 101).unwrap();
+        assert!(!left.0.windows(5).any(|window| window == b"Druid"));
+        shared.remove_player(101).unwrap();
     }
 
     fn native_empty_world_config(bind_addr: SocketAddr) -> NativeOtClientHostConfig {

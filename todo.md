@@ -103,3 +103,9 @@
 - [x] Integrate native sessions with shared player occupancy and current-world map snapshots.
 - [x] Add self-contained shared-world synchronization and concurrent-session regression coverage.
 - [x] Package and publish the shared authoritative world host release with Linux, Windows, and SHA-256 assets.
+- [x] Audit shared player render state and native 740 creature visibility/update boundaries.
+- [x] Expose a bounded authoritative snapshot of renderable active players from the shared world.
+- [x] Render other active players in native 740 initial and refreshed map snapshots.
+- [x] Deliver safe shared-player join, leave, and movement visibility updates without combat, chat synchronization, AI, or Lua.
+- [x] Add self-contained multi-player visibility and concurrent-session regression coverage.
+- [x] Package and publish the native multi-player visibility release with Linux, Windows, and SHA-256 assets.

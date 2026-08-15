@@ -816,6 +816,7 @@ pub const NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT: usize = 14;
 pub const NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS: usize = 8;
 pub const NATIVE_OTCLIENT_MAX_EXTRA_TILE_ITEMS: usize = 8;
 pub const NATIVE_OTCLIENT_MAX_STATIC_ENTITIES_PER_VIEWPORT: usize = 32;
+pub const NATIVE_OTCLIENT_MAX_SHARED_PLAYERS_PER_VIEWPORT: usize = 32;
 pub const NATIVE_OTCLIENT_PLAYER_ID_START: u32 = 0x1000_0000;
 pub const NATIVE_OTCLIENT_PLAYER_ID_END: u32 = 0x4000_0000;
 pub const NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES: usize = 255;
@@ -882,6 +883,16 @@ pub struct NativeOtClientEmptyWorldSnapshot {
     pub player_look_type: u8,
     pub player_speed: u16,
     pub server_beat: u16,
+}
+
+/// Immutable rendering data for an active player other than the local snapshot owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeOtClientVisiblePlayer {
+    pub player_id: u32,
+    pub name: String,
+    pub position: NativeOtClientPosition,
+    pub look_type: u8,
+    pub speed: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1128,13 +1139,30 @@ pub fn encode_native_otclient_game_initialization_with_map_and_static_spawns(
     world_map: &WorldMap,
     static_spawns: Option<&FeTfsStaticSpawnCollection>,
 ) -> Result<Frame, ProtocolError> {
+    encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players(
+        profile,
+        snapshot,
+        world_map,
+        static_spawns,
+        None,
+    )
+}
+
+pub fn encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    world_map: &WorldMap,
+    static_spawns: Option<&FeTfsStaticSpawnCollection>,
+    visible_players: Option<&[NativeOtClientVisiblePlayer]>,
+) -> Result<Frame, ProtocolError> {
     let mut payload = encode_native_otclient_game_login_state(profile, snapshot)?.0;
     payload.extend_from_slice(
-        &encode_native_otclient_map_viewport_with_static_spawns(
+        &encode_native_otclient_map_viewport_with_static_spawns_and_players(
             profile,
             snapshot,
             world_map,
             static_spawns,
+            visible_players,
         )?
         .0,
     );
@@ -1227,6 +1255,22 @@ pub fn encode_native_otclient_map_viewport_with_static_spawns(
     world_map: &WorldMap,
     static_spawns: Option<&FeTfsStaticSpawnCollection>,
 ) -> Result<Frame, ProtocolError> {
+    encode_native_otclient_map_viewport_with_static_spawns_and_players(
+        profile,
+        snapshot,
+        world_map,
+        static_spawns,
+        None,
+    )
+}
+
+pub fn encode_native_otclient_map_viewport_with_static_spawns_and_players(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    world_map: &WorldMap,
+    static_spawns: Option<&FeTfsStaticSpawnCollection>,
+    visible_players: Option<&[NativeOtClientVisiblePlayer]>,
+) -> Result<Frame, ProtocolError> {
     validate_native_empty_world_snapshot(profile, snapshot)?;
     let mut writer = Writer::default();
     writer.byte(NATIVE_OTCLIENT_GAME_FULL_MAP);
@@ -1235,6 +1279,7 @@ pub fn encode_native_otclient_map_viewport_with_static_spawns(
     let center_x = (NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH / 2 - 1) as i16;
     let center_y = (NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT / 2 - 1) as i16;
     let mut static_entity_count = 0usize;
+    let mut visible_player_count = 0usize;
 
     for z in (0..NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS as u8).rev() {
         for x in 0..NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH {
@@ -1277,6 +1322,24 @@ pub fn encode_native_otclient_map_viewport_with_static_spawns(
                         }
                         write_native_otclient_unknown_static_entity(&mut writer, entity);
                         static_entity_count += 1;
+                    }
+                }
+                if !asset_free {
+                    if let Some(visible_players) = visible_players {
+                        for player in visible_players.iter().filter(|player| {
+                            player.player_id != snapshot.player_id
+                                && player.position.x == position.x
+                                && player.position.y == position.y
+                                && player.position.z == position.z
+                        }) {
+                            if visible_player_count
+                                >= NATIVE_OTCLIENT_MAX_SHARED_PLAYERS_PER_VIEWPORT
+                            {
+                                break;
+                            }
+                            write_native_otclient_unknown_visible_player(&mut writer, player);
+                            visible_player_count += 1;
+                        }
                     }
                 }
                 let is_player_tile = z == snapshot.player_position.z
@@ -1549,6 +1612,31 @@ fn write_native_otclient_unknown_player(
     writer.byte(0);
     writer.byte(0);
     writer.u16(snapshot.player_speed);
+    writer.byte(0);
+    writer.byte(0);
+}
+
+fn write_native_otclient_unknown_visible_player(
+    writer: &mut Writer,
+    player: &NativeOtClientVisiblePlayer,
+) {
+    writer.u16(NATIVE_OTCLIENT_UNKNOWN_CREATURE);
+    writer.u32(0);
+    writer.u32(player.player_id);
+    writer.string(&player.name);
+    writer.byte(100);
+    writer.byte(2);
+    writer.byte(player.look_type);
+    if player.look_type == 0 {
+        writer.u16(0);
+    } else {
+        writer.byte(0);
+        writer.byte(0);
+        writer.byte(0);
+        writer.byte(0);
+        writer.byte(0);
+    }
+    writer.u16(player.speed);
     writer.byte(0);
     writer.byte(0);
 }
@@ -2235,6 +2323,43 @@ mod tests {
             NATIVE_OTCLIENT_PLAYER_ID_END + 1
         );
         assert!(static_viewport.0.windows(3).any(|bytes| bytes == b"Rat"));
+        let shared_players = [
+            NativeOtClientVisiblePlayer {
+                player_id: snapshot.player_id,
+                name: "Duplicate Local".into(),
+                position: snapshot.player_position,
+                look_type: snapshot.player_look_type,
+                speed: snapshot.player_speed,
+            },
+            NativeOtClientVisiblePlayer {
+                player_id: NATIVE_OTCLIENT_PLAYER_ID_START + 1,
+                name: "Druid".into(),
+                position: NativeOtClientPosition {
+                    x: 99,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: snapshot.player_look_type,
+                speed: snapshot.player_speed,
+            },
+        ];
+        let shared_viewport = encode_native_otclient_map_viewport_with_static_spawns_and_players(
+            &profile,
+            &snapshot,
+            &world_map,
+            None,
+            Some(&shared_players),
+        )
+        .unwrap();
+        assert!(shared_viewport.0.windows(5).any(|bytes| bytes == b"Druid"));
+        assert!(!shared_viewport
+            .0
+            .windows("Duplicate Local".len())
+            .any(|bytes| bytes == b"Duplicate Local"));
+        assert!(shared_viewport
+            .0
+            .windows(4)
+            .any(|bytes| bytes == (NATIVE_OTCLIENT_PLAYER_ID_START + 1).to_le_bytes()));
         let map_initialization =
             encode_native_otclient_game_initialization_with_map(&profile, &snapshot, &world_map)
                 .unwrap();
