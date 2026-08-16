@@ -260,6 +260,12 @@ struct SharedPublicChatEvent {
     text: String,
 }
 
+#[derive(Debug, Clone)]
+struct NativeWorldRenderSnapshot {
+    static_spawns: FeTfsStaticSpawnCollection,
+    visible_players: Vec<NativeOtClientVisiblePlayer>,
+}
+
 impl SharedNativeWorld {
     pub fn from_static_spawns(
         static_spawns: Option<&FeTfsStaticSpawnCollection>,
@@ -491,6 +497,41 @@ impl SharedNativeWorld {
                 })
             })
             .collect()
+    }
+
+    /// Captures all world-owned data needed for native map rendering under one short lock. The
+    /// returned snapshot contains owned values so protocol encoding and socket writes can proceed
+    /// concurrently without retaining the authoritative-world mutex.
+    fn native_render_snapshot(
+        &self,
+        observer_id: u64,
+        look_type: u8,
+        speed: u16,
+    ) -> Result<NativeWorldRenderSnapshot, HostError> {
+        let (static_spawns, player_snapshots) = {
+            let world = self.lock()?;
+            (
+                world.active_static_spawn_collection(),
+                world.player_render_snapshots(),
+            )
+        };
+        let visible_players = player_snapshots
+            .into_iter()
+            .filter(|player| player.id != observer_id)
+            .map(|player| {
+                Ok(NativeOtClientVisiblePlayer {
+                    player_id: native_player_id(player.id)?,
+                    name: player.name,
+                    position: native_position(player.position),
+                    look_type,
+                    speed,
+                })
+            })
+            .collect::<Result<Vec<_>, HostError>>()?;
+        Ok(NativeWorldRenderSnapshot {
+            static_spawns,
+            visible_players,
+        })
     }
 
     fn register_public_chat_recipient(
@@ -2033,8 +2074,7 @@ fn encode_shared_native_world_viewport(
     shared_world: &SharedNativeWorld,
     observer_id: u64,
 ) -> Result<Frame, HostError> {
-    let active_static_spawns = shared_world.active_static_spawns()?;
-    let visible_players = shared_world.visible_players(
+    let render_snapshot = shared_world.native_render_snapshot(
         observer_id,
         snapshot.player_look_type,
         snapshot.player_speed,
@@ -2043,8 +2083,8 @@ fn encode_shared_native_world_viewport(
         profile,
         snapshot,
         world_map,
-        Some(&active_static_spawns),
-        Some(&visible_players),
+        Some(&render_snapshot.static_spawns),
+        Some(&render_snapshot.visible_players),
     )
     .map_err(HostError::Protocol)
 }
@@ -3670,6 +3710,51 @@ mod tests {
             encode_shared_native_world_viewport(&profile, &snapshot, &map, &shared, 101).unwrap();
         assert!(!left.0.windows(5).any(|window| window == b"Druid"));
         shared.remove_player(101).unwrap();
+    }
+
+    #[test]
+    fn native_render_snapshot_detaches_packet_preparation_from_world_mutation() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 102,
+                    account_id: 2,
+                    name: "Druid".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let render_snapshot = shared.native_render_snapshot(101, 0, 220).unwrap();
+        let preparation = thread::spawn(move || render_snapshot.visible_players);
+        shared.remove_player(102).unwrap();
+        let visible_players = preparation.join().unwrap();
+        assert_eq!(visible_players.len(), 1);
+        assert_eq!(visible_players[0].player_id, native_player_id(102).unwrap());
+        assert!(shared.visible_players(101, 0, 220).unwrap().is_empty());
     }
 
     #[test]
