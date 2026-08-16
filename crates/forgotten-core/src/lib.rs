@@ -379,6 +379,14 @@ impl WorldMap {
         self.towns.values()
     }
 
+    pub fn town(&self, id: u32) -> Option<&WorldMapTown> {
+        self.towns.get(&id)
+    }
+
+    pub fn temple_position_for_town(&self, id: u32) -> Option<Position> {
+        self.town(id).map(|town| town.temple_position)
+    }
+
     pub fn set_town(&mut self, town: WorldMapTown) -> Result<(), CoreError> {
         if town.id == 0 || town.name.trim().is_empty() {
             return Err(CoreError::InvalidMap(
@@ -2531,6 +2539,9 @@ mod tests {
         assert_eq!(map.tile_flags(spawn), 1);
         assert_eq!(map.house_tile_id(spawn), Some(42));
         assert_eq!(map.towns().next().unwrap().name, "Thais");
+        assert_eq!(map.town(1).unwrap().temple_position, spawn);
+        assert_eq!(map.temple_position_for_town(1), Some(spawn));
+        assert_eq!(map.temple_position_for_town(99), None);
         assert_eq!(map.waypoint("temple"), Some(spawn));
         assert!(map.validate().is_ok());
         assert!(map.set_waypoint("", spawn).is_err());

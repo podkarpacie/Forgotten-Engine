@@ -207,4 +207,5 @@
 - [x] Add a bounded authoritative core scheduler for replacement-by-kind poison, burning, and energy damage-over-time conditions with capped damage, expiry cleanup, and lifecycle cleanup; persistence, client effects, and death policy remain deferred.
 - [ ] Add bounded condition state and profile-gated poison, burning, and energy-damage scheduling.
 - [ ] Add death, respawn, temple selection, loss policy, and client-state delivery foundations.
+- [x] Expose imported world-map town and temple-position lookup accessors as the validated map-data prerequisite for later temple respawn behavior.
 - [ ] Establish and satisfy production-readiness gates for complete declared TFS feature conformance, profile-specific protocol validation, reliability, bounded memory/performance, security, and reproducible TFS-to-FE migration before describing any profile as mainstream-ready.
