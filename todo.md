@@ -226,6 +226,7 @@
 - [ ] Complete the next bounded FE 7.4 progression slice by applying configured experience rates and stages to authoritative experience awards.
 - [x] Add a bounded authoritative operator experience award that applies `rateExp` and optional `data/XML/stages.xml` ranges, updates exact level/experience state, and persists it; combat, quest, monster, and client reward event sources remain deferred.
 - [ ] Complete the next bounded FE 7.4 melee progression slice by awarding configured vocation-based skill tries without claiming weapon or spell formula support.
+- [x] Award one configured vocation-based fist try for each successful fixed selected-player melee hit and persist exact progression counters; weapon and spell formula support remains deferred.
 - [ ] Continue FE 7.4 world-interaction, content-runtime, social, and operational milestones with regression coverage and explicit capability reporting until the documented completion model exceeds 50%.
 - [ ] Publish a weighted FE 7.4 completion ledger with evidence requirements for each system category and a rule for reporting progress above 50%.
 - [ ] Apply configured experience rates and `stages.xml` ranges to authoritative experience awards, with exact regression coverage.

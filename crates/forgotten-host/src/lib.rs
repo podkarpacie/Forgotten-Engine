@@ -7,8 +7,9 @@ use forgotten_core::{
     ItemInstance, NativeItemPresentationCatalog, Player, PlayerCondition, PlayerConditionKind,
     PlayerConditionOutcome, PlayerContainers, PlayerEquipment, PlayerExperienceAwardOutcome,
     PlayerInteractionIntent, PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
-    PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerVitals, Position,
-    StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, VocationId, WorldMap, WorldState,
+    PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerSkill, PlayerSkillTryOutcome,
+    PlayerVitals, Position, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, VocationId,
+    WorldMap, WorldState,
 };
 use forgotten_persistence::{EngineDatabase, PlayerVitals as PersistedPlayerVitals};
 use forgotten_protocol::{
@@ -424,6 +425,23 @@ impl SharedNativeWorld {
             .award_player_experience(player_id, raw_experience, policy)
             .map_err(HostError::Core)?;
         if outcome.awarded_experience > 0 {
+            self.progression_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(outcome)
+    }
+
+    pub fn apply_player_skill_tries(
+        &self,
+        player_id: u64,
+        skill: PlayerSkill,
+        awarded_tries: u64,
+        rules: PlayerProgressionRules,
+    ) -> Result<PlayerSkillTryOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .apply_player_skill_tries(player_id, skill, awarded_tries, rules)
+            .map_err(HostError::Core)?;
+        if awarded_tries > 0 {
             self.progression_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok(outcome)
@@ -1467,7 +1485,7 @@ fn handle_native_otclient_game(
     stream.set_write_timeout(Some(config.session_timeout))?;
     let request = decode_native_otclient_game_request(&read_frame(stream)?, &config.client_profile)
         .map_err(HostError::Protocol)?;
-    let database = EngineDatabase::open(database_path).map_err(HostError::Persistence)?;
+    let mut database = EngineDatabase::open(database_path).map_err(HostError::Persistence)?;
     let Some(account) = database
         .authenticate_account_id(request.account_id, &request.password)
         .map_err(HostError::Persistence)?
@@ -1751,10 +1769,11 @@ fn handle_native_otclient_game(
                     }
                     if let Some((target_native_id, target_vitals, outcome)) =
                         apply_native_selected_player_melee(
-                            &database,
+                            &mut database,
                             shared_world,
                             character.id,
                             world_map,
+                            config.progression_rules.as_deref(),
                         )?
                     {
                         let health_update = encode_native_otclient_creature_health(
@@ -2593,10 +2612,11 @@ fn apply_native_player_interaction(
 }
 
 fn apply_native_selected_player_melee(
-    database: &EngineDatabase,
+    database: &mut EngineDatabase,
     shared_world: &SharedNativeWorld,
     attacker_id: u64,
     world_map: &WorldMap,
+    progression_rules: Option<&BTreeMap<VocationId, PlayerProgressionRules>>,
 ) -> Result<
     Option<(
         u32,
@@ -2639,6 +2659,20 @@ fn apply_native_selected_player_melee(
             magic_level: vitals.magic_level,
         },
     )?;
+    if let Some(rules_by_vocation) = progression_rules {
+        let vocation = shared_world.player_progression(attacker_id)?.vocation;
+        if let Some(rules) = rules_by_vocation.get(&vocation).copied() {
+            shared_world.apply_player_skill_tries(attacker_id, PlayerSkill::Fist, 1, rules)?;
+            database.replace_player_progression(
+                attacker_id,
+                shared_world.player_progression(attacker_id)?,
+            )?;
+            database.replace_player_progression_attempts(
+                attacker_id,
+                shared_world.player_progression_attempts(attacker_id)?,
+            )?;
+        }
+    }
     Ok(Some((
         native_player_id(target_id)?,
         NativeOtClientPlayerVitals {
@@ -3778,7 +3812,7 @@ mod tests {
     #[test]
     fn selected_player_melee_persists_authoritative_vitals_and_returns_native_target() {
         let path = database_path("selected-player-melee");
-        let database = EngineDatabase::open(&path).unwrap();
+        let mut database = EngineDatabase::open(&path).unwrap();
         let account_id = database.create_account("operator", "hash").unwrap();
         let map = native_world_map();
         for (id, name, position) in [
@@ -3846,7 +3880,7 @@ mod tests {
         shared.set_player_target(101, Some(102)).unwrap();
 
         let (native_target_id, vitals, outcome) =
-            apply_native_selected_player_melee(&database, &shared, 101, &map)
+            apply_native_selected_player_melee(&mut database, &shared, 101, &map, None)
                 .unwrap()
                 .unwrap();
         assert_eq!(native_target_id, NATIVE_OTCLIENT_PLAYER_ID_START + 102);
@@ -3871,9 +3905,103 @@ mod tests {
     }
 
     #[test]
+    fn selected_player_melee_awards_and_persists_one_configured_fist_try() {
+        let path = database_path("selected-player-melee-skill-try");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("operator", "hash").unwrap();
+        let map = native_world_map();
+        for (id, name, position) in [
+            (301_u64, "Knight", map.spawn()),
+            (
+                302_u64,
+                "Druid",
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+        ] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: account_id as u64,
+                    name: name.into(),
+                    position,
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        for (id, name, position) in [
+            (301_u64, "Knight", map.spawn()),
+            (
+                302_u64,
+                "Druid",
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+        ] {
+            shared
+                .register_player_at_available_position(
+                    Player {
+                        id,
+                        account_id: account_id as u64,
+                        name: name.into(),
+                        position,
+                        level: 8,
+                        experience: 4_900,
+                        skill_points: 3,
+                    },
+                    &map,
+                )
+                .unwrap();
+        }
+        shared.set_player_target(301, Some(302)).unwrap();
+        let multiplier = forgotten_core::ProgressionMultiplier::new(1_000).unwrap();
+        let rules = PlayerProgressionRules {
+            magic_level_multiplier: multiplier,
+            skill_multipliers: [multiplier; 7],
+        };
+        let rules_by_vocation = BTreeMap::from([(VocationId::new(0), rules)]);
+
+        apply_native_selected_player_melee(
+            &mut database,
+            &shared,
+            301,
+            &map,
+            Some(&rules_by_vocation),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            shared
+                .player_progression_attempts(301)
+                .unwrap()
+                .skill_tries(PlayerSkill::Fist),
+            1
+        );
+        assert_eq!(shared.progression_epoch(), 1);
+        assert_eq!(
+            database
+                .player_progression_attempts(301)
+                .unwrap()
+                .skill_tries(PlayerSkill::Fist),
+            1
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn selected_player_melee_enters_server_side_death_state_for_hydrated_town() {
         let path = database_path("selected-player-melee-death");
-        let database = EngineDatabase::open(&path).unwrap();
+        let mut database = EngineDatabase::open(&path).unwrap();
         let account_id = database.create_account("operator", "hash").unwrap();
         let map = native_world_map();
         for (id, name, position) in [
@@ -3942,7 +4070,7 @@ mod tests {
         shared.set_player_target(201, Some(202)).unwrap();
 
         let (_native_target_id, vitals, outcome) =
-            apply_native_selected_player_melee(&database, &shared, 201, &map)
+            apply_native_selected_player_melee(&mut database, &shared, 201, &map, None)
                 .unwrap()
                 .unwrap();
         assert!(outcome.defeated);
