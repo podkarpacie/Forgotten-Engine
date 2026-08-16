@@ -672,6 +672,74 @@ impl EngineDatabase {
         Ok(())
     }
 
+    /// Replaces both fixed equipment and bounded owned containers in one SQLite transaction.
+    /// This is the persistence boundary for authoritative transfers between those two collections;
+    /// map-ground items, nested containers, and client inventory delivery remain separate.
+    pub fn replace_player_inventory(
+        &mut self,
+        player_id: u64,
+        equipment: &PlayerEquipment,
+        containers: &PlayerContainers,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM player_equipment WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM player_container_items WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM player_containers WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        for (slot, item) in equipment.iter() {
+            transaction.execute(
+                "INSERT INTO player_equipment (player_id, slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    player_id as i64,
+                    i64::from(slot.code()),
+                    i64::from(item.server_id),
+                    i64::from(item.count),
+                    item.action_id.map(i64::from),
+                    item.unique_id.map(i64::from),
+                ],
+            )?;
+        }
+        for (container_id, container) in containers.iter() {
+            transaction.execute(
+                "INSERT INTO player_containers (player_id, container_id, server_id, count, name, has_parent, capacity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    player_id as i64,
+                    i64::from(container_id),
+                    i64::from(container.container_item.server_id),
+                    i64::from(container.container_item.count),
+                    container.name,
+                    i64::from(u8::from(container.has_parent)),
+                    i64::from(container.items.capacity()),
+                ],
+            )?;
+            for (slot, item) in container.items.iter().enumerate() {
+                transaction.execute(
+                    "INSERT INTO player_container_items (player_id, container_id, slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        player_id as i64,
+                        i64::from(container_id),
+                        slot as i64,
+                        i64::from(item.server_id),
+                        i64::from(item.count),
+                        item.action_id.map(i64::from),
+                        item.unique_id.map(i64::from),
+                    ],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Loads player-owned containers in client-window order. Raw database values are never
     /// trusted: invalid IDs, item fields, names, capacity, parent flags, or sparse item slots are
     /// rejected before they can be admitted into authoritative world state.
@@ -1429,6 +1497,17 @@ mod tests {
             loaded.item(EquipmentSlot::Armor),
             replacement.item(EquipmentSlot::Armor)
         );
+        let mut backpack =
+            PlayerContainer::new(0, ItemInstance::new(1988, 1).unwrap(), "Backpack", false, 2)
+                .unwrap();
+        backpack.items.insert(sword.clone()).unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(backpack).unwrap();
+        database
+            .replace_player_inventory(7, &replacement, &containers)
+            .unwrap();
+        assert_eq!(database.player_equipment(7).unwrap(), replacement);
+        assert_eq!(database.player_containers(7).unwrap(), containers);
         database
             .connection
             .execute(

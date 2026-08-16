@@ -234,6 +234,7 @@
 - [ ] Deliver bounded client-visible lifecycle state: condition health updates, death state, temple respawn, and only verified loss policies.
 - [ ] Add profile-driven combat events for weapons, spells, damage types, cooldowns, PvP policy, and death/corpse handling after independent compatibility evidence.
 - [ ] Add authoritative item transfer, equipment/inventory synchronization, container windows, item use, actions, doors, switches, and map interactions.
+- [x] Add bounded authoritative transfer between one player equipment slot and one already owned container; client inventory packets, map-ground transfers, nested containers, stack splitting, and item-use semantics remain deferred.
 - [ ] Add validated monster/NPC runtime behavior, spawns, respawns, combat participation, loot, corpses, and script-event dispatch boundaries.
 - [ ] Add sandboxed Lua execution with safe event dispatch, legacy registry adapters, and deterministic failure handling.
 - [ ] Add guilds, parties, channels, private messages, depots, banking/trading, houses, access lists, and administrator controls.

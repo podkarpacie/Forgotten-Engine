@@ -965,6 +965,49 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             );
             Ok(())
         }
+        "container-stow-equipped" => {
+            if arguments.len() != 6 {
+                return Err(
+                    "usage: player container-stow-equipped <directory> <player-id> <slot> <container-id>"
+                        .into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let slot = parse_equipment_slot(arguments.get(4))?;
+            let container_id = parse_u8_argument(arguments.get(5), "container ID")?;
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            let character = database.player_by_id(player_id)?;
+            let equipment = database.player_equipment(player_id)?;
+            let containers = database.player_containers(player_id)?;
+            let mut world = WorldState::default();
+            world.add_player(Player {
+                id: character.id,
+                account_id: 0,
+                name: character.name,
+                position: character.position,
+                level: character.level,
+                experience: character.experience,
+                skill_points: character.skill_points,
+            })?;
+            world.replace_player_equipment(player_id, equipment)?;
+            world.replace_player_containers(player_id, containers)?;
+            let outcome = world.move_equipment_item_to_container(player_id, slot, container_id)?;
+            database.replace_player_inventory(
+                player_id,
+                world.player_equipment(player_id)?,
+                world.player_containers(player_id)?,
+            )?;
+            println!(
+                "moved equipped item to container player-id={player_id} slot={} container-id={} server-item-id={} count={}",
+                outcome.from_slot.code(),
+                outcome.container_id,
+                outcome.item.server_id,
+                outcome.item.count,
+            );
+            Ok(())
+        }
         "container-create" => {
             if arguments.len() < 8 {
                 return Err(
@@ -1211,6 +1254,7 @@ Commands:
   player town <directory> <player-id> <town-id>
   player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]
   player experience <directory> <player-id> <raw-experience>
+  player container-stow-equipped <directory> <player-id> <slot> <container-id>
   player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>
   player container-add <directory> <player-id> <container-id> <server-item-id> [count]
   player container-remove <directory> <player-id> <container-id> <item-index>
@@ -1289,6 +1333,7 @@ mod tests {
             "player town <directory> <player-id> <town-id>",
             "player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]",
             "player experience <directory> <player-id> <raw-experience>",
+            "player container-stow-equipped <directory> <player-id> <slot> <container-id>",
             "player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>",
             "player container-add <directory> <player-id> <container-id> <server-item-id> [count]",
             "player container-remove <directory> <player-id> <container-id> <item-index>",
