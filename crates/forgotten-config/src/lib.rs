@@ -8,6 +8,7 @@ mod legacy_xml;
 mod otbm;
 mod tfs_entities;
 mod tfs_registry;
+mod vocations;
 
 use forgotten_core::{
     OtbmMapHeader, Position, WorldMap, WorldMapItem, WorldMapSource, WorldMapTile, WorldMapTown,
@@ -27,6 +28,10 @@ pub use tfs_entities::{
     TfsEntityKind, TfsSpawnResolution,
 };
 pub use tfs_registry::{TfsContentInventory, TfsRegistryCategory, TfsRegistryInventory};
+pub use vocations::{
+    load_tfs_vocation_registry, parse_tfs_vocations_xml, TfsVocationDefinition,
+    TfsVocationRegistry, VocationMultiplier, VocationRegeneration,
+};
 
 pub const CONFIG_FILE_NAME: &str = "config.lua";
 pub const CONTENT_MANIFEST_NAME: &str = "fe-content.manifest";

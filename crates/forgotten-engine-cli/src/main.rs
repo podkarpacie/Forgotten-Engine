@@ -1,8 +1,8 @@
 use forgotten_config::{
     apply_legacy_item_metadata, ensure_content_skeleton, load, load_legacy_item_catalog,
-    load_tfs_content_inventory, load_tfs_entity_catalog, load_world_companions, load_world_map,
-    materialize_tfs_static_spawns, resolve_tfs_spawn_references, validate_content, world_map_path,
-    write_template,
+    load_tfs_content_inventory, load_tfs_entity_catalog, load_tfs_vocation_registry,
+    load_world_companions, load_world_map, materialize_tfs_static_spawns,
+    resolve_tfs_spawn_references, validate_content, world_map_path, write_template,
 };
 use forgotten_core::{
     EquipmentSlot, ItemInstance, PlayerContainer, PlayerSkill, SkillProgress, VocationId,
@@ -143,13 +143,14 @@ fn validate(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         None => raw_world_map,
     };
     let companions = load_world_companions(&config, &world_map)?;
+    let vocations = load_tfs_vocation_registry(&config)?;
     println!(">> Opening database");
     let database = EngineDatabase::open(&config.database_path)?;
     if database.schema_version()? < 1 {
         return Err("database schema is not migrated".into());
     }
     println!(
-        "> Validation complete: profile={} protocol={} game-port={} status-port={} map={} tiles={} spawn={},{},{} items={} spawns={} houses={} data={} database={}",
+        "> Validation complete: profile={} protocol={} game-port={} status-port={} map={} tiles={} spawn={},{},{} items={} spawns={} houses={} vocations={} data={} database={}",
         config.profile.id,
         config.profile.tibia_protocol,
         config.game_protocol_port,
@@ -162,6 +163,7 @@ fn validate(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         item_catalog.as_ref().map_or(0, |catalog| catalog.len()),
         companions.spawns.len(),
         companions.houses.len(),
+        vocations.as_ref().map_or(0, |registry| registry.len()),
         content.data_directory.display(),
         database.path().display()
     );
@@ -182,6 +184,7 @@ fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Er
     let companions = load_world_companions(&config, &world_map)?;
     let registry_inventory = load_tfs_content_inventory(&config)?;
     let entity_catalog = load_tfs_entity_catalog(&config)?;
+    let vocation_registry = load_tfs_vocation_registry(&config)?;
     let spawn_resolution = resolve_tfs_spawn_references(&companions, &entity_catalog);
     let map_kind = match raw_world_map.source() {
         WorldMapSource::Otbm(_) => "OTBM",
@@ -189,7 +192,7 @@ fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Er
     };
 
     println!(
-        "TFS conversion readiness\n> config={} (FE profile={} protocol={})\n> map={} format={} tiles={} spawn={},{},{}\n> item-mappings={} spawns={} houses={} towns={} waypoints={}\n> registries={} entries={} references={} missing-references={} unsafe-references={}\n> entities={} monsters={} npcs={} missing-definitions={} missing-scripts={} unsafe-entity-references={}\n> spawn-creatures={} resolved-spawn-creatures={} unresolved-monsters={} unresolved-npcs={}",
+        "TFS conversion readiness\n> config={} (FE profile={} protocol={})\n> map={} format={} tiles={} spawn={},{},{}\n> item-mappings={} spawns={} houses={} towns={} waypoints={} vocations={}\n> registries={} entries={} references={} missing-references={} unsafe-references={}\n> entities={} monsters={} npcs={} missing-definitions={} missing-scripts={} unsafe-entity-references={}\n> spawn-creatures={} resolved-spawn-creatures={} unresolved-monsters={} unresolved-npcs={}",
         directory.join("config.lua").display(),
         config.profile.id,
         config.profile.tibia_protocol,
@@ -204,6 +207,7 @@ fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Er
         companions.houses.len(),
         world_map.towns().count(),
         world_map.waypoints().count(),
+        vocation_registry.as_ref().map_or(0, |registry| registry.len()),
         registry_inventory.present_registry_count(),
         registry_inventory.entry_count(),
         registry_inventory.reference_count(),

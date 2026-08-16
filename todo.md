@@ -197,7 +197,7 @@
 - [x] Add schema-v5 safe SQLite migration plus validated transactional persistence and legacy defaults for player skills and vocation identity.
 - [x] Deliver persisted typed skills through the parser-verified classic-740 bootstrap and dedicated authoritative refresh path.
 - [x] Add additive `player vocation` and `player skill` local provisioning commands without changing existing CLI grammar.
-- [ ] Load and validate operator-owned TFS-style `data/XML/vocations.xml` rules, including promoted/custom vocation entries and bounded gain/multiplier settings.
+- [x] Load and validate operator-owned TFS-style `data/XML/vocations.xml` rules, including promoted/custom vocation entries and bounded gain/multiplier settings, without activating gameplay runtime behavior.
 - [ ] Implement formula-based skill tries, magic-level advancement, level progression, and configured vocation multipliers without claiming TFS behavior before profile-specific evidence.
 - [ ] Add elapsed-time-safe health, mana, and soul regeneration using validated vocation rules and reconnect-safe persistence.
 - [ ] Add bounded condition state and profile-gated poison, burning, and energy-damage scheduling.
