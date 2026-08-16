@@ -986,6 +986,15 @@ pub struct PlayerRespawnState {
     pub death_time: Option<u64>,
 }
 
+/// The deterministic state transition returned after a player is restored at a previously
+/// validated temple. Client delivery and persistence remain host-layer responsibilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerRespawnOutcome {
+    pub player_id: u64,
+    pub position: Position,
+    pub vitals: PlayerVitals,
+}
+
 pub const MAX_ITEM_STACK_COUNT: u16 = 100;
 
 /// A bounded runtime instance of an operator-supplied item type. Map placement metadata remains
@@ -1832,6 +1841,53 @@ impl WorldState {
         Ok(state)
     }
 
+    /// Restores a player who has an accepted death state at its already-validated temple. This
+    /// transition intentionally does not calculate loss, write persistence, or emit client death
+    /// and respawn packets. A blocked temple is rejected without altering the death state.
+    pub fn respawn_player(&mut self, player_id: u64) -> Result<PlayerRespawnOutcome, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        let state = self.player_respawn_state(player_id)?;
+        if !state.dead {
+            return Err(CoreError::PlayerIsNotDead(player_id));
+        }
+        let position = state
+            .respawn_at
+            .ok_or(CoreError::MissingRespawnPosition(player_id))?;
+        if self.is_static_creature_occupied(position) {
+            return Err(CoreError::StaticCreatureOccupiesPosition(position));
+        }
+        if self
+            .players
+            .iter()
+            .any(|(id, player)| *id != player_id && player.position == position)
+        {
+            return Err(CoreError::PlayerOccupiesPosition(position));
+        }
+        let vitals = {
+            let vitals = self
+                .player_vitals
+                .get_mut(&player_id)
+                .ok_or(CoreError::UnknownPlayer(player_id))?;
+            vitals.health = vitals.max_health;
+            vitals.mana = vitals.max_mana;
+            *vitals
+        };
+        self.players
+            .get_mut(&player_id)
+            .ok_or(CoreError::UnknownPlayer(player_id))?
+            .position = position;
+        self.player_respawn_states
+            .insert(player_id, PlayerRespawnState::default());
+        self.mark_changed();
+        Ok(PlayerRespawnOutcome {
+            player_id,
+            position,
+            vitals,
+        })
+    }
+
     pub fn player_equipment(&self, player_id: u64) -> Result<&PlayerEquipment, CoreError> {
         self.player_equipments
             .get(&player_id)
@@ -2439,6 +2495,8 @@ pub enum CoreError {
     },
     UnknownPlayer(u64),
     UnknownTown(u32),
+    PlayerIsNotDead(u64),
+    MissingRespawnPosition(u64),
     SelfInteractionNotAllowed(u64),
     InvalidPlayerVitals(u64),
     InvalidProgressionMultiplier(u32),
@@ -3669,6 +3727,54 @@ mod tests {
         assert_eq!(world.revision(), revision + 1);
         assert_eq!(world.apply_player_death(7, 42, &map).unwrap(), state);
         assert_eq!(world.revision(), revision + 1);
+
+        assert_eq!(
+            world.respawn_player(7).unwrap(),
+            PlayerRespawnOutcome {
+                player_id: 7,
+                position: temple,
+                vitals: PlayerVitals::default(),
+            }
+        );
+        assert_eq!(world.player(7).unwrap().position, temple);
+        assert_eq!(world.player_vitals(7).unwrap(), PlayerVitals::default());
+        assert_eq!(
+            world.player_respawn_state(7).unwrap(),
+            PlayerRespawnState::default()
+        );
+        assert_eq!(world.revision(), revision + 2);
+        assert_eq!(world.respawn_player(7), Err(CoreError::PlayerIsNotDead(7)));
+        assert_eq!(world.revision(), revision + 2);
+
+        world
+            .move_player(
+                7,
+                Position {
+                    x: temple.x + 1,
+                    y: temple.y,
+                    z: temple.z,
+                },
+            )
+            .unwrap();
+        world.apply_player_death(7, 42, &map).unwrap();
+        world
+            .add_player(Player {
+                id: 8,
+                account_id: 3,
+                name: "Druid".to_owned(),
+                position: temple,
+                level: 8,
+                experience: 0,
+                skill_points: 0,
+            })
+            .unwrap();
+        let blocked_revision = world.revision();
+        assert_eq!(
+            world.respawn_player(7),
+            Err(CoreError::PlayerOccupiesPosition(temple))
+        );
+        assert!(world.player_respawn_state(7).unwrap().dead);
+        assert_eq!(world.revision(), blocked_revision);
 
         world.remove_player(7).unwrap();
         assert_eq!(
