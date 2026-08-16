@@ -5,8 +5,8 @@
 use forgotten_core::{
     CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, ItemInstance,
     NativeItemPresentationCatalog, Player, PlayerContainers, PlayerEquipment,
-    PlayerInteractionIntent, PlayerVitals, Position, StaticCreatureDecisionBatch,
-    StaticCreatureDecisionPolicy, WorldMap, WorldState,
+    PlayerInteractionIntent, PlayerProgression, PlayerVitals, Position,
+    StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, WorldMap, WorldState,
 };
 use forgotten_persistence::EngineDatabase;
 use forgotten_protocol::{
@@ -28,15 +28,16 @@ use forgotten_protocol::{
     encode_native_otclient_map_step_with_static_spawns_and_players,
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
-    encode_native_otclient_move_creature_at, encode_native_otclient_player_stats,
-    encode_native_otclient_set_inventory, encode_status_binary, encode_status_xml,
-    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
-    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
-    NativeOtClientCardinalDirection, NativeOtClientClassicItemRecord, NativeOtClientClassicOutfit,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPlayerVitals,
-    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
-    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    encode_native_otclient_move_creature_at, encode_native_otclient_player_skills,
+    encode_native_otclient_player_stats, encode_native_otclient_set_inventory,
+    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
+    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
+    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection,
+    NativeOtClientClassicItemRecord, NativeOtClientClassicOutfit, NativeOtClientEmptyWorldSnapshot,
+    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
+    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
+    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -227,6 +228,7 @@ pub struct SharedNativeWorld {
     world: Arc<Mutex<WorldState>>,
     visibility_epoch: Arc<AtomicU64>,
     vitals_epoch: Arc<AtomicU64>,
+    progression_epoch: Arc<AtomicU64>,
     chat_recipients: Arc<Mutex<BTreeMap<u64, mpsc::SyncSender<SharedPublicChatEvent>>>>,
 }
 
@@ -251,6 +253,7 @@ impl SharedNativeWorld {
             world: Arc::new(Mutex::new(world)),
             visibility_epoch: Arc::new(AtomicU64::new(0)),
             vitals_epoch: Arc::new(AtomicU64::new(0)),
+            progression_epoch: Arc::new(AtomicU64::new(0)),
             chat_recipients: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
@@ -277,10 +280,35 @@ impl SharedNativeWorld {
         self.vitals_epoch.load(Ordering::SeqCst)
     }
 
+    pub fn progression_epoch(&self) -> u64 {
+        self.progression_epoch.load(Ordering::SeqCst)
+    }
+
     pub fn player_vitals(&self, player_id: u64) -> Result<PlayerVitals, HostError> {
         self.lock()?
             .player_vitals(player_id)
             .map_err(HostError::Core)
+    }
+
+    pub fn player_progression(&self, player_id: u64) -> Result<PlayerProgression, HostError> {
+        self.lock()?
+            .player_progression(player_id)
+            .map_err(HostError::Core)
+    }
+
+    pub fn replace_player_progression(
+        &self,
+        player_id: u64,
+        progression: PlayerProgression,
+    ) -> Result<bool, HostError> {
+        let changed = self
+            .lock()?
+            .replace_player_progression(player_id, progression)
+            .map_err(HostError::Core)?;
+        if changed {
+            self.progression_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(changed)
     }
 
     pub fn player_equipment(&self, player_id: u64) -> Result<PlayerEquipment, HostError> {
@@ -458,8 +486,23 @@ impl SharedNativeWorld {
 
     pub fn register_player_at_available_position_with_vitals(
         &self,
+        player: Player,
+        vitals: PlayerVitals,
+        world_map: &WorldMap,
+    ) -> Result<Position, HostError> {
+        self.register_player_at_available_position_with_vitals_and_progression(
+            player,
+            vitals,
+            PlayerProgression::default(),
+            world_map,
+        )
+    }
+
+    pub fn register_player_at_available_position_with_vitals_and_progression(
+        &self,
         mut player: Player,
         vitals: PlayerVitals,
+        progression: PlayerProgression,
         world_map: &WorldMap,
     ) -> Result<Position, HostError> {
         let mut world = self.lock()?;
@@ -486,7 +529,7 @@ impl SharedNativeWorld {
             })?;
         player.position = position;
         world
-            .add_player_with_vitals(player, vitals)
+            .add_player_with_vitals_and_progression(player, vitals, progression)
             .map_err(HostError::Core)?;
         self.mark_visibility_changed();
         Ok(position)
@@ -518,6 +561,27 @@ impl SharedNativeWorld {
         let position = self.register_player_at_available_position_with_vitals_and_equipment(
             player, vitals, equipment, world_map,
         )?;
+        self.replace_player_containers(player_id, containers)?;
+        Ok(position)
+    }
+
+    pub fn register_player_at_available_position_with_vitals_equipment_containers_and_progression(
+        &self,
+        player: Player,
+        vitals: PlayerVitals,
+        progression: PlayerProgression,
+        equipment: PlayerEquipment,
+        containers: PlayerContainers,
+        world_map: &WorldMap,
+    ) -> Result<Position, HostError> {
+        let player_id = player.id;
+        let position = self.register_player_at_available_position_with_vitals_and_progression(
+            player,
+            vitals,
+            progression,
+            world_map,
+        )?;
+        self.replace_player_equipment(player_id, equipment)?;
         self.replace_player_containers(player_id, containers)?;
         Ok(position)
     }
@@ -1206,7 +1270,7 @@ fn handle_native_otclient_game(
         .map_err(HostError::Persistence)?;
     let bootstrap_equipment = equipment.clone();
     let initial_position = match shared_world
-        .register_player_at_available_position_with_vitals_equipment_and_containers(
+        .register_player_at_available_position_with_vitals_equipment_containers_and_progression(
             Player {
                 id: character.id,
                 account_id,
@@ -1224,6 +1288,7 @@ fn handle_native_otclient_game(
                 capacity: character.vitals.capacity,
                 magic_level: character.vitals.magic_level,
             },
+            character.progression,
             equipment,
             containers,
             world_map,
@@ -1263,6 +1328,7 @@ fn handle_native_otclient_game(
             capacity: character.vitals.capacity,
             magic_level: character.vitals.magic_level,
         },
+        player_skills: character.progression.skills,
         ground_thing_id: empty_world.ground_thing_id,
         player_look_type: empty_world.player_look_type,
         player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
@@ -1314,6 +1380,7 @@ fn handle_native_otclient_game(
     let mut active_click_walk: Option<NativeActiveClickWalk> = None;
     let mut observed_visibility_epoch = shared_world.visibility_epoch();
     let mut observed_vitals_epoch = shared_world.vitals_epoch();
+    let mut observed_progression_epoch = shared_world.progression_epoch();
     loop {
         drain_shared_public_chat(
             stream,
@@ -1395,6 +1462,24 @@ fn handle_native_otclient_game(
                             ),
                         );
                         observed_vitals_epoch = vitals_epoch;
+                    }
+                    let progression_epoch = shared_world.progression_epoch();
+                    if progression_epoch != observed_progression_epoch {
+                        snapshot.player_skills =
+                            shared_world.player_progression(character.id)?.skills;
+                        let skills_update =
+                            encode_native_otclient_player_skills(&config.client_profile, &snapshot)
+                                .map_err(HostError::Protocol)?;
+                        write_frame(stream, &skills_update)?;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "outbound=player-skills-refresh epoch={progression_epoch} bytes={}",
+                                skills_update.0.len()
+                            ),
+                        );
+                        observed_progression_epoch = progression_epoch;
                     }
                     let visibility_epoch = shared_world.visibility_epoch();
                     if visibility_epoch != observed_visibility_epoch {
@@ -2996,6 +3081,51 @@ mod tests {
     }
 
     #[test]
+    fn shared_native_registration_hydrates_progression_and_tracks_change_epoch() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        let mut skills = forgotten_core::PlayerSkills::default();
+        skills.set(
+            forgotten_core::PlayerSkill::Sword,
+            forgotten_core::SkillProgress::new(65, 42).unwrap(),
+        );
+        let progression = PlayerProgression {
+            vocation: forgotten_core::VocationId::new(4),
+            skills,
+        };
+        shared
+            .register_player_at_available_position_with_vitals_equipment_containers_and_progression(
+                Player {
+                    id: 103,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                PlayerVitals::default(),
+                progression,
+                PlayerEquipment::default(),
+                PlayerContainers::default(),
+                &map,
+            )
+            .unwrap();
+        assert_eq!(shared.player_progression(103).unwrap(), progression);
+        assert_eq!(shared.progression_epoch(), 0);
+        assert!(!shared.replace_player_progression(103, progression).unwrap());
+        assert_eq!(shared.progression_epoch(), 0);
+        let mut changed = progression;
+        changed.skills.set(
+            forgotten_core::PlayerSkill::Shielding,
+            forgotten_core::SkillProgress::new(61, 99).unwrap(),
+        );
+        assert!(shared.replace_player_progression(103, changed).unwrap());
+        assert_eq!(shared.progression_epoch(), 1);
+        assert_eq!(shared.player_progression(103).unwrap(), changed);
+    }
+
+    #[test]
     fn shared_native_world_tracks_and_clears_player_interaction_intent() {
         let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
         let map = native_world_map();
@@ -3253,6 +3383,7 @@ mod tests {
             player_level: 8,
             player_experience: 0,
             player_vitals: NativeOtClientPlayerVitals::default(),
+            player_skills: forgotten_core::PlayerSkills::default(),
             ground_thing_id: 102,
             player_look_type: 128,
             player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
@@ -4147,6 +4278,7 @@ mod tests {
             player_level: 8,
             player_experience: 0,
             player_vitals: NativeOtClientPlayerVitals::default(),
+            player_skills: forgotten_core::PlayerSkills::default(),
             ground_thing_id: 102,
             player_look_type: 128,
             player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
@@ -4218,6 +4350,7 @@ mod tests {
             player_level: 8,
             player_experience: 0,
             player_vitals: NativeOtClientPlayerVitals::default(),
+            player_skills: forgotten_core::PlayerSkills::default(),
             ground_thing_id: 102,
             player_look_type: 128,
             player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),

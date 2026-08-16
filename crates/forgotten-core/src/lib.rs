@@ -550,6 +550,176 @@ impl Default for PlayerVitals {
     }
 }
 
+/// The seven classic player skills occupy stable, explicit positions in the native protocol.
+/// They remain typed throughout authoritative state rather than being represented by an
+/// unvalidated string or integer map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlayerSkill {
+    Fist,
+    Club,
+    Sword,
+    Axe,
+    Distance,
+    Shielding,
+    Fishing,
+}
+
+impl PlayerSkill {
+    pub const ALL: [Self; 7] = [
+        Self::Fist,
+        Self::Club,
+        Self::Sword,
+        Self::Axe,
+        Self::Distance,
+        Self::Shielding,
+        Self::Fishing,
+    ];
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Fist => 0,
+            Self::Club => 1,
+            Self::Sword => 2,
+            Self::Axe => 3,
+            Self::Distance => 4,
+            Self::Shielding => 5,
+            Self::Fishing => 6,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Fist),
+            1 => Some(Self::Club),
+            2 => Some(Self::Sword),
+            3 => Some(Self::Axe),
+            4 => Some(Self::Distance),
+            5 => Some(Self::Shielding),
+            6 => Some(Self::Fishing),
+            _ => None,
+        }
+    }
+}
+
+/// The player-visible level and percentage progress for one named skill. The percentage is
+/// deliberately bounded to the client-visible 0–100 range; skill tries and advancement formulas
+/// are separate future runtime concerns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkillProgress {
+    pub level: u16,
+    pub percent: u8,
+}
+
+impl SkillProgress {
+    pub fn new(level: u16, percent: u8) -> Result<Self, CoreError> {
+        if level == 0 || percent > 100 {
+            return Err(CoreError::InvalidSkillProgress { level, percent });
+        }
+        Ok(Self { level, percent })
+    }
+}
+
+impl Default for SkillProgress {
+    fn default() -> Self {
+        Self {
+            level: 10,
+            percent: 0,
+        }
+    }
+}
+
+/// A fixed, validated collection of all classic skills. The public iterator keeps the packet
+/// ordering explicit and avoids leaking a mutable backing collection to callers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayerSkills {
+    values: [SkillProgress; 7],
+}
+
+impl PlayerSkills {
+    pub fn skill(self, skill: PlayerSkill) -> SkillProgress {
+        self.values[skill.code() as usize]
+    }
+
+    pub fn set(&mut self, skill: PlayerSkill, progress: SkillProgress) -> bool {
+        let current = &mut self.values[skill.code() as usize];
+        if *current == progress {
+            return false;
+        }
+        *current = progress;
+        true
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = (PlayerSkill, SkillProgress)> {
+        PlayerSkill::ALL
+            .into_iter()
+            .map(move |skill| (skill, self.skill(skill)))
+    }
+}
+
+/// A numeric vocation identity. The numeric form remains extensible for operator-owned legacy
+/// vocation registries, while `BaseVocation` exposes the portable five-identity foundation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct VocationId(u16);
+
+impl VocationId {
+    pub const NONE: Self = Self(0);
+
+    pub const fn new(value: u16) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u16 {
+        self.0
+    }
+
+    pub const fn base(self) -> Option<BaseVocation> {
+        BaseVocation::from_id(self.0)
+    }
+}
+
+/// The portable base-vocation identities. Promotion and custom vocation entries remain data-driven
+/// registry work and are not implied by this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseVocation {
+    None,
+    Sorcerer,
+    Druid,
+    Paladin,
+    Knight,
+}
+
+impl BaseVocation {
+    pub const fn id(self) -> VocationId {
+        match self {
+            Self::None => VocationId::new(0),
+            Self::Sorcerer => VocationId::new(1),
+            Self::Druid => VocationId::new(2),
+            Self::Paladin => VocationId::new(3),
+            Self::Knight => VocationId::new(4),
+        }
+    }
+
+    pub const fn from_id(id: u16) -> Option<Self> {
+        match id {
+            0 => Some(Self::None),
+            1 => Some(Self::Sorcerer),
+            2 => Some(Self::Druid),
+            3 => Some(Self::Paladin),
+            4 => Some(Self::Knight),
+            _ => None,
+        }
+    }
+}
+
+/// Persisted player progression state that is independent of equipment, vitals, and map position.
+/// It intentionally stores no formula multipliers: those are loaded later from a validated
+/// operator-owned vocation registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlayerProgression {
+    pub vocation: VocationId,
+    pub skills: PlayerSkills,
+}
+
 pub const MAX_ITEM_STACK_COUNT: u16 = 100;
 
 /// A bounded runtime instance of an operator-supplied item type. Map placement metadata remains
@@ -870,6 +1040,7 @@ pub struct PlayerInteractionIntent {
 pub struct WorldState {
     players: BTreeMap<u64, Player>,
     player_vitals: BTreeMap<u64, PlayerVitals>,
+    player_progressions: BTreeMap<u64, PlayerProgression>,
     player_equipments: BTreeMap<u64, PlayerEquipment>,
     player_containers: BTreeMap<u64, PlayerContainers>,
     player_interactions: BTreeMap<u64, PlayerInteractionIntent>,
@@ -906,6 +1077,15 @@ impl WorldState {
         player: Player,
         vitals: PlayerVitals,
     ) -> Result<(), CoreError> {
+        self.add_player_with_vitals_and_progression(player, vitals, PlayerProgression::default())
+    }
+
+    pub fn add_player_with_vitals_and_progression(
+        &mut self,
+        player: Player,
+        vitals: PlayerVitals,
+        progression: PlayerProgression,
+    ) -> Result<(), CoreError> {
         if player.name.trim().is_empty() {
             return Err(CoreError::EmptyPlayerName);
         }
@@ -926,6 +1106,7 @@ impl WorldState {
             return Err(CoreError::StaticCreatureOccupiesPosition(player.position));
         }
         self.player_vitals.insert(player.id, vitals);
+        self.player_progressions.insert(player.id, progression);
         self.player_equipments
             .insert(player.id, PlayerEquipment::default());
         self.player_containers
@@ -941,6 +1122,7 @@ impl WorldState {
             .remove(&id)
             .ok_or(CoreError::UnknownPlayer(id))?;
         self.player_vitals.remove(&id);
+        self.player_progressions.remove(&id);
         self.player_equipments.remove(&id);
         self.player_containers.remove(&id);
         self.player_interactions.remove(&id);
@@ -1288,6 +1470,13 @@ impl WorldState {
             .ok_or(CoreError::UnknownPlayer(player_id))
     }
 
+    pub fn player_progression(&self, player_id: u64) -> Result<PlayerProgression, CoreError> {
+        self.player_progressions
+            .get(&player_id)
+            .copied()
+            .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
     pub fn player_equipment(&self, player_id: u64) -> Result<&PlayerEquipment, CoreError> {
         self.player_equipments
             .get(&player_id)
@@ -1355,6 +1544,24 @@ impl WorldState {
         self.player_vitals.insert(player_id, vitals);
         self.mark_changed();
         Ok(())
+    }
+
+    /// Replaces player vocation and all typed skills atomically in the authoritative world. No-op
+    /// replacements do not advance the world revision, matching vitals/equipment semantics.
+    pub fn replace_player_progression(
+        &mut self,
+        player_id: u64,
+        progression: PlayerProgression,
+    ) -> Result<bool, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        if self.player_progression(player_id)? == progression {
+            return Ok(false);
+        }
+        self.player_progressions.insert(player_id, progression);
+        self.mark_changed();
+        Ok(true)
     }
 
     pub fn apply_player_damage(
@@ -1554,6 +1761,10 @@ pub enum CoreError {
     UnknownPlayer(u64),
     SelfInteractionNotAllowed(u64),
     InvalidPlayerVitals(u64),
+    InvalidSkillProgress {
+        level: u16,
+        percent: u8,
+    },
     CombatOutOfRange {
         attacker_id: u64,
         target_id: u64,
@@ -2531,6 +2742,63 @@ mod tests {
                 attacker_id: 7,
                 target_id: 9,
             })
+        );
+    }
+
+    #[test]
+    fn typed_player_skills_are_bounded_ordered_and_authoritative() {
+        assert_eq!(
+            PlayerSkill::ALL.map(PlayerSkill::code),
+            [0, 1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(PlayerSkill::from_code(4), Some(PlayerSkill::Distance));
+        assert_eq!(PlayerSkill::from_code(7), None);
+        assert_eq!(
+            SkillProgress::new(0, 0),
+            Err(CoreError::InvalidSkillProgress {
+                level: 0,
+                percent: 0
+            })
+        );
+        assert_eq!(
+            SkillProgress::new(10, 101),
+            Err(CoreError::InvalidSkillProgress {
+                level: 10,
+                percent: 101
+            })
+        );
+
+        let mut skills = PlayerSkills::default();
+        assert!(skills.set(PlayerSkill::Sword, SkillProgress::new(42, 73).unwrap()));
+        assert!(!skills.set(PlayerSkill::Sword, SkillProgress::new(42, 73).unwrap()));
+        assert_eq!(
+            skills.skill(PlayerSkill::Sword),
+            SkillProgress::new(42, 73).unwrap()
+        );
+        assert_eq!(
+            skills.iter().collect::<Vec<_>>()[2],
+            (PlayerSkill::Sword, SkillProgress::new(42, 73).unwrap())
+        );
+
+        assert_eq!(BaseVocation::Knight.id().base(), Some(BaseVocation::Knight));
+        assert_eq!(VocationId::new(8).base(), None);
+
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        let revision = world.revision();
+        let progression = PlayerProgression {
+            vocation: BaseVocation::Knight.id(),
+            skills,
+        };
+        assert!(world.replace_player_progression(7, progression).unwrap());
+        assert_eq!(world.revision(), revision + 1);
+        assert!(!world.replace_player_progression(7, progression).unwrap());
+        assert_eq!(world.revision(), revision + 1);
+        assert_eq!(world.player_progression(7).unwrap(), progression);
+        world.remove_player(7).unwrap();
+        assert_eq!(
+            world.player_progression(7),
+            Err(CoreError::UnknownPlayer(7))
         );
     }
 }

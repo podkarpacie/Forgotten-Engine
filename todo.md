@@ -193,4 +193,13 @@
 - [x] Add schema-v4 transactional persistence for player-owned named containers and ordered container items with safe migration and malformed-record rejection.
 - [x] Hydrate persisted player containers into authoritative native sessions during registration without sending unsolicited container-window packets.
 - [x] Add additive local player-container provisioning commands that create named containers and persist bounded container items without altering existing player command syntax.
+- [x] Add typed authoritative seven-skill level/percentage state and extensible numeric vocation identity with no-op-safe world replacement semantics.
+- [x] Add schema-v5 safe SQLite migration plus validated transactional persistence and legacy defaults for player skills and vocation identity.
+- [x] Deliver persisted typed skills through the parser-verified classic-740 bootstrap and dedicated authoritative refresh path.
+- [x] Add additive `player vocation` and `player skill` local provisioning commands without changing existing CLI grammar.
+- [ ] Load and validate operator-owned TFS-style `data/XML/vocations.xml` rules, including promoted/custom vocation entries and bounded gain/multiplier settings.
+- [ ] Implement formula-based skill tries, magic-level advancement, level progression, and configured vocation multipliers without claiming TFS behavior before profile-specific evidence.
+- [ ] Add elapsed-time-safe health, mana, and soul regeneration using validated vocation rules and reconnect-safe persistence.
+- [ ] Add bounded condition state and profile-gated poison, burning, and energy-damage scheduling.
+- [ ] Add death, respawn, temple selection, loss policy, and client-state delivery foundations.
 - [ ] Establish and satisfy production-readiness gates for complete declared TFS feature conformance, profile-specific protocol validation, reliability, bounded memory/performance, security, and reproducible TFS-to-FE migration before describing any profile as mainstream-ready.

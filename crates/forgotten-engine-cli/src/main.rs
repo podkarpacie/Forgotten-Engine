@@ -4,7 +4,10 @@ use forgotten_config::{
     materialize_tfs_static_spawns, resolve_tfs_spawn_references, validate_content, world_map_path,
     write_template,
 };
-use forgotten_core::{EquipmentSlot, ItemInstance, PlayerContainer, WorldMapSource};
+use forgotten_core::{
+    EquipmentSlot, ItemInstance, PlayerContainer, PlayerSkill, SkillProgress, VocationId,
+    WorldMapSource,
+};
 use forgotten_host::{
     start, start_game_session, start_native_otclient_game, start_native_otclient_login,
     start_status, GameSessionHostConfig, HostConfig, LegacyLoginConfig,
@@ -809,6 +812,50 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             println!("unequipped player-id={player_id} slot={}", slot.code());
             Ok(())
         }
+        "vocation" => {
+            if arguments.len() != 5 {
+                return Err("usage: player vocation <directory> <player-id> <vocation-id>".into());
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let vocation_id = parse_u16_argument(arguments.get(4), "vocation ID")?;
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            let mut progression = database.player_progression(player_id)?;
+            progression.vocation = VocationId::new(vocation_id);
+            database.replace_player_progression(player_id, progression)?;
+            println!("updated player vocation player-id={player_id} vocation-id={vocation_id}");
+            Ok(())
+        }
+        "skill" => {
+            if !(arguments.len() == 6 || arguments.len() == 7) {
+                return Err(
+                    "usage: player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]"
+                        .into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let skill = parse_player_skill(arguments.get(4))?;
+            let level = parse_u16_argument(arguments.get(5), "skill level")?;
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            let mut progression = database.player_progression(player_id)?;
+            let percent = arguments
+                .get(6)
+                .map(|value| parse_u8_argument(Some(value), "skill percent"))
+                .transpose()?
+                .unwrap_or_else(|| progression.skills.skill(skill).percent);
+            progression
+                .skills
+                .set(skill, SkillProgress::new(level, percent)?);
+            database.replace_player_progression(player_id, progression)?;
+            println!(
+                "updated player skill player-id={player_id} skill={} level={level} percent={percent}",
+                skill.code()
+            );
+            Ok(())
+        }
         "container-create" => {
             if arguments.len() < 8 {
                 return Err(
@@ -968,6 +1015,19 @@ fn parse_equipment_slot(
     }
 }
 
+fn parse_player_skill(value: Option<&String>) -> Result<PlayerSkill, Box<dyn std::error::Error>> {
+    match value.map(String::as_str) {
+        Some("fist") => Ok(PlayerSkill::Fist),
+        Some("club") => Ok(PlayerSkill::Club),
+        Some("sword") => Ok(PlayerSkill::Sword),
+        Some("axe") => Ok(PlayerSkill::Axe),
+        Some("distance") | Some("dist") => Ok(PlayerSkill::Distance),
+        Some("shielding") | Some("shield") => Ok(PlayerSkill::Shielding),
+        Some("fishing") | Some("fish") => Ok(PlayerSkill::Fishing),
+        _ => Err("skill must be fist, club, sword, axe, distance, shielding, or fishing".into()),
+    }
+}
+
 fn capability_matrix_json() -> &'static str {
     include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1019,7 +1079,7 @@ fn version() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn help_text() -> &'static str {
-    "Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)\n  fe-8.0  — Tibia 8.0 (protocol foundation)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  tfs-audit <directory>\n  run <directory> [--ed]\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  account create <directory> <account-name> <password>\n  player create <directory> <account-id> <character-name>\n  player equip <directory> <player-id> <slot> <server-item-id> [count]\n  player unequip <directory> <player-id> <slot>\n  player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>\n  player container-add <directory> <player-id> <container-id> <server-item-id> [count]\n  player container-remove <directory> <player-id> <container-id> <item-index>\n  command <directory> broadcast <message>\n  compatibility [--json]\n  version"
+    "Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)\n  fe-8.0  — Tibia 8.0 (protocol foundation)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  tfs-audit <directory>\n  run <directory> [--ed]\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  account create <directory> <account-name> <password>\n  player create <directory> <account-id> <character-name>\n  player equip <directory> <player-id> <slot> <server-item-id> [count]\n  player unequip <directory> <player-id> <slot>\n  player vocation <directory> <player-id> <vocation-id>\n  player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]\n  player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>\n  player container-add <directory> <player-id> <container-id> <server-item-id> [count]\n  player container-remove <directory> <player-id> <container-id> <item-index>\n  command <directory> broadcast <message>\n  compatibility [--json]\n  version"
 }
 
 fn print_help() {
@@ -1088,6 +1148,8 @@ mod tests {
             "player create <directory> <account-id> <character-name>",
             "player equip <directory> <player-id> <slot> <server-item-id> [count]",
             "player unequip <directory> <player-id> <slot>",
+            "player vocation <directory> <player-id> <vocation-id>",
+            "player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]",
             "player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>",
             "player container-add <directory> <player-id> <container-id> <server-item-id> [count]",
             "player container-remove <directory> <player-id> <container-id> <item-index>",
@@ -1129,6 +1191,15 @@ mod tests {
             2
         );
         assert!(parse_usize_argument(Some(&"-1".to_owned()), "container item index").is_err());
+        assert_eq!(
+            parse_player_skill(Some(&"sword".to_owned())).unwrap(),
+            PlayerSkill::Sword
+        );
+        assert_eq!(
+            parse_player_skill(Some(&"dist".to_owned())).unwrap(),
+            PlayerSkill::Distance
+        );
+        assert!(parse_player_skill(Some(&"alchemy".to_owned())).is_err());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 use forgotten_core::{
     CardinalDirection, EmptyWorldViewport, EquipmentSlot, FeTfsStaticEntity,
-    FeTfsStaticSpawnCollection, Position, WorldMap,
+    FeTfsStaticSpawnCollection, PlayerSkills, Position, WorldMap,
 };
 use rand::{rngs::OsRng, RngCore};
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
@@ -919,6 +919,7 @@ pub struct NativeOtClientEmptyWorldSnapshot {
     pub player_level: u16,
     pub player_experience: u64,
     pub player_vitals: NativeOtClientPlayerVitals,
+    pub player_skills: PlayerSkills,
     pub ground_thing_id: u16,
     pub player_look_type: u8,
     pub player_direction: u8,
@@ -1295,20 +1296,32 @@ pub fn encode_native_otclient_player_stats(
     Ok(Frame(writer.finish()))
 }
 
+/// Encodes the fixed-width classic 7.4 typed player-skills record. The selected protocol has one
+/// byte each for a skill level and percentage. Authoritative levels higher than the packet range
+/// are saturated only for client presentation; the persisted core value remains unchanged.
+pub fn encode_native_otclient_player_skills(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+) -> Result<Frame, ProtocolError> {
+    validate_native_empty_world_snapshot(profile, snapshot)?;
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_PLAYER_SKILLS);
+    for (_, progress) in snapshot.player_skills.iter() {
+        writer.byte(progress.level.min(u16::from(u8::MAX)) as u8);
+        writer.byte(progress.percent);
+    }
+    Ok(Frame(writer.finish()))
+}
+
 /// Encodes the fixed-width classic 7.4 local-player records expected immediately after map
-/// delivery. The generic skill baseline remains deferred to the skill-progression milestone.
+/// delivery, including authoritative typed skills supplied by the core runtime.
 pub fn encode_native_otclient_player_bootstrap(
     profile: &NativeOtClientProfile,
     snapshot: &NativeOtClientEmptyWorldSnapshot,
 ) -> Result<Frame, ProtocolError> {
     let mut payload = encode_native_otclient_player_stats(profile, snapshot)?.0;
     let mut writer = Writer::default();
-
-    writer.byte(NATIVE_OTCLIENT_GAME_PLAYER_SKILLS);
-    for _ in 0..7 {
-        writer.byte(10);
-        writer.byte(0);
-    }
+    payload.extend_from_slice(&encode_native_otclient_player_skills(profile, snapshot)?.0);
 
     writer.byte(NATIVE_OTCLIENT_GAME_PLAYER_STATE);
     writer.byte(0);
@@ -2607,6 +2620,7 @@ mod tests {
             player_level: 8,
             player_experience: 4_900,
             player_vitals: NativeOtClientPlayerVitals::default(),
+            player_skills: PlayerSkills::default(),
             ground_thing_id: 102,
             player_look_type: 128,
             player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
@@ -3361,6 +3375,67 @@ mod tests {
     }
 
     #[test]
+    fn classic_740_player_skills_use_typed_order_and_bounded_presentation() {
+        let profile = NativeOtClientProfile {
+            protocol_version: 740,
+            numeric_account_ids: true,
+            login_packet_encryption: false,
+            protocol_checksum: false,
+            challenge_on_login: false,
+            max_padding_bytes: 128,
+        };
+        let mut skills = PlayerSkills::default();
+        skills.set(
+            forgotten_core::PlayerSkill::Sword,
+            forgotten_core::SkillProgress::new(65, 42).unwrap(),
+        );
+        skills.set(
+            forgotten_core::PlayerSkill::Fishing,
+            forgotten_core::SkillProgress::new(512, 100).unwrap(),
+        );
+        let snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_id: NATIVE_OTCLIENT_PLAYER_ID_START + 7,
+            player_name: "Knight".into(),
+            player_position: NativeOtClientPosition {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            player_level: 8,
+            player_experience: 0,
+            player_vitals: NativeOtClientPlayerVitals::default(),
+            player_skills: skills,
+            ground_thing_id: 102,
+            player_look_type: 128,
+            player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
+            player_speed: 220,
+            server_beat: 50,
+        };
+        assert_eq!(
+            encode_native_otclient_player_skills(&profile, &snapshot)
+                .unwrap()
+                .0,
+            vec![
+                NATIVE_OTCLIENT_GAME_PLAYER_SKILLS,
+                10,
+                0,
+                10,
+                0,
+                65,
+                42,
+                10,
+                0,
+                10,
+                0,
+                10,
+                0,
+                255,
+                100
+            ]
+        );
+    }
+
+    #[test]
     fn dense_native_viewport_remains_within_the_frame_budget() {
         let profile = NativeOtClientProfile {
             protocol_version: 740,
@@ -3381,6 +3456,7 @@ mod tests {
             player_level: 8,
             player_experience: 0,
             player_vitals: NativeOtClientPlayerVitals::default(),
+            player_skills: PlayerSkills::default(),
             ground_thing_id: 102,
             player_look_type: 128,
             player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),

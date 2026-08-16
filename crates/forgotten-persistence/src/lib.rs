@@ -6,7 +6,7 @@ use argon2::{
 };
 use forgotten_core::{
     EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerContainers, PlayerEquipment,
-    Position,
+    PlayerProgression, PlayerSkill, PlayerSkills, Position, SkillProgress, VocationId,
 };
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SCHEMA_VERSION_EQUIPMENT: i64 = 3;
-const LATEST_SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION_CONTAINERS: i64 = 4;
+const LATEST_SCHEMA_VERSION: i64 = 5;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct EngineDatabase {
@@ -148,7 +149,7 @@ impl EngineDatabase {
         let mut statement = self.connection.prepare(
             "SELECT id, name, level, experience, skill_points, health, max_health, mana, max_mana, capacity, magic_level, x, y, z FROM players WHERE account_id = ?1 ORDER BY name COLLATE NOCASE",
         )?;
-        let characters = statement
+        let mut characters = statement
             .query_map(params![account_id], |row| {
                 Ok(LoginCharacter {
                     id: row.get::<_, i64>(0)? as u64,
@@ -156,6 +157,7 @@ impl EngineDatabase {
                     level: row.get::<_, i64>(2)? as u32,
                     experience: row.get::<_, i64>(3)? as u64,
                     skill_points: row.get::<_, i64>(4)? as u32,
+                    progression: PlayerProgression::default(),
                     vitals: PlayerVitals {
                         health: row.get::<_, i64>(5)? as u16,
                         max_health: row.get::<_, i64>(6)? as u16,
@@ -172,6 +174,9 @@ impl EngineDatabase {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        for character in &mut characters {
+            character.progression = self.player_progression(character.id)?;
+        }
         Ok(characters)
     }
 
@@ -239,6 +244,7 @@ impl EngineDatabase {
             level: 8,
             experience: 0,
             skill_points: 0,
+            progression: PlayerProgression::default(),
             vitals: PlayerVitals::default(),
             position,
         })
@@ -268,6 +274,73 @@ impl EngineDatabase {
             return Err(PersistenceError::UnknownPlayer(player_id));
         }
         Ok(())
+    }
+
+    /// Replaces a player's vocation identity and all typed skill values atomically. The caller
+    /// supplies validated core types; SQLite rows are still validated again on every reload.
+    pub fn replace_player_progression(
+        &mut self,
+        player_id: u64,
+        progression: PlayerProgression,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE players SET vocation = ?1 WHERE id = ?2",
+            params![i64::from(progression.vocation.value()), player_id as i64],
+        )?;
+        let values = progression
+            .skills
+            .iter()
+            .flat_map(|(_, progress)| [i64::from(progress.level), i64::from(progress.percent)]);
+        let values = values.collect::<Vec<_>>();
+        transaction.execute(
+            "INSERT INTO player_skills (player_id, fist_level, fist_percent, club_level, club_percent, sword_level, sword_percent, axe_level, axe_percent, distance_level, distance_percent, shielding_level, shielding_percent, fishing_level, fishing_percent) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) ON CONFLICT(player_id) DO UPDATE SET fist_level=excluded.fist_level, fist_percent=excluded.fist_percent, club_level=excluded.club_level, club_percent=excluded.club_percent, sword_level=excluded.sword_level, sword_percent=excluded.sword_percent, axe_level=excluded.axe_level, axe_percent=excluded.axe_percent, distance_level=excluded.distance_level, distance_percent=excluded.distance_percent, shielding_level=excluded.shielding_level, shielding_percent=excluded.shielding_percent, fishing_level=excluded.fishing_level, fishing_percent=excluded.fishing_percent",
+            params![
+                player_id as i64,
+                values[0], values[1], values[2], values[3], values[4], values[5], values[6],
+                values[7], values[8], values[9], values[10], values[11], values[12], values[13]
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Loads a player's progression through validated fixed-width database fields. Worlds that
+    /// predate schema-v5 have no skill row after migration and are represented by safe defaults.
+    pub fn player_progression(
+        &self,
+        player_id: u64,
+    ) -> Result<PlayerProgression, PersistenceError> {
+        let vocation = self
+            .connection
+            .query_row(
+                "SELECT vocation FROM players WHERE id = ?1",
+                params![player_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(PersistenceError::UnknownPlayer(player_id))?;
+        let vocation = u16::try_from(vocation).map_err(|_| {
+            PersistenceError::InvalidProgressionRecord("vocation ID does not fit u16".into())
+        })?;
+        let record = self.connection.query_row(
+            "SELECT fist_level, fist_percent, club_level, club_percent, sword_level, sword_percent, axe_level, axe_percent, distance_level, distance_percent, shielding_level, shielding_percent, fishing_level, fishing_percent FROM player_skills WHERE player_id = ?1",
+            params![player_id as i64],
+            |row| Ok([
+                row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?, row.get::<_, i64>(5)?, row.get::<_, i64>(6)?, row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?, row.get::<_, i64>(9)?, row.get::<_, i64>(10)?, row.get::<_, i64>(11)?,
+                row.get::<_, i64>(12)?, row.get::<_, i64>(13)?,
+            ]),
+        ).optional()?;
+        Ok(PlayerProgression {
+            vocation: VocationId::new(vocation),
+            skills: record
+                .map(player_skills_from_record)
+                .transpose()?
+                .unwrap_or_default(),
+        })
     }
 
     pub fn update_player_position(
@@ -557,10 +630,24 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_EQUIPMENT, unix_seconds()],
             )?;
         }
-        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+        if self.schema_version()? < SCHEMA_VERSION_CONTAINERS {
             self.connection.execute_batch(
                 "CREATE TABLE IF NOT EXISTS player_containers (player_id INTEGER NOT NULL, container_id INTEGER NOT NULL, server_id INTEGER NOT NULL, count INTEGER NOT NULL, name TEXT NOT NULL, has_parent INTEGER NOT NULL, capacity INTEGER NOT NULL, PRIMARY KEY (player_id, container_id));\
                  CREATE TABLE IF NOT EXISTS player_container_items (player_id INTEGER NOT NULL, container_id INTEGER NOT NULL, slot INTEGER NOT NULL, server_id INTEGER NOT NULL, count INTEGER NOT NULL, action_id INTEGER, unique_id INTEGER, PRIMARY KEY (player_id, container_id, slot));",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_CONTAINERS, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+            if !self.player_column_exists("vocation")? {
+                self.connection.execute_batch(
+                    "ALTER TABLE players ADD COLUMN vocation INTEGER NOT NULL DEFAULT 0",
+                )?;
+            }
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS player_skills (player_id INTEGER PRIMARY KEY, fist_level INTEGER NOT NULL, fist_percent INTEGER NOT NULL, club_level INTEGER NOT NULL, club_percent INTEGER NOT NULL, sword_level INTEGER NOT NULL, sword_percent INTEGER NOT NULL, axe_level INTEGER NOT NULL, axe_percent INTEGER NOT NULL, distance_level INTEGER NOT NULL, distance_percent INTEGER NOT NULL, shielding_level INTEGER NOT NULL, shielding_percent INTEGER NOT NULL, fishing_level INTEGER NOT NULL, fishing_percent INTEGER NOT NULL);",
             )?;
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
@@ -636,6 +723,7 @@ pub struct LoginCharacter {
     pub level: u32,
     pub experience: u64,
     pub skill_points: u32,
+    pub progression: PlayerProgression,
     pub vitals: PlayerVitals,
     pub position: Position,
 }
@@ -716,6 +804,29 @@ fn optional_u16_container_attribute(
         .transpose()
 }
 
+fn player_skills_from_record(record: [i64; 14]) -> Result<PlayerSkills, PersistenceError> {
+    let mut skills = PlayerSkills::default();
+    for skill in PlayerSkill::ALL {
+        let offset = usize::from(skill.code()) * 2;
+        let level = u16::try_from(record[offset]).map_err(|_| {
+            PersistenceError::InvalidProgressionRecord(format!(
+                "{} skill level does not fit u16",
+                skill.code()
+            ))
+        })?;
+        let percent = u8::try_from(record[offset + 1]).map_err(|_| {
+            PersistenceError::InvalidProgressionRecord(format!(
+                "{} skill percent does not fit u8",
+                skill.code()
+            ))
+        })?;
+        let progress = SkillProgress::new(level, percent)
+            .map_err(|error| PersistenceError::InvalidProgressionRecord(error.to_string()))?;
+        skills.set(skill, progress);
+    }
+    Ok(skills)
+}
+
 #[derive(Debug)]
 pub enum PersistenceError {
     Io(std::io::Error),
@@ -725,6 +836,7 @@ pub enum PersistenceError {
     InvalidPlayerVitals,
     InvalidEquipmentRecord(String),
     InvalidContainerRecord(String),
+    InvalidProgressionRecord(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
 }
@@ -790,7 +902,61 @@ mod tests {
         let character = database.characters_for_account(1).unwrap().remove(0);
         assert_eq!(character.experience, 4_900);
         assert_eq!(character.vitals, PlayerVitals::default());
+        assert_eq!(character.progression, PlayerProgression::default());
         assert!(database.player_equipment(7).unwrap().is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_and_validates_player_progression_transactionally() {
+        let path = temporary_path("progression");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("admin", "hash").unwrap();
+        database
+            .save_player(&Player {
+                id: 7,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let mut skills = PlayerSkills::default();
+        skills.set(PlayerSkill::Sword, SkillProgress::new(65, 42).unwrap());
+        skills.set(PlayerSkill::Shielding, SkillProgress::new(61, 99).unwrap());
+        let progression = PlayerProgression {
+            vocation: VocationId::new(4),
+            skills,
+        };
+        database.replace_player_progression(7, progression).unwrap();
+        assert_eq!(database.player_progression(7).unwrap(), progression);
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].progression,
+            progression
+        );
+
+        database
+            .connection
+            .execute(
+                "UPDATE player_skills SET sword_percent = 255 WHERE player_id = ?1",
+                params![7_i64],
+            )
+            .unwrap();
+        assert!(matches!(
+            database.player_progression(7),
+            Err(PersistenceError::InvalidProgressionRecord(_))
+        ));
+        assert!(matches!(
+            database.player_progression(999),
+            Err(PersistenceError::UnknownPlayer(999))
+        ));
         let _ = fs::remove_file(path);
     }
 
