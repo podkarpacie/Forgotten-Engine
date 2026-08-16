@@ -870,6 +870,23 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             println!("updated player vocation player-id={player_id} vocation-id={vocation_id}");
             Ok(())
         }
+        "town" => {
+            if arguments.len() != 5 {
+                return Err("usage: player town <directory> <player-id> <town-id>".into());
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let town_id = arguments
+                .get(4)
+                .ok_or("a town ID is required")?
+                .parse::<u32>()
+                .map_err(|_| "town ID must be an unsigned 32-bit integer")?;
+            let config = load(&directory)?;
+            let database = EngineDatabase::open(&config.database_path)?;
+            database.update_player_town(player_id, town_id)?;
+            println!("updated player town player-id={player_id} town-id={town_id}");
+            Ok(())
+        }
         "skill" => {
             if !(arguments.len() == 6 || arguments.len() == 7) {
                 return Err(
@@ -1122,7 +1139,7 @@ fn version() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn help_text() -> &'static str {
-    "Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)\n  fe-8.0  — Tibia 8.0 (protocol foundation)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  tfs-audit <directory>\n  run <directory> [--ed]\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  account create <directory> <account-name> <password>\n  player create <directory> <account-id> <character-name>\n  player equip <directory> <player-id> <slot> <server-item-id> [count]\n  player unequip <directory> <player-id> <slot>\n  player vocation <directory> <player-id> <vocation-id>\n  player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]\n  player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>\n  player container-add <directory> <player-id> <container-id> <server-item-id> [count]\n  player container-remove <directory> <player-id> <container-id> <item-index>\n  command <directory> broadcast <message>\n  compatibility [--json]\n  version"
+    "Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)\n  fe-8.0  — Tibia 8.0 (protocol foundation)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  tfs-audit <directory>\n  run <directory> [--ed]\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  account create <directory> <account-name> <password>\n  player create <directory> <account-id> <character-name>\n  player equip <directory> <player-id> <slot> <server-item-id> [count]\n  player unequip <directory> <player-id> <slot>\n  player vocation <directory> <player-id> <vocation-id>\n  player town <directory> <player-id> <town-id>\n  player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]\n  player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>\n  player container-add <directory> <player-id> <container-id> <server-item-id> [count]\n  player container-remove <directory> <player-id> <container-id> <item-index>\n  command <directory> broadcast <message>\n  compatibility [--json]\n  version"
 }
 
 fn print_help() {
@@ -1192,6 +1209,7 @@ mod tests {
             "player equip <directory> <player-id> <slot> <server-item-id> [count]",
             "player unequip <directory> <player-id> <slot>",
             "player vocation <directory> <player-id> <vocation-id>",
+            "player town <directory> <player-id> <town-id>",
             "player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]",
             "player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>",
             "player container-add <directory> <player-id> <container-id> <server-item-id> [count]",
@@ -1342,6 +1360,22 @@ experienceStages = {
             "Knight".into(),
         ])
         .unwrap();
+        player_command(&[
+            "player".into(),
+            "town".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "42".into(),
+        ])
+        .unwrap();
+        assert!(player_command(&[
+            "player".into(),
+            "town".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "invalid".into(),
+        ])
+        .is_err());
 
         let config = load(&directory).unwrap();
         let database = EngineDatabase::open(&config.database_path).unwrap();
@@ -1351,6 +1385,7 @@ experienceStages = {
             .unwrap();
         assert_eq!(account.name, "test-account");
         assert_eq!(account.characters[0].name, "Knight");
+        assert_eq!(account.characters[0].town_id, 42);
         let _ = fs::remove_dir_all(directory);
     }
 }
