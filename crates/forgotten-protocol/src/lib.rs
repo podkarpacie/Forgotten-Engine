@@ -3,8 +3,8 @@
 //! The legacy 7.4 types below are a tested foundation, not a claim of official-client support.
 
 use forgotten_core::{
-    CardinalDirection, EmptyWorldViewport, FeTfsStaticEntity, FeTfsStaticSpawnCollection, Position,
-    WorldMap,
+    CardinalDirection, EmptyWorldViewport, EquipmentSlot, FeTfsStaticEntity,
+    FeTfsStaticSpawnCollection, Position, WorldMap,
 };
 use rand::{rngs::OsRng, RngCore};
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
@@ -785,6 +785,9 @@ pub const NATIVE_OTCLIENT_GAME_LOGIN_ERROR: u8 = 0x14;
 pub const NATIVE_OTCLIENT_GAME_LOGIN_STATE: u8 = 0x0a;
 pub const NATIVE_OTCLIENT_GAME_FULL_MAP: u8 = 0x64;
 pub const NATIVE_OTCLIENT_GAME_MOVE_CREATURE: u8 = 0x6d;
+pub const NATIVE_OTCLIENT_GAME_OPEN_CONTAINER: u8 = 0x6e;
+pub const NATIVE_OTCLIENT_GAME_SET_INVENTORY: u8 = 0x78;
+pub const NATIVE_OTCLIENT_GAME_DELETE_INVENTORY: u8 = 0x79;
 pub const NATIVE_OTCLIENT_GAME_PING_BACK: u8 = 0x1d;
 pub const NATIVE_OTCLIENT_GAME_PING: u8 = 0x1e;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATS: u8 = 0xa0;
@@ -848,6 +851,33 @@ impl NativeOtClientProfile {
             && !self.challenge_on_login
             && self.max_padding_bytes <= MAX_FRAME_SIZE
     }
+
+    /// Classic equipment records have been verified only for the selected 740 native profile.
+    /// Other configured protocol versions must add their own parser-backed layout before reuse.
+    pub fn supports_classic_740_inventory_records(&self) -> bool {
+        self.supports_current_native_foundation() && self.protocol_version == 740
+    }
+}
+
+/// One classic wire item record. `subtype` is present only when the validated operator-supplied
+/// item catalog identifies the client thing as stackable, chargeable, fluid, or splash. FE does
+/// not infer that field from a server item ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeOtClientClassicItemRecord {
+    pub client_thing_id: u16,
+    pub subtype: Option<u8>,
+}
+
+/// Parser-verified classic 740 `OpenContainer` (`0x6e`) payload. Pagination and modern quick-loot
+/// fields are deliberately absent because they are feature-gated outside the selected profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeOtClientClassicOpenContainer {
+    pub container_id: u8,
+    pub container_item: NativeOtClientClassicItemRecord,
+    pub name: String,
+    pub capacity: u8,
+    pub has_parent: bool,
+    pub items: Vec<NativeOtClientClassicItemRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1284,6 +1314,72 @@ pub fn encode_native_otclient_player_bootstrap(
     writer.byte(0);
     payload.extend_from_slice(&writer.finish());
     Ok(Frame(payload))
+}
+
+/// Encodes classic `SetInventory` (`0x78`) for the parser-verified native 740 layout. The caller
+/// must obtain `client_thing_id` and subtype semantics from a validated operator-supplied item
+/// catalog; this codec does not infer either property from a server item ID.
+pub fn encode_native_otclient_set_inventory(
+    profile: &NativeOtClientProfile,
+    slot: EquipmentSlot,
+    item: NativeOtClientClassicItemRecord,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() || item.client_thing_id == 0 {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_SET_INVENTORY);
+    writer.byte(slot.code());
+    write_native_otclient_classic_item_record(&mut writer, item);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes classic `DeleteInventory` (`0x79`) for a fixed player equipment slot.
+pub fn encode_native_otclient_delete_inventory(
+    profile: &NativeOtClientProfile,
+    slot: EquipmentSlot,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    Ok(Frame(vec![
+        NATIVE_OTCLIENT_GAME_DELETE_INVENTORY,
+        slot.code(),
+    ]))
+}
+
+/// Encodes classic `OpenContainer` (`0x6e`) in the exact non-pagination field order consumed by
+/// the selected 740 profile: container ID, item record, name, capacity, parent flag, item count,
+/// then item records. It does not enable client requests or runtime container ownership.
+pub fn encode_native_otclient_open_container(
+    profile: &NativeOtClientProfile,
+    container: &NativeOtClientClassicOpenContainer,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records()
+        || container.name.is_empty()
+        || container.name.len() > MAX_LOGIN_STRING_BYTES
+        || container.items.len() > u8::MAX as usize
+        || container.container_item.client_thing_id == 0
+        || container.items.iter().any(|item| item.client_thing_id == 0)
+    {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_OPEN_CONTAINER);
+    writer.byte(container.container_id);
+    write_native_otclient_classic_item_record(&mut writer, container.container_item);
+    writer.string(&container.name);
+    writer.byte(container.capacity);
+    writer.byte(u8::from(container.has_parent));
+    writer.byte(container.items.len() as u8);
+    for item in &container.items {
+        write_native_otclient_classic_item_record(&mut writer, *item);
+    }
+    let frame = Frame(writer.finish());
+    if frame.0.len() > MAX_FRAME_SIZE {
+        return Err(ProtocolError::InvalidLength(frame.0.len()));
+    }
+    Ok(frame)
 }
 
 pub fn encode_native_otclient_empty_world_map(
@@ -1914,6 +2010,16 @@ fn write_native_otclient_position(writer: &mut Writer, position: NativeOtClientP
     writer.u16(position.x);
     writer.u16(position.y);
     writer.byte(position.z);
+}
+
+fn write_native_otclient_classic_item_record(
+    writer: &mut Writer,
+    item: NativeOtClientClassicItemRecord,
+) {
+    writer.u16(item.client_thing_id);
+    if let Some(subtype) = item.subtype {
+        writer.byte(subtype);
+    }
 }
 
 fn write_native_otclient_unknown_player(
@@ -3110,6 +3216,148 @@ mod tests {
             .0
             .windows(asset_free_snapshot.player_name.len())
             .any(|bytes| bytes == asset_free_snapshot.player_name.as_bytes()));
+    }
+
+    #[test]
+    fn classic_740_container_open_record_is_profile_gated_and_parser_shaped() {
+        let profile = NativeOtClientProfile {
+            protocol_version: 740,
+            numeric_account_ids: true,
+            login_packet_encryption: false,
+            protocol_checksum: false,
+            challenge_on_login: false,
+            max_padding_bytes: 128,
+        };
+        let container = NativeOtClientClassicOpenContainer {
+            container_id: 1,
+            container_item: NativeOtClientClassicItemRecord {
+                client_thing_id: 1988,
+                subtype: None,
+            },
+            name: "Backpack".into(),
+            capacity: 20,
+            has_parent: false,
+            items: vec![
+                NativeOtClientClassicItemRecord {
+                    client_thing_id: 102,
+                    subtype: Some(25),
+                },
+                NativeOtClientClassicItemRecord {
+                    client_thing_id: 2463,
+                    subtype: None,
+                },
+            ],
+        };
+        assert_eq!(
+            encode_native_otclient_open_container(&profile, &container)
+                .unwrap()
+                .0,
+            vec![
+                NATIVE_OTCLIENT_GAME_OPEN_CONTAINER,
+                1,
+                196,
+                7,
+                8,
+                0,
+                b'B',
+                b'a',
+                b'c',
+                b'k',
+                b'p',
+                b'a',
+                b'c',
+                b'k',
+                20,
+                0,
+                2,
+                102,
+                0,
+                25,
+                159,
+                9,
+            ]
+        );
+        assert!(matches!(
+            encode_native_otclient_open_container(
+                &profile,
+                &NativeOtClientClassicOpenContainer {
+                    name: String::new(),
+                    ..container.clone()
+                }
+            ),
+            Err(ProtocolError::UnsupportedNativeClientProfile)
+        ));
+        let incompatible_profile = NativeOtClientProfile {
+            protocol_version: 800,
+            ..profile
+        };
+        assert!(matches!(
+            encode_native_otclient_open_container(&incompatible_profile, &container),
+            Err(ProtocolError::UnsupportedNativeClientProfile)
+        ));
+    }
+
+    #[test]
+    fn classic_740_inventory_records_are_profile_gated_and_parser_shaped() {
+        let profile = NativeOtClientProfile {
+            protocol_version: 740,
+            numeric_account_ids: true,
+            login_packet_encryption: false,
+            protocol_checksum: false,
+            challenge_on_login: false,
+            max_padding_bytes: 128,
+        };
+        let stackable = encode_native_otclient_set_inventory(
+            &profile,
+            EquipmentSlot::RightHand,
+            NativeOtClientClassicItemRecord {
+                client_thing_id: 102,
+                subtype: Some(25),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            stackable.0,
+            vec![NATIVE_OTCLIENT_GAME_SET_INVENTORY, 5, 102, 0, 25]
+        );
+        let non_stackable = encode_native_otclient_set_inventory(
+            &profile,
+            EquipmentSlot::Armor,
+            NativeOtClientClassicItemRecord {
+                client_thing_id: 2463,
+                subtype: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            non_stackable.0,
+            vec![NATIVE_OTCLIENT_GAME_SET_INVENTORY, 4, 159, 9]
+        );
+        assert_eq!(
+            encode_native_otclient_delete_inventory(&profile, EquipmentSlot::LeftHand)
+                .unwrap()
+                .0,
+            vec![NATIVE_OTCLIENT_GAME_DELETE_INVENTORY, 6]
+        );
+        assert!(matches!(
+            encode_native_otclient_set_inventory(
+                &profile,
+                EquipmentSlot::Head,
+                NativeOtClientClassicItemRecord {
+                    client_thing_id: 0,
+                    subtype: None,
+                },
+            ),
+            Err(ProtocolError::UnsupportedNativeClientProfile)
+        ));
+        let incompatible_profile = NativeOtClientProfile {
+            protocol_version: 800,
+            ..profile
+        };
+        assert!(matches!(
+            encode_native_otclient_delete_inventory(&incompatible_profile, EquipmentSlot::Head),
+            Err(ProtocolError::UnsupportedNativeClientProfile)
+        ));
     }
 
     #[test]

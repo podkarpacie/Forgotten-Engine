@@ -3,9 +3,9 @@
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
 use forgotten_core::{
-    CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, Player,
-    PlayerInteractionIntent, PlayerVitals, Position, StaticCreatureDecisionBatch,
-    StaticCreatureDecisionPolicy, WorldMap, WorldState,
+    CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, ItemInstance,
+    NativeItemPresentationCatalog, Player, PlayerEquipment, PlayerInteractionIntent, PlayerVitals,
+    Position, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, WorldMap, WorldState,
 };
 use forgotten_persistence::EngineDatabase;
 use forgotten_protocol::{
@@ -28,10 +28,11 @@ use forgotten_protocol::{
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
     encode_native_otclient_move_creature_at, encode_native_otclient_player_stats,
-    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
-    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
-    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
-    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection, NativeOtClientClassicOutfit,
+    encode_native_otclient_set_inventory, encode_status_binary, encode_status_xml,
+    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
+    NativeOtClientCardinalDirection, NativeOtClientClassicItemRecord, NativeOtClientClassicOutfit,
     NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPlayerVitals,
     NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
     ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
@@ -58,6 +59,36 @@ const NATIVE_OTCLIENT_DEFAULT_GROUND_SPEED: u64 = 150;
 const NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY: Duration = Duration::from_secs(2);
 const NATIVE_OTCLIENT_SHARED_CHAT_QUEUE_CAPACITY: usize = 64;
 const NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE: u16 = 10;
+
+fn native_classic_item_record(
+    catalog: Option<&NativeItemPresentationCatalog>,
+    item: &ItemInstance,
+) -> Option<NativeOtClientClassicItemRecord> {
+    let presentation = catalog?.presentation(item.server_id)?;
+    Some(NativeOtClientClassicItemRecord {
+        client_thing_id: presentation.client_thing_id,
+        subtype: presentation
+            .requires_classic_740_subtype
+            .then_some(item.count.min(u16::from(u8::MAX)) as u8),
+    })
+}
+
+fn native_classic_equipment_frames(
+    profile: &NativeOtClientProfile,
+    catalog: Option<&NativeItemPresentationCatalog>,
+    equipment: &PlayerEquipment,
+) -> Result<Vec<Frame>, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Ok(Vec::new());
+    }
+    equipment
+        .iter()
+        .filter_map(|(slot, item)| {
+            native_classic_item_record(catalog, item).map(|record| (slot, record))
+        })
+        .map(|(slot, record)| encode_native_otclient_set_inventory(profile, slot, record))
+        .collect()
+}
 
 fn truncate_native_chat_text(message: &str) -> String {
     let mut output = String::new();
@@ -172,6 +203,9 @@ pub struct NativeOtClientHostConfig {
     pub extended_diagnostics: bool,
     pub empty_world: Option<NativeOtClientEmptyWorldConfig>,
     pub world_map: Option<Arc<WorldMap>>,
+    /// Validated operator-supplied server-to-client item metadata. It is retained for later
+    /// parser-safe inventory delivery and does not itself enable inventory packets.
+    pub item_presentation_catalog: Option<Arc<NativeItemPresentationCatalog>>,
     /// Immutable display-only TFS spawn entities. No AI, combat, movement, or Lua behavior is
     /// attached at this host boundary.
     pub static_spawns: Option<Arc<FeTfsStaticSpawnCollection>>,
@@ -228,6 +262,12 @@ impl SharedNativeWorld {
         Ok(self.lock()?.tick())
     }
 
+    /// Returns the generic authoritative world revision. Protocol paths continue to use their
+    /// dedicated visibility and vitals epochs until a typed event stream is introduced.
+    pub fn world_revision(&self) -> Result<u64, HostError> {
+        Ok(self.lock()?.revision())
+    }
+
     pub fn visibility_epoch(&self) -> u64 {
         self.visibility_epoch.load(Ordering::SeqCst)
     }
@@ -239,6 +279,23 @@ impl SharedNativeWorld {
     pub fn player_vitals(&self, player_id: u64) -> Result<PlayerVitals, HostError> {
         self.lock()?
             .player_vitals(player_id)
+            .map_err(HostError::Core)
+    }
+
+    pub fn player_equipment(&self, player_id: u64) -> Result<PlayerEquipment, HostError> {
+        self.lock()?
+            .player_equipment(player_id)
+            .cloned()
+            .map_err(HostError::Core)
+    }
+
+    pub fn replace_player_equipment(
+        &self,
+        player_id: u64,
+        equipment: PlayerEquipment,
+    ) -> Result<bool, HostError> {
+        self.lock()?
+            .replace_player_equipment(player_id, equipment)
             .map_err(HostError::Core)
     }
 
@@ -414,6 +471,20 @@ impl SharedNativeWorld {
             .add_player_with_vitals(player, vitals)
             .map_err(HostError::Core)?;
         self.mark_visibility_changed();
+        Ok(position)
+    }
+
+    pub fn register_player_at_available_position_with_vitals_and_equipment(
+        &self,
+        player: Player,
+        vitals: PlayerVitals,
+        equipment: PlayerEquipment,
+        world_map: &WorldMap,
+    ) -> Result<Position, HostError> {
+        let player_id = player.id;
+        let position =
+            self.register_player_at_available_position_with_vitals(player, vitals, world_map)?;
+        self.replace_player_equipment(player_id, equipment)?;
         Ok(position)
     }
 
@@ -1093,26 +1164,32 @@ fn handle_native_otclient_game(
     let account_id = u64::try_from(account.id).map_err(|_| {
         HostError::InvalidConfiguration("native numeric account IDs must be non-negative".into())
     })?;
-    let initial_position = match shared_world.register_player_at_available_position_with_vitals(
-        Player {
-            id: character.id,
-            account_id,
-            name: character.name.clone(),
-            position: character.position,
-            level: character.level,
-            experience: character.experience,
-            skill_points: character.skill_points,
-        },
-        PlayerVitals {
-            health: character.vitals.health,
-            max_health: character.vitals.max_health,
-            mana: character.vitals.mana,
-            max_mana: character.vitals.max_mana,
-            capacity: character.vitals.capacity,
-            magic_level: character.vitals.magic_level,
-        },
-        world_map,
-    ) {
+    let equipment = database
+        .player_equipment(character.id)
+        .map_err(HostError::Persistence)?;
+    let bootstrap_equipment = equipment.clone();
+    let initial_position = match shared_world
+        .register_player_at_available_position_with_vitals_and_equipment(
+            Player {
+                id: character.id,
+                account_id,
+                name: character.name.clone(),
+                position: character.position,
+                level: character.level,
+                experience: character.experience,
+                skill_points: character.skill_points,
+            },
+            PlayerVitals {
+                health: character.vitals.health,
+                max_health: character.vitals.max_health,
+                mana: character.vitals.mana,
+                max_mana: character.vitals.max_mana,
+                capacity: character.vitals.capacity,
+                magic_level: character.vitals.magic_level,
+            },
+            equipment,
+            world_map,
+        ) {
         Ok(position) => position,
         Err(HostError::Core(forgotten_core::CoreError::DuplicatePlayer(_))) => {
             write_frame(
@@ -1169,13 +1246,23 @@ fn handle_native_otclient_game(
             Some(&visible_players),
         )
         .map_err(HostError::Protocol)?;
+    let equipment_frames = native_classic_equipment_frames(
+        &config.client_profile,
+        config.item_presentation_catalog.as_deref(),
+        &bootstrap_equipment,
+    )
+    .map_err(HostError::Protocol)?;
     write_frame(stream, &initialization)?;
+    for frame in &equipment_frames {
+        write_frame(stream, frame)?;
+    }
     stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
     if config.extended_diagnostics {
         eprintln!(
-            "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
+            "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} equipment-records={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
             character.name,
             initialization.0.len(),
+            equipment_frames.len(),
             world_map.identifier(),
             world_map.tile_count(),
             active_static_spawns.entities.len(),
@@ -2634,6 +2721,7 @@ mod tests {
             extended_diagnostics: false,
             empty_world: None,
             world_map: None,
+            item_presentation_catalog: None,
             static_spawns: None,
         }
     }
@@ -2659,6 +2747,53 @@ mod tests {
         }
         map.validate().unwrap();
         Arc::new(map)
+    }
+
+    #[test]
+    fn native_classic_item_records_require_validated_presentation_metadata() {
+        let item = ItemInstance::new(4526, 25).unwrap();
+        assert_eq!(native_classic_item_record(None, &item), None);
+
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                4526,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 102,
+                    requires_classic_740_subtype: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            native_classic_item_record(Some(&catalog), &item),
+            Some(NativeOtClientClassicItemRecord {
+                client_thing_id: 102,
+                subtype: Some(25),
+            })
+        );
+
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(forgotten_core::EquipmentSlot::RightHand, item);
+        equipment.equip(
+            forgotten_core::EquipmentSlot::LeftHand,
+            ItemInstance::new(9999, 1).unwrap(),
+        );
+        let config = native_otclient_config("127.0.0.1:0".parse().unwrap());
+        let frames =
+            native_classic_equipment_frames(&config.client_profile, Some(&catalog), &equipment)
+                .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, vec![0x78, 5, 102, 0, 25]);
+
+        let incompatible_profile = NativeOtClientProfile {
+            protocol_version: 800,
+            ..config.client_profile
+        };
+        assert!(
+            native_classic_equipment_frames(&incompatible_profile, Some(&catalog), &equipment,)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2725,6 +2860,62 @@ mod tests {
         assert_eq!(recycled, first_position);
         shared.remove_player(102).unwrap();
         shared.remove_player(103).unwrap();
+    }
+
+    #[test]
+    fn shared_native_world_exposes_the_authoritative_revision_baseline() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        assert_eq!(shared.world_revision().unwrap(), 0);
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                &map,
+            )
+            .unwrap();
+        assert_eq!(shared.world_revision().unwrap(), 1);
+        shared.advance_tick().unwrap();
+        assert_eq!(shared.world_revision().unwrap(), 2);
+    }
+
+    #[test]
+    fn shared_native_registration_accepts_persisted_equipment_without_inventory_packets() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        let sword = forgotten_core::ItemInstance::new(2376, 1).unwrap();
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(forgotten_core::EquipmentSlot::RightHand, sword.clone());
+        shared
+            .register_player_at_available_position_with_vitals_and_equipment(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                PlayerVitals::default(),
+                equipment,
+                &map,
+            )
+            .unwrap();
+        assert_eq!(
+            shared
+                .player_equipment(101)
+                .unwrap()
+                .item(forgotten_core::EquipmentSlot::RightHand),
+            Some(&sword)
+        );
     }
 
     #[test]

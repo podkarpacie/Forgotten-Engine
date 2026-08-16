@@ -4,14 +4,14 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use forgotten_core::{Player, Position};
+use forgotten_core::{EquipmentSlot, ItemInstance, Player, PlayerEquipment, Position};
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const LATEST_SCHEMA_VERSION: i64 = 2;
+const LATEST_SCHEMA_VERSION: i64 = 3;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct EngineDatabase {
@@ -286,6 +286,82 @@ impl EngineDatabase {
         Ok(())
     }
 
+    /// Replaces the player's fixed equipment set in one SQLite transaction. Containers, depot,
+    /// inbox, and map-item ownership are intentionally outside this first inventory slice.
+    pub fn replace_player_equipment(
+        &mut self,
+        player_id: u64,
+        equipment: &PlayerEquipment,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM player_equipment WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        for (slot, item) in equipment.iter() {
+            transaction.execute(
+                "INSERT INTO player_equipment (player_id, slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    player_id as i64,
+                    i64::from(slot.code()),
+                    i64::from(item.server_id),
+                    i64::from(item.count),
+                    item.action_id.map(i64::from),
+                    item.unique_id.map(i64::from),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Loads a player's fixed equipment into the validated core item model. Database values are
+    /// never trusted blindly: invalid slot codes, item IDs, counts, or attribute widths are
+    /// surfaced as safe persistence errors.
+    pub fn player_equipment(&self, player_id: u64) -> Result<PlayerEquipment, PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT slot, server_id, count, action_id, unique_id FROM player_equipment WHERE player_id = ?1 ORDER BY slot",
+        )?;
+        let records = statement
+            .query_map(params![player_id as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut equipment = PlayerEquipment::default();
+        for (slot_code, server_id, count, action_id, unique_id) in records {
+            let slot_code = u8::try_from(slot_code).map_err(|_| {
+                PersistenceError::InvalidEquipmentRecord(
+                    "slot does not fit an unsigned byte".into(),
+                )
+            })?;
+            let slot = EquipmentSlot::from_code(slot_code).ok_or_else(|| {
+                PersistenceError::InvalidEquipmentRecord(format!(
+                    "unknown equipment slot {slot_code}"
+                ))
+            })?;
+            let server_id = u16::try_from(server_id).map_err(|_| {
+                PersistenceError::InvalidEquipmentRecord("server item ID does not fit u16".into())
+            })?;
+            let count = u16::try_from(count).map_err(|_| {
+                PersistenceError::InvalidEquipmentRecord("item count does not fit u16".into())
+            })?;
+            let mut item = ItemInstance::new(server_id, count)
+                .map_err(|error| PersistenceError::InvalidEquipmentRecord(error.to_string()))?;
+            item.action_id = optional_u16_attribute(action_id, "action ID")?;
+            item.unique_id = optional_u16_attribute(unique_id, "unique ID")?;
+            equipment.equip(slot, item);
+        }
+        Ok(equipment)
+    }
+
     pub fn record_event(&self, level: &str, message: &str) -> Result<(), PersistenceError> {
         self.connection.execute(
             "INSERT INTO engine_events (level, message, created_at) VALUES (?1, ?2, ?3)",
@@ -311,7 +387,7 @@ impl EngineDatabase {
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             params![1_i64, unix_seconds()],
         )?;
-        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+        if self.schema_version()? < 2 {
             for (name, definition) in [
                 ("health", "INTEGER NOT NULL DEFAULT 150"),
                 ("max_health", "INTEGER NOT NULL DEFAULT 150"),
@@ -331,7 +407,29 @@ impl EngineDatabase {
                 params![2_i64, unix_seconds()],
             )?;
         }
+        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS player_equipment (player_id INTEGER NOT NULL, slot INTEGER NOT NULL, server_id INTEGER NOT NULL, count INTEGER NOT NULL, action_id INTEGER, unique_id INTEGER, PRIMARY KEY (player_id, slot));",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![LATEST_SCHEMA_VERSION, unix_seconds()],
+            )?;
+        }
         Ok(())
+    }
+
+    fn ensure_player_exists(&self, player_id: u64) -> Result<(), PersistenceError> {
+        let exists = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM players WHERE id = ?1)",
+            params![player_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if exists {
+            Ok(())
+        } else {
+            Err(PersistenceError::UnknownPlayer(player_id))
+        }
     }
 
     fn player_column_exists(&self, column: &str) -> Result<bool, PersistenceError> {
@@ -427,6 +525,19 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
+fn optional_u16_attribute(
+    value: Option<i64>,
+    label: &str,
+) -> Result<Option<u16>, PersistenceError> {
+    value
+        .map(|value| {
+            u16::try_from(value).map_err(|_| {
+                PersistenceError::InvalidEquipmentRecord(format!("{label} does not fit u16"))
+            })
+        })
+        .transpose()
+}
+
 #[derive(Debug)]
 pub enum PersistenceError {
     Io(std::io::Error),
@@ -434,6 +545,7 @@ pub enum PersistenceError {
     PasswordHash(String),
     InvalidPlayerName,
     InvalidPlayerVitals,
+    InvalidEquipmentRecord(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
 }
@@ -499,6 +611,7 @@ mod tests {
         let character = database.characters_for_account(1).unwrap().remove(0);
         assert_eq!(character.experience, 4_900);
         assert_eq!(character.vitals, PlayerVitals::default());
+        assert!(database.player_equipment(7).unwrap().is_empty());
         let _ = fs::remove_file(path);
     }
 
@@ -524,6 +637,67 @@ mod tests {
             .unwrap();
         database.record_event("info", "player saved").unwrap();
         assert_eq!(database.event_count().unwrap(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_and_replaces_player_equipment_transactionally() {
+        let path = temporary_path("equipment");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("admin", "hash").unwrap();
+        database
+            .save_player(&Player {
+                id: 7,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let mut sword = ItemInstance::new(2376, 1).unwrap();
+        sword.action_id = Some(4_500);
+        let shield = ItemInstance::new(2512, 1).unwrap();
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(EquipmentSlot::RightHand, sword.clone());
+        equipment.equip(EquipmentSlot::LeftHand, shield.clone());
+        database.replace_player_equipment(7, &equipment).unwrap();
+
+        let loaded = database.player_equipment(7).unwrap();
+        assert_eq!(loaded.item(EquipmentSlot::RightHand), Some(&sword));
+        assert_eq!(loaded.item(EquipmentSlot::LeftHand), Some(&shield));
+
+        let mut replacement = PlayerEquipment::default();
+        replacement.equip(EquipmentSlot::Armor, ItemInstance::new(2463, 1).unwrap());
+        database.replace_player_equipment(7, &replacement).unwrap();
+        let loaded = database.player_equipment(7).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.item(EquipmentSlot::RightHand).is_none());
+        assert_eq!(
+            loaded.item(EquipmentSlot::Armor),
+            replacement.item(EquipmentSlot::Armor)
+        );
+        database
+            .connection
+            .execute(
+                "INSERT INTO player_equipment (player_id, slot, server_id, count) VALUES (?1, ?2, ?3, ?4)",
+                params![7_i64, 99_i64, 2376_i64, 1_i64],
+            )
+            .unwrap();
+        assert!(matches!(
+            database.player_equipment(7),
+            Err(PersistenceError::InvalidEquipmentRecord(_))
+        ));
+        assert!(matches!(
+            database.player_equipment(999),
+            Err(PersistenceError::UnknownPlayer(999))
+        ));
         let _ = fs::remove_file(path);
     }
 

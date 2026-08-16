@@ -1,0 +1,32 @@
+# Compatibility Evidence Register
+
+This register records externally observable format and architecture evidence used to guide original FE behavior. It is deliberately a **reference index**, not a copy of upstream implementation, game data, maps, scripts, or client assets.
+
+## Weapon content boundary
+
+| Evidence | Clean-room interpretation for FE | Implementation consequence |
+|---|---|---|
+| TFS publishes a legacy `data/weapons/weapons.xml` registry.[1] | A legacy TFS directory can declare weapon entries independently of OTBM map placement. | `tfs-audit` discovers and validates the registry/reference paths, but labels it `deferred weapon runtime` until typed weapon semantics exist. |
+| TFS documentation describes a modern RevScript registration approach and identifies `Weapon` among supported event/metatable families.[2] | Modern TFS-derived packs can register weapon behavior through scripts rather than only legacy XML. | FE must eventually create one typed weapon-registration model with legacy XML and modern Lua adapters; parsing either source must not execute scripts. |
+| The historical 7.4 configuration contract separates map location, item-use intervals, combat/weapon exhaustion, rates, spawns, houses, persistence, and operational saves.[3] | A map file cannot be treated as a complete weapon or gameplay definition. | FE stages item registry, inventory/equipment, player skills, combat rules, timing, PvP policy, and script hooks as separate dependencies before claiming working weapons. |
+
+## Evidence handling rules
+
+1. Public sources may guide a format/behavior observation, but FE code and fixtures are authored independently.
+2. Private operator maps, items, scripts, client assets, packet captures, and server directories remain local. They are never committed to FE.
+3. Every future source-format parser records accepted structure, bounded limits, unsupported attributes, and a regression fixture before enabling runtime behavior.
+4. Content discovery is not permission to execute content. Audit and parser paths must remain side-effect free.
+
+## Inventory protocol boundary
+
+The current FE work has added authoritative/persistent equipment foundations but has not introduced a native 740 inventory or container encoder. The local public OTClientV8 parser establishes the classic inventory dispatch IDs: `OpenContainer` (`0x6E`), `CloseContainer` (`0x6F`), container add/update/remove (`0x70`–`0x72`), set inventory (`0x78`), and remove inventory (`0x79`).[4] For the non-pagination branch applicable to the classic profile, the parser consumes an inventory slot byte followed by an item record for `0x78`, or just a slot byte for `0x79`. It consumes a container ID, container item, name, capacity, parent flag, item count, and item records for `0x6E`; pagination-only fields are gated separately. FE will now document the independently implemented item-record encoder and write parser-aligned golden fixtures before enabling this output. This avoids repeating the earlier class of client parser failures caused by guessed classic-protocol records.
+
+## References
+
+[1] [TFS legacy weapon registry path](https://github.com/otland/forgottenserver/blob/master/data/weapons/weapons.xml).
+
+[2] [TFS Revscriptsys documentation](https://github.com/otland/forgottenserver/wiki/Revscriptsys).
+
+[3] [Historical 7.4 configuration contract available in the local reference environment](file:///tmp/avesta-74/Avesta%207.4%20(OTServ_SVN%200.6.3)/config-74.lua).
+
+[4] [Local public OTClientV8 parser reference](file:///tmp/otcv8-dev-source/src/client/protocolgameparse.cpp) and [opcode definitions](file:///tmp/otcv8-dev-source/src/client/protocolcodes.h). Read-only behavioral evidence; no client source is copied into FE.

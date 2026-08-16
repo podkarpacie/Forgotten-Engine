@@ -1,4 +1,5 @@
 use crate::ConfigError;
+use forgotten_core::{NativeItemPresentation, NativeItemPresentationCatalog};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 use std::collections::BTreeMap;
@@ -12,6 +13,10 @@ const ITEM_ATTR_SERVER_ID: u8 = 0x10;
 const ITEM_ATTR_CLIENT_ID: u8 = 0x11;
 const FLAG_BLOCK_SOLID: u32 = 1 << 0;
 const FLAG_BLOCK_PATHFIND: u32 = 1 << 2;
+const FLAG_STACKABLE: u32 = 1 << 7;
+const FLAG_CLIENT_CHARGES: u32 = 1 << 22;
+const OTB_ITEM_GROUP_SPLASH: u8 = 10;
+const OTB_ITEM_GROUP_FLUID: u8 = 11;
 const MAX_OTB_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OTB_NODES: usize = 300_000;
 const MAX_OTB_NODE_DEPTH: usize = 64;
@@ -29,6 +34,7 @@ pub struct LegacyItemCatalog {
 pub struct LegacyItemDefinition {
     pub server_id: u16,
     pub client_id: u16,
+    pub group: u8,
     pub flags: u32,
     pub xml_blocks_solid: Option<bool>,
     pub xml_blocks_pathfind: Option<bool>,
@@ -42,11 +48,52 @@ impl LegacyItemDefinition {
                 .xml_blocks_pathfind
                 .unwrap_or((self.flags & FLAG_BLOCK_PATHFIND) != 0)
     }
+
+    /// Whether the classic 740 client parser expects one subtype/count byte after the client
+    /// thing ID. This is derived only from validated OTB metadata; caller-provided item IDs are
+    /// never treated as an implicit subtype contract.
+    pub fn requires_classic_740_subtype(&self) -> bool {
+        self.flags & (FLAG_STACKABLE | FLAG_CLIENT_CHARGES) != 0
+            || matches!(self.group, OTB_ITEM_GROUP_SPLASH | OTB_ITEM_GROUP_FLUID)
+    }
 }
 
 impl LegacyItemCatalog {
     pub fn definition(&self, server_id: u16) -> Option<&LegacyItemDefinition> {
         self.definitions.get(&server_id)
+    }
+
+    pub fn client_thing_id(&self, server_id: u16) -> Option<u16> {
+        self.definition(server_id)
+            .map(|definition| definition.client_id)
+    }
+
+    pub fn requires_classic_740_subtype(&self, server_id: u16) -> Option<bool> {
+        self.definition(server_id)
+            .map(LegacyItemDefinition::requires_classic_740_subtype)
+    }
+
+    pub fn native_item_presentation_catalog(
+        &self,
+    ) -> Result<NativeItemPresentationCatalog, ConfigError> {
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for definition in self.definitions.values() {
+            catalog
+                .insert(
+                    definition.server_id,
+                    NativeItemPresentation {
+                        client_thing_id: definition.client_id,
+                        requires_classic_740_subtype: definition.requires_classic_740_subtype(),
+                    },
+                )
+                .map_err(|error| {
+                    invalid(format!(
+                        "items.otb has an invalid native item presentation for {}: {error}",
+                        definition.server_id
+                    ))
+                })?;
+        }
+        Ok(catalog)
     }
 
     pub fn len(&self) -> usize {
@@ -60,6 +107,7 @@ impl LegacyItemCatalog {
 
 #[derive(Debug)]
 struct Node {
+    kind: u8,
     props: Vec<u8>,
     children: Vec<Node>,
 }
@@ -75,7 +123,7 @@ pub(crate) fn parse_items_otb(bytes: &[u8]) -> Result<LegacyItemCatalog, ConfigE
     let (otb_major_version, client_version, build_number) = parse_root_version(&root.props)?;
     let mut definitions = BTreeMap::new();
     for node in &root.children {
-        if let Some(definition) = parse_item_node(&node.props)? {
+        if let Some(definition) = parse_item_node(node.kind, &node.props)? {
             if definitions
                 .insert(definition.server_id, definition)
                 .is_some()
@@ -156,7 +204,7 @@ fn parse_tree(bytes: &[u8]) -> Result<Node, ConfigError> {
         match bytes[index] {
             NODE_START => {
                 index += 1;
-                let _kind = read_framed_byte(bytes, &mut index)?;
+                let kind = read_framed_byte(bytes, &mut index)?;
                 count += 1;
                 if count > MAX_OTB_NODES {
                     return Err(invalid("OTB node count exceeds the configured limit"));
@@ -165,6 +213,7 @@ fn parse_tree(bytes: &[u8]) -> Result<Node, ConfigError> {
                     return Err(invalid("OTB node depth exceeds the configured limit"));
                 }
                 stack.push(Node {
+                    kind,
                     props: Vec::new(),
                     children: Vec::new(),
                 });
@@ -252,7 +301,7 @@ fn parse_root_version(props: &[u8]) -> Result<(u32, u32, u32), ConfigError> {
     ))
 }
 
-fn parse_item_node(props: &[u8]) -> Result<Option<LegacyItemDefinition>, ConfigError> {
+fn parse_item_node(group: u8, props: &[u8]) -> Result<Option<LegacyItemDefinition>, ConfigError> {
     let mut cursor = Cursor::new(props);
     let flags = cursor.read_u32()?;
     let mut server_id = None;
@@ -279,6 +328,7 @@ fn parse_item_node(props: &[u8]) -> Result<Option<LegacyItemDefinition>, ConfigE
             Ok(Some(LegacyItemDefinition {
                 server_id,
                 client_id,
+                group,
                 flags,
                 xml_blocks_solid: None,
                 xml_blocks_pathfind: None,
@@ -519,6 +569,9 @@ mod tests {
 
         let mut catalog = parse_items_otb(&bytes).unwrap();
         assert_eq!(catalog.definition(4526).unwrap().client_id, 102);
+        assert_eq!(catalog.definition(4526).unwrap().group, 1);
+        assert_eq!(catalog.client_thing_id(4526), Some(102));
+        assert_eq!(catalog.client_thing_id(9999), None);
         assert!(catalog.definition(4526).unwrap().blocks_movement());
         apply_items_xml(
             &mut catalog,
@@ -526,6 +579,47 @@ mod tests {
         )
         .unwrap();
         assert!(!catalog.definition(4526).unwrap().blocks_movement());
+    }
+
+    #[test]
+    fn classifies_classic_subtype_requirements_from_otb_group_and_flags() {
+        let ordinary = LegacyItemDefinition {
+            server_id: 100,
+            client_id: 200,
+            group: 1,
+            flags: 0,
+            xml_blocks_solid: None,
+            xml_blocks_pathfind: None,
+        };
+        let fluid = LegacyItemDefinition {
+            group: OTB_ITEM_GROUP_FLUID,
+            ..ordinary.clone()
+        };
+        let charged = LegacyItemDefinition {
+            flags: FLAG_CLIENT_CHARGES,
+            ..ordinary.clone()
+        };
+        let catalog = LegacyItemCatalog {
+            otb_major_version: 3,
+            client_version: 57,
+            build_number: 1,
+            definitions: BTreeMap::from([(ordinary.server_id, ordinary.clone())]),
+        };
+        assert!(!ordinary.requires_classic_740_subtype());
+        assert!(fluid.requires_classic_740_subtype());
+        assert!(charged.requires_classic_740_subtype());
+        assert_eq!(catalog.client_thing_id(100), Some(200));
+        assert_eq!(catalog.requires_classic_740_subtype(100), Some(false));
+        assert_eq!(
+            catalog
+                .native_item_presentation_catalog()
+                .unwrap()
+                .presentation(100),
+            Some(NativeItemPresentation {
+                client_thing_id: 200,
+                requires_classic_740_subtype: false,
+            })
+        );
     }
 
     #[test]

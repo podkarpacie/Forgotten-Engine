@@ -171,3 +171,21 @@
 - [x] Add a parser-safe native 740 creature-health update encoder and a bounded selected-player combat path that persists resulting vitals without implementing spells, monsters, or automatic attacks.
 - [x] Validate, package, and publish the next parser-safe native 740 compatibility release with Linux, Windows, and SHA-256 assets.
 - [x] Validate, package, and publish FE 7.4.42 persistent player-state and bounded combat-foundation assets with Linux, Windows, and SHA-256 checksums.
+- [x] Establish a source-controlled per-profile capability matrix that distinguishes implemented behavior from foundations and deferred systems.
+- [x] Preserve the current local-first command-line workflow through help-text and option-parsing regression coverage before adding new operator capabilities.
+- [x] Report parsed TFS weapon registries as a distinct deferred weapon-runtime dependency during conversion audit output.
+- [x] Add a monotonic authoritative world revision for future item, condition, combat, and creature change delivery without replacing the existing visibility/vitals epochs.
+- [x] Define bounded typed runtime item instances and equipment slots as the core foundation for persistent inventory and containers.
+- [x] Add schema-v3 transactional persistence for player equipment with safe migration and malformed-record rejection.
+- [x] Define a bounded ordered core container model for future persistent inventories, depot storage, loot, and nested item trees.
+- [x] Add authoritative player-owned equipment state with validated replacement semantics, without claiming native inventory-window delivery.
+- [x] Load persisted player equipment into the authoritative native session world during character registration without claiming inventory-window delivery.
+- [x] Expose validated OTB server-to-client item ID translation as a prerequisite for parser-safe native inventory delivery.
+- [x] Add a profile-gated classic-740 inventory record encoder with golden byte-layout tests, without emitting it from native sessions yet.
+- [x] Preserve validated OTB item group and subtype-relevant flags so classic 740 inventory records can derive subtype presence from operator-supplied metadata.
+- [x] Add a dependency-neutral validated item-presentation catalog so configuration can pass classic client-ID and subtype requirements to the native host without a crate cycle.
+- [x] Pass the validated item-presentation catalog through native host configuration without emitting inventory packets yet.
+- [x] Resolve authoritative player items through the validated native host catalog into classic record metadata without emitting packet writes yet.
+- [x] Append only catalog-validated classic-740 equipment records to native bootstrap delivery, omitting unmapped items without guessed packet output.
+- [x] Add a strict classic-740 container-open encoder with golden parser-layout tests, without enabling client item-use or container-window actions yet.
+- [x] Add additive local player equipment provisioning commands that persist bounded item instances without altering existing player command syntax.

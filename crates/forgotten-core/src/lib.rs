@@ -550,6 +550,218 @@ impl Default for PlayerVitals {
     }
 }
 
+pub const MAX_ITEM_STACK_COUNT: u16 = 100;
+
+/// A bounded runtime instance of an operator-supplied item type. Map placement metadata remains
+/// separate in `WorldMapItem`; this type is the foundation for player inventory, containers,
+/// equipment, loot, and persistent attributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemInstance {
+    pub server_id: u16,
+    pub count: u16,
+    pub action_id: Option<u16>,
+    pub unique_id: Option<u16>,
+}
+
+impl ItemInstance {
+    pub fn new(server_id: u16, count: u16) -> Result<Self, CoreError> {
+        if server_id == 0 {
+            return Err(CoreError::InvalidItemId(server_id));
+        }
+        if !(1..=MAX_ITEM_STACK_COUNT).contains(&count) {
+            return Err(CoreError::InvalidItemStackCount(count));
+        }
+        Ok(Self {
+            server_id,
+            count,
+            action_id: None,
+            unique_id: None,
+        })
+    }
+}
+
+/// Presentation metadata validated from an operator-supplied item catalog. It deliberately holds
+/// only the data needed to construct a classic client item record; gameplay properties stay in
+/// the content/runtime layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeItemPresentation {
+    pub client_thing_id: u16,
+    pub requires_classic_740_subtype: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeItemPresentationCatalog {
+    entries: BTreeMap<u16, NativeItemPresentation>,
+}
+
+impl NativeItemPresentationCatalog {
+    pub fn insert(
+        &mut self,
+        server_id: u16,
+        presentation: NativeItemPresentation,
+    ) -> Result<(), CoreError> {
+        if server_id == 0 {
+            return Err(CoreError::InvalidItemId(server_id));
+        }
+        if presentation.client_thing_id == 0 {
+            return Err(CoreError::InvalidClientThingId(server_id));
+        }
+        if self.entries.contains_key(&server_id) {
+            return Err(CoreError::DuplicateItemPresentation(server_id));
+        }
+        self.entries.insert(server_id, presentation);
+        Ok(())
+    }
+
+    pub fn presentation(&self, server_id: u16) -> Option<NativeItemPresentation> {
+        self.entries.get(&server_id).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// The fixed equipment locations recognized by Tibia-style player inventories. Containers and
+/// depot/inbox storage will be modeled separately because they need ordered item trees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EquipmentSlot {
+    Head,
+    Neck,
+    Backpack,
+    Armor,
+    RightHand,
+    LeftHand,
+    Legs,
+    Feet,
+    Ring,
+    Ammo,
+}
+
+impl EquipmentSlot {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Head => 1,
+            Self::Neck => 2,
+            Self::Backpack => 3,
+            Self::Armor => 4,
+            Self::RightHand => 5,
+            Self::LeftHand => 6,
+            Self::Legs => 7,
+            Self::Feet => 8,
+            Self::Ring => 9,
+            Self::Ammo => 10,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Head),
+            2 => Some(Self::Neck),
+            3 => Some(Self::Backpack),
+            4 => Some(Self::Armor),
+            5 => Some(Self::RightHand),
+            6 => Some(Self::LeftHand),
+            7 => Some(Self::Legs),
+            8 => Some(Self::Feet),
+            9 => Some(Self::Ring),
+            10 => Some(Self::Ammo),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlayerEquipment {
+    items: BTreeMap<EquipmentSlot, ItemInstance>,
+}
+
+impl PlayerEquipment {
+    pub fn item(&self, slot: EquipmentSlot) -> Option<&ItemInstance> {
+        self.items.get(&slot)
+    }
+
+    pub fn equip(&mut self, slot: EquipmentSlot, item: ItemInstance) -> Option<ItemInstance> {
+        self.items.insert(slot, item)
+    }
+
+    pub fn unequip(&mut self, slot: EquipmentSlot) -> Option<ItemInstance> {
+        self.items.remove(&slot)
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (EquipmentSlot, &ItemInstance)> + '_ {
+        self.items.iter().map(|(slot, item)| (*slot, item))
+    }
+}
+
+pub const MAX_CONTAINER_CAPACITY: u16 = 100;
+
+/// Ordered bounded storage for validated item instances. Recursive containers, player ownership,
+/// persistence, and client window synchronization are added by later inventory milestones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemContainer {
+    capacity: u16,
+    items: Vec<ItemInstance>,
+}
+
+impl ItemContainer {
+    pub fn new(capacity: u16) -> Result<Self, CoreError> {
+        if capacity == 0 || capacity > MAX_CONTAINER_CAPACITY {
+            return Err(CoreError::InvalidContainerCapacity(capacity));
+        }
+        Ok(Self {
+            capacity,
+            items: Vec::new(),
+        })
+    }
+
+    pub fn capacity(&self) -> u16 {
+        self.capacity
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn item(&self, index: usize) -> Option<&ItemInstance> {
+        self.items.get(index)
+    }
+
+    pub fn insert(&mut self, item: ItemInstance) -> Result<(), CoreError> {
+        if self.items.len() >= usize::from(self.capacity) {
+            return Err(CoreError::ContainerFull {
+                capacity: self.capacity,
+            });
+        }
+        self.items.push(item);
+        Ok(())
+    }
+
+    pub fn remove(&mut self, index: usize) -> Option<ItemInstance> {
+        (index < self.items.len()).then(|| self.items.remove(index))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ItemInstance> + '_ {
+        self.items.iter()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayerDamageOutcome {
     pub attacker_id: u64,
@@ -580,10 +792,12 @@ pub struct PlayerInteractionIntent {
 pub struct WorldState {
     players: BTreeMap<u64, Player>,
     player_vitals: BTreeMap<u64, PlayerVitals>,
+    player_equipments: BTreeMap<u64, PlayerEquipment>,
     player_interactions: BTreeMap<u64, PlayerInteractionIntent>,
     static_creatures: BTreeMap<u32, StaticCreatureRuntime>,
     static_occupied_positions: BTreeSet<Position>,
     tick: u64,
+    revision: u64,
 }
 
 impl WorldState {
@@ -591,8 +805,16 @@ impl WorldState {
         self.tick
     }
 
+    /// Monotonically advances after an accepted authoritative world mutation. The revision is a
+    /// generic synchronization baseline for future item, condition, combat, and creature events;
+    /// profile-specific delivery still uses its dedicated visibility and vitals epochs.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn advance_tick(&mut self) -> u64 {
         self.tick = self.tick.saturating_add(1);
+        self.mark_changed();
         self.tick
     }
 
@@ -625,7 +847,10 @@ impl WorldState {
             return Err(CoreError::StaticCreatureOccupiesPosition(player.position));
         }
         self.player_vitals.insert(player.id, vitals);
+        self.player_equipments
+            .insert(player.id, PlayerEquipment::default());
         self.players.insert(player.id, player);
+        self.mark_changed();
         Ok(())
     }
 
@@ -635,6 +860,7 @@ impl WorldState {
             .remove(&id)
             .ok_or(CoreError::UnknownPlayer(id))?;
         self.player_vitals.remove(&id);
+        self.player_equipments.remove(&id);
         self.player_interactions.remove(&id);
         self.player_interactions.retain(|_, intent| {
             if intent.target_player_id == Some(id) {
@@ -645,6 +871,7 @@ impl WorldState {
             }
             intent.target_player_id.is_some() || intent.follow_player_id.is_some()
         });
+        self.mark_changed();
         Ok(player)
     }
 
@@ -736,6 +963,7 @@ impl WorldState {
         }
         self.static_creatures = creatures;
         self.refresh_static_creature_occupancy();
+        self.mark_changed();
         Ok(())
     }
 
@@ -862,6 +1090,9 @@ impl WorldState {
         let changed = runtime.active;
         runtime.active = false;
         self.refresh_static_creature_occupancy();
+        if changed {
+            self.mark_changed();
+        }
         Ok(changed)
     }
 
@@ -899,6 +1130,9 @@ impl WorldState {
             summary.reactivated += 1;
         }
         self.refresh_static_creature_occupancy();
+        if summary.reactivated > 0 {
+            self.mark_changed();
+        }
         summary
     }
 
@@ -940,6 +1174,7 @@ impl WorldState {
             .ok_or(CoreError::UnknownStaticCreature(id))?;
         runtime.entity.position = destination;
         self.refresh_static_creature_occupancy();
+        self.mark_changed();
         Ok((previous, destination))
     }
 
@@ -956,6 +1191,10 @@ impl WorldState {
             .collect();
     }
 
+    fn mark_changed(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+    }
+
     pub fn player(&self, id: u64) -> Option<&Player> {
         self.players.get(&id)
     }
@@ -965,6 +1204,31 @@ impl WorldState {
             .get(&player_id)
             .copied()
             .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
+    pub fn player_equipment(&self, player_id: u64) -> Result<&PlayerEquipment, CoreError> {
+        self.player_equipments
+            .get(&player_id)
+            .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
+    /// Replaces a player's fixed equipment set only after that player is known to the
+    /// authoritative world. Native inventory windows and container synchronization remain
+    /// deferred, but later protocol paths can use this validated state directly.
+    pub fn replace_player_equipment(
+        &mut self,
+        player_id: u64,
+        equipment: PlayerEquipment,
+    ) -> Result<bool, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        if self.player_equipment(player_id)? == &equipment {
+            return Ok(false);
+        }
+        self.player_equipments.insert(player_id, equipment);
+        self.mark_changed();
+        Ok(true)
     }
 
     pub fn update_player_vitals(
@@ -978,7 +1242,11 @@ impl WorldState {
         if !self.players.contains_key(&player_id) {
             return Err(CoreError::UnknownPlayer(player_id));
         }
+        if self.player_vitals(player_id)? == vitals {
+            return Ok(());
+        }
         self.player_vitals.insert(player_id, vitals);
+        self.mark_changed();
         Ok(())
     }
 
@@ -997,19 +1265,25 @@ impl WorldState {
         if !self.players.contains_key(&target_id) {
             return Err(CoreError::UnknownPlayer(target_id));
         }
-        let vitals = self
-            .player_vitals
-            .get_mut(&target_id)
-            .ok_or(CoreError::UnknownPlayer(target_id))?;
-        let applied_damage = requested_damage.min(vitals.health);
-        vitals.health = vitals.health.saturating_sub(applied_damage);
+        let (applied_damage, remaining_health) = {
+            let vitals = self
+                .player_vitals
+                .get_mut(&target_id)
+                .ok_or(CoreError::UnknownPlayer(target_id))?;
+            let applied_damage = requested_damage.min(vitals.health);
+            vitals.health = vitals.health.saturating_sub(applied_damage);
+            (applied_damage, vitals.health)
+        };
+        if applied_damage > 0 {
+            self.mark_changed();
+        }
         Ok(PlayerDamageOutcome {
             attacker_id,
             target_id,
             requested_damage,
             applied_damage,
-            remaining_health: vitals.health,
-            defeated: vitals.health == 0,
+            remaining_health,
+            defeated: remaining_health == 0,
         })
     }
 
@@ -1038,17 +1312,20 @@ impl WorldState {
         if self.is_static_creature_occupied(destination) {
             return Err(CoreError::StaticCreatureOccupiesPosition(destination));
         }
-        let player = self
-            .players
-            .get_mut(&id)
-            .ok_or(CoreError::UnknownPlayer(id))?;
-        if !player.position.is_adjacent_to(destination) {
-            return Err(CoreError::InvalidMovement {
-                from: player.position,
-                to: destination,
-            });
+        {
+            let player = self
+                .players
+                .get_mut(&id)
+                .ok_or(CoreError::UnknownPlayer(id))?;
+            if !player.position.is_adjacent_to(destination) {
+                return Err(CoreError::InvalidMovement {
+                    from: player.position,
+                    to: destination,
+                });
+            }
+            player.position = destination;
         }
-        player.position = destination;
+        self.mark_changed();
         Ok(())
     }
 
@@ -1089,6 +1366,7 @@ impl WorldState {
         if !self.players.contains_key(&player_id) {
             return Err(CoreError::UnknownPlayer(player_id));
         }
+        let previous = self.player_interaction_intent(player_id)?;
         let selected_player_id = if replace_target {
             target_player_id
         } else {
@@ -1115,6 +1393,9 @@ impl WorldState {
         if intent == PlayerInteractionIntent::default() {
             self.player_interactions.remove(&player_id);
         }
+        if previous != intent {
+            self.mark_changed();
+        }
         Ok(intent)
     }
 }
@@ -1128,6 +1409,14 @@ pub fn level_for_experience(experience: u64) -> u32 {
 pub enum CoreError {
     DuplicatePlayer(u64),
     EmptyPlayerName,
+    InvalidContainerCapacity(u16),
+    ContainerFull {
+        capacity: u16,
+    },
+    InvalidItemId(u16),
+    InvalidClientThingId(u16),
+    DuplicateItemPresentation(u16),
+    InvalidItemStackCount(u16),
     InvalidMovement {
         from: Position,
         to: Position,
@@ -1204,6 +1493,133 @@ mod tests {
     }
 
     #[test]
+    fn runtime_item_instances_and_equipment_slots_are_bounded_and_replaceable() {
+        assert_eq!(ItemInstance::new(0, 1), Err(CoreError::InvalidItemId(0)));
+        assert_eq!(
+            ItemInstance::new(2376, 0),
+            Err(CoreError::InvalidItemStackCount(0))
+        );
+        assert_eq!(
+            ItemInstance::new(2376, MAX_ITEM_STACK_COUNT + 1),
+            Err(CoreError::InvalidItemStackCount(MAX_ITEM_STACK_COUNT + 1))
+        );
+
+        let sword = ItemInstance::new(2376, 1).unwrap();
+        let shield = ItemInstance::new(2512, 1).unwrap();
+        let replacement_sword = ItemInstance::new(2400, 1).unwrap();
+        let mut equipment = PlayerEquipment::default();
+        assert!(equipment.is_empty());
+        assert_eq!(
+            equipment.equip(EquipmentSlot::RightHand, sword.clone()),
+            None
+        );
+        assert_eq!(
+            equipment.equip(EquipmentSlot::LeftHand, shield.clone()),
+            None
+        );
+        assert_eq!(equipment.len(), 2);
+        assert_eq!(equipment.item(EquipmentSlot::RightHand), Some(&sword));
+        assert_eq!(
+            equipment.equip(EquipmentSlot::RightHand, replacement_sword.clone()),
+            Some(sword)
+        );
+        assert_eq!(equipment.unequip(EquipmentSlot::LeftHand), Some(shield));
+        assert_eq!(
+            equipment.item(EquipmentSlot::RightHand),
+            Some(&replacement_sword)
+        );
+        assert_eq!(equipment.len(), 1);
+        assert_eq!(EquipmentSlot::RightHand.code(), 5);
+        assert_eq!(EquipmentSlot::from_code(5), Some(EquipmentSlot::RightHand));
+        assert_eq!(EquipmentSlot::from_code(11), None);
+    }
+
+    #[test]
+    fn native_item_presentation_catalog_is_validated_and_duplicate_safe() {
+        let presentation = NativeItemPresentation {
+            client_thing_id: 102,
+            requires_classic_740_subtype: true,
+        };
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog.insert(4526, presentation).unwrap();
+        assert_eq!(catalog.presentation(4526), Some(presentation));
+        assert_eq!(catalog.len(), 1);
+        assert!(matches!(
+            catalog.insert(
+                1,
+                NativeItemPresentation {
+                    client_thing_id: 0,
+                    requires_classic_740_subtype: false,
+                },
+            ),
+            Err(CoreError::InvalidClientThingId(1))
+        ));
+        assert_eq!(
+            catalog.insert(4526, presentation),
+            Err(CoreError::DuplicateItemPresentation(4526))
+        );
+    }
+
+    #[test]
+    fn ordered_item_containers_are_bounded_and_preserve_item_order() {
+        assert_eq!(
+            ItemContainer::new(0),
+            Err(CoreError::InvalidContainerCapacity(0))
+        );
+        assert_eq!(
+            ItemContainer::new(MAX_CONTAINER_CAPACITY + 1),
+            Err(CoreError::InvalidContainerCapacity(
+                MAX_CONTAINER_CAPACITY + 1
+            ))
+        );
+
+        let first = ItemInstance::new(2376, 1).unwrap();
+        let second = ItemInstance::new(2512, 1).unwrap();
+        let mut container = ItemContainer::new(2).unwrap();
+        assert!(container.is_empty());
+        container.insert(first.clone()).unwrap();
+        container.insert(second.clone()).unwrap();
+        assert_eq!(container.capacity(), 2);
+        assert_eq!(container.item(0), Some(&first));
+        assert_eq!(container.item(1), Some(&second));
+        assert_eq!(
+            container.insert(ItemInstance::new(2463, 1).unwrap()),
+            Err(CoreError::ContainerFull { capacity: 2 })
+        );
+        assert_eq!(container.remove(0), Some(first));
+        assert_eq!(container.item(0), Some(&second));
+        assert_eq!(container.remove(9), None);
+    }
+
+    #[test]
+    fn authoritative_player_equipment_replaces_only_when_state_changes() {
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        assert!(world.player_equipment(7).unwrap().is_empty());
+        assert_eq!(world.revision(), 1);
+
+        let mut equipment = PlayerEquipment::default();
+        let sword = ItemInstance::new(2376, 1).unwrap();
+        equipment.equip(EquipmentSlot::RightHand, sword.clone());
+        assert!(world
+            .replace_player_equipment(7, equipment.clone())
+            .unwrap());
+        assert_eq!(world.revision(), 2);
+        assert_eq!(
+            world
+                .player_equipment(7)
+                .unwrap()
+                .item(EquipmentSlot::RightHand),
+            Some(&sword)
+        );
+        assert!(!world.replace_player_equipment(7, equipment).unwrap());
+        assert_eq!(world.revision(), 2);
+
+        world.remove_player(7).unwrap();
+        assert_eq!(world.player_equipment(7), Err(CoreError::UnknownPlayer(7)));
+    }
+
+    #[test]
     fn movement_rejects_teleporting() {
         let mut world = WorldState::default();
         world.add_player(player()).unwrap();
@@ -1227,6 +1643,50 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn world_revision_tracks_accepted_authoritative_mutations_only() {
+        let mut world = WorldState::default();
+        assert_eq!(world.revision(), 0);
+
+        world.advance_tick();
+        assert_eq!(world.revision(), 1);
+
+        world.add_player(player()).unwrap();
+        assert_eq!(world.revision(), 2);
+
+        let unchanged_vitals = world.player_vitals(7).unwrap();
+        world.update_player_vitals(7, unchanged_vitals).unwrap();
+        assert_eq!(world.revision(), 2);
+
+        let mut changed_vitals = unchanged_vitals;
+        changed_vitals.health -= 1;
+        world.update_player_vitals(7, changed_vitals).unwrap();
+        assert_eq!(world.revision(), 3);
+
+        assert!(world
+            .move_player(
+                7,
+                Position {
+                    x: 102,
+                    y: 100,
+                    z: 7,
+                },
+            )
+            .is_err());
+        assert_eq!(world.revision(), 3);
+
+        world
+            .move_player_cardinal(7, CardinalDirection::East)
+            .unwrap();
+        assert_eq!(world.revision(), 4);
+
+        world.set_player_target(7, None).unwrap();
+        assert_eq!(world.revision(), 4);
+
+        world.remove_player(7).unwrap();
+        assert_eq!(world.revision(), 5);
     }
 
     #[test]

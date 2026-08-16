@@ -4,7 +4,7 @@ use forgotten_config::{
     materialize_tfs_static_spawns, resolve_tfs_spawn_references, validate_content, world_map_path,
     write_template,
 };
-use forgotten_core::WorldMapSource;
+use forgotten_core::{EquipmentSlot, ItemInstance, WorldMapSource};
 use forgotten_host::{
     start, start_game_session, start_native_otclient_game, start_native_otclient_login,
     start_status, GameSessionHostConfig, HostConfig, LegacyLoginConfig,
@@ -51,7 +51,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "command" => command_line(&arguments),
         "account" => account_command(&arguments),
         "player" => player_command(&arguments),
-        "compatibility" => compatibility(),
+        "compatibility" => compatibility(&arguments),
         "version" | "--version" | "-V" => version(),
         "help" | "--help" | "-h" => {
             print_help();
@@ -343,6 +343,10 @@ fn run_host(
     let config = load(&directory)?;
     let raw_world_map = load_world_map(&config)?;
     let item_catalog = load_legacy_item_catalog(&config, &raw_world_map)?;
+    let item_presentation_catalog = item_catalog
+        .as_ref()
+        .map(|catalog| catalog.native_item_presentation_catalog())
+        .transpose()?;
     let world_map = Arc::new(match &item_catalog {
         Some(catalog) => apply_legacy_item_metadata(&raw_world_map, catalog)?,
         None => raw_world_map,
@@ -474,6 +478,7 @@ fn run_host(
             extended_diagnostics,
             empty_world,
             world_map: Some(Arc::clone(&world_map)),
+            item_presentation_catalog: item_presentation_catalog.map(Arc::new),
             static_spawns: (!static_spawns.entities.is_empty()).then(|| Arc::new(static_spawns)),
         })
     } else {
@@ -757,11 +762,111 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             );
             Ok(())
         }
+        "equip" => {
+            if !(arguments.len() == 6 || arguments.len() == 7) {
+                return Err(
+                    "usage: player equip <directory> <player-id> <slot> <server-item-id> [count]"
+                        .into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let slot = parse_equipment_slot(arguments.get(4))?;
+            let server_id = parse_u16_argument(arguments.get(5), "server item ID")?;
+            let count = arguments
+                .get(6)
+                .map(|value| value.parse::<u16>().map_err(|_| "item count must be a u16"))
+                .transpose()?
+                .unwrap_or(1);
+            let item = ItemInstance::new(server_id, count)?;
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            let mut equipment = database.player_equipment(player_id)?;
+            equipment.equip(slot, item);
+            database.replace_player_equipment(player_id, &equipment)?;
+            println!(
+                "equipped player-id={player_id} slot={} server-item-id={server_id} count={count}",
+                slot.code()
+            );
+            Ok(())
+        }
+        "unequip" => {
+            if arguments.len() != 5 {
+                return Err("usage: player unequip <directory> <player-id> <slot>".into());
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let slot = parse_equipment_slot(arguments.get(4))?;
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            let mut equipment = database.player_equipment(player_id)?;
+            if equipment.unequip(slot).is_none() {
+                return Err(
+                    format!("player {player_id} has no item in slot {}", slot.code()).into(),
+                );
+            }
+            database.replace_player_equipment(player_id, &equipment)?;
+            println!("unequipped player-id={player_id} slot={}", slot.code());
+            Ok(())
+        }
         unsupported => Err(format!("unsupported player action `{unsupported}`").into()),
     }
 }
 
-fn compatibility() -> Result<(), Box<dyn std::error::Error>> {
+fn parse_player_id(value: Option<&String>) -> Result<u64, Box<dyn std::error::Error>> {
+    value
+        .ok_or("a player ID is required")?
+        .parse()
+        .map_err(|_| "player ID must be an unsigned 64-bit integer".into())
+}
+
+fn parse_u16_argument(
+    value: Option<&String>,
+    label: &str,
+) -> Result<u16, Box<dyn std::error::Error>> {
+    value
+        .ok_or_else(|| format!("a {label} is required"))?
+        .parse()
+        .map_err(|_| format!("{label} must be an unsigned 16-bit integer").into())
+}
+
+fn parse_equipment_slot(
+    value: Option<&String>,
+) -> Result<EquipmentSlot, Box<dyn std::error::Error>> {
+    match value.map(String::as_str) {
+        Some("head") => Ok(EquipmentSlot::Head),
+        Some("necklace") | Some("neck") => Ok(EquipmentSlot::Neck),
+        Some("backpack") => Ok(EquipmentSlot::Backpack),
+        Some("armor") => Ok(EquipmentSlot::Armor),
+        Some("right") | Some("right-hand") => Ok(EquipmentSlot::RightHand),
+        Some("left") | Some("left-hand") => Ok(EquipmentSlot::LeftHand),
+        Some("legs") => Ok(EquipmentSlot::Legs),
+        Some("feet") => Ok(EquipmentSlot::Feet),
+        Some("ring") => Ok(EquipmentSlot::Ring),
+        Some("ammo") => Ok(EquipmentSlot::Ammo),
+        _ => Err(
+            "equipment slot must be head, necklace, backpack, armor, right, left, legs, feet, ring, or ammo"
+                .into(),
+        ),
+    }
+}
+
+fn capability_matrix_json() -> &'static str {
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/capability-matrix.json"
+    ))
+}
+
+fn compatibility(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    match arguments {
+        [command] if command == "compatibility" => {}
+        [command, format] if command == "compatibility" && format == "--json" => {
+            println!("{}", capability_matrix_json().trim());
+            return Ok(());
+        }
+        _ => return Err("usage: compatibility [--json]".into()),
+    }
     for profile in COMPATIBILITY_PROFILES {
         println!(
             "FE {}\t{}\tTibia {}\tofficial-client={}",
@@ -796,8 +901,12 @@ fn version() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn help_text() -> &'static str {
+    "Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)\n  fe-8.0  — Tibia 8.0 (protocol foundation)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  tfs-audit <directory>\n  run <directory> [--ed]\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  account create <directory> <account-name> <password>\n  player create <directory> <account-id> <character-name>\n  player equip <directory> <player-id> <slot> <server-item-id> [count]\n  player unequip <directory> <player-id> <slot>\n  command <directory> broadcast <message>\n  compatibility [--json]\n  version"
+}
+
 fn print_help() {
-    println!("Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)\n  fe-8.0  — Tibia 8.0 (protocol foundation)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  tfs-audit <directory>\n  run <directory> [--ed]\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  account create <directory> <account-name> <password>\n  player create <directory> <account-id> <character-name>\n  command <directory> broadcast <message>\n  compatibility\n  version");
+    println!("{}", help_text());
 }
 
 #[cfg(test)]
@@ -845,6 +954,62 @@ mod tests {
 
         let invalid = vec!["run".into(), "native-world".into(), "--verbose".into()];
         assert!(run_options(&invalid).is_err());
+    }
+
+    #[test]
+    fn help_text_preserves_the_established_local_world_workflow() {
+        let help = help_text();
+        for command in [
+            "init <directory>",
+            "validate <directory>",
+            "tfs-audit <directory>",
+            "run <directory> [--ed]",
+            "status <directory>",
+            "generate-key <directory>",
+            "backup <directory>",
+            "account create <directory> <account-name> <password>",
+            "player create <directory> <account-id> <character-name>",
+            "player equip <directory> <player-id> <slot> <server-item-id> [count]",
+            "player unequip <directory> <player-id> <slot>",
+            "command <directory> broadcast <message>",
+            "compatibility",
+            "version",
+        ] {
+            assert!(
+                help.contains(command),
+                "missing stable CLI command: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn equipment_slot_parsing_is_explicit_and_bounded() {
+        assert_eq!(
+            parse_equipment_slot(Some(&"right".to_owned())).unwrap(),
+            EquipmentSlot::RightHand
+        );
+        assert_eq!(
+            parse_equipment_slot(Some(&"left-hand".to_owned())).unwrap(),
+            EquipmentSlot::LeftHand
+        );
+        assert_eq!(
+            parse_equipment_slot(Some(&"ammo".to_owned())).unwrap(),
+            EquipmentSlot::Ammo
+        );
+        assert!(parse_equipment_slot(Some(&"purse".to_owned())).is_err());
+        assert!(parse_player_id(Some(&"7".to_owned())).is_ok());
+        assert!(parse_u16_argument(Some(&"65536".to_owned()), "server item ID").is_err());
+    }
+
+    #[test]
+    fn compatibility_json_is_an_additive_machine_readable_profile_report() {
+        let matrix = capability_matrix_json();
+        assert!(matrix.contains("\"schemaVersion\": 1"));
+        assert!(matrix.contains("\"id\": \"fe-7.4\""));
+        assert!(matrix.contains("\"id\": \"fe-8.0\""));
+        assert!(matrix.contains("\"id\": \"fe-1.2\""));
+        assert!(compatibility(&["compatibility".into(), "--json".into()]).is_ok());
+        assert!(compatibility(&["compatibility".into(), "--unknown".into()]).is_err());
     }
 
     #[test]

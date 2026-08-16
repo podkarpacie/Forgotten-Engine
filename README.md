@@ -10,7 +10,11 @@ Forgotten Engine is an original Rust project pursuing clean-room behavioral and 
 | `fe-8.0` | Tibia 8.0 |
 | `fe-1.2` | TFS 1.2 / Tibia 10.98 |
 
-The current native OTCv8 740 path is experimental. It supports numeric-account login, character selection, and an opt-in generated empty-world fixture. It is not yet a general-purpose playable server: real map loading, map streaming, collision, items, creatures, scripting, and gameplay are still under development.
+The current native 740 path is experimental. It supports numeric-account login, character selection, operator-supplied map loading with streamed native viewports, authoritative walkability and occupancy, bounded shared-player visibility, static spawned-creature representation, persisted player vitals, and a deliberately bounded selected-player melee foundation. It is not yet a general-purpose playable server: runtime items/inventory, weapon formulas, spells, monster AI/respawn/loot, NPC behavior, Lua execution, social/economy systems, and most gameplay semantics remain under development.
+
+## Capability matrix
+
+The source-controlled [capability matrix](docs/capability-matrix.md) is the authoritative statement of each profile’s supported, partial, and deferred features. Operators can also use `forgotten-engine compatibility` for the concise human-readable summary or `forgotten-engine compatibility --json` for the same profile baseline in a machine-readable form.
 
 ## Build
 

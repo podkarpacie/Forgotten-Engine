@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "statusVocabulary": [
+    "supported",
+    "partial",
+    "deferred",
+    "not-applicable",
+    "unknown"
+  ],
+  "profiles": [
+    {
+      "id": "fe-7.4",
+      "target": "Tibia 7.4",
+      "nativeOtClientV8": "partial",
+      "officialClientProtocolEmulation": "deferred",
+      "contentAudit": "partial",
+      "runtimeItemsAndInventory": "partial",
+      "runtimeItemsAndInventoryDetail": "bounded item/equipment/container core, SQLite equipment, native-session hydration, and catalog-validated classic-740 initial equipment delivery; no live inventory updates, containers, or item actions",
+      "playerState": "partial",
+      "combat": "partial",
+      "creatures": "partial",
+      "scripting": "deferred",
+      "socialAndEconomy": "deferred"
+    },
+    {
+      "id": "fe-8.0",
+      "target": "Tibia 8.0",
+      "nativeOtClientV8": "deferred",
+      "officialClientProtocolEmulation": "deferred",
+      "contentAudit": "partial",
+      "runtimeItemsAndInventory": "deferred",
+      "playerState": "deferred",
+      "combat": "deferred",
+      "creatures": "deferred",
+      "scripting": "deferred",
+      "socialAndEconomy": "deferred"
+    },
+    {
+      "id": "fe-1.2",
+      "target": "TFS 1.2 / Tibia 10.98",
+      "nativeOtClientV8": "deferred",
+      "officialClientProtocolEmulation": "deferred",
+      "contentAudit": "partial",
+      "runtimeItemsAndInventory": "deferred",
+      "playerState": "deferred",
+      "combat": "deferred",
+      "creatures": "deferred",
+      "scripting": "deferred",
+      "socialAndEconomy": "deferred"
+    }
+  ],
+  "cliCompatibility": {
+    "policy": "additive-only",
+    "normalRunOutput": "concise",
+    "extendedDiagnosticsFlag": "--ed",
+    "diagnosticsMayExposeCredentials": false,
+    "diagnosticsMayExposeRawPacketBodies": false,
+    "deprecatedCommandMinimumReleaseOverlap": 2
+  }
+}

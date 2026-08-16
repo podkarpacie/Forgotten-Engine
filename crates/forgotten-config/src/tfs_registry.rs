@@ -41,6 +41,7 @@ impl TfsRegistryCategory {
     pub fn runtime_status(self) -> &'static str {
         match self {
             Self::Monsters | Self::Npcs => "deferred creature runtime",
+            Self::Weapons => "deferred weapon runtime",
             _ => "deferred Lua event runtime",
         }
     }
@@ -417,6 +418,7 @@ mod tests {
         let data = temporary_content_directory("tfs-registry");
         fs::create_dir_all(data.join("actions/scripts")).unwrap();
         fs::create_dir_all(data.join("monster/monsters")).unwrap();
+        fs::create_dir_all(data.join("weapons/scripts")).unwrap();
         fs::write(
             data.join("actions/actions.xml"),
             r#"<actions><action itemid="100" script="scripts/rope.lua"/><action itemid="101" script="../escape.lua"/></actions>"#,
@@ -428,13 +430,28 @@ mod tests {
             r#"<monsters><monster name="Rat" file="monsters/rat.xml"/></monsters>"#,
         )
         .unwrap();
+        fs::write(
+            data.join("weapons/weapons.xml"),
+            r#"<weapons><weapon id="2376" script="scripts/sword.lua"/></weapons>"#,
+        )
+        .unwrap();
+        fs::write(
+            data.join("weapons/scripts/sword.lua"),
+            "-- private weapon script",
+        )
+        .unwrap();
 
         let inventory = inventory_tfs_content_directory(&data).unwrap();
-        assert_eq!(inventory.present_registry_count(), 2);
-        assert_eq!(inventory.entry_count(), 3);
-        assert_eq!(inventory.reference_count(), 3);
+        assert_eq!(inventory.present_registry_count(), 3);
+        assert_eq!(inventory.entry_count(), 4);
+        assert_eq!(inventory.reference_count(), 4);
         assert_eq!(inventory.missing_reference_count(), 1);
         assert_eq!(inventory.unsafe_reference_count(), 1);
+        assert!(inventory.registries.iter().any(|registry| {
+            registry.category == TfsRegistryCategory::Weapons
+                && registry.entry_count == 1
+                && registry.category.runtime_status() == "deferred weapon runtime"
+        }));
         let _ = fs::remove_dir_all(data.parent().unwrap());
     }
 
@@ -445,5 +462,17 @@ mod tests {
         fs::write(data.join("actions/actions.xml"), "<broken/>").unwrap();
         assert!(inventory_tfs_content_directory(&data).is_err());
         let _ = fs::remove_dir_all(data.parent().unwrap());
+    }
+
+    #[test]
+    fn weapon_registry_is_reported_as_a_distinct_deferred_runtime() {
+        assert_eq!(
+            TfsRegistryCategory::Weapons.runtime_status(),
+            "deferred weapon runtime"
+        );
+        assert_eq!(
+            TfsRegistryCategory::Spells.runtime_status(),
+            "deferred Lua event runtime"
+        );
     }
 }
