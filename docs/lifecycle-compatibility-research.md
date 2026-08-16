@@ -10,6 +10,12 @@ The public legacy TFS configuration template exposes the same `deathLosePercent`
 
 Public configuration behavior also shows that experience stages are ordered level ranges. When a matching stage exists it takes precedence over the flat experience rate; otherwise the flat rate applies.[5] This confirms that FE should model stages as an explicit validated data structure rather than reuse its current temporary square-root level curve as a compatibility formula.
 
+## Observed death-loss accounting boundary
+
+The public player lifecycle behavior measures lossable magic progression against cumulative required mana plus the player’s current spent mana, and lossable skills against cumulative required tries plus each skill’s current tries. It applies the resulting loss percentage to experience as well.[6] In its non-default configuration path, the public behavior adjusts the configured percentage for promoted status and blessings before using it; the default `-1` formula follows a distinct level/experience-based path.[6]
+
+Forgotten Engine therefore has sufficient evidence for **exact accounting inputs** but not yet for full profile-compatible policy application: FE has no blessing, promotion-status, magic-spent event source, weapon/spell source, or client death delivery. The next bounded slice may expose an explicit fixed-percent loss model only if it takes a caller-supplied effective percentage and operates on persisted exact counters; it must leave the configured default formula and blessing/promotion adjustments deferred.
+
 | Observed surface | Forgotten Engine design implication | Status |
 | --- | --- | --- |
 | Death loss is configurable and can be formula-selected or disabled. | Add a typed, validated death-loss policy only after experience and skill-try accounting exist; do not use the current level/percentage display state as a substitute for lossable tries. | Deferred |
@@ -28,3 +34,4 @@ The next FE slice should begin with a bounded operator-owned vocation registry p
 [3]: https://github.com/otland/forgottenserver/wiki/Script-Interface "The Forgotten Server scripting-interface overview"
 [4]: https://github.com/otland/tfs-old-svn/blob/master/config.lua "Legacy The Forgotten Server configuration template"
 [5]: https://github.com/otland/forgottenserver/blob/master/src/configmanager.cpp "The Forgotten Server public configuration-manager surface"
+[6]: https://raw.githubusercontent.com/otland/forgottenserver/master/src/player.cpp "The Forgotten Server public player lifecycle behavior"

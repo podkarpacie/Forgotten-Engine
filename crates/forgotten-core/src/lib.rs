@@ -984,6 +984,7 @@ pub struct PlayerRespawnState {
     pub dead: bool,
     pub respawn_at: Option<Position>,
     pub death_time: Option<u64>,
+    pub loss_applied: bool,
 }
 
 /// The deterministic state transition returned after a player is restored at a previously
@@ -992,6 +993,21 @@ pub struct PlayerRespawnState {
 pub struct PlayerRespawnOutcome {
     pub player_id: u64,
     pub position: Position,
+    pub vitals: PlayerVitals,
+}
+
+/// Exact authoritative loss result. It contains no client packet data and does not imply
+/// persistence; callers decide when to commit or display a verified lifecycle transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerDeathLossOutcome {
+    pub player_id: u64,
+    pub percent: u8,
+    pub experience_lost: u64,
+    pub skill_tries_lost: [u64; 7],
+    pub magic_mana_lost: u64,
+    pub level: u32,
+    pub progression: PlayerProgression,
+    pub progression_attempts: PlayerProgressionAttempts,
     pub vitals: PlayerVitals,
 }
 
@@ -1835,10 +1851,88 @@ impl WorldState {
             dead: true,
             respawn_at: Some(respawn_at),
             death_time: Some(self.tick),
+            loss_applied: false,
         };
         self.player_respawn_states.insert(player_id, state);
         self.mark_changed();
         Ok(state)
+    }
+
+    /// Applies one bounded fixed-percent loss transition to a player with an accepted death state.
+    /// The caller must supply data-driven vocation rules. Default-formula behavior, promotion and
+    /// blessing reductions, persistence, and client packets remain outside this core operation.
+    pub fn apply_fixed_percent_death_loss(
+        &mut self,
+        player_id: u64,
+        percent: u8,
+        rules: PlayerProgressionRules,
+    ) -> Result<PlayerDeathLossOutcome, CoreError> {
+        if !(1..=100).contains(&percent) {
+            return Err(CoreError::InvalidFixedDeathLossPercent(percent));
+        }
+        let mut death_state = self.player_respawn_state(player_id)?;
+        if !death_state.dead {
+            return Err(CoreError::PlayerIsNotDead(player_id));
+        }
+        if death_state.loss_applied {
+            return Err(CoreError::DeathLossAlreadyApplied(player_id));
+        }
+        let mut player = self
+            .players
+            .get(&player_id)
+            .cloned()
+            .ok_or(CoreError::UnknownPlayer(player_id))?;
+        let mut progression = self.player_progression(player_id)?;
+        let mut attempts = self.player_progression_attempts(player_id)?;
+        let mut vitals = self.player_vitals(player_id)?;
+
+        let experience_lost = fixed_percent_of(player.experience, percent);
+        player.experience = player.experience.saturating_sub(experience_lost);
+        player.level = level_for_experience(player.experience);
+
+        let mut skill_tries_lost = [0_u64; 7];
+        for skill in PlayerSkill::ALL {
+            let index = skill.code() as usize;
+            let total_tries = cumulative_skill_tries(
+                progression.skills.skill(skill),
+                attempts.skill_tries[index],
+                rules,
+                skill,
+            );
+            let lost_tries = fixed_percent_of(total_tries, percent);
+            let (progress, stored_tries) =
+                skill_progress_from_total(total_tries.saturating_sub(lost_tries), rules, skill);
+            progression.skills.set(skill, progress);
+            attempts.skill_tries[index] = stored_tries;
+            skill_tries_lost[index] = lost_tries;
+        }
+
+        let total_mana = cumulative_magic_mana(vitals.magic_level, attempts.magic_mana, rules);
+        let magic_mana_lost = fixed_percent_of(total_mana, percent);
+        let (magic_level, stored_mana) =
+            magic_progress_from_total(total_mana.saturating_sub(magic_mana_lost), rules);
+        vitals.magic_level = magic_level;
+        attempts.magic_mana = stored_mana;
+        let level = player.level;
+
+        death_state.loss_applied = true;
+        self.players.insert(player_id, player);
+        self.player_progressions.insert(player_id, progression);
+        self.player_progression_attempts.insert(player_id, attempts);
+        self.player_vitals.insert(player_id, vitals);
+        self.player_respawn_states.insert(player_id, death_state);
+        self.mark_changed();
+        Ok(PlayerDeathLossOutcome {
+            player_id,
+            percent,
+            experience_lost,
+            skill_tries_lost,
+            magic_mana_lost,
+            level,
+            progression,
+            progression_attempts: attempts,
+            vitals,
+        })
     }
 
     /// Restores a player who has an accepted death state at its already-validated temple. This
@@ -2454,6 +2548,69 @@ fn progress_percent(stored: u64, required: u64) -> u8 {
     ((stored.saturating_mul(100) / required).min(100)) as u8
 }
 
+fn fixed_percent_of(value: u64, percent: u8) -> u64 {
+    let whole = (value / 100).saturating_mul(u64::from(percent));
+    let remainder = (value % 100).saturating_mul(u64::from(percent)) / 100;
+    whole.saturating_add(remainder)
+}
+
+fn cumulative_skill_tries(
+    progress: SkillProgress,
+    stored_tries: u64,
+    rules: PlayerProgressionRules,
+    skill: PlayerSkill,
+) -> u64 {
+    let mut total = stored_tries;
+    for target_level in (MINIMUM_PLAYER_SKILL_LEVEL + 1)..=progress.level {
+        total = total.saturating_add(rules.required_skill_tries(skill, target_level));
+    }
+    total
+}
+
+fn skill_progress_from_total(
+    mut total_tries: u64,
+    rules: PlayerProgressionRules,
+    skill: PlayerSkill,
+) -> (SkillProgress, u64) {
+    let mut level = MINIMUM_PLAYER_SKILL_LEVEL;
+    while level < u16::MAX {
+        let required = rules.required_skill_tries(skill, level.saturating_add(1));
+        if total_tries < required {
+            return (
+                SkillProgress {
+                    level,
+                    percent: progress_percent(total_tries, required),
+                },
+                total_tries,
+            );
+        }
+        total_tries = total_tries.saturating_sub(required);
+        level = level.saturating_add(1);
+    }
+    (SkillProgress { level, percent: 0 }, 0)
+}
+
+fn cumulative_magic_mana(magic_level: u8, stored_mana: u64, rules: PlayerProgressionRules) -> u64 {
+    let mut total = stored_mana;
+    for target_level in 1..=magic_level {
+        total = total.saturating_add(rules.required_magic_mana(target_level));
+    }
+    total
+}
+
+fn magic_progress_from_total(mut total_mana: u64, rules: PlayerProgressionRules) -> (u8, u64) {
+    let mut magic_level = 0_u8;
+    while magic_level < u8::MAX {
+        let required = rules.required_magic_mana(magic_level.saturating_add(1));
+        if total_mana < required {
+            return (magic_level, total_mana);
+        }
+        total_mana = total_mana.saturating_sub(required);
+        magic_level = magic_level.saturating_add(1);
+    }
+    (magic_level, 0)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CoreError {
     DuplicatePlayer(u64),
@@ -2497,6 +2654,8 @@ pub enum CoreError {
     UnknownTown(u32),
     PlayerIsNotDead(u64),
     MissingRespawnPosition(u64),
+    DeathLossAlreadyApplied(u64),
+    InvalidFixedDeathLossPercent(u8),
     SelfInteractionNotAllowed(u64),
     InvalidPlayerVitals(u64),
     InvalidProgressionMultiplier(u32),
@@ -3719,6 +3878,7 @@ mod tests {
                 dead: true,
                 respawn_at: Some(temple),
                 death_time: Some(2),
+                loss_applied: false,
             }
         );
         assert_eq!(world.player_vitals(7).unwrap().health, 0);
@@ -3780,6 +3940,111 @@ mod tests {
         assert_eq!(
             world.player_respawn_state(7),
             Err(CoreError::UnknownPlayer(7))
+        );
+    }
+
+    #[test]
+    fn fixed_percent_death_loss_uses_exact_cumulative_progress_once() {
+        let multiplier = ProgressionMultiplier::new(1_000).unwrap();
+        let rules = PlayerProgressionRules {
+            magic_level_multiplier: multiplier,
+            skill_multipliers: [multiplier; 7],
+        };
+        let temple = Position {
+            x: 110,
+            y: 120,
+            z: 7,
+        };
+        let mut map = WorldMap::new("fixed-loss", temple);
+        map.set_town(WorldMapTown {
+            id: 42,
+            name: "Thais".to_owned(),
+            temple_position: temple,
+        })
+        .unwrap();
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        {
+            let player = world.players.get_mut(&7).unwrap();
+            player.experience = 100_000;
+            player.level = level_for_experience(player.experience);
+        }
+        let mut skills = PlayerSkills::default();
+        skills.set(PlayerSkill::Sword, SkillProgress::new(11, 50).unwrap());
+        world
+            .replace_player_progression(
+                7,
+                PlayerProgression {
+                    vocation: BaseVocation::Knight.id(),
+                    skills,
+                },
+            )
+            .unwrap();
+        world
+            .replace_player_progression_attempts(
+                7,
+                PlayerProgressionAttempts::new([0, 0, 25, 0, 0, 0, 0], 800),
+            )
+            .unwrap();
+        world
+            .update_player_vitals(
+                7,
+                PlayerVitals {
+                    magic_level: 1,
+                    ..PlayerVitals::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            world.apply_fixed_percent_death_loss(7, 0, rules),
+            Err(CoreError::InvalidFixedDeathLossPercent(0))
+        );
+        assert_eq!(
+            world.apply_fixed_percent_death_loss(7, 25, rules),
+            Err(CoreError::PlayerIsNotDead(7))
+        );
+        world.apply_player_death(7, 42, &map).unwrap();
+        let revision = world.revision();
+        let outcome = world.apply_fixed_percent_death_loss(7, 25, rules).unwrap();
+        assert_eq!(outcome.experience_lost, 25_000);
+        assert_eq!(
+            outcome.skill_tries_lost[PlayerSkill::Sword.code() as usize],
+            18
+        );
+        assert_eq!(outcome.magic_mana_lost, 600);
+        assert_eq!(world.player(7).unwrap().experience, 75_000);
+        assert_eq!(world.player(7).unwrap().level, level_for_experience(75_000));
+        assert_eq!(
+            world
+                .player_progression(7)
+                .unwrap()
+                .skills
+                .skill(PlayerSkill::Sword),
+            SkillProgress::new(11, 14).unwrap()
+        );
+        assert_eq!(
+            world
+                .player_progression_attempts(7)
+                .unwrap()
+                .skill_tries(PlayerSkill::Sword),
+            7
+        );
+        assert_eq!(world.player_vitals(7).unwrap().magic_level, 1);
+        assert_eq!(
+            world.player_progression_attempts(7).unwrap().magic_mana(),
+            200
+        );
+        assert!(world.player_respawn_state(7).unwrap().loss_applied);
+        assert_eq!(world.revision(), revision + 1);
+        assert_eq!(
+            world.apply_fixed_percent_death_loss(7, 25, rules),
+            Err(CoreError::DeathLossAlreadyApplied(7))
+        );
+        assert_eq!(world.revision(), revision + 1);
+        world.respawn_player(7).unwrap();
+        assert_eq!(
+            world.player_respawn_state(7).unwrap(),
+            PlayerRespawnState::default()
         );
     }
 
