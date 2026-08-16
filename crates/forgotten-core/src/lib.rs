@@ -848,6 +848,17 @@ impl DeathLossPolicy {
     }
 }
 
+/// Authoritative in-memory lifecycle state for a player who has died. `death_time` is expressed
+/// as the deterministic world tick at which the transition was accepted; no wall-clock source is
+/// consulted by the core. A later respawn slice will consume `respawn_at` to perform validated
+/// teleportation and client delivery.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayerRespawnState {
+    pub dead: bool,
+    pub respawn_at: Option<Position>,
+    pub death_time: Option<u64>,
+}
+
 pub const MAX_ITEM_STACK_COUNT: u16 = 100;
 
 /// A bounded runtime instance of an operator-supplied item type. Map placement metadata remains
@@ -1171,6 +1182,7 @@ pub struct WorldState {
     player_progressions: BTreeMap<u64, PlayerProgression>,
     player_regeneration_schedules: BTreeMap<u64, PlayerRegenerationSchedule>,
     player_conditions: BTreeMap<u64, BTreeMap<PlayerConditionKind, PlayerCondition>>,
+    player_respawn_states: BTreeMap<u64, PlayerRespawnState>,
     player_equipments: BTreeMap<u64, PlayerEquipment>,
     player_containers: BTreeMap<u64, PlayerContainers>,
     player_interactions: BTreeMap<u64, PlayerInteractionIntent>,
@@ -1240,6 +1252,8 @@ impl WorldState {
         self.player_regeneration_schedules
             .insert(player.id, PlayerRegenerationSchedule::default());
         self.player_conditions.insert(player.id, BTreeMap::new());
+        self.player_respawn_states
+            .insert(player.id, PlayerRespawnState::default());
         self.player_equipments
             .insert(player.id, PlayerEquipment::default());
         self.player_containers
@@ -1258,6 +1272,7 @@ impl WorldState {
         self.player_progressions.remove(&id);
         self.player_regeneration_schedules.remove(&id);
         self.player_conditions.remove(&id);
+        self.player_respawn_states.remove(&id);
         self.player_equipments.remove(&id);
         self.player_containers.remove(&id);
         self.player_interactions.remove(&id);
@@ -1610,6 +1625,51 @@ impl WorldState {
             .get(&player_id)
             .copied()
             .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
+    pub fn player_respawn_state(&self, player_id: u64) -> Result<PlayerRespawnState, CoreError> {
+        self.player_respawn_states
+            .get(&player_id)
+            .copied()
+            .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
+    /// Records a death against a known imported town temple without performing the future
+    /// respawn teleport, loss-policy execution, persistence, or client death-screen delivery.
+    /// Repeating a death for an already-dead player is a no-op that returns the original state.
+    pub fn apply_player_death(
+        &mut self,
+        player_id: u64,
+        town_id: u32,
+        world_map: &WorldMap,
+    ) -> Result<PlayerRespawnState, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        let existing = self.player_respawn_state(player_id)?;
+        if existing.dead {
+            return Ok(existing);
+        }
+        let respawn_at = world_map
+            .temple_position_for_town(town_id)
+            .ok_or(CoreError::UnknownTown(town_id))?;
+        let vitals = self
+            .player_vitals
+            .get_mut(&player_id)
+            .ok_or(CoreError::UnknownPlayer(player_id))?;
+        vitals.health = 0;
+        self.player_conditions
+            .get_mut(&player_id)
+            .ok_or(CoreError::UnknownPlayer(player_id))?
+            .clear();
+        let state = PlayerRespawnState {
+            dead: true,
+            respawn_at: Some(respawn_at),
+            death_time: Some(self.tick),
+        };
+        self.player_respawn_states.insert(player_id, state);
+        self.mark_changed();
+        Ok(state)
     }
 
     pub fn player_equipment(&self, player_id: u64) -> Result<&PlayerEquipment, CoreError> {
@@ -2060,6 +2120,7 @@ pub enum CoreError {
         command: LifecycleCommand,
     },
     UnknownPlayer(u64),
+    UnknownTown(u32),
     SelfInteractionNotAllowed(u64),
     InvalidPlayerVitals(u64),
     InvalidSkillProgress {
@@ -3158,6 +3219,71 @@ mod tests {
         world.remove_player(7).unwrap();
         assert_eq!(
             world.apply_player_regeneration(7, rules, 1),
+            Err(CoreError::UnknownPlayer(7))
+        );
+    }
+
+    #[test]
+    fn authoritative_death_state_resolves_a_temple_without_respawning() {
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        assert_eq!(
+            world.player_respawn_state(7).unwrap(),
+            PlayerRespawnState::default()
+        );
+        world
+            .apply_player_condition(
+                7,
+                PlayerCondition::new(PlayerConditionKind::Poison, 2, 7, 5).unwrap(),
+            )
+            .unwrap();
+
+        let temple = Position {
+            x: 110,
+            y: 120,
+            z: 7,
+        };
+        let mut map = WorldMap::new("death-state", temple);
+        map.set_town(WorldMapTown {
+            id: 42,
+            name: "Thais".to_owned(),
+            temple_position: temple,
+        })
+        .unwrap();
+
+        assert_eq!(
+            world.apply_player_death(7, 999, &map),
+            Err(CoreError::UnknownTown(999))
+        );
+        assert_eq!(
+            world.player_respawn_state(7).unwrap(),
+            PlayerRespawnState::default()
+        );
+        assert_eq!(world.player_vitals(7).unwrap().health, 150);
+
+        world.advance_tick();
+        world.advance_tick();
+        let position_before_death = world.player(7).unwrap().position;
+        let revision = world.revision();
+        let state = world.apply_player_death(7, 42, &map).unwrap();
+        assert_eq!(
+            state,
+            PlayerRespawnState {
+                dead: true,
+                respawn_at: Some(temple),
+                death_time: Some(2),
+            }
+        );
+        assert_eq!(world.player_vitals(7).unwrap().health, 0);
+        assert!(world.player_conditions(7).unwrap().is_empty());
+        assert_eq!(world.player(7).unwrap().position, position_before_death);
+        assert_eq!(world.revision(), revision + 1);
+        assert_eq!(world.apply_player_death(7, 42, &map).unwrap(), state);
+        assert_eq!(world.revision(), revision + 1);
+
+        world.remove_player(7).unwrap();
+        assert_eq!(
+            world.player_respawn_state(7),
             Err(CoreError::UnknownPlayer(7))
         );
     }

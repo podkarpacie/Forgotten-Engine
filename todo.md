@@ -209,4 +209,5 @@
 - [ ] Add death, respawn, temple selection, loss policy, and client-state delivery foundations.
 - [x] Expose imported world-map town and temple-position lookup accessors as the validated map-data prerequisite for later temple respawn behavior.
 - [x] Add schema-v6 player town assignment persistence with a zero-default migration, authenticated-character hydration, and an additive update helper; temple teleportation and death mechanics remain deferred.
+- [x] Add an authoritative in-memory player death-state record that validates a selected imported-town temple and sets health to zero without yet teleporting, persisting death state, applying loss, or sending client death packets.
 - [ ] Establish and satisfy production-readiness gates for complete declared TFS feature conformance, profile-specific protocol validation, reliability, bounded memory/performance, security, and reproducible TFS-to-FE migration before describing any profile as mainstream-ready.
