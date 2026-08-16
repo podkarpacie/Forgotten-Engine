@@ -22,7 +22,8 @@ const SCHEMA_VERSION_PROGRESSION: i64 = 5;
 const SCHEMA_VERSION_TOWNS: i64 = 6;
 const SCHEMA_VERSION_CONDITIONS: i64 = 7;
 const SCHEMA_VERSION_PROGRESSION_ATTEMPTS: i64 = 8;
-const LATEST_SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION_LIFECYCLE: i64 = 9;
+const LATEST_SCHEMA_VERSION: i64 = 10;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct EngineDatabase {
@@ -410,13 +411,14 @@ impl EngineDatabase {
         )?;
         for condition in conditions.values() {
             transaction.execute(
-                "INSERT INTO player_conditions (player_id, kind, interval_seconds, damage, remaining_seconds) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO player_conditions (player_id, kind, interval_seconds, damage, remaining_seconds, elapsed_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     player_id as i64,
                     i64::from(condition.kind.code()),
                     i64::from(condition.interval_seconds),
                     i64::from(condition.damage),
                     i64::from(condition.remaining_seconds),
+                    i64::from(condition.elapsed_seconds()),
                 ],
             )?;
         }
@@ -424,15 +426,15 @@ impl EngineDatabase {
         Ok(())
     }
 
-    /// Loads only validated active condition schedules. Progress within a damage interval is not
-    /// yet persisted, so reloads restart each persisted condition's interval countdown.
+    /// Loads only validated active condition schedules, including the deterministic remainder of
+    /// the current damage interval so restart hydration resumes the same next tick boundary.
     pub fn player_conditions(
         &self,
         player_id: u64,
     ) -> Result<BTreeMap<PlayerConditionKind, PlayerCondition>, PersistenceError> {
         self.ensure_player_exists(player_id)?;
         let mut statement = self.connection.prepare(
-            "SELECT kind, interval_seconds, damage, remaining_seconds FROM player_conditions WHERE player_id = ?1 ORDER BY kind",
+            "SELECT kind, interval_seconds, damage, remaining_seconds, elapsed_seconds FROM player_conditions WHERE player_id = ?1 ORDER BY kind",
         )?;
         let records = statement
             .query_map(params![player_id as i64], |row| {
@@ -441,11 +443,12 @@ impl EngineDatabase {
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let mut conditions = BTreeMap::new();
-        for (kind, interval_seconds, damage, remaining_seconds) in records {
+        for (kind, interval_seconds, damage, remaining_seconds, elapsed_seconds) in records {
             let kind = u8::try_from(kind).map_err(|_| {
                 PersistenceError::InvalidConditionRecord("kind does not fit u8".into())
             })?;
@@ -463,8 +466,17 @@ impl EngineDatabase {
                     "remaining duration does not fit u16".into(),
                 )
             })?;
-            let condition = PlayerCondition::new(kind, interval_seconds, damage, remaining_seconds)
-                .map_err(|error| PersistenceError::InvalidConditionRecord(error.to_string()))?;
+            let elapsed_seconds = u16::try_from(elapsed_seconds).map_err(|_| {
+                PersistenceError::InvalidConditionRecord("elapsed interval does not fit u16".into())
+            })?;
+            let condition = PlayerCondition::from_persisted(
+                kind,
+                interval_seconds,
+                damage,
+                remaining_seconds,
+                elapsed_seconds,
+            )
+            .map_err(|error| PersistenceError::InvalidConditionRecord(error.to_string()))?;
             if conditions.insert(kind, condition).is_some() {
                 return Err(PersistenceError::InvalidConditionRecord(
                     "duplicate condition kind".into(),
@@ -1078,7 +1090,7 @@ impl EngineDatabase {
         }
         if self.schema_version()? < SCHEMA_VERSION_CONDITIONS {
             self.connection.execute_batch(
-                "CREATE TABLE IF NOT EXISTS player_conditions (player_id INTEGER NOT NULL, kind INTEGER NOT NULL, interval_seconds INTEGER NOT NULL, damage INTEGER NOT NULL, remaining_seconds INTEGER NOT NULL, PRIMARY KEY (player_id, kind));",
+                "CREATE TABLE IF NOT EXISTS player_conditions (player_id INTEGER NOT NULL, kind INTEGER NOT NULL, interval_seconds INTEGER NOT NULL, damage INTEGER NOT NULL, remaining_seconds INTEGER NOT NULL, elapsed_seconds INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (player_id, kind));",
             )?;
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
@@ -1094,10 +1106,21 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_PROGRESSION_ATTEMPTS, unix_seconds()],
             )?;
         }
-        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+        if self.schema_version()? < SCHEMA_VERSION_LIFECYCLE {
             self.connection.execute_batch(
                 "CREATE TABLE IF NOT EXISTS player_lifecycle (player_id INTEGER PRIMARY KEY, dead INTEGER NOT NULL, respawn_x INTEGER, respawn_y INTEGER, respawn_z INTEGER, death_time INTEGER, loss_applied INTEGER NOT NULL);",
             )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_LIFECYCLE, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+            if !self.player_conditions_column_exists("elapsed_seconds")? {
+                self.connection.execute_batch(
+                    "ALTER TABLE player_conditions ADD COLUMN elapsed_seconds INTEGER NOT NULL DEFAULT 0",
+                )?;
+            }
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![LATEST_SCHEMA_VERSION, unix_seconds()],
@@ -1121,6 +1144,16 @@ impl EngineDatabase {
 
     fn player_column_exists(&self, column: &str) -> Result<bool, PersistenceError> {
         let mut statement = self.connection.prepare("PRAGMA table_info(players)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(columns.iter().any(|name| name == column))
+    }
+
+    fn player_conditions_column_exists(&self, column: &str) -> Result<bool, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("PRAGMA table_info(player_conditions)")?;
         let columns = statement
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1465,7 +1498,8 @@ mod tests {
             })
             .unwrap();
 
-        let poison = PlayerCondition::new(PlayerConditionKind::Poison, 2, 7, 10).unwrap();
+        let poison =
+            PlayerCondition::from_persisted(PlayerConditionKind::Poison, 2, 7, 10, 1).unwrap();
         let burning = PlayerCondition::new(PlayerConditionKind::Burning, 3, 4, 9).unwrap();
         let conditions = BTreeMap::from([
             (PlayerConditionKind::Poison, poison),

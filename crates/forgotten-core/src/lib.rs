@@ -1026,6 +1026,27 @@ impl PlayerCondition {
             elapsed_seconds: 0,
         })
     }
+
+    /// Restores a previously validated bounded schedule. Elapsed progress is always less than one
+    /// interval because the authoritative scheduler stores the remainder after every tick.
+    pub fn from_persisted(
+        kind: PlayerConditionKind,
+        interval_seconds: u16,
+        damage: u16,
+        remaining_seconds: u16,
+        elapsed_seconds: u16,
+    ) -> Result<Self, CoreError> {
+        let mut condition = Self::new(kind, interval_seconds, damage, remaining_seconds)?;
+        if elapsed_seconds >= interval_seconds {
+            return Err(CoreError::InvalidPlayerCondition);
+        }
+        condition.elapsed_seconds = elapsed_seconds;
+        Ok(condition)
+    }
+
+    pub const fn elapsed_seconds(self) -> u16 {
+        self.elapsed_seconds
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4495,6 +4516,33 @@ mod tests {
         assert_eq!(
             world.apply_player_conditions(7, 1),
             Err(CoreError::UnknownPlayer(7))
+        );
+    }
+
+    #[test]
+    fn persisted_condition_elapsed_progress_resumes_exact_tick_timing() {
+        assert_eq!(
+            PlayerCondition::from_persisted(PlayerConditionKind::Poison, 2, 7, 5, 2),
+            Err(CoreError::InvalidPlayerCondition)
+        );
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        world
+            .apply_player_condition(
+                7,
+                PlayerCondition::from_persisted(PlayerConditionKind::Poison, 3, 7, 5, 2).unwrap(),
+            )
+            .unwrap();
+        let outcome = world.apply_player_conditions(7, 1).unwrap();
+        assert_eq!(outcome.applied_damage, 7);
+        assert_eq!(
+            world
+                .player_conditions(7)
+                .unwrap()
+                .get(&PlayerConditionKind::Poison)
+                .unwrap()
+                .elapsed_seconds(),
+            0
         );
     }
 
