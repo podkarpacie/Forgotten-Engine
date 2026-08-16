@@ -791,13 +791,10 @@ pub const NATIVE_OTCLIENT_GAME_PLAYER_STATS: u8 = 0xa0;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_SKILLS: u8 = 0xa1;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATE: u8 = 0xa2;
 pub const NATIVE_OTCLIENT_GAME_ANIMATED_TEXT: u8 = 0x84;
-pub const NATIVE_OTCLIENT_GAME_TALK: u8 = 0xaa;
 pub const NATIVE_OTCLIENT_GAME_TEXT_MESSAGE: u8 = 0xb4;
 pub const NATIVE_OTCLIENT_GAME_CANCEL_WALK: u8 = 0xb5;
 /// Classic 7.x status-console blue: a text-only message shown in the default client console.
 pub const NATIVE_OTCLIENT_MESSAGE_STATUS_CONSOLE_BLUE: u8 = 4;
-/// Classic 740 public local-speech mode. A talk record with this mode includes a position.
-pub const NATIVE_OTCLIENT_MESSAGE_SAY: u8 = 1;
 pub const NATIVE_OTCLIENT_ENTER_GAME: u8 = 0x0f;
 pub const NATIVE_OTCLIENT_LEAVE_GAME: u8 = 0x14;
 pub const NATIVE_OTCLIENT_CLIENT_PING: u8 = 0x1d;
@@ -1683,31 +1680,6 @@ pub fn encode_native_otclient_game_status_message(
     let mut writer = Writer::default();
     writer.byte(NATIVE_OTCLIENT_GAME_TEXT_MESSAGE);
     writer.byte(NATIVE_OTCLIENT_MESSAGE_STATUS_CONSOLE_BLUE);
-    writer.string(message);
-    Ok(Frame(writer.finish()))
-}
-
-/// Encodes public local speech for classic protocol 740. This is deliberately a `GameServerTalk`
-/// record instead of a generic status message so the client receives speaker and spatial context.
-pub fn encode_native_otclient_public_say(
-    profile: &NativeOtClientProfile,
-    speaker_name: &str,
-    speaker_position: NativeOtClientPosition,
-    message: &str,
-) -> Result<Frame, ProtocolError> {
-    if !profile.supports_current_native_foundation()
-        || speaker_name.is_empty()
-        || speaker_name.len() > MAX_LOGIN_STRING_BYTES
-        || message.is_empty()
-        || message.len() > NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES
-    {
-        return Err(ProtocolError::UnsupportedNativeClientProfile);
-    }
-    let mut writer = Writer::default();
-    writer.byte(NATIVE_OTCLIENT_GAME_TALK);
-    writer.string(speaker_name);
-    writer.byte(NATIVE_OTCLIENT_MESSAGE_SAY);
-    write_native_otclient_position(&mut writer, speaker_position);
     writer.string(message);
     Ok(Frame(writer.finish()))
 }
@@ -2671,43 +2643,6 @@ mod tests {
             ]
         );
         assert!(encode_native_otclient_game_status_message(&profile, "").is_err());
-        assert_eq!(
-            encode_native_otclient_public_say(&profile, "Knight", snapshot.player_position, "hi",)
-                .unwrap()
-                .0,
-            vec![
-                NATIVE_OTCLIENT_GAME_TALK,
-                6,
-                0,
-                b'K',
-                b'n',
-                b'i',
-                b'g',
-                b'h',
-                b't',
-                NATIVE_OTCLIENT_MESSAGE_SAY,
-                100,
-                0,
-                100,
-                0,
-                7,
-                2,
-                0,
-                b'h',
-                b'i',
-            ]
-        );
-        assert!(
-            encode_native_otclient_public_say(&profile, "", snapshot.player_position, "hi")
-                .is_err()
-        );
-        assert!(encode_native_otclient_public_say(
-            &profile,
-            "Knight",
-            snapshot.player_position,
-            ""
-        )
-        .is_err());
 
         assert_eq!(
             decode_native_otclient_cardinal_move_request(&Frame(vec![0x66]), &profile).unwrap(),

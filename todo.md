@@ -145,3 +145,10 @@
 - [x] Replace the currently broken native 740 shared public-chat encoder with a bounded TFS-compatible record.
 - [x] Add end-to-end native chat input, broadcast, and client-record regression coverage beyond a mode-only assertion.
 - [x] Package and publish the native 740 chat compatibility patch release with Linux, Windows, and SHA-256 assets.
+- [x] Decode the real-client `GameServerTalk` mode-255 failure and identify the actual OTCv8 740 mode-map gap rather than a speech-preamble field defect.
+- [x] Correct native 740 shared public-chat delivery so OTCv8 consumes console and spatial feedback without `GameServerTalk` parser errors.
+- [x] Add parser-aligned end-to-end shared-chat regressions using the observed real-client failure shape.
+- [x] Package and publish the native 740 chat parser-fix release with Linux, Windows, and SHA-256 assets.
+- [x] Replace native 740 `GameServerTalk` delivery, which unmodified OTCv8 rejects because its 740 message-mode map lacks public-say mode translation, with parser-safe no-client-modification delivery.
+- [x] Deliver shared public chat through the working default-console status message and a bounded map-visible effect at the authoritative speaker position.
+- [x] Add regression coverage proving native 740 shared chat emits no `GameServerTalk` record while retaining console and map-visible delivery.

@@ -18,22 +18,22 @@ use forgotten_protocol::{
     encode_fe_otclient_initial_world, encode_fe_otclient_movement_ack,
     encode_fe_otclient_world_tick, encode_legacy_74_character_list,
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
-    encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
-    encode_native_otclient_game_cancel_walk_facing,
+    encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_animated_text,
+    encode_native_otclient_character_list, encode_native_otclient_game_cancel_walk_facing,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
-    encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
+    encode_native_otclient_game_ping_back, encode_native_otclient_game_status_message,
+    encode_native_otclient_login_error,
     encode_native_otclient_map_step_with_static_spawns_and_players,
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
-    encode_native_otclient_move_creature_at, encode_native_otclient_public_say,
-    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
-    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
-    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
-    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPosition,
-    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
-    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    encode_native_otclient_move_creature_at, encode_status_binary, encode_status_xml,
+    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
+    NativeOtClientCardinalDirection, NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction,
+    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
+    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -1339,16 +1339,24 @@ fn drain_shared_public_chat(
 ) -> Result<(), HostError> {
     loop {
         match events.try_recv() {
-            Ok(event) => write_frame(
-                stream,
-                &encode_native_otclient_public_say(
-                    profile,
-                    &event.speaker_name,
-                    event.speaker_position,
-                    &event.text,
-                )
-                .map_err(HostError::Protocol)?,
-            )?,
+            Ok(event) => {
+                let visible_text =
+                    truncate_native_chat_text(&format!("{}: {}", event.speaker_name, event.text));
+                write_frame(
+                    stream,
+                    &encode_native_otclient_game_status_message(profile, &visible_text)
+                        .map_err(HostError::Protocol)?,
+                )?;
+                write_frame(
+                    stream,
+                    &encode_native_otclient_animated_text(
+                        profile,
+                        event.speaker_position,
+                        &visible_text,
+                    )
+                    .map_err(HostError::Protocol)?,
+                )?;
+            }
             Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return Ok(()),
         }
     }
@@ -3078,12 +3086,13 @@ mod tests {
         );
 
         write_frame(&mut stream, &Frame(vec![0x96, 1, 2, 0, b'h', b'i'])).unwrap();
-        let chat_echo = read_frame(&mut stream).unwrap();
+        let chat_console = read_frame(&mut stream).unwrap();
         assert_eq!(
-            chat_echo.0,
+            chat_console.0,
             vec![
-                forgotten_protocol::NATIVE_OTCLIENT_GAME_TALK,
-                6,
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
+                forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_CONSOLE_BLUE,
+                10,
                 0,
                 b'K',
                 b'n',
@@ -3091,14 +3100,34 @@ mod tests {
                 b'g',
                 b'h',
                 b't',
-                forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_SAY,
+                b':',
+                b' ',
+                b'h',
+                b'i',
+            ]
+        );
+        assert!(!chat_console.0.contains(&0xaa));
+        let chat_map_label = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            chat_map_label.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_ANIMATED_TEXT,
                 101,
                 0,
                 100,
                 0,
                 7,
-                2,
+                215,
+                10,
                 0,
+                b'K',
+                b'n',
+                b'i',
+                b'g',
+                b'h',
+                b't',
+                b':',
+                b' ',
                 b'h',
                 b'i',
             ]
