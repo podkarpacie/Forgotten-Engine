@@ -8,6 +8,8 @@ The public TFS configuration template exposes a `deathLosePercent` setting and e
 
 The public legacy TFS configuration template exposes the same `deathLosePercent` conventions and additionally documents death-list retention settings, confirming that loss policy and death-record retention are distinct concerns.[4]
 
+Public configuration behavior also shows that experience stages are ordered level ranges. When a matching stage exists it takes precedence over the flat experience rate; otherwise the flat rate applies.[5] This confirms that FE should model stages as an explicit validated data structure rather than reuse its current temporary square-root level curve as a compatibility formula.
+
 | Observed surface | Forgotten Engine design implication | Status |
 | --- | --- | --- |
 | Death loss is configurable and can be formula-selected or disabled. | Add a typed, validated death-loss policy only after experience and skill-try accounting exist; do not use the current level/percentage display state as a substitute for lossable tries. | Deferred |
@@ -25,3 +27,4 @@ The next FE slice should begin with a bounded operator-owned vocation registry p
 [2]: https://github.com/otland/forgottenserver/blob/master/data/XML/vocations.xml "The Forgotten Server vocation configuration"
 [3]: https://github.com/otland/forgottenserver/wiki/Script-Interface "The Forgotten Server scripting-interface overview"
 [4]: https://github.com/otland/tfs-old-svn/blob/master/config.lua "Legacy The Forgotten Server configuration template"
+[5]: https://github.com/otland/forgottenserver/blob/master/src/configmanager.cpp "The Forgotten Server public configuration-manager surface"
