@@ -820,6 +820,26 @@ pub struct PlayerConditionOutcome {
     pub expired_conditions: u8,
 }
 
+/// Explicit configuration modes for character-death loss. The default-formula mode is retained
+/// as data only until profile-specific compatibility evidence supports an implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeathLossPolicy {
+    DefaultFormula,
+    None,
+    FixedPercent(u8),
+}
+
+impl DeathLossPolicy {
+    pub fn from_config(value: i32) -> Result<Self, CoreError> {
+        match value {
+            -1 => Ok(Self::DefaultFormula),
+            0 => Ok(Self::None),
+            1..=100 => Ok(Self::FixedPercent(value as u8)),
+            _ => Err(CoreError::InvalidDeathLossPolicy),
+        }
+    }
+}
+
 pub const MAX_ITEM_STACK_COUNT: u16 = 100;
 
 /// A bounded runtime instance of an operator-supplied item type. Map placement metadata remains
@@ -2040,6 +2060,7 @@ pub enum CoreError {
     },
     InvalidRegenerationInterval,
     InvalidPlayerCondition,
+    InvalidDeathLossPolicy,
     CombatOutOfRange {
         attacker_id: u64,
         target_id: u64,
@@ -3173,6 +3194,23 @@ mod tests {
         assert_eq!(
             world.apply_player_conditions(7, 1),
             Err(CoreError::UnknownPlayer(7))
+        );
+    }
+
+    #[test]
+    fn death_loss_policy_preserves_documented_configuration_modes() {
+        assert_eq!(
+            DeathLossPolicy::from_config(-1),
+            Ok(DeathLossPolicy::DefaultFormula)
+        );
+        assert_eq!(DeathLossPolicy::from_config(0), Ok(DeathLossPolicy::None));
+        assert_eq!(
+            DeathLossPolicy::from_config(10),
+            Ok(DeathLossPolicy::FixedPercent(10))
+        );
+        assert_eq!(
+            DeathLossPolicy::from_config(101),
+            Err(CoreError::InvalidDeathLossPolicy)
         );
     }
 }

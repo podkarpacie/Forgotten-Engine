@@ -202,6 +202,7 @@
 - [ ] Add a bounded non-executing parser for TFS `experienceStages` table entries and flat `rateExp`, preserving ordered range precedence and rejecting malformed/overlapping stage data.
 - [x] Add a bounded non-executing TFS-style `data/XML/stages.xml` parser with ordered range validation and malformed/overlap rejection; Lua-table syntax and live rate application remain deferred.
 - [ ] Add a validated death-loss policy for `deathLosePercent` modes and a town/temple respawn state model before exposing any client-visible death or respawn behavior.
+- [x] Add a typed validated death-loss policy model for documented `deathLosePercent` modes without yet applying loss, respawning a player, or claiming a default-formula implementation.
 - [x] Add elapsed-time-safe online health/mana regeneration using validated vocation rules, bounded catch-up, persisted vitals, and native 740 HUD refreshes; soul remains deferred.
 - [x] Add a bounded authoritative core scheduler for replacement-by-kind poison, burning, and energy damage-over-time conditions with capped damage, expiry cleanup, and lifecycle cleanup; persistence, client effects, and death policy remain deferred.
 - [ ] Add bounded condition state and profile-gated poison, burning, and energy-damage scheduling.
