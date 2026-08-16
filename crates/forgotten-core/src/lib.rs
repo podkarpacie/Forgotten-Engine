@@ -728,6 +728,114 @@ pub struct PlayerProgression {
     pub skills: PlayerSkills,
 }
 
+pub const MINIMUM_PLAYER_SKILL_LEVEL: u16 = 10;
+pub const MAX_PROGRESSION_MULTIPLIER_MILLI: u32 = 100_000;
+const PROGRESSION_MULTIPLIER_SCALE: u64 = 1_000;
+const SKILL_BASE_TRIES: [u64; 7] = [50, 50, 50, 50, 30, 100, 20];
+const MAGIC_LEVEL_BASE_MANA: u64 = 1_600;
+
+/// A validated fixed-point multiplier loaded from an operator-owned vocation registry. The core
+/// uses integer arithmetic so advancement remains deterministic across platforms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressionMultiplier {
+    milli: u32,
+}
+
+impl ProgressionMultiplier {
+    pub fn new(milli: u32) -> Result<Self, CoreError> {
+        if milli == 0 || milli > MAX_PROGRESSION_MULTIPLIER_MILLI {
+            return Err(CoreError::InvalidProgressionMultiplier(milli));
+        }
+        Ok(Self { milli })
+    }
+
+    pub const fn milli(self) -> u32 {
+        self.milli
+    }
+}
+
+/// Formula inputs derived from one validated vocation definition. The formula is intentionally
+/// parameterized by data rather than by FE release or a hard-coded vocation identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerProgressionRules {
+    pub magic_level_multiplier: ProgressionMultiplier,
+    pub skill_multipliers: [ProgressionMultiplier; 7],
+}
+
+impl PlayerProgressionRules {
+    /// Returns the required tries for the supplied target skill level. The classic seven skill
+    /// bases are retained as a profile-research input; profile parity still requires validation
+    /// against the selected operator data and client profile.
+    pub fn required_skill_tries(self, skill: PlayerSkill, target_level: u16) -> u64 {
+        let multiplier = self.skill_multipliers[skill.code() as usize];
+        let exponent = target_level.saturating_sub(MINIMUM_PLAYER_SKILL_LEVEL + 1);
+        scale_progression_requirement(
+            SKILL_BASE_TRIES[skill.code() as usize],
+            multiplier,
+            exponent,
+        )
+    }
+
+    /// Returns the required spent mana for the supplied target magic level. Level zero has no
+    /// requirement because the first advancement consumes the level-one requirement.
+    pub fn required_magic_mana(self, target_magic_level: u8) -> u64 {
+        if target_magic_level == 0 {
+            return 0;
+        }
+        scale_progression_requirement(
+            MAGIC_LEVEL_BASE_MANA,
+            self.magic_level_multiplier,
+            u16::from(target_magic_level.saturating_sub(1)),
+        )
+    }
+}
+
+/// Exact remaining progression counters that cannot be represented by client-visible percentage
+/// fields alone. Weapon hits and spell casts remain future sources of these values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayerProgressionAttempts {
+    skill_tries: [u64; 7],
+    magic_mana: u64,
+}
+
+impl PlayerProgressionAttempts {
+    pub const fn new(skill_tries: [u64; 7], magic_mana: u64) -> Self {
+        Self {
+            skill_tries,
+            magic_mana,
+        }
+    }
+
+    pub const fn all_skill_tries(self) -> [u64; 7] {
+        self.skill_tries
+    }
+
+    pub const fn skill_tries(self, skill: PlayerSkill) -> u64 {
+        self.skill_tries[skill.code() as usize]
+    }
+
+    pub const fn magic_mana(self) -> u64 {
+        self.magic_mana
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerSkillTryOutcome {
+    pub player_id: u64,
+    pub skill: PlayerSkill,
+    pub gained_levels: u16,
+    pub progress: SkillProgress,
+    pub stored_tries: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerMagicAdvanceOutcome {
+    pub player_id: u64,
+    pub gained_levels: u8,
+    pub magic_level: u8,
+    pub stored_mana: u64,
+}
+
 pub const MAX_REGENERATION_ELAPSED_SECONDS: u16 = 60;
 
 /// One bounded player-resource regeneration rule. Intervals are expressed in wall-clock seconds
@@ -1199,6 +1307,7 @@ pub struct WorldState {
     players: BTreeMap<u64, Player>,
     player_vitals: BTreeMap<u64, PlayerVitals>,
     player_progressions: BTreeMap<u64, PlayerProgression>,
+    player_progression_attempts: BTreeMap<u64, PlayerProgressionAttempts>,
     player_regeneration_schedules: BTreeMap<u64, PlayerRegenerationSchedule>,
     player_conditions: BTreeMap<u64, BTreeMap<PlayerConditionKind, PlayerCondition>>,
     player_respawn_states: BTreeMap<u64, PlayerRespawnState>,
@@ -1268,6 +1377,8 @@ impl WorldState {
         }
         self.player_vitals.insert(player.id, vitals);
         self.player_progressions.insert(player.id, progression);
+        self.player_progression_attempts
+            .insert(player.id, PlayerProgressionAttempts::default());
         self.player_regeneration_schedules
             .insert(player.id, PlayerRegenerationSchedule::default());
         self.player_conditions.insert(player.id, BTreeMap::new());
@@ -1289,6 +1400,7 @@ impl WorldState {
             .ok_or(CoreError::UnknownPlayer(id))?;
         self.player_vitals.remove(&id);
         self.player_progressions.remove(&id);
+        self.player_progression_attempts.remove(&id);
         self.player_regeneration_schedules.remove(&id);
         self.player_conditions.remove(&id);
         self.player_respawn_states.remove(&id);
@@ -1646,6 +1758,35 @@ impl WorldState {
             .ok_or(CoreError::UnknownPlayer(player_id))
     }
 
+    pub fn player_progression_attempts(
+        &self,
+        player_id: u64,
+    ) -> Result<PlayerProgressionAttempts, CoreError> {
+        self.player_progression_attempts
+            .get(&player_id)
+            .copied()
+            .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
+    /// Replaces exact progression counters after the player is known to the authoritative world.
+    /// The caller is responsible for pairing these counters with a matching visible progression
+    /// state during persistence hydration.
+    pub fn replace_player_progression_attempts(
+        &mut self,
+        player_id: u64,
+        attempts: PlayerProgressionAttempts,
+    ) -> Result<bool, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        if self.player_progression_attempts(player_id)? == attempts {
+            return Ok(false);
+        }
+        self.player_progression_attempts.insert(player_id, attempts);
+        self.mark_changed();
+        Ok(true)
+    }
+
     pub fn player_respawn_state(&self, player_id: u64) -> Result<PlayerRespawnState, CoreError> {
         self.player_respawn_states
             .get(&player_id)
@@ -1947,6 +2088,72 @@ impl WorldState {
         Ok(true)
     }
 
+    /// Applies a nonnegative exact skill-try award using caller-supplied validated vocation rules.
+    /// This foundation deliberately has no weapon, combat, offline-training, or Lua event source.
+    pub fn apply_player_skill_tries(
+        &mut self,
+        player_id: u64,
+        skill: PlayerSkill,
+        awarded_tries: u64,
+        rules: PlayerProgressionRules,
+    ) -> Result<PlayerSkillTryOutcome, CoreError> {
+        let mut progression = self.player_progression(player_id)?;
+        let mut attempts = self.player_progression_attempts(player_id)?;
+        let progress = progression.skills.skill(skill);
+        let (progress, stored_tries, gained_levels) = advance_skill_tries(
+            progress,
+            attempts.skill_tries[skill.code() as usize],
+            awarded_tries,
+            rules,
+            skill,
+        );
+        progression.skills.set(skill, progress);
+        attempts.skill_tries[skill.code() as usize] = stored_tries;
+        let changed = progression != self.player_progression(player_id)?
+            || attempts != self.player_progression_attempts(player_id)?;
+        if changed {
+            self.player_progressions.insert(player_id, progression);
+            self.player_progression_attempts.insert(player_id, attempts);
+            self.mark_changed();
+        }
+        Ok(PlayerSkillTryOutcome {
+            player_id,
+            skill,
+            gained_levels,
+            progress,
+            stored_tries,
+        })
+    }
+
+    /// Applies spent mana to magic-level advancement using caller-supplied validated vocation
+    /// rules. It does not consume a player's current mana pool and has no spell integration.
+    pub fn apply_player_magic_mana(
+        &mut self,
+        player_id: u64,
+        awarded_mana: u64,
+        rules: PlayerProgressionRules,
+    ) -> Result<PlayerMagicAdvanceOutcome, CoreError> {
+        let mut attempts = self.player_progression_attempts(player_id)?;
+        let mut vitals = self.player_vitals(player_id)?;
+        let (magic_level, stored_mana, gained_levels) =
+            advance_magic_mana(vitals.magic_level, attempts.magic_mana, awarded_mana, rules);
+        vitals.magic_level = magic_level;
+        attempts.magic_mana = stored_mana;
+        let changed = vitals != self.player_vitals(player_id)?
+            || attempts != self.player_progression_attempts(player_id)?;
+        if changed {
+            self.player_vitals.insert(player_id, vitals);
+            self.player_progression_attempts.insert(player_id, attempts);
+            self.mark_changed();
+        }
+        Ok(PlayerMagicAdvanceOutcome {
+            player_id,
+            gained_levels,
+            magic_level,
+            stored_mana,
+        })
+    }
+
     pub fn apply_player_damage(
         &mut self,
         attacker_id: u64,
@@ -2117,6 +2324,80 @@ fn regeneration_gain(current: u16, maximum: u16, amount: u16, events: u16) -> u1
         .saturating_sub(current)
 }
 
+fn scale_progression_requirement(
+    base: u64,
+    multiplier: ProgressionMultiplier,
+    exponent: u16,
+) -> u64 {
+    let factor = multiplier.milli() as f64 / PROGRESSION_MULTIPLIER_SCALE as f64;
+    let required = (base as f64 * factor.powi(i32::from(exponent))).floor();
+    required.clamp(1.0, u64::MAX as f64) as u64
+}
+
+fn advance_skill_tries(
+    mut progress: SkillProgress,
+    stored_tries: u64,
+    awarded_tries: u64,
+    rules: PlayerProgressionRules,
+    skill: PlayerSkill,
+) -> (SkillProgress, u64, u16) {
+    let mut stored_tries = stored_tries;
+    let mut awarded_tries = awarded_tries;
+    let mut gained_levels = 0_u16;
+    while awarded_tries > 0 && progress.level < u16::MAX {
+        let required = rules.required_skill_tries(skill, progress.level.saturating_add(1));
+        let needed = required.saturating_sub(stored_tries);
+        if awarded_tries < needed {
+            stored_tries = stored_tries.saturating_add(awarded_tries);
+            break;
+        }
+        awarded_tries = awarded_tries.saturating_sub(needed);
+        progress.level = progress.level.saturating_add(1);
+        stored_tries = 0;
+        gained_levels = gained_levels.saturating_add(1);
+    }
+    if progress.level == u16::MAX {
+        stored_tries = 0;
+    }
+    let required = rules.required_skill_tries(skill, progress.level.saturating_add(1));
+    progress.percent = progress_percent(stored_tries, required);
+    (progress, stored_tries, gained_levels)
+}
+
+fn advance_magic_mana(
+    mut magic_level: u8,
+    stored_mana: u64,
+    awarded_mana: u64,
+    rules: PlayerProgressionRules,
+) -> (u8, u64, u8) {
+    let mut stored_mana = stored_mana;
+    let mut awarded_mana = awarded_mana;
+    let mut gained_levels = 0_u8;
+    while awarded_mana > 0 && magic_level < u8::MAX {
+        let required = rules.required_magic_mana(magic_level.saturating_add(1));
+        let needed = required.saturating_sub(stored_mana);
+        if awarded_mana < needed {
+            stored_mana = stored_mana.saturating_add(awarded_mana);
+            break;
+        }
+        awarded_mana = awarded_mana.saturating_sub(needed);
+        magic_level = magic_level.saturating_add(1);
+        stored_mana = 0;
+        gained_levels = gained_levels.saturating_add(1);
+    }
+    if magic_level == u8::MAX {
+        stored_mana = 0;
+    }
+    (magic_level, stored_mana, gained_levels)
+}
+
+fn progress_percent(stored: u64, required: u64) -> u8 {
+    if required == 0 {
+        return 0;
+    }
+    ((stored.saturating_mul(100) / required).min(100)) as u8
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CoreError {
     DuplicatePlayer(u64),
@@ -2160,6 +2441,7 @@ pub enum CoreError {
     UnknownTown(u32),
     SelfInteractionNotAllowed(u64),
     InvalidPlayerVitals(u64),
+    InvalidProgressionMultiplier(u32),
     InvalidSkillProgress {
         level: u16,
         percent: u8,
@@ -3203,6 +3485,76 @@ mod tests {
         world.remove_player(7).unwrap();
         assert_eq!(
             world.player_progression(7),
+            Err(CoreError::UnknownPlayer(7))
+        );
+    }
+
+    #[test]
+    fn progression_attempts_are_multiplier_driven_and_authoritative() {
+        assert_eq!(
+            ProgressionMultiplier::new(0),
+            Err(CoreError::InvalidProgressionMultiplier(0))
+        );
+        assert_eq!(
+            ProgressionMultiplier::new(MAX_PROGRESSION_MULTIPLIER_MILLI + 1),
+            Err(CoreError::InvalidProgressionMultiplier(
+                MAX_PROGRESSION_MULTIPLIER_MILLI + 1
+            ))
+        );
+        let multiplier = ProgressionMultiplier::new(1_100).unwrap();
+        let rules = PlayerProgressionRules {
+            magic_level_multiplier: multiplier,
+            skill_multipliers: [multiplier; 7],
+        };
+        assert_eq!(rules.required_skill_tries(PlayerSkill::Sword, 11), 50);
+        assert_eq!(rules.required_skill_tries(PlayerSkill::Sword, 12), 55);
+        assert_eq!(rules.required_magic_mana(0), 0);
+        assert_eq!(rules.required_magic_mana(1), 1_600);
+        assert_eq!(rules.required_magic_mana(2), 1_760);
+
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        let revision = world.revision();
+        let partial = world
+            .apply_player_skill_tries(7, PlayerSkill::Sword, 49, rules)
+            .unwrap();
+        assert_eq!(partial.gained_levels, 0);
+        assert_eq!(partial.progress, SkillProgress::new(10, 98).unwrap());
+        assert_eq!(partial.stored_tries, 49);
+        assert_eq!(world.revision(), revision + 1);
+
+        let advanced = world
+            .apply_player_skill_tries(7, PlayerSkill::Sword, 1, rules)
+            .unwrap();
+        assert_eq!(advanced.gained_levels, 1);
+        assert_eq!(advanced.progress, SkillProgress::new(11, 0).unwrap());
+        assert_eq!(advanced.stored_tries, 0);
+        assert_eq!(
+            world
+                .player_progression_attempts(7)
+                .unwrap()
+                .skill_tries(PlayerSkill::Sword),
+            0
+        );
+
+        let magic = world.apply_player_magic_mana(7, 1_600, rules).unwrap();
+        assert_eq!(magic.gained_levels, 1);
+        assert_eq!(magic.magic_level, 1);
+        assert_eq!(magic.stored_mana, 0);
+        assert_eq!(world.player_vitals(7).unwrap().magic_level, 1);
+        let no_op_revision = world.revision();
+        assert_eq!(
+            world
+                .apply_player_magic_mana(7, 0, rules)
+                .unwrap()
+                .gained_levels,
+            0
+        );
+        assert_eq!(world.revision(), no_op_revision);
+
+        world.remove_player(7).unwrap();
+        assert_eq!(
+            world.player_progression_attempts(7),
             Err(CoreError::UnknownPlayer(7))
         );
     }
