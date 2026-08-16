@@ -6,6 +6,7 @@
 mod items;
 mod legacy_xml;
 mod otbm;
+mod stages;
 mod tfs_entities;
 mod tfs_registry;
 mod vocations;
@@ -23,6 +24,7 @@ pub use items::{LegacyItemCatalog, LegacyItemDefinition};
 pub use legacy_xml::{
     LegacyHouse, LegacySpawnArea, LegacySpawnCreature, LegacySpawnKind, LegacyWorldCompanionData,
 };
+pub use stages::{parse_tfs_stages_xml, ExperienceStage, ExperienceStages};
 pub use tfs_entities::{
     materialize_tfs_static_spawns, TfsEntityAppearance, TfsEntityCatalog, TfsEntityDefinition,
     TfsEntityKind, TfsSpawnResolution,
