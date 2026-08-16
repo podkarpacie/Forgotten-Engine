@@ -5,9 +5,10 @@
 use forgotten_core::{
     CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, ItemInstance,
     NativeItemPresentationCatalog, Player, PlayerCondition, PlayerConditionKind, PlayerContainers,
-    PlayerEquipment, PlayerInteractionIntent, PlayerProgression, PlayerRegenerationOutcome,
-    PlayerRegenerationRules, PlayerVitals, Position, StaticCreatureDecisionBatch,
-    StaticCreatureDecisionPolicy, VocationId, WorldMap, WorldState,
+    PlayerEquipment, PlayerInteractionIntent, PlayerProgression, PlayerProgressionAttempts,
+    PlayerProgressionRules, PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerVitals,
+    Position, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, VocationId, WorldMap,
+    WorldState,
 };
 use forgotten_persistence::{EngineDatabase, PlayerVitals as PersistedPlayerVitals};
 use forgotten_protocol::{
@@ -215,6 +216,10 @@ pub struct NativeOtClientHostConfig {
     /// Optional validated vocation recovery rules. Without this catalog automatic recovery is
     /// disabled; soul, conditions, death, and scripted lifecycle hooks remain deferred.
     pub regeneration_rules: Option<Arc<BTreeMap<VocationId, PlayerRegenerationRules>>>,
+    /// Optional validated vocation progression rules. The host stores these data-driven formula
+    /// inputs for explicit authoritative awards; weapons, spells, training, and Lua are not yet
+    /// event sources.
+    pub progression_rules: Option<Arc<BTreeMap<VocationId, PlayerProgressionRules>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +236,7 @@ pub struct NativeOtClientEmptyWorldConfig {
 #[derive(Debug, Clone)]
 pub struct NativePlayerHydration {
     pub progression: PlayerProgression,
+    pub progression_attempts: PlayerProgressionAttempts,
     pub equipment: PlayerEquipment,
     pub containers: PlayerContainers,
     pub conditions: BTreeMap<PlayerConditionKind, PlayerCondition>,
@@ -324,6 +330,25 @@ impl SharedNativeWorld {
             self.progression_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok(changed)
+    }
+
+    pub fn player_progression_attempts(
+        &self,
+        player_id: u64,
+    ) -> Result<PlayerProgressionAttempts, HostError> {
+        self.lock()?
+            .player_progression_attempts(player_id)
+            .map_err(HostError::Core)
+    }
+
+    pub fn replace_player_progression_attempts(
+        &self,
+        player_id: u64,
+        attempts: PlayerProgressionAttempts,
+    ) -> Result<bool, HostError> {
+        self.lock()?
+            .replace_player_progression_attempts(player_id, attempts)
+            .map_err(HostError::Core)
     }
 
     pub fn apply_player_regeneration(
@@ -654,6 +679,7 @@ impl SharedNativeWorld {
                 hydration.containers,
                 world_map,
             )?;
+        self.replace_player_progression_attempts(player_id, hydration.progression_attempts)?;
         self.replace_player_conditions(player_id, hydration.conditions)?;
         Ok(position)
     }
@@ -1365,6 +1391,7 @@ fn handle_native_otclient_game(
             },
             NativePlayerHydration {
                 progression: character.progression,
+                progression_attempts: character.progression_attempts,
                 equipment,
                 containers,
                 conditions,
@@ -2968,6 +2995,7 @@ mod tests {
             item_presentation_catalog: None,
             static_spawns: None,
             regeneration_rules: None,
+            progression_rules: None,
         }
     }
 
@@ -3267,6 +3295,7 @@ mod tests {
                 PlayerVitals::default(),
                 NativePlayerHydration {
                     progression: PlayerProgression::default(),
+                    progression_attempts: PlayerProgressionAttempts::default(),
                     equipment: PlayerEquipment::default(),
                     containers: PlayerContainers::default(),
                     conditions: conditions.clone(),
@@ -3275,6 +3304,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(shared.player_conditions(104).unwrap(), conditions);
+    }
+
+    #[test]
+    fn shared_native_registration_hydrates_exact_progression_attempts() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        let attempts = PlayerProgressionAttempts::new([1, 2, 3, 4, 5, 6, 7], 8);
+        shared
+            .register_player_at_available_position_with_vitals_equipment_containers_progression_and_conditions(
+                Player {
+                    id: 105,
+                    account_id: 1,
+                    name: "Paladin".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                PlayerVitals::default(),
+                NativePlayerHydration {
+                    progression: PlayerProgression::default(),
+                    progression_attempts: attempts,
+                    equipment: PlayerEquipment::default(),
+                    containers: PlayerContainers::default(),
+                    conditions: BTreeMap::new(),
+                },
+                &map,
+            )
+            .unwrap();
+        assert_eq!(shared.player_progression_attempts(105).unwrap(), attempts);
     }
 
     #[test]

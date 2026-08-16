@@ -6,8 +6,8 @@ use argon2::{
 };
 use forgotten_core::{
     EquipmentSlot, ItemInstance, Player, PlayerCondition, PlayerConditionKind, PlayerContainer,
-    PlayerContainers, PlayerEquipment, PlayerProgression, PlayerSkill, PlayerSkills, Position,
-    SkillProgress, VocationId,
+    PlayerContainers, PlayerEquipment, PlayerProgression, PlayerProgressionAttempts, PlayerSkill,
+    PlayerSkills, Position, SkillProgress, VocationId,
 };
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -20,7 +20,8 @@ const SCHEMA_VERSION_EQUIPMENT: i64 = 3;
 const SCHEMA_VERSION_CONTAINERS: i64 = 4;
 const SCHEMA_VERSION_PROGRESSION: i64 = 5;
 const SCHEMA_VERSION_TOWNS: i64 = 6;
-const LATEST_SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION_CONDITIONS: i64 = 7;
+const LATEST_SCHEMA_VERSION: i64 = 8;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct EngineDatabase {
@@ -162,6 +163,7 @@ impl EngineDatabase {
                     experience: row.get::<_, i64>(3)? as u64,
                     skill_points: row.get::<_, i64>(4)? as u32,
                     progression: PlayerProgression::default(),
+                    progression_attempts: PlayerProgressionAttempts::default(),
                     vitals: PlayerVitals {
                         health: row.get::<_, i64>(5)? as u16,
                         max_health: row.get::<_, i64>(6)? as u16,
@@ -181,6 +183,7 @@ impl EngineDatabase {
             .collect::<Result<Vec<_>, _>>()?;
         for character in &mut characters {
             character.progression = self.player_progression(character.id)?;
+            character.progression_attempts = self.player_progression_attempts(character.id)?;
         }
         Ok(characters)
     }
@@ -262,6 +265,7 @@ impl EngineDatabase {
             experience: 0,
             skill_points: 0,
             progression: PlayerProgression::default(),
+            progression_attempts: PlayerProgressionAttempts::default(),
             vitals: PlayerVitals::default(),
             position,
             town_id: 0,
@@ -439,6 +443,53 @@ impl EngineDatabase {
                 .transpose()?
                 .unwrap_or_default(),
         })
+    }
+
+    /// Replaces the exact invisible counters that back client-visible skill and magic progress.
+    /// Counter ranges are checked before SQLite receives them and every stored value is checked
+    /// again during reload.
+    pub fn replace_player_progression_attempts(
+        &mut self,
+        player_id: u64,
+        attempts: PlayerProgressionAttempts,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let values = attempts
+            .all_skill_tries()
+            .into_iter()
+            .map(sqlite_progression_attempt)
+            .collect::<Result<Vec<_>, _>>()?;
+        let magic_mana = sqlite_progression_attempt(attempts.magic_mana())?;
+        self.connection.execute(
+            "INSERT INTO player_progression_attempts (player_id, fist_tries, club_tries, sword_tries, axe_tries, distance_tries, shielding_tries, fishing_tries, magic_mana) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(player_id) DO UPDATE SET fist_tries=excluded.fist_tries, club_tries=excluded.club_tries, sword_tries=excluded.sword_tries, axe_tries=excluded.axe_tries, distance_tries=excluded.distance_tries, shielding_tries=excluded.shielding_tries, fishing_tries=excluded.fishing_tries, magic_mana=excluded.magic_mana",
+            params![
+                player_id as i64,
+                values[0], values[1], values[2], values[3], values[4], values[5], values[6],
+                magic_mana,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Loads exact progression counters, supplying safe zeros for worlds migrated from a schema
+    /// that predates their persistence. Formula-threshold validation belongs to the runtime rules.
+    pub fn player_progression_attempts(
+        &self,
+        player_id: u64,
+    ) -> Result<PlayerProgressionAttempts, PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let record = self.connection.query_row(
+            "SELECT fist_tries, club_tries, sword_tries, axe_tries, distance_tries, shielding_tries, fishing_tries, magic_mana FROM player_progression_attempts WHERE player_id = ?1",
+            params![player_id as i64],
+            |row| Ok([
+                row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?, row.get::<_, i64>(5)?, row.get::<_, i64>(6)?, row.get::<_, i64>(7)?,
+            ]),
+        ).optional()?;
+        record
+            .map(progression_attempts_from_record)
+            .transpose()?
+            .map_or_else(|| Ok(PlayerProgressionAttempts::default()), Ok)
     }
 
     pub fn update_player_position(
@@ -763,9 +814,18 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_TOWNS, unix_seconds()],
             )?;
         }
-        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+        if self.schema_version()? < SCHEMA_VERSION_CONDITIONS {
             self.connection.execute_batch(
                 "CREATE TABLE IF NOT EXISTS player_conditions (player_id INTEGER NOT NULL, kind INTEGER NOT NULL, interval_seconds INTEGER NOT NULL, damage INTEGER NOT NULL, remaining_seconds INTEGER NOT NULL, PRIMARY KEY (player_id, kind));",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_CONDITIONS, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS player_progression_attempts (player_id INTEGER PRIMARY KEY, fist_tries INTEGER NOT NULL, club_tries INTEGER NOT NULL, sword_tries INTEGER NOT NULL, axe_tries INTEGER NOT NULL, distance_tries INTEGER NOT NULL, shielding_tries INTEGER NOT NULL, fishing_tries INTEGER NOT NULL, magic_mana INTEGER NOT NULL);",
             )?;
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
@@ -842,6 +902,7 @@ pub struct LoginCharacter {
     pub experience: u64,
     pub skill_points: u32,
     pub progression: PlayerProgression,
+    pub progression_attempts: PlayerProgressionAttempts,
     pub vitals: PlayerVitals,
     pub position: Position,
     /// Imported map town identifier, or zero when no town has been assigned.
@@ -947,6 +1008,35 @@ fn player_skills_from_record(record: [i64; 14]) -> Result<PlayerSkills, Persiste
     Ok(skills)
 }
 
+fn sqlite_progression_attempt(value: u64) -> Result<i64, PersistenceError> {
+    i64::try_from(value).map_err(|_| {
+        PersistenceError::InvalidProgressionAttemptRecord(
+            "progression counter exceeds SQLite signed integer range".into(),
+        )
+    })
+}
+
+fn progression_attempts_from_record(
+    record: [i64; 8],
+) -> Result<PlayerProgressionAttempts, PersistenceError> {
+    let values = record
+        .into_iter()
+        .map(|value| {
+            u64::try_from(value).map_err(|_| {
+                PersistenceError::InvalidProgressionAttemptRecord(
+                    "progression counters must be nonnegative".into(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PlayerProgressionAttempts::new(
+        [
+            values[0], values[1], values[2], values[3], values[4], values[5], values[6],
+        ],
+        values[7],
+    ))
+}
+
 #[derive(Debug)]
 pub enum PersistenceError {
     Io(std::io::Error),
@@ -958,6 +1048,7 @@ pub enum PersistenceError {
     InvalidContainerRecord(String),
     InvalidConditionRecord(String),
     InvalidProgressionRecord(String),
+    InvalidProgressionAttemptRecord(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
 }
@@ -1024,6 +1115,10 @@ mod tests {
         assert_eq!(character.experience, 4_900);
         assert_eq!(character.vitals, PlayerVitals::default());
         assert_eq!(character.progression, PlayerProgression::default());
+        assert_eq!(
+            character.progression_attempts,
+            PlayerProgressionAttempts::default()
+        );
         assert_eq!(character.town_id, 0);
         assert!(database.player_equipment(7).unwrap().is_empty());
         assert!(database.player_conditions(7).unwrap().is_empty());
@@ -1100,6 +1195,62 @@ mod tests {
         ));
         assert!(matches!(
             database.player_conditions(999),
+            Err(PersistenceError::UnknownPlayer(999))
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_and_validates_player_progression_attempts_transactionally() {
+        let path = temporary_path("progression-attempts");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("admin", "hash").unwrap();
+        database
+            .save_player(&Player {
+                id: 7,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let attempts = PlayerProgressionAttempts::new([1, 2, 3, 4, 5, 6, 7], 8);
+        database
+            .replace_player_progression_attempts(7, attempts)
+            .unwrap();
+        assert_eq!(database.player_progression_attempts(7).unwrap(), attempts);
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].progression_attempts,
+            attempts
+        );
+
+        database
+            .replace_player_progression_attempts(7, PlayerProgressionAttempts::default())
+            .unwrap();
+        assert_eq!(
+            database.player_progression_attempts(7).unwrap(),
+            PlayerProgressionAttempts::default()
+        );
+        database
+            .connection
+            .execute(
+                "UPDATE player_progression_attempts SET sword_tries = -1 WHERE player_id = ?1",
+                params![7_i64],
+            )
+            .unwrap();
+        assert!(matches!(
+            database.player_progression_attempts(7),
+            Err(PersistenceError::InvalidProgressionAttemptRecord(_))
+        ));
+        assert!(matches!(
+            database.player_progression_attempts(999),
             Err(PersistenceError::UnknownPlayer(999))
         ));
         let _ = fs::remove_file(path);

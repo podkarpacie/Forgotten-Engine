@@ -17,6 +17,12 @@ The public Forgotten Server repository exposes a configurable `vocations.xml` re
 
 An OTLand discussion about TFS 1.2 vocation configuration identifies the health cadence and amount fields as the number of seconds between gains and the amount gained, respectively.[2] This is supporting operational evidence, not a normative specification. Forgotten Engine will make intervals explicit in seconds, validate nonzero values, persist the necessary runtime state for reconnect safety, and expose the result in its capability matrix.
 
+## Observed progression requirement behavior
+
+The public TFS vocation implementation exposes a seven-entry skill base table and computes a required skill-try count from the selected skill base multiplied by the configured vocation multiplier raised to the target-level offset. It also exposes required magic mana from a base of 1,600 multiplied by the configured magic multiplier raised to the target magic-level offset.[3] Forgotten Engine treats this as **behavioral research**, not reusable implementation text: the Rust core stores exact tries and spent mana separately from visible percentage fields, takes validated fixed-point rules as input, uses saturating deterministic calculations, and performs no automatic weapon-hit, spell-cast, offline-training, or Lua gain event.
+
+> FE must not describe the resulting progression behavior as profile-compatible until its requirements, rounded percentage updates, persistence transitions, and client refreshes have been validated against the operator’s selected profile and content configuration.
+
 ## Scope boundary for this milestone
 
 The initial implementation will cover typed skills, typed vocation configuration, persistence/migration, and profile-gated stat delivery. It will **not** claim formula combat, weapons runtime, spells, conditions, death/respawn, or full Lua event behavior. Those remain separate future milestones and must remain reported as deferred until verified.
@@ -25,3 +31,4 @@ The initial implementation will cover typed skills, typed vocation configuration
 
 [1]: https://github.com/otland/forgottenserver/blob/master/data/XML/vocations.xml "The Forgotten Server: vocation configuration"
 [2]: https://otland.net/threads/tfs-1-2-vocations-xml-fast-regeneration.243428/ "OTLand discussion: TFS 1.2 vocation regeneration configuration"
+[3]: https://raw.githubusercontent.com/otland/forgottenserver/master/src/vocation.cpp "The Forgotten Server: public vocation progression requirement behavior"

@@ -1,5 +1,7 @@
 use super::{ConfigError, EngineConfig};
-use forgotten_core::{PlayerSkill, VocationId};
+use forgotten_core::{
+    CoreError, PlayerProgressionRules, PlayerSkill, ProgressionMultiplier, VocationId,
+};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 use std::collections::BTreeMap;
@@ -45,6 +47,25 @@ pub struct TfsVocationDefinition {
     pub soul_regeneration: VocationRegeneration,
     pub magic_level_multiplier: VocationMultiplier,
     pub skill_multipliers: [VocationMultiplier; 7],
+}
+
+impl TfsVocationDefinition {
+    /// Converts already-validated operator-owned vocation multipliers into the core's deterministic
+    /// fixed-point progression inputs. Gameplay gain events and profile-parity claims remain
+    /// outside this configuration adapter.
+    pub fn progression_rules(&self) -> Result<PlayerProgressionRules, CoreError> {
+        let mut skill_multipliers = [ProgressionMultiplier::new(1_000)?; 7];
+        for skill in PlayerSkill::ALL {
+            skill_multipliers[skill.code() as usize] =
+                ProgressionMultiplier::new(self.skill_multipliers[skill.code() as usize].milli())?;
+        }
+        Ok(PlayerProgressionRules {
+            magic_level_multiplier: ProgressionMultiplier::new(
+                self.magic_level_multiplier.milli(),
+            )?,
+            skill_multipliers,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -396,6 +417,12 @@ mod tests {
         );
         assert_eq!(
             knight.skill_multipliers[PlayerSkill::Distance.code() as usize].milli(),
+            1_400
+        );
+        let rules = knight.progression_rules().unwrap();
+        assert_eq!(rules.magic_level_multiplier.milli(), 3_000);
+        assert_eq!(
+            rules.skill_multipliers[PlayerSkill::Distance.code() as usize].milli(),
             1_400
         );
     }

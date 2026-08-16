@@ -465,7 +465,9 @@ fn run_host(
         };
         let companions = load_world_companions(&config, &world_map)?;
         let entity_catalog = load_tfs_entity_catalog(&config)?;
-        let regeneration_rules = load_tfs_vocation_registry(&config)?
+        let vocation_registry = load_tfs_vocation_registry(&config)?;
+        let regeneration_rules = vocation_registry
+            .as_ref()
             .map(|registry| {
                 registry
                     .iter()
@@ -484,6 +486,17 @@ fn run_host(
                             },
                         ))
                     })
+                    .collect::<Result<std::collections::BTreeMap<_, _>, forgotten_core::CoreError>>(
+                    )
+            })
+            .transpose()?
+            .map(Arc::new);
+        let progression_rules = vocation_registry
+            .as_ref()
+            .map(|registry| {
+                registry
+                    .iter()
+                    .map(|(id, definition)| Ok((*id, definition.progression_rules()?)))
                     .collect::<Result<std::collections::BTreeMap<_, _>, forgotten_core::CoreError>>(
                     )
             })
@@ -512,6 +525,7 @@ fn run_host(
             item_presentation_catalog: item_presentation_catalog.map(Arc::new),
             static_spawns: (!static_spawns.entities.is_empty()).then(|| Arc::new(static_spawns)),
             regeneration_rules,
+            progression_rules,
         })
     } else {
         None
