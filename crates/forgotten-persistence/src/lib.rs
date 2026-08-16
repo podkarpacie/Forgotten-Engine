@@ -5,11 +5,13 @@ use argon2::{
     Argon2,
 };
 use forgotten_core::{
-    EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerContainers, PlayerEquipment,
-    PlayerProgression, PlayerSkill, PlayerSkills, Position, SkillProgress, VocationId,
+    EquipmentSlot, ItemInstance, Player, PlayerCondition, PlayerConditionKind, PlayerContainer,
+    PlayerContainers, PlayerEquipment, PlayerProgression, PlayerSkill, PlayerSkills, Position,
+    SkillProgress, VocationId,
 };
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,7 +19,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const SCHEMA_VERSION_EQUIPMENT: i64 = 3;
 const SCHEMA_VERSION_CONTAINERS: i64 = 4;
 const SCHEMA_VERSION_PROGRESSION: i64 = 5;
-const LATEST_SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION_TOWNS: i64 = 6;
+const LATEST_SCHEMA_VERSION: i64 = 7;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct EngineDatabase {
@@ -289,6 +292,86 @@ impl EngineDatabase {
             return Err(PersistenceError::UnknownPlayer(player_id));
         }
         Ok(())
+    }
+
+    /// Replaces all active bounded conditions for one known player in a single transaction. The
+    /// core condition type already validates timing and damage; stored values are validated again
+    /// when loaded to defend against malformed database records.
+    pub fn replace_player_conditions(
+        &mut self,
+        player_id: u64,
+        conditions: &BTreeMap<PlayerConditionKind, PlayerCondition>,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM player_conditions WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        for condition in conditions.values() {
+            transaction.execute(
+                "INSERT INTO player_conditions (player_id, kind, interval_seconds, damage, remaining_seconds) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    player_id as i64,
+                    i64::from(condition.kind.code()),
+                    i64::from(condition.interval_seconds),
+                    i64::from(condition.damage),
+                    i64::from(condition.remaining_seconds),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Loads only validated active condition schedules. Progress within a damage interval is not
+    /// yet persisted, so reloads restart each persisted condition's interval countdown.
+    pub fn player_conditions(
+        &self,
+        player_id: u64,
+    ) -> Result<BTreeMap<PlayerConditionKind, PlayerCondition>, PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT kind, interval_seconds, damage, remaining_seconds FROM player_conditions WHERE player_id = ?1 ORDER BY kind",
+        )?;
+        let records = statement
+            .query_map(params![player_id as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut conditions = BTreeMap::new();
+        for (kind, interval_seconds, damage, remaining_seconds) in records {
+            let kind = u8::try_from(kind).map_err(|_| {
+                PersistenceError::InvalidConditionRecord("kind does not fit u8".into())
+            })?;
+            let kind = PlayerConditionKind::from_code(kind).ok_or_else(|| {
+                PersistenceError::InvalidConditionRecord(format!("unknown condition kind {kind}"))
+            })?;
+            let interval_seconds = u16::try_from(interval_seconds).map_err(|_| {
+                PersistenceError::InvalidConditionRecord("interval does not fit u16".into())
+            })?;
+            let damage = u16::try_from(damage).map_err(|_| {
+                PersistenceError::InvalidConditionRecord("damage does not fit u16".into())
+            })?;
+            let remaining_seconds = u16::try_from(remaining_seconds).map_err(|_| {
+                PersistenceError::InvalidConditionRecord(
+                    "remaining duration does not fit u16".into(),
+                )
+            })?;
+            let condition = PlayerCondition::new(kind, interval_seconds, damage, remaining_seconds)
+                .map_err(|error| PersistenceError::InvalidConditionRecord(error.to_string()))?;
+            if conditions.insert(kind, condition).is_some() {
+                return Err(PersistenceError::InvalidConditionRecord(
+                    "duplicate condition kind".into(),
+                ));
+            }
+        }
+        Ok(conditions)
     }
 
     /// Replaces a player's vocation identity and all typed skill values atomically. The caller
@@ -669,12 +752,21 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_PROGRESSION, unix_seconds()],
             )?;
         }
-        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+        if self.schema_version()? < SCHEMA_VERSION_TOWNS {
             if !self.player_column_exists("town_id")? {
                 self.connection.execute_batch(
                     "ALTER TABLE players ADD COLUMN town_id INTEGER NOT NULL DEFAULT 0",
                 )?;
             }
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_TOWNS, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS player_conditions (player_id INTEGER NOT NULL, kind INTEGER NOT NULL, interval_seconds INTEGER NOT NULL, damage INTEGER NOT NULL, remaining_seconds INTEGER NOT NULL, PRIMARY KEY (player_id, kind));",
+            )?;
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![LATEST_SCHEMA_VERSION, unix_seconds()],
@@ -864,6 +956,7 @@ pub enum PersistenceError {
     InvalidPlayerVitals,
     InvalidEquipmentRecord(String),
     InvalidContainerRecord(String),
+    InvalidConditionRecord(String),
     InvalidProgressionRecord(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
@@ -933,6 +1026,7 @@ mod tests {
         assert_eq!(character.progression, PlayerProgression::default());
         assert_eq!(character.town_id, 0);
         assert!(database.player_equipment(7).unwrap().is_empty());
+        assert!(database.player_conditions(7).unwrap().is_empty());
         let _ = fs::remove_file(path);
     }
 
@@ -953,6 +1047,59 @@ mod tests {
         );
         assert!(matches!(
             database.update_player_town(999, 1),
+            Err(PersistenceError::UnknownPlayer(999))
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_and_validates_player_conditions_transactionally() {
+        let path = temporary_path("conditions");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("admin", "hash").unwrap();
+        database
+            .save_player(&Player {
+                id: 7,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let poison = PlayerCondition::new(PlayerConditionKind::Poison, 2, 7, 10).unwrap();
+        let burning = PlayerCondition::new(PlayerConditionKind::Burning, 3, 4, 9).unwrap();
+        let conditions = BTreeMap::from([
+            (PlayerConditionKind::Poison, poison),
+            (PlayerConditionKind::Burning, burning),
+        ]);
+        database.replace_player_conditions(7, &conditions).unwrap();
+        assert_eq!(database.player_conditions(7).unwrap(), conditions);
+
+        database
+            .replace_player_conditions(7, &BTreeMap::new())
+            .unwrap();
+        assert!(database.player_conditions(7).unwrap().is_empty());
+
+        database
+            .connection
+            .execute(
+                "INSERT INTO player_conditions (player_id, kind, interval_seconds, damage, remaining_seconds) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![7_i64, 99_i64, 1_i64, 1_i64, 1_i64],
+            )
+            .unwrap();
+        assert!(matches!(
+            database.player_conditions(7),
+            Err(PersistenceError::InvalidConditionRecord(_))
+        ));
+        assert!(matches!(
+            database.player_conditions(999),
             Err(PersistenceError::UnknownPlayer(999))
         ));
         let _ = fs::remove_file(path);

@@ -4,10 +4,10 @@
 
 use forgotten_core::{
     CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, ItemInstance,
-    NativeItemPresentationCatalog, Player, PlayerContainers, PlayerEquipment,
-    PlayerInteractionIntent, PlayerProgression, PlayerRegenerationOutcome, PlayerRegenerationRules,
-    PlayerVitals, Position, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, VocationId,
-    WorldMap, WorldState,
+    NativeItemPresentationCatalog, Player, PlayerCondition, PlayerConditionKind, PlayerContainers,
+    PlayerEquipment, PlayerInteractionIntent, PlayerProgression, PlayerRegenerationOutcome,
+    PlayerRegenerationRules, PlayerVitals, Position, StaticCreatureDecisionBatch,
+    StaticCreatureDecisionPolicy, VocationId, WorldMap, WorldState,
 };
 use forgotten_persistence::{EngineDatabase, PlayerVitals as PersistedPlayerVitals};
 use forgotten_protocol::{
@@ -225,6 +225,17 @@ pub struct NativeOtClientEmptyWorldConfig {
     pub server_beat: u16,
 }
 
+/// Validated persisted player state admitted to the authoritative native world during session
+/// registration. It is a state-transfer payload only; neither client inventory nor condition
+/// effects are enabled by constructing it.
+#[derive(Debug, Clone)]
+pub struct NativePlayerHydration {
+    pub progression: PlayerProgression,
+    pub equipment: PlayerEquipment,
+    pub containers: PlayerContainers,
+    pub conditions: BTreeMap<PlayerConditionKind, PlayerCondition>,
+}
+
 /// One synchronized authoritative world for all native game sessions started by a host. It owns
 /// no automatic scheduler: callers advance ticks and apply creature policy explicitly.
 #[derive(Debug, Clone)]
@@ -362,6 +373,26 @@ impl SharedNativeWorld {
     ) -> Result<bool, HostError> {
         self.lock()?
             .replace_player_containers(player_id, containers)
+            .map_err(HostError::Core)
+    }
+
+    pub fn player_conditions(
+        &self,
+        player_id: u64,
+    ) -> Result<BTreeMap<PlayerConditionKind, PlayerCondition>, HostError> {
+        self.lock()?
+            .player_conditions(player_id)
+            .cloned()
+            .map_err(HostError::Core)
+    }
+
+    pub fn replace_player_conditions(
+        &self,
+        player_id: u64,
+        conditions: BTreeMap<PlayerConditionKind, PlayerCondition>,
+    ) -> Result<bool, HostError> {
+        self.lock()?
+            .replace_player_conditions(player_id, conditions)
             .map_err(HostError::Core)
     }
 
@@ -603,6 +634,27 @@ impl SharedNativeWorld {
         )?;
         self.replace_player_equipment(player_id, equipment)?;
         self.replace_player_containers(player_id, containers)?;
+        Ok(position)
+    }
+
+    pub fn register_player_at_available_position_with_vitals_equipment_containers_progression_and_conditions(
+        &self,
+        player: Player,
+        vitals: PlayerVitals,
+        hydration: NativePlayerHydration,
+        world_map: &WorldMap,
+    ) -> Result<Position, HostError> {
+        let player_id = player.id;
+        let position = self
+            .register_player_at_available_position_with_vitals_equipment_containers_and_progression(
+                player,
+                vitals,
+                hydration.progression,
+                hydration.equipment,
+                hydration.containers,
+                world_map,
+            )?;
+        self.replace_player_conditions(player_id, hydration.conditions)?;
         Ok(position)
     }
 
@@ -1288,9 +1340,12 @@ fn handle_native_otclient_game(
     let containers = database
         .player_containers(character.id)
         .map_err(HostError::Persistence)?;
+    let conditions = database
+        .player_conditions(character.id)
+        .map_err(HostError::Persistence)?;
     let bootstrap_equipment = equipment.clone();
     let initial_position = match shared_world
-        .register_player_at_available_position_with_vitals_equipment_containers_and_progression(
+        .register_player_at_available_position_with_vitals_equipment_containers_progression_and_conditions(
             Player {
                 id: character.id,
                 account_id,
@@ -1308,9 +1363,12 @@ fn handle_native_otclient_game(
                 capacity: character.vitals.capacity,
                 magic_level: character.vitals.magic_level,
             },
-            character.progression,
-            equipment,
-            containers,
+            NativePlayerHydration {
+                progression: character.progression,
+                equipment,
+                containers,
+                conditions,
+            },
             world_map,
         ) {
         Ok(position) => position,
@@ -3187,6 +3245,36 @@ mod tests {
         assert!(shared.replace_player_progression(103, changed).unwrap());
         assert_eq!(shared.progression_epoch(), 1);
         assert_eq!(shared.player_progression(103).unwrap(), changed);
+    }
+
+    #[test]
+    fn shared_native_registration_hydrates_conditions_without_client_effect_delivery() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        let poison = PlayerCondition::new(PlayerConditionKind::Poison, 2, 7, 10).unwrap();
+        let conditions = BTreeMap::from([(PlayerConditionKind::Poison, poison)]);
+        shared
+            .register_player_at_available_position_with_vitals_equipment_containers_progression_and_conditions(
+                Player {
+                    id: 104,
+                    account_id: 1,
+                    name: "Sorcerer".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                PlayerVitals::default(),
+                NativePlayerHydration {
+                    progression: PlayerProgression::default(),
+                    equipment: PlayerEquipment::default(),
+                    containers: PlayerContainers::default(),
+                    conditions: conditions.clone(),
+                },
+                &map,
+            )
+            .unwrap();
+        assert_eq!(shared.player_conditions(104).unwrap(), conditions);
     }
 
     #[test]

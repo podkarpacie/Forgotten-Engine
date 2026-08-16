@@ -786,6 +786,25 @@ pub enum PlayerConditionKind {
     Energy,
 }
 
+impl PlayerConditionKind {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Poison => 0,
+            Self::Burning => 1,
+            Self::Energy => 2,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Poison),
+            1 => Some(Self::Burning),
+            2 => Some(Self::Energy),
+            _ => None,
+        }
+    }
+}
+
 /// A single validated condition schedule. The condition is stored by kind, so applying the same
 /// kind replaces its timing/damage record instead of creating an unbounded stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1810,6 +1829,24 @@ impl WorldState {
         self.player_conditions
             .get(&player_id)
             .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
+    /// Replaces a known player's complete bounded condition set. Persistence and client effects
+    /// remain separate layers, but native-session hydration can use this atomic state transfer.
+    pub fn replace_player_conditions(
+        &mut self,
+        player_id: u64,
+        conditions: BTreeMap<PlayerConditionKind, PlayerCondition>,
+    ) -> Result<bool, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        if self.player_conditions(player_id)? == &conditions {
+            return Ok(false);
+        }
+        self.player_conditions.insert(player_id, conditions);
+        self.mark_changed();
+        Ok(true)
     }
 
     /// Applies or replaces a single condition kind. Replacing a condition never creates an
