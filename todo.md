@@ -222,4 +222,9 @@
 - [x] Define a repeatable validation matrix for each currently implemented FE 7.4 behavior, separating automated assertions from required unmodified-OTClientV8 manual checks.
 - [x] Add a bounded local validation harness for the supported CLI, SQLite migration, configuration, world import, and native protocol smoke-test paths; do not claim production coverage for deferred gameplay systems.
 - [x] Document production-release blockers and evidence requirements for a future production-readiness decision.
+- [ ] Define weighted, evidence-based FE 7.4 completion categories so “more than 50% complete” means implemented, tested runtime scope rather than an unsupported claim.
+- [ ] Complete the next bounded FE 7.4 progression slice by applying configured experience rates and stages to authoritative experience awards.
+- [ ] Complete the next bounded FE 7.4 melee progression slice by awarding configured vocation-based skill tries without claiming weapon or spell formula support.
+- [ ] Continue FE 7.4 world-interaction, content-runtime, social, and operational milestones with regression coverage and explicit capability reporting until the documented completion model exceeds 50%.
+- [x] Build, package, checksum, and publish fresh Linux and Windows artifacts from the latest verified Forgotten Engine commit for manual testing.
 - [ ] Establish and satisfy production-readiness gates for complete declared TFS feature conformance, profile-specific protocol validation, reliability, bounded memory/performance, security, and reproducible TFS-to-FE migration before describing any profile as mainstream-ready.
