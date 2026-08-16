@@ -767,6 +767,59 @@ pub struct PlayerRegenerationOutcome {
     pub vitals: PlayerVitals,
 }
 
+pub const MAX_CONDITION_DURATION_SECONDS: u16 = 60 * 60;
+
+/// Bounded damage-over-time condition families. Their visual effects, immunity rules, Lua hooks,
+/// and death policy remain separate protocol and scripting concerns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlayerConditionKind {
+    Poison,
+    Burning,
+    Energy,
+}
+
+/// A single validated condition schedule. The condition is stored by kind, so applying the same
+/// kind replaces its timing/damage record instead of creating an unbounded stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerCondition {
+    pub kind: PlayerConditionKind,
+    pub interval_seconds: u16,
+    pub damage: u16,
+    pub remaining_seconds: u16,
+    elapsed_seconds: u16,
+}
+
+impl PlayerCondition {
+    pub fn new(
+        kind: PlayerConditionKind,
+        interval_seconds: u16,
+        damage: u16,
+        remaining_seconds: u16,
+    ) -> Result<Self, CoreError> {
+        if interval_seconds == 0 || damage == 0 || remaining_seconds == 0 {
+            return Err(CoreError::InvalidPlayerCondition);
+        }
+        if remaining_seconds > MAX_CONDITION_DURATION_SECONDS {
+            return Err(CoreError::InvalidPlayerCondition);
+        }
+        Ok(Self {
+            kind,
+            interval_seconds,
+            damage,
+            remaining_seconds,
+            elapsed_seconds: 0,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerConditionOutcome {
+    pub player_id: u64,
+    pub applied_damage: u16,
+    pub remaining_health: u16,
+    pub expired_conditions: u8,
+}
+
 pub const MAX_ITEM_STACK_COUNT: u16 = 100;
 
 /// A bounded runtime instance of an operator-supplied item type. Map placement metadata remains
@@ -1089,6 +1142,7 @@ pub struct WorldState {
     player_vitals: BTreeMap<u64, PlayerVitals>,
     player_progressions: BTreeMap<u64, PlayerProgression>,
     player_regeneration_schedules: BTreeMap<u64, PlayerRegenerationSchedule>,
+    player_conditions: BTreeMap<u64, BTreeMap<PlayerConditionKind, PlayerCondition>>,
     player_equipments: BTreeMap<u64, PlayerEquipment>,
     player_containers: BTreeMap<u64, PlayerContainers>,
     player_interactions: BTreeMap<u64, PlayerInteractionIntent>,
@@ -1157,6 +1211,7 @@ impl WorldState {
         self.player_progressions.insert(player.id, progression);
         self.player_regeneration_schedules
             .insert(player.id, PlayerRegenerationSchedule::default());
+        self.player_conditions.insert(player.id, BTreeMap::new());
         self.player_equipments
             .insert(player.id, PlayerEquipment::default());
         self.player_containers
@@ -1174,6 +1229,7 @@ impl WorldState {
         self.player_vitals.remove(&id);
         self.player_progressions.remove(&id);
         self.player_regeneration_schedules.remove(&id);
+        self.player_conditions.remove(&id);
         self.player_equipments.remove(&id);
         self.player_containers.remove(&id);
         self.player_interactions.remove(&id);
@@ -1659,6 +1715,95 @@ impl WorldState {
         })
     }
 
+    pub fn player_conditions(
+        &self,
+        player_id: u64,
+    ) -> Result<&BTreeMap<PlayerConditionKind, PlayerCondition>, CoreError> {
+        self.player_conditions
+            .get(&player_id)
+            .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
+    /// Applies or replaces a single condition kind. Replacing a condition never creates an
+    /// unbounded stack and is observable through the authoritative world revision.
+    pub fn apply_player_condition(
+        &mut self,
+        player_id: u64,
+        condition: PlayerCondition,
+    ) -> Result<bool, CoreError> {
+        let conditions = self
+            .player_conditions
+            .get_mut(&player_id)
+            .ok_or(CoreError::UnknownPlayer(player_id))?;
+        if conditions.get(&condition.kind) == Some(&condition) {
+            return Ok(false);
+        }
+        conditions.insert(condition.kind, condition);
+        self.mark_changed();
+        Ok(true)
+    }
+
+    /// Advances condition schedules by bounded elapsed time. Damage is capped by current health;
+    /// zero health is represented in the outcome but death/respawn policy remains deferred.
+    pub fn apply_player_conditions(
+        &mut self,
+        player_id: u64,
+        elapsed_seconds: u16,
+    ) -> Result<PlayerConditionOutcome, CoreError> {
+        let current_vitals = self.player_vitals(player_id)?;
+        let elapsed_seconds = elapsed_seconds.min(MAX_REGENERATION_ELAPSED_SECONDS);
+        let conditions = self
+            .player_conditions
+            .get_mut(&player_id)
+            .ok_or(CoreError::UnknownPlayer(player_id))?;
+        if elapsed_seconds == 0 || conditions.is_empty() {
+            return Ok(PlayerConditionOutcome {
+                player_id,
+                applied_damage: 0,
+                remaining_health: current_vitals.health,
+                expired_conditions: 0,
+            });
+        }
+        let mut requested_damage = 0_u32;
+        let mut expired = Vec::new();
+        for (kind, condition) in conditions.iter_mut() {
+            let active_seconds = elapsed_seconds.min(condition.remaining_seconds);
+            let total = condition.elapsed_seconds.saturating_add(active_seconds);
+            let events = total / condition.interval_seconds;
+            condition.elapsed_seconds = total % condition.interval_seconds;
+            condition.remaining_seconds =
+                condition.remaining_seconds.saturating_sub(active_seconds);
+            requested_damage = requested_damage
+                .saturating_add(u32::from(events).saturating_mul(u32::from(condition.damage)));
+            if condition.remaining_seconds == 0 {
+                expired.push(*kind);
+            }
+        }
+        for kind in &expired {
+            conditions.remove(kind);
+        }
+        let applied_damage = requested_damage.min(u32::from(current_vitals.health)) as u16;
+        let remaining_health = current_vitals.health.saturating_sub(applied_damage);
+        if applied_damage > 0 {
+            self.player_vitals.insert(
+                player_id,
+                PlayerVitals {
+                    health: remaining_health,
+                    ..current_vitals
+                },
+            );
+        }
+        if applied_damage > 0 || !expired.is_empty() {
+            self.mark_changed();
+        }
+        Ok(PlayerConditionOutcome {
+            player_id,
+            applied_damage,
+            remaining_health,
+            expired_conditions: expired.len().min(usize::from(u8::MAX)) as u8,
+        })
+    }
+
     /// Replaces player vocation and all typed skills atomically in the authoritative world. No-op
     /// replacements do not advance the world revision, matching vitals/equipment semantics.
     pub fn replace_player_progression(
@@ -1894,6 +2039,7 @@ pub enum CoreError {
         percent: u8,
     },
     InvalidRegenerationInterval,
+    InvalidPlayerCondition,
     CombatOutOfRange {
         attacker_id: u64,
         target_id: u64,
@@ -2980,6 +3126,52 @@ mod tests {
         world.remove_player(7).unwrap();
         assert_eq!(
             world.apply_player_regeneration(7, rules, 1),
+            Err(CoreError::UnknownPlayer(7))
+        );
+    }
+
+    #[test]
+    fn authoritative_conditions_are_bounded_replacing_and_expire_cleanly() {
+        assert_eq!(
+            PlayerCondition::new(PlayerConditionKind::Poison, 0, 1, 1),
+            Err(CoreError::InvalidPlayerCondition)
+        );
+        assert_eq!(
+            PlayerCondition::new(PlayerConditionKind::Poison, 1, 0, 1),
+            Err(CoreError::InvalidPlayerCondition)
+        );
+        let poison = PlayerCondition::new(PlayerConditionKind::Poison, 2, 7, 5).unwrap();
+        let burning = PlayerCondition::new(PlayerConditionKind::Burning, 3, 4, 3).unwrap();
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        world
+            .update_player_vitals(
+                7,
+                PlayerVitals {
+                    health: 18,
+                    max_health: 150,
+                    mana: 50,
+                    max_mana: 50,
+                    capacity: 40_000,
+                    magic_level: 0,
+                },
+            )
+            .unwrap();
+        assert!(world.apply_player_condition(7, poison).unwrap());
+        assert!(!world.apply_player_condition(7, poison).unwrap());
+        assert!(world.apply_player_condition(7, burning).unwrap());
+        let first = world.apply_player_conditions(7, 2).unwrap();
+        assert_eq!(first.applied_damage, 7);
+        assert_eq!(first.remaining_health, 11);
+        assert_eq!(first.expired_conditions, 0);
+        let final_tick = world.apply_player_conditions(7, 3).unwrap();
+        assert_eq!(final_tick.applied_damage, 11);
+        assert_eq!(final_tick.remaining_health, 0);
+        assert_eq!(final_tick.expired_conditions, 2);
+        assert!(world.player_conditions(7).unwrap().is_empty());
+        world.remove_player(7).unwrap();
+        assert_eq!(
+            world.apply_player_conditions(7, 1),
             Err(CoreError::UnknownPlayer(7))
         );
     }

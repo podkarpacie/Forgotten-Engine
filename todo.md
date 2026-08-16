@@ -200,6 +200,7 @@
 - [x] Load and validate operator-owned TFS-style `data/XML/vocations.xml` rules, including promoted/custom vocation entries and bounded gain/multiplier settings, without activating gameplay runtime behavior.
 - [ ] Implement formula-based skill tries, magic-level advancement, level progression, and configured vocation multipliers without claiming TFS behavior before profile-specific evidence.
 - [x] Add elapsed-time-safe online health/mana regeneration using validated vocation rules, bounded catch-up, persisted vitals, and native 740 HUD refreshes; soul remains deferred.
+- [x] Add a bounded authoritative core scheduler for replacement-by-kind poison, burning, and energy damage-over-time conditions with capped damage, expiry cleanup, and lifecycle cleanup; persistence, client effects, and death policy remain deferred.
 - [ ] Add bounded condition state and profile-gated poison, burning, and energy-damage scheduling.
 - [ ] Add death, respawn, temple selection, loss policy, and client-state delivery foundations.
 - [ ] Establish and satisfy production-readiness gates for complete declared TFS feature conformance, profile-specific protocol validation, reliability, bounded memory/performance, security, and reproducible TFS-to-FE migration before describing any profile as mainstream-ready.
