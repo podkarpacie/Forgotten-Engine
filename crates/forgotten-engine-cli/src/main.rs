@@ -5,8 +5,8 @@ use forgotten_config::{
     resolve_tfs_spawn_references, validate_content, world_map_path, write_template,
 };
 use forgotten_core::{
-    EquipmentSlot, ItemInstance, PlayerContainer, PlayerSkill, SkillProgress, VocationId,
-    WorldMapSource,
+    EquipmentSlot, ItemInstance, PlayerContainer, PlayerRegenerationRules, PlayerSkill,
+    RegenerationRule, SkillProgress, VocationId, WorldMapSource,
 };
 use forgotten_host::{
     start, start_game_session, start_native_otclient_game, start_native_otclient_login,
@@ -465,6 +465,30 @@ fn run_host(
         };
         let companions = load_world_companions(&config, &world_map)?;
         let entity_catalog = load_tfs_entity_catalog(&config)?;
+        let regeneration_rules = load_tfs_vocation_registry(&config)?
+            .map(|registry| {
+                registry
+                    .iter()
+                    .map(|(id, definition)| {
+                        Ok((
+                            *id,
+                            PlayerRegenerationRules {
+                                health: RegenerationRule::new(
+                                    definition.health_regeneration.interval_seconds,
+                                    definition.health_regeneration.amount,
+                                )?,
+                                mana: RegenerationRule::new(
+                                    definition.mana_regeneration.interval_seconds,
+                                    definition.mana_regeneration.amount,
+                                )?,
+                            },
+                        ))
+                    })
+                    .collect::<Result<std::collections::BTreeMap<_, _>, forgotten_core::CoreError>>(
+                    )
+            })
+            .transpose()?
+            .map(Arc::new);
         let static_spawns = materialize_tfs_static_spawns(&companions, &entity_catalog)?;
         if !static_spawns.entities.is_empty() {
             println!(
@@ -487,6 +511,7 @@ fn run_host(
             world_map: Some(Arc::clone(&world_map)),
             item_presentation_catalog: item_presentation_catalog.map(Arc::new),
             static_spawns: (!static_spawns.entities.is_empty()).then(|| Arc::new(static_spawns)),
+            regeneration_rules,
         })
     } else {
         None

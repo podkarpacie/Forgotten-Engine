@@ -5,10 +5,11 @@
 use forgotten_core::{
     CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, ItemInstance,
     NativeItemPresentationCatalog, Player, PlayerContainers, PlayerEquipment,
-    PlayerInteractionIntent, PlayerProgression, PlayerVitals, Position,
-    StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, WorldMap, WorldState,
+    PlayerInteractionIntent, PlayerProgression, PlayerRegenerationOutcome, PlayerRegenerationRules,
+    PlayerVitals, Position, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, VocationId,
+    WorldMap, WorldState,
 };
-use forgotten_persistence::EngineDatabase;
+use forgotten_persistence::{EngineDatabase, PlayerVitals as PersistedPlayerVitals};
 use forgotten_protocol::{
     decode, decode_fe_otclient_capability_ack, decode_fe_otclient_move_request,
     decode_legacy_74_envelope, decode_legacy_74_game_session_bootstrap_plaintext,
@@ -211,6 +212,9 @@ pub struct NativeOtClientHostConfig {
     /// Immutable display-only TFS spawn entities. No AI, combat, movement, or Lua behavior is
     /// attached at this host boundary.
     pub static_spawns: Option<Arc<FeTfsStaticSpawnCollection>>,
+    /// Optional validated vocation recovery rules. Without this catalog automatic recovery is
+    /// disabled; soul, conditions, death, and scripted lifecycle hooks remain deferred.
+    pub regeneration_rules: Option<Arc<BTreeMap<VocationId, PlayerRegenerationRules>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -309,6 +313,22 @@ impl SharedNativeWorld {
             self.progression_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok(changed)
+    }
+
+    pub fn apply_player_regeneration(
+        &self,
+        player_id: u64,
+        rules: PlayerRegenerationRules,
+        elapsed_seconds: u16,
+    ) -> Result<PlayerRegenerationOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .apply_player_regeneration(player_id, rules, elapsed_seconds)
+            .map_err(HostError::Core)?;
+        if outcome.health_gained > 0 || outcome.mana_gained > 0 {
+            self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(outcome)
     }
 
     pub fn player_equipment(&self, player_id: u64) -> Result<PlayerEquipment, HostError> {
@@ -1378,6 +1398,7 @@ fn handle_native_otclient_game(
     let mut facing = NativeOtClientCardinalDirection::South;
     let mut player_outfit = NativeOtClientClassicOutfit::from_snapshot(&snapshot);
     let mut active_click_walk: Option<NativeActiveClickWalk> = None;
+    let mut last_regeneration_tick = Instant::now();
     let mut observed_visibility_epoch = shared_world.visibility_epoch();
     let mut observed_vitals_epoch = shared_world.vitals_epoch();
     let mut observed_progression_epoch = shared_world.progression_epoch();
@@ -1415,6 +1436,48 @@ fn handle_native_otclient_game(
                         config.extended_diagnostics,
                         peer,
                     )?;
+                    if let Some(rules_by_vocation) = config.regeneration_rules.as_deref() {
+                        let now = Instant::now();
+                        let elapsed_seconds =
+                            now.saturating_duration_since(last_regeneration_tick)
+                                .as_secs()
+                                .min(u64::from(u16::MAX)) as u16;
+                        if elapsed_seconds > 0 {
+                            last_regeneration_tick +=
+                                Duration::from_secs(u64::from(elapsed_seconds));
+                            let vocation = shared_world.player_progression(character.id)?.vocation;
+                            if let Some(rules) = rules_by_vocation.get(&vocation).copied() {
+                                let outcome = shared_world.apply_player_regeneration(
+                                    character.id,
+                                    rules,
+                                    elapsed_seconds,
+                                )?;
+                                if outcome.health_gained > 0 || outcome.mana_gained > 0 {
+                                    database.update_player_vitals(
+                                        character.id,
+                                        PersistedPlayerVitals {
+                                            health: outcome.vitals.health,
+                                            max_health: outcome.vitals.max_health,
+                                            mana: outcome.vitals.mana,
+                                            max_mana: outcome.vitals.max_mana,
+                                            capacity: outcome.vitals.capacity,
+                                            magic_level: outcome.vitals.magic_level,
+                                        },
+                                    )?;
+                                    native_diagnostic(
+                                        config.extended_diagnostics,
+                                        peer,
+                                        &format!(
+                                            "lifecycle=regeneration vocation={} health-gained={} mana-gained={}",
+                                            vocation.value(),
+                                            outcome.health_gained,
+                                            outcome.mana_gained
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     if let Some((target_native_id, target_vitals, outcome)) =
                         apply_native_selected_player_melee(&database, shared_world, character.id)?
                     {
@@ -2846,6 +2909,7 @@ mod tests {
             world_map: None,
             item_presentation_catalog: None,
             static_spawns: None,
+            regeneration_rules: None,
         }
     }
 
@@ -3123,6 +3187,47 @@ mod tests {
         assert!(shared.replace_player_progression(103, changed).unwrap());
         assert_eq!(shared.progression_epoch(), 1);
         assert_eq!(shared.player_progression(103).unwrap(), changed);
+    }
+
+    #[test]
+    fn shared_native_regeneration_updates_vitals_epoch_only_on_recovery() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position_with_vitals(
+                Player {
+                    id: 104,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                PlayerVitals {
+                    health: 140,
+                    max_health: 150,
+                    mana: 45,
+                    max_mana: 50,
+                    capacity: 40_000,
+                    magic_level: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let rules = PlayerRegenerationRules {
+            health: forgotten_core::RegenerationRule::new(3, 5).unwrap(),
+            mana: forgotten_core::RegenerationRule::new(2, 4).unwrap(),
+        };
+        assert_eq!(shared.vitals_epoch(), 0);
+        let unchanged = shared.apply_player_regeneration(104, rules, 1).unwrap();
+        assert_eq!(unchanged.health_gained, 0);
+        assert_eq!(shared.vitals_epoch(), 0);
+        let recovered = shared.apply_player_regeneration(104, rules, 2).unwrap();
+        assert_eq!(recovered.health_gained, 5);
+        assert_eq!(recovered.mana_gained, 4);
+        assert_eq!(shared.vitals_epoch(), 1);
+        assert_eq!(shared.player_vitals(104).unwrap(), recovered.vitals);
     }
 
     #[test]

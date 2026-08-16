@@ -720,6 +720,53 @@ pub struct PlayerProgression {
     pub skills: PlayerSkills,
 }
 
+pub const MAX_REGENERATION_ELAPSED_SECONDS: u16 = 60;
+
+/// One bounded player-resource regeneration rule. Intervals are expressed in wall-clock seconds
+/// by the host boundary; the core never assumes that a network heartbeat is itself a second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegenerationRule {
+    pub interval_seconds: u16,
+    pub amount: u16,
+}
+
+impl RegenerationRule {
+    pub fn new(interval_seconds: u16, amount: u16) -> Result<Self, CoreError> {
+        if interval_seconds == 0 {
+            return Err(CoreError::InvalidRegenerationInterval);
+        }
+        Ok(Self {
+            interval_seconds,
+            amount,
+        })
+    }
+}
+
+/// A player's health and mana recovery rules. Soul recovery is intentionally deferred because
+/// current persisted vitals do not yet own soul state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerRegenerationRules {
+    pub health: RegenerationRule,
+    pub mana: RegenerationRule,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PlayerRegenerationSchedule {
+    health_elapsed_seconds: u16,
+    mana_elapsed_seconds: u16,
+}
+
+/// The observable result of a bounded regeneration application. An elapsed period can advance
+/// schedule state without restoring a full resource, so only positive gains trigger world/vital
+/// updates at the host boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerRegenerationOutcome {
+    pub player_id: u64,
+    pub health_gained: u16,
+    pub mana_gained: u16,
+    pub vitals: PlayerVitals,
+}
+
 pub const MAX_ITEM_STACK_COUNT: u16 = 100;
 
 /// A bounded runtime instance of an operator-supplied item type. Map placement metadata remains
@@ -1041,6 +1088,7 @@ pub struct WorldState {
     players: BTreeMap<u64, Player>,
     player_vitals: BTreeMap<u64, PlayerVitals>,
     player_progressions: BTreeMap<u64, PlayerProgression>,
+    player_regeneration_schedules: BTreeMap<u64, PlayerRegenerationSchedule>,
     player_equipments: BTreeMap<u64, PlayerEquipment>,
     player_containers: BTreeMap<u64, PlayerContainers>,
     player_interactions: BTreeMap<u64, PlayerInteractionIntent>,
@@ -1107,6 +1155,8 @@ impl WorldState {
         }
         self.player_vitals.insert(player.id, vitals);
         self.player_progressions.insert(player.id, progression);
+        self.player_regeneration_schedules
+            .insert(player.id, PlayerRegenerationSchedule::default());
         self.player_equipments
             .insert(player.id, PlayerEquipment::default());
         self.player_containers
@@ -1123,6 +1173,7 @@ impl WorldState {
             .ok_or(CoreError::UnknownPlayer(id))?;
         self.player_vitals.remove(&id);
         self.player_progressions.remove(&id);
+        self.player_regeneration_schedules.remove(&id);
         self.player_equipments.remove(&id);
         self.player_containers.remove(&id);
         self.player_interactions.remove(&id);
@@ -1546,6 +1597,68 @@ impl WorldState {
         Ok(())
     }
 
+    /// Applies a bounded elapsed period to one player's configured health/mana schedules. The
+    /// caller owns wall-clock measurement; this method admits only a capped duration and mutates
+    /// authoritative vitals when a configured recovery event produces a positive gain.
+    pub fn apply_player_regeneration(
+        &mut self,
+        player_id: u64,
+        rules: PlayerRegenerationRules,
+        elapsed_seconds: u16,
+    ) -> Result<PlayerRegenerationOutcome, CoreError> {
+        let current_vitals = self.player_vitals(player_id)?;
+        if elapsed_seconds == 0 {
+            return Ok(PlayerRegenerationOutcome {
+                player_id,
+                health_gained: 0,
+                mana_gained: 0,
+                vitals: current_vitals,
+            });
+        }
+        let elapsed_seconds = elapsed_seconds.min(MAX_REGENERATION_ELAPSED_SECONDS);
+        let schedule = self
+            .player_regeneration_schedules
+            .get_mut(&player_id)
+            .ok_or(CoreError::UnknownPlayer(player_id))?;
+        let health_events = advance_regeneration_schedule(
+            &mut schedule.health_elapsed_seconds,
+            rules.health.interval_seconds,
+            elapsed_seconds,
+        );
+        let mana_events = advance_regeneration_schedule(
+            &mut schedule.mana_elapsed_seconds,
+            rules.mana.interval_seconds,
+            elapsed_seconds,
+        );
+        let health_gained = regeneration_gain(
+            current_vitals.health,
+            current_vitals.max_health,
+            rules.health.amount,
+            health_events,
+        );
+        let mana_gained = regeneration_gain(
+            current_vitals.mana,
+            current_vitals.max_mana,
+            rules.mana.amount,
+            mana_events,
+        );
+        let vitals = PlayerVitals {
+            health: current_vitals.health.saturating_add(health_gained),
+            mana: current_vitals.mana.saturating_add(mana_gained),
+            ..current_vitals
+        };
+        if health_gained > 0 || mana_gained > 0 {
+            self.player_vitals.insert(player_id, vitals);
+            self.mark_changed();
+        }
+        Ok(PlayerRegenerationOutcome {
+            player_id,
+            health_gained,
+            mana_gained,
+            vitals,
+        })
+    }
+
     /// Replaces player vocation and all typed skills atomically in the authoritative world. No-op
     /// replacements do not advance the world revision, matching vitals/equipment semantics.
     pub fn replace_player_progression(
@@ -1719,6 +1832,21 @@ pub fn level_for_experience(experience: u64) -> u32 {
     1 + (((experience / 100) as f64).sqrt() as u32)
 }
 
+fn advance_regeneration_schedule(elapsed: &mut u16, interval: u16, delta: u16) -> u16 {
+    let total = elapsed.saturating_add(delta);
+    let events = total / interval;
+    *elapsed = total % interval;
+    events
+}
+
+fn regeneration_gain(current: u16, maximum: u16, amount: u16, events: u16) -> u16 {
+    let requested = u32::from(amount).saturating_mul(u32::from(events));
+    current
+        .saturating_add(requested.min(u32::from(u16::MAX)) as u16)
+        .min(maximum)
+        .saturating_sub(current)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CoreError {
     DuplicatePlayer(u64),
@@ -1765,6 +1893,7 @@ pub enum CoreError {
         level: u16,
         percent: u8,
     },
+    InvalidRegenerationInterval,
     CombatOutOfRange {
         attacker_id: u64,
         target_id: u64,
@@ -2798,6 +2927,59 @@ mod tests {
         world.remove_player(7).unwrap();
         assert_eq!(
             world.player_progression(7),
+            Err(CoreError::UnknownPlayer(7))
+        );
+    }
+
+    #[test]
+    fn authoritative_regeneration_is_interval_bound_capped_and_cleanup_safe() {
+        assert_eq!(
+            RegenerationRule::new(0, 1),
+            Err(CoreError::InvalidRegenerationInterval)
+        );
+        let rules = PlayerRegenerationRules {
+            health: RegenerationRule::new(3, 5).unwrap(),
+            mana: RegenerationRule::new(2, 4).unwrap(),
+        };
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        world
+            .update_player_vitals(
+                7,
+                PlayerVitals {
+                    health: 140,
+                    max_health: 150,
+                    mana: 45,
+                    max_mana: 50,
+                    capacity: 40_000,
+                    magic_level: 0,
+                },
+            )
+            .unwrap();
+        let revision = world.revision();
+        assert_eq!(
+            world.apply_player_regeneration(7, rules, 1).unwrap(),
+            PlayerRegenerationOutcome {
+                player_id: 7,
+                health_gained: 0,
+                mana_gained: 0,
+                vitals: world.player_vitals(7).unwrap(),
+            }
+        );
+        assert_eq!(world.revision(), revision);
+        let outcome = world.apply_player_regeneration(7, rules, 2).unwrap();
+        assert_eq!(outcome.health_gained, 5);
+        assert_eq!(outcome.mana_gained, 4);
+        assert_eq!(outcome.vitals.health, 145);
+        assert_eq!(outcome.vitals.mana, 49);
+        let capped = world
+            .apply_player_regeneration(7, rules, MAX_REGENERATION_ELAPSED_SECONDS)
+            .unwrap();
+        assert_eq!(capped.vitals.health, 150);
+        assert_eq!(capped.vitals.mana, 50);
+        world.remove_player(7).unwrap();
+        assert_eq!(
+            world.apply_player_regeneration(7, rules, 1),
             Err(CoreError::UnknownPlayer(7))
         );
     }
