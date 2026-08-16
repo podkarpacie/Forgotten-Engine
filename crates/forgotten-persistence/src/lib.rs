@@ -6,8 +6,8 @@ use argon2::{
 };
 use forgotten_core::{
     EquipmentSlot, ItemInstance, Player, PlayerCondition, PlayerConditionKind, PlayerContainer,
-    PlayerContainers, PlayerEquipment, PlayerProgression, PlayerProgressionAttempts, PlayerSkill,
-    PlayerSkills, Position, SkillProgress, VocationId,
+    PlayerContainers, PlayerEquipment, PlayerProgression, PlayerProgressionAttempts,
+    PlayerRespawnState, PlayerSkill, PlayerSkills, Position, SkillProgress, VocationId,
 };
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -21,7 +21,8 @@ const SCHEMA_VERSION_CONTAINERS: i64 = 4;
 const SCHEMA_VERSION_PROGRESSION: i64 = 5;
 const SCHEMA_VERSION_TOWNS: i64 = 6;
 const SCHEMA_VERSION_CONDITIONS: i64 = 7;
-const LATEST_SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION_PROGRESSION_ATTEMPTS: i64 = 8;
+const LATEST_SCHEMA_VERSION: i64 = 9;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct EngineDatabase {
@@ -178,12 +179,14 @@ impl EngineDatabase {
                         z: row.get::<_, i64>(13)? as u8,
                     },
                     town_id: row.get::<_, i64>(14)? as u32,
+                    respawn_state: PlayerRespawnState::default(),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         for character in &mut characters {
             character.progression = self.player_progression(character.id)?;
             character.progression_attempts = self.player_progression_attempts(character.id)?;
+            character.respawn_state = self.player_respawn_state(character.id)?;
         }
         Ok(characters)
     }
@@ -285,6 +288,7 @@ impl EngineDatabase {
             vitals: PlayerVitals::default(),
             position,
             town_id: 0,
+            respawn_state: PlayerRespawnState::default(),
         })
     }
 
@@ -311,6 +315,64 @@ impl EngineDatabase {
         if affected == 0 {
             return Err(PersistenceError::UnknownPlayer(player_id));
         }
+        Ok(())
+    }
+
+    /// Commits authoritative vitals and lifecycle state together. The normal nonlethal vitals
+    /// path remains lightweight; this combined path is for death/respawn transitions where a
+    /// restart must not observe zero health without its matching persisted lifecycle record.
+    pub fn update_player_vitals_and_respawn_state(
+        &mut self,
+        player_id: u64,
+        vitals: PlayerVitals,
+        state: PlayerRespawnState,
+    ) -> Result<(), PersistenceError> {
+        if !vitals.is_valid() {
+            return Err(PersistenceError::InvalidPlayerVitals);
+        }
+        self.ensure_player_exists(player_id)?;
+        let lifecycle = if state == PlayerRespawnState::default() {
+            None
+        } else {
+            Some(lifecycle_state_fields(player_id, state)?)
+        };
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE players SET health = ?1, max_health = ?2, mana = ?3, max_mana = ?4, capacity = ?5, magic_level = ?6 WHERE id = ?7",
+            params![
+                i64::from(vitals.health),
+                i64::from(vitals.max_health),
+                i64::from(vitals.mana),
+                i64::from(vitals.max_mana),
+                i64::from(vitals.capacity),
+                i64::from(vitals.magic_level),
+                player_id as i64,
+            ],
+        )?;
+        if let Some((position, death_time)) = lifecycle {
+            let death_time = i64::try_from(death_time).map_err(|_| {
+                PersistenceError::InvalidLifecycleRecord(
+                    "death time does not fit SQLite integer".into(),
+                )
+            })?;
+            transaction.execute(
+                "INSERT INTO player_lifecycle (player_id, dead, respawn_x, respawn_y, respawn_z, death_time, loss_applied) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(player_id) DO UPDATE SET dead=excluded.dead, respawn_x=excluded.respawn_x, respawn_y=excluded.respawn_y, respawn_z=excluded.respawn_z, death_time=excluded.death_time, loss_applied=excluded.loss_applied",
+                params![
+                    player_id as i64,
+                    i64::from(position.x),
+                    i64::from(position.y),
+                    i64::from(position.z),
+                    death_time,
+                    i64::from(u8::from(state.loss_applied)),
+                ],
+            )?;
+        } else {
+            transaction.execute(
+                "DELETE FROM player_lifecycle WHERE player_id = ?1",
+                params![player_id as i64],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -410,6 +472,104 @@ impl EngineDatabase {
             }
         }
         Ok(conditions)
+    }
+
+    /// Replaces one known player's persisted authoritative lifecycle state. A default living state
+    /// removes its row; a dead state must retain the previously validated temple position and
+    /// deterministic death tick. Client delivery and automatic timing are intentionally separate.
+    pub fn replace_player_respawn_state(
+        &mut self,
+        player_id: u64,
+        state: PlayerRespawnState,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        if state == PlayerRespawnState::default() {
+            self.connection.execute(
+                "DELETE FROM player_lifecycle WHERE player_id = ?1",
+                params![player_id as i64],
+            )?;
+            return Ok(());
+        }
+        let (position, death_time) = lifecycle_state_fields(player_id, state)?;
+        let death_time = i64::try_from(death_time).map_err(|_| {
+            PersistenceError::InvalidLifecycleRecord(
+                "death time does not fit SQLite integer".into(),
+            )
+        })?;
+        self.connection.execute(
+            "INSERT INTO player_lifecycle (player_id, dead, respawn_x, respawn_y, respawn_z, death_time, loss_applied) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(player_id) DO UPDATE SET dead=excluded.dead, respawn_x=excluded.respawn_x, respawn_y=excluded.respawn_y, respawn_z=excluded.respawn_z, death_time=excluded.death_time, loss_applied=excluded.loss_applied",
+            params![
+                player_id as i64,
+                i64::from(position.x),
+                i64::from(position.y),
+                i64::from(position.z),
+                death_time,
+                i64::from(u8::from(state.loss_applied)),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Loads the persisted authoritative lifecycle state. No row is a default living player;
+    /// malformed rows are rejected rather than interpreted as a safe respawn or death state.
+    pub fn player_respawn_state(
+        &self,
+        player_id: u64,
+    ) -> Result<PlayerRespawnState, PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let record = self
+            .connection
+            .query_row(
+                "SELECT dead, respawn_x, respawn_y, respawn_z, death_time, loss_applied FROM player_lifecycle WHERE player_id = ?1",
+                params![player_id as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((dead, x, y, z, death_time, loss_applied)) = record else {
+            return Ok(PlayerRespawnState::default());
+        };
+        if dead != 1 || !(0..=1).contains(&loss_applied) {
+            return Err(PersistenceError::InvalidLifecycleRecord(
+                "dead and loss-applied values must be encoded as one-bit values".into(),
+            ));
+        }
+        let (x, y, z, death_time) = match (x, y, z, death_time) {
+            (Some(x), Some(y), Some(z), Some(death_time)) => (x, y, z, death_time),
+            _ => {
+                return Err(PersistenceError::InvalidLifecycleRecord(
+                    "dead lifecycle state requires respawn coordinates and death time".into(),
+                ))
+            }
+        };
+        let position = Position {
+            x: u16::try_from(x).map_err(|_| {
+                PersistenceError::InvalidLifecycleRecord("respawn x does not fit u16".into())
+            })?,
+            y: u16::try_from(y).map_err(|_| {
+                PersistenceError::InvalidLifecycleRecord("respawn y does not fit u16".into())
+            })?,
+            z: u8::try_from(z).map_err(|_| {
+                PersistenceError::InvalidLifecycleRecord("respawn z does not fit u8".into())
+            })?,
+        };
+        let death_time = u64::try_from(death_time).map_err(|_| {
+            PersistenceError::InvalidLifecycleRecord("death time must be non-negative".into())
+        })?;
+        Ok(PlayerRespawnState {
+            dead: true,
+            respawn_at: Some(position),
+            death_time: Some(death_time),
+            loss_applied: loss_applied == 1,
+        })
     }
 
     /// Replaces a player's vocation identity and all typed skill values atomically. The caller
@@ -925,9 +1085,18 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_CONDITIONS, unix_seconds()],
             )?;
         }
-        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+        if self.schema_version()? < SCHEMA_VERSION_PROGRESSION_ATTEMPTS {
             self.connection.execute_batch(
                 "CREATE TABLE IF NOT EXISTS player_progression_attempts (player_id INTEGER PRIMARY KEY, fist_tries INTEGER NOT NULL, club_tries INTEGER NOT NULL, sword_tries INTEGER NOT NULL, axe_tries INTEGER NOT NULL, distance_tries INTEGER NOT NULL, shielding_tries INTEGER NOT NULL, fishing_tries INTEGER NOT NULL, magic_mana INTEGER NOT NULL);",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_PROGRESSION_ATTEMPTS, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS player_lifecycle (player_id INTEGER PRIMARY KEY, dead INTEGER NOT NULL, respawn_x INTEGER, respawn_y INTEGER, respawn_z INTEGER, death_time INTEGER, loss_applied INTEGER NOT NULL);",
             )?;
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
@@ -1009,6 +1178,9 @@ pub struct LoginCharacter {
     pub position: Position,
     /// Imported map town identifier, or zero when no town has been assigned.
     pub town_id: u32,
+    /// Persisted authoritative lifecycle state. Client death and respawn delivery remain outside
+    /// the storage layer.
+    pub respawn_state: PlayerRespawnState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1045,6 +1217,28 @@ fn unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn lifecycle_state_fields(
+    player_id: u64,
+    state: PlayerRespawnState,
+) -> Result<(Position, u64), PersistenceError> {
+    if !state.dead {
+        return Err(PersistenceError::InvalidLifecycleRecord(format!(
+            "player {player_id} has non-default living lifecycle state"
+        )));
+    }
+    let position = state.respawn_at.ok_or_else(|| {
+        PersistenceError::InvalidLifecycleRecord(format!(
+            "player {player_id} dead lifecycle state has no respawn position"
+        ))
+    })?;
+    let death_time = state.death_time.ok_or_else(|| {
+        PersistenceError::InvalidLifecycleRecord(format!(
+            "player {player_id} dead lifecycle state has no death time"
+        ))
+    })?;
+    Ok((position, death_time))
 }
 
 fn optional_u16_attribute(
@@ -1151,6 +1345,7 @@ pub enum PersistenceError {
     InvalidConditionRecord(String),
     InvalidProgressionRecord(String),
     InvalidProgressionAttemptRecord(String),
+    InvalidLifecycleRecord(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
 }
@@ -1297,6 +1492,82 @@ mod tests {
         ));
         assert!(matches!(
             database.player_conditions(999),
+            Err(PersistenceError::UnknownPlayer(999))
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_and_validates_player_respawn_state_transactionally() {
+        let path = temporary_path("lifecycle");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("admin", "hash").unwrap();
+        let character = database
+            .create_player_for_account(account_id as u32, "Knight")
+            .unwrap();
+        assert_eq!(
+            database.player_respawn_state(character.id).unwrap(),
+            PlayerRespawnState::default()
+        );
+
+        let state = PlayerRespawnState {
+            dead: true,
+            respawn_at: Some(Position {
+                x: 110,
+                y: 120,
+                z: 7,
+            }),
+            death_time: Some(42),
+            loss_applied: true,
+        };
+        database
+            .replace_player_respawn_state(character.id, state)
+            .unwrap();
+        assert_eq!(database.player_respawn_state(character.id).unwrap(), state);
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].respawn_state,
+            state
+        );
+
+        let defeated_vitals = PlayerVitals {
+            health: 0,
+            max_health: 150,
+            mana: 50,
+            max_mana: 50,
+            capacity: 40_000,
+            magic_level: 0,
+        };
+        database
+            .update_player_vitals_and_respawn_state(character.id, defeated_vitals, state)
+            .unwrap();
+        let loaded = database
+            .characters_for_account(account_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(loaded.vitals, defeated_vitals);
+        assert_eq!(loaded.respawn_state, state);
+
+        database
+            .replace_player_respawn_state(character.id, PlayerRespawnState::default())
+            .unwrap();
+        assert_eq!(
+            database.player_respawn_state(character.id).unwrap(),
+            PlayerRespawnState::default()
+        );
+
+        database
+            .connection
+            .execute(
+                "INSERT INTO player_lifecycle (player_id, dead, respawn_x, respawn_y, respawn_z, death_time, loss_applied) VALUES (?1, ?2, NULL, NULL, NULL, NULL, ?3)",
+                params![character.id as i64, 1_i64, 0_i64],
+            )
+            .unwrap();
+        assert!(matches!(
+            database.player_respawn_state(character.id),
+            Err(PersistenceError::InvalidLifecycleRecord(_))
+        ));
+        assert!(matches!(
+            database.player_respawn_state(999),
             Err(PersistenceError::UnknownPlayer(999))
         ));
         let _ = fs::remove_file(path);

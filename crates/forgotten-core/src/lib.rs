@@ -1975,6 +1975,34 @@ impl WorldState {
             .ok_or(CoreError::UnknownPlayer(player_id))
     }
 
+    /// Hydrates a persisted lifecycle record after the player has entered the authoritative
+    /// world. A living player must use the exact empty lifecycle state; a dead player must retain
+    /// both its previously validated temple position and deterministic death tick. Packet delivery
+    /// and automatic timing remain separate host responsibilities.
+    pub fn hydrate_player_respawn_state(
+        &mut self,
+        player_id: u64,
+        state: PlayerRespawnState,
+    ) -> Result<bool, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        let valid = if state.dead {
+            state.respawn_at.is_some() && state.death_time.is_some()
+        } else {
+            state == PlayerRespawnState::default()
+        };
+        if !valid {
+            return Err(CoreError::InvalidPlayerRespawnState(player_id));
+        }
+        if self.player_respawn_state(player_id)? == state {
+            return Ok(false);
+        }
+        self.player_respawn_states.insert(player_id, state);
+        self.mark_changed();
+        Ok(true)
+    }
+
     /// Records a death against a known imported town temple without performing the future
     /// respawn teleport, loss-policy execution, persistence, or client death-screen delivery.
     /// Repeating a death for an already-dead player is a no-op that returns the original state.
@@ -2854,6 +2882,7 @@ pub enum CoreError {
     UnknownPlayer(u64),
     UnknownTown(u32),
     PlayerTownUnassigned(u64),
+    InvalidPlayerRespawnState(u64),
     PlayerIsNotDead(u64),
     MissingRespawnPosition(u64),
     DeathLossAlreadyApplied(u64),
@@ -4150,6 +4179,58 @@ mod tests {
             world.apply_player_regeneration(7, rules, 1),
             Err(CoreError::UnknownPlayer(7))
         );
+    }
+
+    #[test]
+    fn persisted_respawn_state_hydration_is_strict_and_idempotent() {
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        let state = PlayerRespawnState {
+            dead: true,
+            respawn_at: Some(Position {
+                x: 110,
+                y: 120,
+                z: 7,
+            }),
+            death_time: Some(12),
+            loss_applied: true,
+        };
+        let revision = world.revision();
+        assert!(world.hydrate_player_respawn_state(7, state).unwrap());
+        assert_eq!(world.player_respawn_state(7).unwrap(), state);
+        assert_eq!(world.revision(), revision + 1);
+        assert!(!world.hydrate_player_respawn_state(7, state).unwrap());
+        assert_eq!(world.revision(), revision + 1);
+
+        assert_eq!(
+            world.hydrate_player_respawn_state(
+                7,
+                PlayerRespawnState {
+                    dead: true,
+                    respawn_at: None,
+                    death_time: Some(12),
+                    loss_applied: false,
+                },
+            ),
+            Err(CoreError::InvalidPlayerRespawnState(7))
+        );
+        assert_eq!(
+            world.hydrate_player_respawn_state(
+                7,
+                PlayerRespawnState {
+                    dead: false,
+                    respawn_at: Some(Position {
+                        x: 110,
+                        y: 120,
+                        z: 7,
+                    }),
+                    death_time: None,
+                    loss_applied: false,
+                },
+            ),
+            Err(CoreError::InvalidPlayerRespawnState(7))
+        );
+        assert_eq!(world.player_respawn_state(7).unwrap(), state);
     }
 
     #[test]

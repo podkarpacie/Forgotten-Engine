@@ -7,9 +7,9 @@ use forgotten_core::{
     ItemInstance, NativeItemPresentationCatalog, Player, PlayerCondition, PlayerConditionKind,
     PlayerConditionOutcome, PlayerContainers, PlayerEquipment, PlayerExperienceAwardOutcome,
     PlayerInteractionIntent, PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
-    PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerSkill, PlayerSkillTryOutcome,
-    PlayerVitals, Position, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy,
-    StaticCreatureResetSummary, VocationId, WorldMap, WorldState,
+    PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState, PlayerSkill,
+    PlayerSkillTryOutcome, PlayerVitals, Position, StaticCreatureDecisionBatch,
+    StaticCreatureDecisionPolicy, StaticCreatureResetSummary, VocationId, WorldMap, WorldState,
 };
 use forgotten_persistence::{EngineDatabase, PlayerVitals as PersistedPlayerVitals};
 use forgotten_protocol::{
@@ -244,6 +244,7 @@ pub struct NativePlayerHydration {
     pub progression: PlayerProgression,
     pub progression_attempts: PlayerProgressionAttempts,
     pub town_id: u32,
+    pub respawn_state: PlayerRespawnState,
     pub equipment: PlayerEquipment,
     pub containers: PlayerContainers,
     pub conditions: BTreeMap<PlayerConditionKind, PlayerCondition>,
@@ -380,6 +381,16 @@ impl SharedNativeWorld {
     ) -> Result<forgotten_core::PlayerRespawnState, HostError> {
         self.lock()?
             .player_respawn_state(player_id)
+            .map_err(HostError::Core)
+    }
+
+    pub fn hydrate_player_respawn_state(
+        &self,
+        player_id: u64,
+        state: PlayerRespawnState,
+    ) -> Result<bool, HostError> {
+        self.lock()?
+            .hydrate_player_respawn_state(player_id, state)
             .map_err(HostError::Core)
     }
 
@@ -849,6 +860,7 @@ impl SharedNativeWorld {
         self.replace_player_progression_attempts(player_id, hydration.progression_attempts)?;
         self.replace_player_town(player_id, hydration.town_id)?;
         self.replace_player_conditions(player_id, hydration.conditions)?;
+        self.hydrate_player_respawn_state(player_id, hydration.respawn_state)?;
         Ok(position)
     }
 
@@ -1561,6 +1573,7 @@ fn handle_native_otclient_game(
                 progression: character.progression,
                 progression_attempts: character.progression_attempts,
                 town_id: character.town_id,
+                respawn_state: character.respawn_state,
                 equipment,
                 containers,
                 conditions,
@@ -2655,7 +2668,7 @@ fn apply_native_selected_player_melee(
     else {
         return Ok(None);
     };
-    let (outcome, vitals, _death_state) = match shared_world.apply_player_melee_damage_with_death(
+    let (outcome, vitals, death_state) = match shared_world.apply_player_melee_damage_with_death(
         attacker_id,
         target_id,
         NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE,
@@ -2672,17 +2685,23 @@ fn apply_native_selected_player_melee(
     if outcome.applied_damage == 0 {
         return Ok(None);
     }
-    database.update_player_vitals(
-        target_id,
-        forgotten_persistence::PlayerVitals {
-            health: vitals.health,
-            max_health: vitals.max_health,
-            mana: vitals.mana,
-            max_mana: vitals.max_mana,
-            capacity: vitals.capacity,
-            magic_level: vitals.magic_level,
-        },
-    )?;
+    let persisted_vitals = forgotten_persistence::PlayerVitals {
+        health: vitals.health,
+        max_health: vitals.max_health,
+        mana: vitals.mana,
+        max_mana: vitals.max_mana,
+        capacity: vitals.capacity,
+        magic_level: vitals.magic_level,
+    };
+    if let Some(death_state) = death_state {
+        database.update_player_vitals_and_respawn_state(
+            target_id,
+            persisted_vitals,
+            death_state,
+        )?;
+    } else {
+        database.update_player_vitals(target_id, persisted_vitals)?;
+    }
     if let Some(rules_by_vocation) = progression_rules {
         let vocation = shared_world.player_progression(attacker_id)?.vocation;
         if let Some(rules) = rules_by_vocation.get(&vocation).copied() {
@@ -3590,6 +3609,7 @@ mod tests {
                     progression: PlayerProgression::default(),
                     progression_attempts: PlayerProgressionAttempts::default(),
                     town_id: 0,
+                    respawn_state: PlayerRespawnState::default(),
                     equipment: PlayerEquipment::default(),
                     containers: PlayerContainers::default(),
                     conditions: conditions.clone(),
@@ -3622,6 +3642,7 @@ mod tests {
                     progression: PlayerProgression::default(),
                     progression_attempts: PlayerProgressionAttempts::default(),
                     town_id: 0,
+                    respawn_state: PlayerRespawnState::default(),
                     equipment: PlayerEquipment::default(),
                     containers: PlayerContainers::default(),
                     conditions: BTreeMap::from([(PlayerConditionKind::Poison, poison)]),
@@ -3665,6 +3686,7 @@ mod tests {
                     progression: PlayerProgression::default(),
                     progression_attempts: attempts,
                     town_id: 42,
+                    respawn_state: PlayerRespawnState::default(),
                     equipment: PlayerEquipment::default(),
                     containers: PlayerContainers::default(),
                     conditions: BTreeMap::new(),
@@ -3674,6 +3696,47 @@ mod tests {
             .unwrap();
         assert_eq!(shared.player_progression_attempts(105).unwrap(), attempts);
         assert_eq!(shared.player_town(105).unwrap(), 42);
+    }
+
+    #[test]
+    fn shared_native_registration_hydrates_persisted_dead_state_without_client_delivery() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        let state = PlayerRespawnState {
+            dead: true,
+            respawn_at: Some(map.spawn()),
+            death_time: Some(42),
+            loss_applied: true,
+        };
+        shared
+            .register_player_at_available_position_with_vitals_equipment_containers_progression_and_conditions(
+                Player {
+                    id: 106,
+                    account_id: 1,
+                    name: "DeadKnight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                PlayerVitals {
+                    health: 0,
+                    ..PlayerVitals::default()
+                },
+                NativePlayerHydration {
+                    progression: PlayerProgression::default(),
+                    progression_attempts: PlayerProgressionAttempts::default(),
+                    town_id: 42,
+                    respawn_state: state,
+                    equipment: PlayerEquipment::default(),
+                    containers: PlayerContainers::default(),
+                    conditions: BTreeMap::new(),
+                },
+                &map,
+            )
+            .unwrap();
+        assert_eq!(shared.player_respawn_state(106).unwrap(), state);
+        assert_eq!(shared.player_vitals(106).unwrap().health, 0);
     }
 
     #[test]

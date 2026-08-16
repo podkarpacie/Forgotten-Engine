@@ -232,6 +232,7 @@
 - [x] Apply configured experience rates and `stages.xml` ranges to authoritative operator experience awards, with exact regression coverage; combat/quest/monster event sources remain deferred.
 - [x] Apply configured vocation progression formulas to fixed-melee fist skill-try awards, with no claim of weapon or spell formulas.
 - [ ] Deliver bounded client-visible lifecycle state: condition health updates, death state, temple respawn, and only verified loss policies.
+- [x] Persist and hydrate authoritative dead/respawn/loss state across restarts without claiming client death screens, automatic timers, teleport packets, or unverified default-loss behavior.
 - [ ] Add profile-driven combat events for weapons, spells, damage types, cooldowns, PvP policy, and death/corpse handling after independent compatibility evidence.
 - [ ] Add authoritative item transfer, equipment/inventory synchronization, container windows, item use, actions, doors, switches, and map interactions.
 - [x] Add bounded authoritative transfer between one player equipment slot and one already owned container; client inventory packets, map-ground transfers, nested containers, stack splitting, and item-use semantics remain deferred.
