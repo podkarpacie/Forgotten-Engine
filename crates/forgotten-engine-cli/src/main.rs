@@ -4,7 +4,7 @@ use forgotten_config::{
     materialize_tfs_static_spawns, resolve_tfs_spawn_references, validate_content, world_map_path,
     write_template,
 };
-use forgotten_core::{EquipmentSlot, ItemInstance, WorldMapSource};
+use forgotten_core::{EquipmentSlot, ItemInstance, PlayerContainer, WorldMapSource};
 use forgotten_host::{
     start, start_game_session, start_native_otclient_game, start_native_otclient_login,
     start_status, GameSessionHostConfig, HostConfig, LegacyLoginConfig,
@@ -809,6 +809,103 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             println!("unequipped player-id={player_id} slot={}", slot.code());
             Ok(())
         }
+        "container-create" => {
+            if arguments.len() < 8 {
+                return Err(
+                    "usage: player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>"
+                        .into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let container_id = parse_u8_argument(arguments.get(4), "container ID")?;
+            let server_id = parse_u16_argument(arguments.get(5), "container server item ID")?;
+            let capacity = parse_u16_argument(arguments.get(6), "container capacity")?;
+            let name = arguments[7..].join(" ");
+            let container = PlayerContainer::new(
+                container_id,
+                ItemInstance::new(server_id, 1)?,
+                name,
+                false,
+                capacity,
+            )?;
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            let mut containers = database.player_containers(player_id)?;
+            if containers.container(container_id).is_some() {
+                return Err(
+                    format!("player {player_id} already has container {container_id}").into(),
+                );
+            }
+            containers.insert(container)?;
+            database.replace_player_containers(player_id, &containers)?;
+            println!(
+                "created player container player-id={player_id} container-id={container_id} server-item-id={server_id} capacity={capacity}"
+            );
+            Ok(())
+        }
+        "container-add" => {
+            if !(arguments.len() == 7 || arguments.len() == 8) {
+                return Err(
+                    "usage: player container-add <directory> <player-id> <container-id> <server-item-id> [count]"
+                        .into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let container_id = parse_u8_argument(arguments.get(4), "container ID")?;
+            let server_id = parse_u16_argument(arguments.get(5), "server item ID")?;
+            let count = arguments
+                .get(6)
+                .map(|value| value.parse::<u16>().map_err(|_| "item count must be a u16"))
+                .transpose()?
+                .unwrap_or(1);
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            let mut containers = database.player_containers(player_id)?;
+            let mut container = containers
+                .remove(container_id)
+                .ok_or_else(|| format!("player {player_id} has no container {container_id}"))?;
+            container
+                .items
+                .insert(ItemInstance::new(server_id, count)?)?;
+            containers.insert(container)?;
+            database.replace_player_containers(player_id, &containers)?;
+            println!(
+                "added player container item player-id={player_id} container-id={container_id} server-item-id={server_id} count={count}"
+            );
+            Ok(())
+        }
+        "container-remove" => {
+            if arguments.len() != 6 {
+                return Err(
+                    "usage: player container-remove <directory> <player-id> <container-id> <item-index>"
+                        .into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let container_id = parse_u8_argument(arguments.get(4), "container ID")?;
+            let item_index = parse_usize_argument(arguments.get(5), "container item index")?;
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            let mut containers = database.player_containers(player_id)?;
+            let mut container = containers
+                .remove(container_id)
+                .ok_or_else(|| format!("player {player_id} has no container {container_id}"))?;
+            if container.items.remove(item_index).is_none() {
+                return Err(format!(
+                    "player {player_id} container {container_id} has no item at index {item_index}"
+                )
+                .into());
+            }
+            containers.insert(container)?;
+            database.replace_player_containers(player_id, &containers)?;
+            println!(
+                "removed player container item player-id={player_id} container-id={container_id} item-index={item_index}"
+            );
+            Ok(())
+        }
         unsupported => Err(format!("unsupported player action `{unsupported}`").into()),
     }
 }
@@ -828,6 +925,26 @@ fn parse_u16_argument(
         .ok_or_else(|| format!("a {label} is required"))?
         .parse()
         .map_err(|_| format!("{label} must be an unsigned 16-bit integer").into())
+}
+
+fn parse_u8_argument(
+    value: Option<&String>,
+    label: &str,
+) -> Result<u8, Box<dyn std::error::Error>> {
+    value
+        .ok_or_else(|| format!("a {label} is required"))?
+        .parse()
+        .map_err(|_| format!("{label} must be an unsigned 8-bit integer").into())
+}
+
+fn parse_usize_argument(
+    value: Option<&String>,
+    label: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    value
+        .ok_or_else(|| format!("a {label} is required"))?
+        .parse()
+        .map_err(|_| format!("{label} must be a non-negative integer").into())
 }
 
 fn parse_equipment_slot(
@@ -902,7 +1019,7 @@ fn version() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn help_text() -> &'static str {
-    "Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)\n  fe-8.0  — Tibia 8.0 (protocol foundation)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  tfs-audit <directory>\n  run <directory> [--ed]\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  account create <directory> <account-name> <password>\n  player create <directory> <account-id> <character-name>\n  player equip <directory> <player-id> <slot> <server-item-id> [count]\n  player unequip <directory> <player-id> <slot>\n  command <directory> broadcast <message>\n  compatibility [--json]\n  version"
+    "Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)\n  fe-8.0  — Tibia 8.0 (protocol foundation)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  tfs-audit <directory>\n  run <directory> [--ed]\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  account create <directory> <account-name> <password>\n  player create <directory> <account-id> <character-name>\n  player equip <directory> <player-id> <slot> <server-item-id> [count]\n  player unequip <directory> <player-id> <slot>\n  player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>\n  player container-add <directory> <player-id> <container-id> <server-item-id> [count]\n  player container-remove <directory> <player-id> <container-id> <item-index>\n  command <directory> broadcast <message>\n  compatibility [--json]\n  version"
 }
 
 fn print_help() {
@@ -971,6 +1088,9 @@ mod tests {
             "player create <directory> <account-id> <character-name>",
             "player equip <directory> <player-id> <slot> <server-item-id> [count]",
             "player unequip <directory> <player-id> <slot>",
+            "player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>",
+            "player container-add <directory> <player-id> <container-id> <server-item-id> [count]",
+            "player container-remove <directory> <player-id> <container-id> <item-index>",
             "command <directory> broadcast <message>",
             "compatibility",
             "version",
@@ -999,6 +1119,16 @@ mod tests {
         assert!(parse_equipment_slot(Some(&"purse".to_owned())).is_err());
         assert!(parse_player_id(Some(&"7".to_owned())).is_ok());
         assert!(parse_u16_argument(Some(&"65536".to_owned()), "server item ID").is_err());
+        assert_eq!(
+            parse_u8_argument(Some(&"15".to_owned()), "container ID").unwrap(),
+            15
+        );
+        assert!(parse_u8_argument(Some(&"256".to_owned()), "container ID").is_err());
+        assert_eq!(
+            parse_usize_argument(Some(&"2".to_owned()), "container item index").unwrap(),
+            2
+        );
+        assert!(parse_usize_argument(Some(&"-1".to_owned()), "container item index").is_err());
     }
 
     #[test]

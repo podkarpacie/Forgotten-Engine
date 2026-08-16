@@ -707,6 +707,8 @@ impl PlayerEquipment {
 }
 
 pub const MAX_CONTAINER_CAPACITY: u16 = 100;
+pub const MAX_PLAYER_CONTAINERS: usize = 16;
+pub const MAX_PLAYER_CONTAINER_NAME_BYTES: usize = 64;
 
 /// Ordered bounded storage for validated item instances. Recursive containers, player ownership,
 /// persistence, and client window synchronization are added by later inventory milestones.
@@ -762,6 +764,82 @@ impl ItemContainer {
     }
 }
 
+/// One player-owned, non-recursive container window. The `container_id` is a client window
+/// identifier; the runtime does not infer nested ownership or item-use semantics from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerContainer {
+    pub container_id: u8,
+    pub container_item: ItemInstance,
+    pub name: String,
+    pub has_parent: bool,
+    pub items: ItemContainer,
+}
+
+impl PlayerContainer {
+    pub fn new(
+        container_id: u8,
+        container_item: ItemInstance,
+        name: impl Into<String>,
+        has_parent: bool,
+        capacity: u16,
+    ) -> Result<Self, CoreError> {
+        let name = name.into();
+        if name.is_empty() || name.len() > MAX_PLAYER_CONTAINER_NAME_BYTES {
+            return Err(CoreError::InvalidContainerName(name.len()));
+        }
+        Ok(Self {
+            container_id,
+            container_item,
+            name,
+            has_parent,
+            items: ItemContainer::new(capacity)?,
+        })
+    }
+}
+
+/// Bounded player-owned container windows. Entries are keyed by their client window identifier;
+/// an inserted matching identifier replaces the prior window without creating a duplicate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlayerContainers {
+    containers: BTreeMap<u8, PlayerContainer>,
+}
+
+impl PlayerContainers {
+    pub fn len(&self) -> usize {
+        self.containers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.containers.is_empty()
+    }
+
+    pub fn container(&self, container_id: u8) -> Option<&PlayerContainer> {
+        self.containers.get(&container_id)
+    }
+
+    pub fn insert(
+        &mut self,
+        container: PlayerContainer,
+    ) -> Result<Option<PlayerContainer>, CoreError> {
+        if !self.containers.contains_key(&container.container_id)
+            && self.containers.len() >= MAX_PLAYER_CONTAINERS
+        {
+            return Err(CoreError::TooManyPlayerContainers(MAX_PLAYER_CONTAINERS));
+        }
+        Ok(self.containers.insert(container.container_id, container))
+    }
+
+    pub fn remove(&mut self, container_id: u8) -> Option<PlayerContainer> {
+        self.containers.remove(&container_id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u8, &PlayerContainer)> + '_ {
+        self.containers
+            .iter()
+            .map(|(id, container)| (*id, container))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayerDamageOutcome {
     pub attacker_id: u64,
@@ -793,6 +871,7 @@ pub struct WorldState {
     players: BTreeMap<u64, Player>,
     player_vitals: BTreeMap<u64, PlayerVitals>,
     player_equipments: BTreeMap<u64, PlayerEquipment>,
+    player_containers: BTreeMap<u64, PlayerContainers>,
     player_interactions: BTreeMap<u64, PlayerInteractionIntent>,
     static_creatures: BTreeMap<u32, StaticCreatureRuntime>,
     static_occupied_positions: BTreeSet<Position>,
@@ -849,6 +928,8 @@ impl WorldState {
         self.player_vitals.insert(player.id, vitals);
         self.player_equipments
             .insert(player.id, PlayerEquipment::default());
+        self.player_containers
+            .insert(player.id, PlayerContainers::default());
         self.players.insert(player.id, player);
         self.mark_changed();
         Ok(())
@@ -861,6 +942,7 @@ impl WorldState {
             .ok_or(CoreError::UnknownPlayer(id))?;
         self.player_vitals.remove(&id);
         self.player_equipments.remove(&id);
+        self.player_containers.remove(&id);
         self.player_interactions.remove(&id);
         self.player_interactions.retain(|_, intent| {
             if intent.target_player_id == Some(id) {
@@ -1212,6 +1294,12 @@ impl WorldState {
             .ok_or(CoreError::UnknownPlayer(player_id))
     }
 
+    pub fn player_containers(&self, player_id: u64) -> Result<&PlayerContainers, CoreError> {
+        self.player_containers
+            .get(&player_id)
+            .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
     /// Replaces a player's fixed equipment set only after that player is known to the
     /// authoritative world. Native inventory windows and container synchronization remain
     /// deferred, but later protocol paths can use this validated state directly.
@@ -1227,6 +1315,25 @@ impl WorldState {
             return Ok(false);
         }
         self.player_equipments.insert(player_id, equipment);
+        self.mark_changed();
+        Ok(true)
+    }
+
+    /// Replaces a player's bounded non-recursive container collection after the player is known
+    /// to the authoritative world. Persistence and native container-window synchronization are
+    /// intentionally separate layers.
+    pub fn replace_player_containers(
+        &mut self,
+        player_id: u64,
+        containers: PlayerContainers,
+    ) -> Result<bool, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        if self.player_containers(player_id)? == &containers {
+            return Ok(false);
+        }
+        self.player_containers.insert(player_id, containers);
         self.mark_changed();
         Ok(true)
     }
@@ -1410,6 +1517,8 @@ pub enum CoreError {
     DuplicatePlayer(u64),
     EmptyPlayerName,
     InvalidContainerCapacity(u16),
+    InvalidContainerName(usize),
+    TooManyPlayerContainers(usize),
     ContainerFull {
         capacity: u16,
     },
@@ -1617,6 +1726,49 @@ mod tests {
 
         world.remove_player(7).unwrap();
         assert_eq!(world.player_equipment(7), Err(CoreError::UnknownPlayer(7)));
+    }
+
+    #[test]
+    fn authoritative_player_containers_are_bounded_and_replace_only_when_changed() {
+        let backpack = ItemInstance::new(1988, 1).unwrap();
+        let mut container = PlayerContainer::new(0, backpack, "Backpack", false, 2).unwrap();
+        container
+            .items
+            .insert(ItemInstance::new(2376, 1).unwrap())
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        assert_eq!(containers.insert(container.clone()).unwrap(), None);
+        assert_eq!(containers.container(0), Some(&container));
+
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        assert!(world.player_containers(7).unwrap().is_empty());
+        assert!(world
+            .replace_player_containers(7, containers.clone())
+            .unwrap());
+        assert_eq!(world.revision(), 2);
+        assert_eq!(
+            world.player_containers(7).unwrap().container(0),
+            Some(&container)
+        );
+        assert!(!world.replace_player_containers(7, containers).unwrap());
+        assert_eq!(world.revision(), 2);
+
+        assert_eq!(
+            PlayerContainer::new(
+                0,
+                ItemInstance::new(1988, 1).unwrap(),
+                "x".repeat(MAX_PLAYER_CONTAINER_NAME_BYTES + 1),
+                false,
+                1,
+            ),
+            Err(CoreError::InvalidContainerName(
+                MAX_PLAYER_CONTAINER_NAME_BYTES + 1
+            ))
+        );
+
+        world.remove_player(7).unwrap();
+        assert_eq!(world.player_containers(7), Err(CoreError::UnknownPlayer(7)));
     }
 
     #[test]

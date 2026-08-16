@@ -189,3 +189,8 @@
 - [x] Append only catalog-validated classic-740 equipment records to native bootstrap delivery, omitting unmapped items without guessed packet output.
 - [x] Add a strict classic-740 container-open encoder with golden parser-layout tests, without enabling client item-use or container-window actions yet.
 - [x] Add additive local player equipment provisioning commands that persist bounded item instances without altering existing player command syntax.
+- [x] Define authoritative player-owned named containers with bounded IDs and items as the foundation for persistence and future parser-safe window delivery.
+- [x] Add schema-v4 transactional persistence for player-owned named containers and ordered container items with safe migration and malformed-record rejection.
+- [x] Hydrate persisted player containers into authoritative native sessions during registration without sending unsolicited container-window packets.
+- [x] Add additive local player-container provisioning commands that create named containers and persist bounded container items without altering existing player command syntax.
+- [ ] Establish and satisfy production-readiness gates for complete declared TFS feature conformance, profile-specific protocol validation, reliability, bounded memory/performance, security, and reproducible TFS-to-FE migration before describing any profile as mainstream-ready.

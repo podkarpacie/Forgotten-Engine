@@ -4,8 +4,9 @@
 
 use forgotten_core::{
     CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, ItemInstance,
-    NativeItemPresentationCatalog, Player, PlayerEquipment, PlayerInteractionIntent, PlayerVitals,
-    Position, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, WorldMap, WorldState,
+    NativeItemPresentationCatalog, Player, PlayerContainers, PlayerEquipment,
+    PlayerInteractionIntent, PlayerVitals, Position, StaticCreatureDecisionBatch,
+    StaticCreatureDecisionPolicy, WorldMap, WorldState,
 };
 use forgotten_persistence::EngineDatabase;
 use forgotten_protocol::{
@@ -299,6 +300,23 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)
     }
 
+    pub fn player_containers(&self, player_id: u64) -> Result<PlayerContainers, HostError> {
+        self.lock()?
+            .player_containers(player_id)
+            .cloned()
+            .map_err(HostError::Core)
+    }
+
+    pub fn replace_player_containers(
+        &self,
+        player_id: u64,
+        containers: PlayerContainers,
+    ) -> Result<bool, HostError> {
+        self.lock()?
+            .replace_player_containers(player_id, containers)
+            .map_err(HostError::Core)
+    }
+
     pub fn apply_player_melee_damage(
         &self,
         attacker_id: u64,
@@ -485,6 +503,22 @@ impl SharedNativeWorld {
         let position =
             self.register_player_at_available_position_with_vitals(player, vitals, world_map)?;
         self.replace_player_equipment(player_id, equipment)?;
+        Ok(position)
+    }
+
+    pub fn register_player_at_available_position_with_vitals_equipment_and_containers(
+        &self,
+        player: Player,
+        vitals: PlayerVitals,
+        equipment: PlayerEquipment,
+        containers: PlayerContainers,
+        world_map: &WorldMap,
+    ) -> Result<Position, HostError> {
+        let player_id = player.id;
+        let position = self.register_player_at_available_position_with_vitals_and_equipment(
+            player, vitals, equipment, world_map,
+        )?;
+        self.replace_player_containers(player_id, containers)?;
         Ok(position)
     }
 
@@ -1167,9 +1201,12 @@ fn handle_native_otclient_game(
     let equipment = database
         .player_equipment(character.id)
         .map_err(HostError::Persistence)?;
+    let containers = database
+        .player_containers(character.id)
+        .map_err(HostError::Persistence)?;
     let bootstrap_equipment = equipment.clone();
     let initial_position = match shared_world
-        .register_player_at_available_position_with_vitals_and_equipment(
+        .register_player_at_available_position_with_vitals_equipment_and_containers(
             Player {
                 id: character.id,
                 account_id,
@@ -1188,6 +1225,7 @@ fn handle_native_otclient_game(
                 magic_level: character.vitals.magic_level,
             },
             equipment,
+            containers,
             world_map,
         ) {
         Ok(position) => position,
@@ -2915,6 +2953,45 @@ mod tests {
                 .unwrap()
                 .item(forgotten_core::EquipmentSlot::RightHand),
             Some(&sword)
+        );
+    }
+
+    #[test]
+    fn shared_native_registration_hydrates_persisted_containers_without_window_packets() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        let mut container = forgotten_core::PlayerContainer::new(
+            0,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            2,
+        )
+        .unwrap();
+        let gold = ItemInstance::new(3031, 25).unwrap();
+        container.items.insert(gold).unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(container.clone()).unwrap();
+        shared
+            .register_player_at_available_position_with_vitals_equipment_and_containers(
+                Player {
+                    id: 102,
+                    account_id: 1,
+                    name: "Druid".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                PlayerVitals::default(),
+                PlayerEquipment::default(),
+                containers,
+                &map,
+            )
+            .unwrap();
+        assert_eq!(
+            shared.player_containers(102).unwrap().container(0),
+            Some(&container)
         );
     }
 

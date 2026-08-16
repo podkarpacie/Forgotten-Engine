@@ -4,14 +4,18 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use forgotten_core::{EquipmentSlot, ItemInstance, Player, PlayerEquipment, Position};
+use forgotten_core::{
+    EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerContainers, PlayerEquipment,
+    Position,
+};
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const LATEST_SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION_EQUIPMENT: i64 = 3;
+const LATEST_SCHEMA_VERSION: i64 = 4;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct EngineDatabase {
@@ -362,6 +366,143 @@ impl EngineDatabase {
         Ok(equipment)
     }
 
+    /// Replaces a player's bounded non-recursive containers and their ordered contents in one
+    /// SQLite transaction. Item-use, nested containers, depot, and inbox semantics remain outside
+    /// this storage slice.
+    pub fn replace_player_containers(
+        &mut self,
+        player_id: u64,
+        containers: &PlayerContainers,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM player_container_items WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM player_containers WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        for (container_id, container) in containers.iter() {
+            transaction.execute(
+                "INSERT INTO player_containers (player_id, container_id, server_id, count, name, has_parent, capacity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    player_id as i64,
+                    i64::from(container_id),
+                    i64::from(container.container_item.server_id),
+                    i64::from(container.container_item.count),
+                    container.name,
+                    i64::from(u8::from(container.has_parent)),
+                    i64::from(container.items.capacity()),
+                ],
+            )?;
+            for (slot, item) in container.items.iter().enumerate() {
+                transaction.execute(
+                    "INSERT INTO player_container_items (player_id, container_id, slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        player_id as i64,
+                        i64::from(container_id),
+                        slot as i64,
+                        i64::from(item.server_id),
+                        i64::from(item.count),
+                        item.action_id.map(i64::from),
+                        item.unique_id.map(i64::from),
+                    ],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Loads player-owned containers in client-window order. Raw database values are never
+    /// trusted: invalid IDs, item fields, names, capacity, parent flags, or sparse item slots are
+    /// rejected before they can be admitted into authoritative world state.
+    pub fn player_containers(&self, player_id: u64) -> Result<PlayerContainers, PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT container_id, server_id, count, name, has_parent, capacity FROM player_containers WHERE player_id = ?1 ORDER BY container_id",
+        )?;
+        let records = statement
+            .query_map(params![player_id as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut containers = PlayerContainers::default();
+        for (container_id, server_id, count, name, has_parent, capacity) in records {
+            let container_id = u8::try_from(container_id).map_err(|_| {
+                PersistenceError::InvalidContainerRecord(
+                    "container ID does not fit an unsigned byte".into(),
+                )
+            })?;
+            let has_parent = match has_parent {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(PersistenceError::InvalidContainerRecord(
+                        "parent flag must be zero or one".into(),
+                    ));
+                }
+            };
+            let capacity = u16::try_from(capacity).map_err(|_| {
+                PersistenceError::InvalidContainerRecord("capacity does not fit u16".into())
+            })?;
+            let mut container = PlayerContainer::new(
+                container_id,
+                container_item_from_record(server_id, count)?,
+                name,
+                has_parent,
+                capacity,
+            )
+            .map_err(|error| PersistenceError::InvalidContainerRecord(error.to_string()))?;
+            let mut item_statement = self.connection.prepare(
+                "SELECT slot, server_id, count, action_id, unique_id FROM player_container_items WHERE player_id = ?1 AND container_id = ?2 ORDER BY slot",
+            )?;
+            let item_records = item_statement
+                .query_map(params![player_id as i64, i64::from(container_id)], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (expected_slot, (slot, server_id, count, action_id, unique_id)) in
+                item_records.into_iter().enumerate()
+            {
+                let slot = usize::try_from(slot).map_err(|_| {
+                    PersistenceError::InvalidContainerRecord("item slot does not fit usize".into())
+                })?;
+                if slot != expected_slot {
+                    return Err(PersistenceError::InvalidContainerRecord(
+                        "container item slots must be contiguous from zero".into(),
+                    ));
+                }
+                let mut item = container_item_from_record(server_id, count)?;
+                item.action_id = optional_u16_container_attribute(action_id, "action ID")?;
+                item.unique_id = optional_u16_container_attribute(unique_id, "unique ID")?;
+                container
+                    .items
+                    .insert(item)
+                    .map_err(|error| PersistenceError::InvalidContainerRecord(error.to_string()))?;
+            }
+            containers
+                .insert(container)
+                .map_err(|error| PersistenceError::InvalidContainerRecord(error.to_string()))?;
+        }
+        Ok(containers)
+    }
+
     pub fn record_event(&self, level: &str, message: &str) -> Result<(), PersistenceError> {
         self.connection.execute(
             "INSERT INTO engine_events (level, message, created_at) VALUES (?1, ?2, ?3)",
@@ -407,9 +548,19 @@ impl EngineDatabase {
                 params![2_i64, unix_seconds()],
             )?;
         }
-        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+        if self.schema_version()? < SCHEMA_VERSION_EQUIPMENT {
             self.connection.execute_batch(
                 "CREATE TABLE IF NOT EXISTS player_equipment (player_id INTEGER NOT NULL, slot INTEGER NOT NULL, server_id INTEGER NOT NULL, count INTEGER NOT NULL, action_id INTEGER, unique_id INTEGER, PRIMARY KEY (player_id, slot));",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_EQUIPMENT, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS player_containers (player_id INTEGER NOT NULL, container_id INTEGER NOT NULL, server_id INTEGER NOT NULL, count INTEGER NOT NULL, name TEXT NOT NULL, has_parent INTEGER NOT NULL, capacity INTEGER NOT NULL, PRIMARY KEY (player_id, container_id));\
+                 CREATE TABLE IF NOT EXISTS player_container_items (player_id INTEGER NOT NULL, container_id INTEGER NOT NULL, slot INTEGER NOT NULL, server_id INTEGER NOT NULL, count INTEGER NOT NULL, action_id INTEGER, unique_id INTEGER, PRIMARY KEY (player_id, container_id, slot));",
             )?;
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
@@ -538,6 +689,33 @@ fn optional_u16_attribute(
         .transpose()
 }
 
+fn container_item_from_record(
+    server_id: i64,
+    count: i64,
+) -> Result<ItemInstance, PersistenceError> {
+    let server_id = u16::try_from(server_id).map_err(|_| {
+        PersistenceError::InvalidContainerRecord("server item ID does not fit u16".into())
+    })?;
+    let count = u16::try_from(count).map_err(|_| {
+        PersistenceError::InvalidContainerRecord("item count does not fit u16".into())
+    })?;
+    ItemInstance::new(server_id, count)
+        .map_err(|error| PersistenceError::InvalidContainerRecord(error.to_string()))
+}
+
+fn optional_u16_container_attribute(
+    value: Option<i64>,
+    label: &str,
+) -> Result<Option<u16>, PersistenceError> {
+    value
+        .map(|value| {
+            u16::try_from(value).map_err(|_| {
+                PersistenceError::InvalidContainerRecord(format!("{label} does not fit u16"))
+            })
+        })
+        .transpose()
+}
+
 #[derive(Debug)]
 pub enum PersistenceError {
     Io(std::io::Error),
@@ -546,6 +724,7 @@ pub enum PersistenceError {
     InvalidPlayerName,
     InvalidPlayerVitals,
     InvalidEquipmentRecord(String),
+    InvalidContainerRecord(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
 }
@@ -696,6 +875,61 @@ mod tests {
         ));
         assert!(matches!(
             database.player_equipment(999),
+            Err(PersistenceError::UnknownPlayer(999))
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_and_replaces_player_containers_transactionally() {
+        let path = temporary_path("containers");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("admin", "hash").unwrap();
+        database
+            .save_player(&Player {
+                id: 7,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let mut backpack =
+            PlayerContainer::new(0, ItemInstance::new(1988, 1).unwrap(), "Backpack", false, 4)
+                .unwrap();
+        let mut gold = ItemInstance::new(3031, 25).unwrap();
+        gold.unique_id = Some(7_000);
+        backpack.items.insert(gold).unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(backpack).unwrap();
+        database.replace_player_containers(7, &containers).unwrap();
+        assert_eq!(database.player_containers(7).unwrap(), containers);
+
+        database
+            .replace_player_containers(7, &PlayerContainers::default())
+            .unwrap();
+        assert!(database.player_containers(7).unwrap().is_empty());
+
+        database
+            .connection
+            .execute(
+                "INSERT INTO player_containers (player_id, container_id, server_id, count, name, has_parent, capacity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![7_i64, 0_i64, 1988_i64, 1_i64, "Broken", 2_i64, 4_i64],
+            )
+            .unwrap();
+        assert!(matches!(
+            database.player_containers(7),
+            Err(PersistenceError::InvalidContainerRecord(_))
+        ));
+        assert!(matches!(
+            database.player_containers(999),
             Err(PersistenceError::UnknownPlayer(999))
         ));
         let _ = fs::remove_file(path);
