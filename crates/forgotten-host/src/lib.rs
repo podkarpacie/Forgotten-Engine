@@ -55,6 +55,7 @@ const MAX_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
 const NATIVE_OTCLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const NATIVE_OTCLIENT_DEFAULT_GROUND_SPEED: u64 = 150;
 const NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY: Duration = Duration::from_secs(2);
+const NATIVE_OTCLIENT_SHARED_CHAT_QUEUE_CAPACITY: usize = 64;
 
 fn truncate_native_chat_text(message: &str) -> String {
     let mut output = String::new();
@@ -185,7 +186,7 @@ pub struct NativeOtClientEmptyWorldConfig {
 pub struct SharedNativeWorld {
     world: Arc<Mutex<WorldState>>,
     visibility_epoch: Arc<AtomicU64>,
-    chat_recipients: Arc<Mutex<BTreeMap<u64, mpsc::Sender<SharedPublicChatEvent>>>>,
+    chat_recipients: Arc<Mutex<BTreeMap<u64, mpsc::SyncSender<SharedPublicChatEvent>>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,7 +284,7 @@ impl SharedNativeWorld {
         &self,
         player_id: u64,
     ) -> Result<mpsc::Receiver<SharedPublicChatEvent>, HostError> {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(NATIVE_OTCLIENT_SHARED_CHAT_QUEUE_CAPACITY);
         let mut recipients = self
             .chat_recipients
             .lock()
@@ -322,8 +323,16 @@ impl SharedNativeWorld {
             .chat_recipients
             .lock()
             .map_err(|_| HostError::SharedWorldUnavailable)?;
-        recipients.retain(|_, recipient| recipient.send(event.clone()).is_ok());
-        Ok(recipients.len())
+        let mut delivered = 0;
+        recipients.retain(|_, recipient| match recipient.try_send(event.clone()) {
+            Ok(()) => {
+                delivered += 1;
+                true
+            }
+            Err(mpsc::TrySendError::Full(_)) => true,
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        });
+        Ok(delivered)
     }
 
     pub fn register_player_at_available_position(
@@ -2799,6 +2808,40 @@ mod tests {
         shared.unregister_public_chat_recipient(101);
         shared.remove_player(101).unwrap();
         shared.remove_player(102).unwrap();
+    }
+
+    #[test]
+    fn shared_public_chat_bounds_a_slow_recipient_queue_without_unregistering_it() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let events = shared.register_public_chat_recipient(101).unwrap();
+        for index in 0..NATIVE_OTCLIENT_SHARED_CHAT_QUEUE_CAPACITY {
+            assert_eq!(
+                shared
+                    .broadcast_public_chat(101, &format!("queued-{index}"))
+                    .unwrap(),
+                1
+            );
+        }
+        assert_eq!(shared.broadcast_public_chat(101, "dropped").unwrap(), 0);
+        assert!(events.try_recv().is_ok());
+        assert_eq!(shared.broadcast_public_chat(101, "resumed").unwrap(), 1);
+        shared.unregister_public_chat_recipient(101);
+        shared.remove_player(101).unwrap();
     }
 
     fn native_empty_world_config(bind_addr: SocketAddr) -> NativeOtClientHostConfig {

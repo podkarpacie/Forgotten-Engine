@@ -9,9 +9,10 @@ use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const LATEST_SCHEMA_VERSION: i64 = 1;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct EngineDatabase {
     connection: Connection,
@@ -25,6 +26,7 @@ impl EngineDatabase {
             fs::create_dir_all(parent)?;
         }
         let connection = Connection::open(&path)?;
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         let mut database = Self { connection, path };
         database.migrate()?;
         Ok(database)
@@ -360,6 +362,8 @@ impl std::error::Error for PersistenceError {}
 mod tests {
     use super::*;
     use forgotten_core::Position;
+    use std::sync::mpsc;
+    use std::thread;
 
     fn temporary_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("forgotten-engine-{name}-{}.db", unix_seconds()))
@@ -496,6 +500,62 @@ mod tests {
             .characters
             .iter()
             .any(|entry| entry.name == "Knight"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn waits_for_a_brief_concurrent_sqlite_write_lock() {
+        let path = temporary_path("sqlite-busy-timeout");
+        let database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("admin", "hash").unwrap();
+        database
+            .save_player(&Player {
+                id: 7,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 0,
+                skill_points: 0,
+            })
+            .unwrap();
+        let updater = EngineDatabase::open(&path).unwrap();
+        let (start_sender, start_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let update_thread = thread::spawn(move || {
+            start_receiver.recv().unwrap();
+            result_sender.send(updater.update_player_position(
+                7,
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ))
+        });
+
+        database
+            .connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap();
+        start_sender.send(()).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        database.connection.execute_batch("COMMIT").unwrap();
+        assert!(result_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_ok());
+        assert!(update_thread.join().unwrap().is_ok());
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0]
+                .position
+                .x,
+            101
+        );
         let _ = fs::remove_file(path);
     }
 }

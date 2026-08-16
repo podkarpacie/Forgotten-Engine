@@ -1303,12 +1303,17 @@ pub fn encode_native_otclient_map_viewport_with_static_spawns_and_players(
     let asset_free = snapshot.ground_thing_id == 0 && snapshot.player_look_type == 0;
     let center_x = (NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH / 2 - 1) as i16;
     let center_y = (NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT / 2 - 1) as i16;
+    let viewport_cells = NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH
+        * NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT
+        * NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS;
+    let mut encoded_cells = 0usize;
     let mut static_entity_count = 0usize;
     let mut visible_player_count = 0usize;
 
     for z in (0..NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS as u8).rev() {
         for x in 0..NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH {
             for y in 0..NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT {
+                let remaining_cells = viewport_cells.saturating_sub(encoded_cells + 1);
                 let position = Position {
                     x: snapshot
                         .player_position
@@ -1325,7 +1330,9 @@ pub fn encode_native_otclient_map_viewport_with_static_spawns_and_players(
                     .map(|tile| tile.ground_thing_id)
                     .filter(|ground_thing_id| *ground_thing_id != 0)
                     .unwrap_or(snapshot.ground_thing_id);
-                if ground_thing_id != 0 {
+                if ground_thing_id != 0
+                    && native_map_record_fits_budget(&writer, 2, remaining_cells)
+                {
                     writer.u16(ground_thing_id);
                 }
                 if let Some(items) = world_map.tile_items(position) {
@@ -1335,8 +1342,12 @@ pub fn encode_native_otclient_map_viewport_with_static_spawns_and_players(
                         .take(NATIVE_OTCLIENT_MAX_EXTRA_TILE_ITEMS)
                     {
                         let thing_id = item.client_thing_id.unwrap_or(item.server_id);
-                        if thing_id != 0 {
+                        if thing_id != 0
+                            && native_map_record_fits_budget(&writer, 2, remaining_cells)
+                        {
                             writer.u16(thing_id);
+                        } else if thing_id != 0 {
+                            break;
                         }
                     }
                 }
@@ -1345,8 +1356,18 @@ pub fn encode_native_otclient_map_viewport_with_static_spawns_and_players(
                         if static_entity_count >= NATIVE_OTCLIENT_MAX_STATIC_ENTITIES_PER_VIEWPORT {
                             break;
                         }
-                        write_native_otclient_unknown_static_entity(&mut writer, entity);
-                        static_entity_count += 1;
+                        let mut entity_record = Writer::default();
+                        write_native_otclient_unknown_static_entity(&mut entity_record, entity);
+                        if native_map_record_fits_budget(
+                            &writer,
+                            entity_record.len(),
+                            remaining_cells,
+                        ) {
+                            writer.bytes(&entity_record.finish());
+                            static_entity_count += 1;
+                        } else {
+                            break;
+                        }
                     }
                 }
                 if !asset_free {
@@ -1362,8 +1383,21 @@ pub fn encode_native_otclient_map_viewport_with_static_spawns_and_players(
                             {
                                 break;
                             }
-                            write_native_otclient_unknown_visible_player(&mut writer, player);
-                            visible_player_count += 1;
+                            let mut player_record = Writer::default();
+                            write_native_otclient_unknown_visible_player(
+                                &mut player_record,
+                                player,
+                            );
+                            if native_map_record_fits_budget(
+                                &writer,
+                                player_record.len(),
+                                remaining_cells,
+                            ) {
+                                writer.bytes(&player_record.finish());
+                                visible_player_count += 1;
+                            } else {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1371,9 +1405,15 @@ pub fn encode_native_otclient_map_viewport_with_static_spawns_and_players(
                     && x == NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH / 2 - 1
                     && y == NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT / 2 - 1;
                 if is_player_tile && !asset_free {
-                    write_native_otclient_unknown_player(&mut writer, snapshot);
+                    let mut player_record = Writer::default();
+                    write_native_otclient_unknown_player(&mut player_record, snapshot);
+                    if native_map_record_fits_budget(&writer, player_record.len(), remaining_cells)
+                    {
+                        writer.bytes(&player_record.finish());
+                    }
                 }
                 writer.u16(NATIVE_OTCLIENT_TILE_END);
+                encoded_cells += 1;
             }
         }
     }
@@ -1455,15 +1495,18 @@ pub fn encode_native_otclient_map_step_with_static_spawns_and_players(
         NativeOtClientCardinalDirection::South => 0x67,
         NativeOtClientCardinalDirection::West => 0x68,
     });
+    let step_cells = positions.len() * NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS;
+    let mut encoded_cells = 0usize;
     for z in (0..NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS as u8).rev() {
         for position in &positions {
+            let remaining_cells = step_cells.saturating_sub(encoded_cells + 1);
             let position = Position { z, ..*position };
             let ground_thing_id = world_map
                 .tile(position)
                 .map(|tile| tile.ground_thing_id)
                 .filter(|ground_thing_id| *ground_thing_id != 0)
                 .unwrap_or(snapshot.ground_thing_id);
-            if ground_thing_id != 0 {
+            if ground_thing_id != 0 && native_map_record_fits_budget(&writer, 2, remaining_cells) {
                 writer.u16(ground_thing_id);
             }
             if let Some(items) = world_map.tile_items(position) {
@@ -1473,8 +1516,10 @@ pub fn encode_native_otclient_map_step_with_static_spawns_and_players(
                     .take(NATIVE_OTCLIENT_MAX_EXTRA_TILE_ITEMS)
                 {
                     let thing_id = item.client_thing_id.unwrap_or(item.server_id);
-                    if thing_id != 0 {
+                    if thing_id != 0 && native_map_record_fits_budget(&writer, 2, remaining_cells) {
                         writer.u16(thing_id);
+                    } else if thing_id != 0 {
+                        break;
                     }
                 }
             }
@@ -1483,8 +1528,15 @@ pub fn encode_native_otclient_map_step_with_static_spawns_and_players(
                     if static_entity_count >= NATIVE_OTCLIENT_MAX_STATIC_ENTITIES_PER_VIEWPORT {
                         break;
                     }
-                    write_native_otclient_unknown_static_entity(&mut writer, entity);
-                    static_entity_count += 1;
+                    let mut entity_record = Writer::default();
+                    write_native_otclient_unknown_static_entity(&mut entity_record, entity);
+                    if native_map_record_fits_budget(&writer, entity_record.len(), remaining_cells)
+                    {
+                        writer.bytes(&entity_record.finish());
+                        static_entity_count += 1;
+                    } else {
+                        break;
+                    }
                 }
             }
             if !asset_free {
@@ -1497,12 +1549,23 @@ pub fn encode_native_otclient_map_step_with_static_spawns_and_players(
                         if visible_player_count >= NATIVE_OTCLIENT_MAX_SHARED_PLAYERS_PER_VIEWPORT {
                             break;
                         }
-                        write_native_otclient_unknown_visible_player(&mut writer, player);
-                        visible_player_count += 1;
+                        let mut player_record = Writer::default();
+                        write_native_otclient_unknown_visible_player(&mut player_record, player);
+                        if native_map_record_fits_budget(
+                            &writer,
+                            player_record.len(),
+                            remaining_cells,
+                        ) {
+                            writer.bytes(&player_record.finish());
+                            visible_player_count += 1;
+                        } else {
+                            break;
+                        }
                     }
                 }
             }
             writer.u16(NATIVE_OTCLIENT_TILE_END);
+            encoded_cells += 1;
         }
     }
     let frame = Frame(writer.finish());
@@ -1510,6 +1573,19 @@ pub fn encode_native_otclient_map_step_with_static_spawns_and_players(
         return Err(ProtocolError::InvalidLength(frame.0.len()));
     }
     Ok(frame)
+}
+
+fn native_map_record_fits_budget(
+    writer: &Writer,
+    record_bytes: usize,
+    remaining_cells: usize,
+) -> bool {
+    writer
+        .len()
+        .saturating_add(record_bytes)
+        .saturating_add(2)
+        .saturating_add(remaining_cells.saturating_mul(4))
+        <= MAX_FRAME_SIZE
 }
 
 pub fn decode_native_otclient_cardinal_move_request(
@@ -1935,6 +2011,10 @@ impl std::error::Error for ProtocolError {}
 #[derive(Default)]
 struct Writer(Vec<u8>);
 impl Writer {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
     fn byte(&mut self, value: u8) {
         self.0.push(value);
     }
@@ -2925,5 +3005,87 @@ mod tests {
             .0
             .windows(asset_free_snapshot.player_name.len())
             .any(|bytes| bytes == asset_free_snapshot.player_name.as_bytes()));
+    }
+
+    #[test]
+    fn dense_native_viewport_remains_within_the_frame_budget() {
+        let profile = NativeOtClientProfile {
+            protocol_version: 740,
+            numeric_account_ids: true,
+            login_packet_encryption: false,
+            protocol_checksum: false,
+            challenge_on_login: false,
+            max_padding_bytes: 128,
+        };
+        let snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_id: NATIVE_OTCLIENT_PLAYER_ID_START + 7,
+            player_name: "Knight".into(),
+            player_position: NativeOtClientPosition {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            player_level: 8,
+            ground_thing_id: 102,
+            player_look_type: 128,
+            player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
+            player_speed: 220,
+            server_beat: 50,
+        };
+        let mut world_map = WorldMap::new(
+            "dense-viewport",
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+        );
+        let item = forgotten_core::WorldMapItem {
+            server_id: 102,
+            client_thing_id: Some(102),
+            count: 1,
+            action_id: None,
+            unique_id: None,
+            text: None,
+            description: None,
+            teleport_destination: None,
+            duration: None,
+            charges: None,
+            children: Vec::new(),
+        };
+        let center_x = (NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH / 2 - 1) as i16;
+        let center_y = (NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT / 2 - 1) as i16;
+        for z in 0..NATIVE_OTCLIENT_CLASSIC_SURFACE_FLOORS as u8 {
+            for x in 0..NATIVE_OTCLIENT_CLASSIC_MAP_WIDTH {
+                for y in 0..NATIVE_OTCLIENT_CLASSIC_MAP_HEIGHT {
+                    let position = Position {
+                        x: snapshot
+                            .player_position
+                            .x
+                            .saturating_add_signed(x as i16 - center_x),
+                        y: snapshot
+                            .player_position
+                            .y
+                            .saturating_add_signed(y as i16 - center_y),
+                        z,
+                    };
+                    world_map
+                        .set_tile(
+                            position,
+                            forgotten_core::WorldMapTile {
+                                ground_thing_id: 102,
+                                walkable: true,
+                            },
+                        )
+                        .unwrap();
+                    world_map
+                        .set_tile_items(position, vec![item.clone(); 9])
+                        .unwrap();
+                }
+            }
+        }
+        let frame = encode_native_otclient_map_viewport(&profile, &snapshot, &world_map).unwrap();
+        assert_eq!(frame.0[0], NATIVE_OTCLIENT_GAME_FULL_MAP);
+        assert!(frame.0.len() <= MAX_FRAME_SIZE);
     }
 }

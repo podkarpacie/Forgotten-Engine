@@ -156,3 +156,7 @@
 - [x] Replace native 740 `GameServerTalk` delivery, which unmodified OTCv8 rejects because its 740 message-mode map lacks public-say mode translation, with parser-safe no-client-modification delivery.
 - [x] Deliver shared public chat through the working default-console status message and a bounded map-visible effect at the authoritative speaker position.
 - [x] Add regression coverage proving native 740 shared chat emits no `GameServerTalk` record while retaining console and map-visible delivery.
+- [x] Audit FE 7.4 native OTCv8 session transitions, frame decoding, movement scheduling, shared-world refreshes, and disconnect handling for reproducible defects.
+- [x] Audit TFS-style configuration, map/content conversion, persistence, and CLI error paths using malformed and boundary-case fixtures.
+- [x] Add regression tests and corrective patches for every verified defect discovered by the current bug-hunt.
+- [x] Validate, package, and publish the verified FE 7.4 bug-fix release with Linux, Windows, and SHA-256 assets.

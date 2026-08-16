@@ -1013,7 +1013,7 @@ pub fn template(profile: CompatibilityProfile) -> String {
 fn parse_assignments(contents: &str) -> Result<BTreeMap<String, Literal>, ConfigError> {
     let mut values = BTreeMap::new();
     for (index, source_line) in contents.lines().enumerate() {
-        let line = source_line.split("--").next().unwrap_or_default().trim();
+        let line = strip_lua_line_comment(source_line).trim();
         if line.is_empty() {
             continue;
         }
@@ -1038,6 +1038,34 @@ fn parse_assignments(contents: &str) -> Result<BTreeMap<String, Literal>, Config
         values.insert(key.to_owned(), literal);
     }
     Ok(values)
+}
+
+fn strip_lua_line_comment(source: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut characters = source.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == '-'
+            && characters
+                .peek()
+                .is_some_and(|(_, next_character)| *next_character == '-')
+        {
+            return &source[..index];
+        }
+    }
+    source
 }
 
 fn is_recognized_config_key(key: &str) -> bool {
@@ -1537,5 +1565,27 @@ experienceStages = {
         assert_eq!(parsed.towns().next().unwrap().name, "Thais");
         assert_eq!(parsed.waypoint("temple"), Some(spawn));
         assert!(matches!(parsed.source(), WorldMapSource::Otbm(_)));
+    }
+
+    #[test]
+    fn preserves_double_hyphens_inside_quoted_tfs_configuration_values() {
+        let world = temporary_world("quoted-lua-comment-marker");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}serverName = \"Private -- World\" -- trailing operator note\nrsaPrivateKey = \"keys--private/legacy.pem\"\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+
+        let config = load(&world).unwrap();
+        assert_eq!(config.server_name, "Private -- World");
+        assert_eq!(
+            config.rsa_private_key_path,
+            world.join("keys--private/legacy.pem")
+        );
+        let _ = fs::remove_dir_all(world);
     }
 }
