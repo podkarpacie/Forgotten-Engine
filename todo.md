@@ -205,8 +205,8 @@
 - [x] Add a typed validated death-loss policy model for documented `deathLosePercent` modes without yet applying loss, respawning a player, or claiming a default-formula implementation.
 - [x] Add elapsed-time-safe online health/mana regeneration using validated vocation rules, bounded catch-up, persisted vitals, and native 740 HUD refreshes; soul remains deferred.
 - [x] Add a bounded authoritative core scheduler for replacement-by-kind poison, burning, and energy damage-over-time conditions with capped damage, expiry cleanup, and lifecycle cleanup; persistence, client effects, and death policy remain deferred.
-- [ ] Add bounded condition state and profile-gated poison, burning, and energy-damage scheduling.
-- [ ] Add death, respawn, temple selection, loss policy, and client-state delivery foundations.
+- [x] Add bounded condition state and profile-gated poison, burning, and energy-damage scheduling.
+- [x] Add death, respawn, temple selection, loss policy, and client-state delivery foundations; full client-state delivery remains deferred.
 - [x] Expose imported world-map town and temple-position lookup accessors as the validated map-data prerequisite for later temple respawn behavior.
 - [x] Add schema-v6 player town assignment persistence with a zero-default migration, authenticated-character hydration, and an additive update helper; temple teleportation and death mechanics remain deferred.
 - [x] Add an authoritative in-memory player death-state record that validates a selected imported-town temple and sets health to zero without yet teleporting, persisting death state, applying loss, or sending client death packets.
@@ -222,15 +222,15 @@
 - [x] Define a repeatable validation matrix for each currently implemented FE 7.4 behavior, separating automated assertions from required unmodified-OTClientV8 manual checks.
 - [x] Add a bounded local validation harness for the supported CLI, SQLite migration, configuration, world import, and native protocol smoke-test paths; do not claim production coverage for deferred gameplay systems.
 - [x] Document production-release blockers and evidence requirements for a future production-readiness decision.
-- [ ] Define weighted, evidence-based FE 7.4 completion categories so “more than 50% complete” means implemented, tested runtime scope rather than an unsupported claim.
+- [x] Define weighted, evidence-based FE 7.4 completion categories so “more than 50% complete” means implemented, tested runtime scope rather than an unsupported claim.
 - [ ] Complete the next bounded FE 7.4 progression slice by applying configured experience rates and stages to authoritative experience awards.
 - [x] Add a bounded authoritative operator experience award that applies `rateExp` and optional `data/XML/stages.xml` ranges, updates exact level/experience state, and persists it; combat, quest, monster, and client reward event sources remain deferred.
 - [ ] Complete the next bounded FE 7.4 melee progression slice by awarding configured vocation-based skill tries without claiming weapon or spell formula support.
 - [x] Award one configured vocation-based fist try for each successful fixed selected-player melee hit and persist exact progression counters; weapon and spell formula support remains deferred.
 - [ ] Continue FE 7.4 world-interaction, content-runtime, social, and operational milestones with regression coverage and explicit capability reporting until the documented completion model exceeds 50%.
-- [ ] Publish a weighted FE 7.4 completion ledger with evidence requirements for each system category and a rule for reporting progress above 50%.
-- [ ] Apply configured experience rates and `stages.xml` ranges to authoritative experience awards, with exact regression coverage.
-- [ ] Apply configured vocation progression formulas to melee skill-try awards, with no claim of weapon or spell formulas.
+- [x] Publish a weighted FE 7.4 completion ledger with evidence requirements for each system category and a rule for reporting progress above 50%.
+- [x] Apply configured experience rates and `stages.xml` ranges to authoritative operator experience awards, with exact regression coverage; combat/quest/monster event sources remain deferred.
+- [x] Apply configured vocation progression formulas to fixed-melee fist skill-try awards, with no claim of weapon or spell formulas.
 - [ ] Deliver bounded client-visible lifecycle state: condition health updates, death state, temple respawn, and only verified loss policies.
 - [ ] Add profile-driven combat events for weapons, spells, damage types, cooldowns, PvP policy, and death/corpse handling after independent compatibility evidence.
 - [ ] Add authoritative item transfer, equipment/inventory synchronization, container windows, item use, actions, doors, switches, and map interactions.
