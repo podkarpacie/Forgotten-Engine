@@ -64,6 +64,8 @@ pub struct EngineConfig {
     pub game_protocol_port: u16,
     pub status_protocol_port: u16,
     pub max_players: u32,
+    pub experience_rate: u32,
+    pub death_loss_percent: i32,
     pub server_name: String,
     pub map_name: String,
     pub map_format: WorldMapFormat,
@@ -205,6 +207,14 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
     let game_protocol_port = optional_u16(&values, "gameProtocolPort", 7172)?;
     let status_protocol_port = optional_u16(&values, "statusProtocolPort", 7171)?;
     let max_players = optional_u32(&values, "maxPlayers", 0)?;
+    let experience_rate = optional_u32(&values, "rateExp", 5)?;
+    let death_loss_percent = optional_i32(&values, "deathLosePercent", -1)?;
+    if !(-1..=100).contains(&death_loss_percent) {
+        return Err(ConfigError::InvalidValue {
+            key: "deathLosePercent",
+            message: "must be between -1 and 100".into(),
+        });
+    }
     let profile_id = optional_string(&values, "feProfile", "fe-7.4")?;
     let profile = profile_by_id(profile_id).ok_or_else(|| ConfigError::InvalidValue {
         key: "feProfile",
@@ -284,6 +294,8 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         game_protocol_port,
         status_protocol_port,
         max_players,
+        experience_rate,
+        death_loss_percent,
         server_name: optional_string(&values, "serverName", "Forgotten Engine")?.to_owned(),
         map_name: optional_string(&values, "mapName", "forgotten")?.to_owned(),
         map_format: WorldMapFormat::parse(optional_string(&values, "mapFormat", "auto")?)?,
@@ -1079,6 +1091,8 @@ fn is_recognized_config_key(key: &str) -> bool {
         "ip" | "gameProtocolPort"
             | "statusProtocolPort"
             | "maxPlayers"
+            | "rateExp"
+            | "deathLosePercent"
             | "serverName"
             | "mapName"
             | "mapFormat"
@@ -1225,6 +1239,26 @@ fn optional_u32(
     }
 }
 
+fn optional_i32(
+    values: &BTreeMap<String, Literal>,
+    key: &'static str,
+    default: i32,
+) -> Result<i32, ConfigError> {
+    match values.get(key) {
+        Some(Literal::Integer(value)) => {
+            i32::try_from(*value).map_err(|_| ConfigError::InvalidValue {
+                key,
+                message: "must fit a signed 32-bit integer".into(),
+            })
+        }
+        Some(_) => Err(ConfigError::InvalidValue {
+            key,
+            message: "must be an integer".into(),
+        }),
+        None => Ok(default),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentReport {
     pub data_directory: PathBuf,
@@ -1360,6 +1394,8 @@ ip = "127.0.0.1"
 gameProtocolPort = 7172
 statusProtocolPort = 7171
 maxPlayers = 0
+rateExp = 5
+deathLosePercent = -1
 serverName = "Private Forgotten"
 mapName = "myworld"
 mapAuthor = "Operator"
@@ -1382,6 +1418,8 @@ experienceStages = {
         assert_eq!(config.server_name, "Private Forgotten");
         assert_eq!(config.map_name, "myworld");
         assert_eq!(config.game_protocol_port, 7172);
+        assert_eq!(config.experience_rate, 5);
+        assert_eq!(config.death_loss_percent, -1);
         assert!(!config.otclient_v8_native_enabled);
         let _ = fs::remove_dir_all(world);
     }
