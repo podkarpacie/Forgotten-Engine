@@ -16,7 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SCHEMA_VERSION_EQUIPMENT: i64 = 3;
 const SCHEMA_VERSION_CONTAINERS: i64 = 4;
-const LATEST_SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION_PROGRESSION: i64 = 5;
+const LATEST_SCHEMA_VERSION: i64 = 6;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct EngineDatabase {
@@ -147,7 +148,7 @@ impl EngineDatabase {
         account_id: i64,
     ) -> Result<Vec<LoginCharacter>, PersistenceError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, name, level, experience, skill_points, health, max_health, mana, max_mana, capacity, magic_level, x, y, z FROM players WHERE account_id = ?1 ORDER BY name COLLATE NOCASE",
+            "SELECT id, name, level, experience, skill_points, health, max_health, mana, max_mana, capacity, magic_level, x, y, z, town_id FROM players WHERE account_id = ?1 ORDER BY name COLLATE NOCASE",
         )?;
         let mut characters = statement
             .query_map(params![account_id], |row| {
@@ -171,6 +172,7 @@ impl EngineDatabase {
                         y: row.get::<_, i64>(12)? as u16,
                         z: row.get::<_, i64>(13)? as u8,
                     },
+                    town_id: row.get::<_, i64>(14)? as u32,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -199,6 +201,18 @@ impl EngineDatabase {
                 player.skill_points as i64,
             ],
         )?;
+        Ok(())
+    }
+
+    /// Updates the persistent town assignment used by future temple-respawn behavior.
+    pub fn update_player_town(&self, player_id: u64, town_id: u32) -> Result<(), PersistenceError> {
+        let affected = self.connection.execute(
+            "UPDATE players SET town_id = ?1 WHERE id = ?2",
+            params![town_id as i64, player_id as i64],
+        )?;
+        if affected == 0 {
+            return Err(PersistenceError::UnknownPlayer(player_id));
+        }
         Ok(())
     }
 
@@ -247,6 +261,7 @@ impl EngineDatabase {
             progression: PlayerProgression::default(),
             vitals: PlayerVitals::default(),
             position,
+            town_id: 0,
         })
     }
 
@@ -594,7 +609,7 @@ impl EngineDatabase {
         self.connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);\
              CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL);\
-             CREATE TABLE IF NOT EXISTS players (id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, name TEXT NOT NULL UNIQUE, x INTEGER NOT NULL, y INTEGER NOT NULL, z INTEGER NOT NULL, level INTEGER NOT NULL, experience INTEGER NOT NULL, skill_points INTEGER NOT NULL, health INTEGER NOT NULL DEFAULT 150, max_health INTEGER NOT NULL DEFAULT 150, mana INTEGER NOT NULL DEFAULT 50, max_mana INTEGER NOT NULL DEFAULT 50, capacity INTEGER NOT NULL DEFAULT 40000, magic_level INTEGER NOT NULL DEFAULT 0);\
+             CREATE TABLE IF NOT EXISTS players (id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, name TEXT NOT NULL UNIQUE, x INTEGER NOT NULL, y INTEGER NOT NULL, z INTEGER NOT NULL, level INTEGER NOT NULL, experience INTEGER NOT NULL, skill_points INTEGER NOT NULL, health INTEGER NOT NULL DEFAULT 150, max_health INTEGER NOT NULL DEFAULT 150, mana INTEGER NOT NULL DEFAULT 50, max_mana INTEGER NOT NULL DEFAULT 50, capacity INTEGER NOT NULL DEFAULT 40000, magic_level INTEGER NOT NULL DEFAULT 0, town_id INTEGER NOT NULL DEFAULT 0);\
              CREATE TABLE IF NOT EXISTS engine_events (id INTEGER PRIMARY KEY, level TEXT NOT NULL, message TEXT NOT NULL, created_at INTEGER NOT NULL);",
         )?;
         self.connection.execute(
@@ -640,7 +655,7 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_CONTAINERS, unix_seconds()],
             )?;
         }
-        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+        if self.schema_version()? < SCHEMA_VERSION_PROGRESSION {
             if !self.player_column_exists("vocation")? {
                 self.connection.execute_batch(
                     "ALTER TABLE players ADD COLUMN vocation INTEGER NOT NULL DEFAULT 0",
@@ -649,6 +664,17 @@ impl EngineDatabase {
             self.connection.execute_batch(
                 "CREATE TABLE IF NOT EXISTS player_skills (player_id INTEGER PRIMARY KEY, fist_level INTEGER NOT NULL, fist_percent INTEGER NOT NULL, club_level INTEGER NOT NULL, club_percent INTEGER NOT NULL, sword_level INTEGER NOT NULL, sword_percent INTEGER NOT NULL, axe_level INTEGER NOT NULL, axe_percent INTEGER NOT NULL, distance_level INTEGER NOT NULL, distance_percent INTEGER NOT NULL, shielding_level INTEGER NOT NULL, shielding_percent INTEGER NOT NULL, fishing_level INTEGER NOT NULL, fishing_percent INTEGER NOT NULL);",
             )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_PROGRESSION, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+            if !self.player_column_exists("town_id")? {
+                self.connection.execute_batch(
+                    "ALTER TABLE players ADD COLUMN town_id INTEGER NOT NULL DEFAULT 0",
+                )?;
+            }
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![LATEST_SCHEMA_VERSION, unix_seconds()],
@@ -726,6 +752,8 @@ pub struct LoginCharacter {
     pub progression: PlayerProgression,
     pub vitals: PlayerVitals,
     pub position: Position,
+    /// Imported map town identifier, or zero when no town has been assigned.
+    pub town_id: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -903,7 +931,30 @@ mod tests {
         assert_eq!(character.experience, 4_900);
         assert_eq!(character.vitals, PlayerVitals::default());
         assert_eq!(character.progression, PlayerProgression::default());
+        assert_eq!(character.town_id, 0);
         assert!(database.player_equipment(7).unwrap().is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_player_town_assignment_with_a_safe_default() {
+        let path = temporary_path("town-assignment");
+        let database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("admin", "hash").unwrap();
+        let character = database
+            .create_player_for_account(account_id as u32, "Knight")
+            .unwrap();
+        assert_eq!(character.town_id, 0);
+
+        database.update_player_town(character.id, 42).unwrap();
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].town_id,
+            42
+        );
+        assert!(matches!(
+            database.update_player_town(999, 1),
+            Err(PersistenceError::UnknownPlayer(999))
+        ));
         let _ = fs::remove_file(path);
     }
 
