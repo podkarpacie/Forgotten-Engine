@@ -368,6 +368,15 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)
     }
 
+    pub fn player_respawn_state(
+        &self,
+        player_id: u64,
+    ) -> Result<forgotten_core::PlayerRespawnState, HostError> {
+        self.lock()?
+            .player_respawn_state(player_id)
+            .map_err(HostError::Core)
+    }
+
     pub fn apply_player_regeneration(
         &self,
         player_id: u64,
@@ -453,6 +462,58 @@ impl SharedNativeWorld {
             self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok((outcome, vitals))
+    }
+
+    /// Applies one bounded player melee hit and, only when it would defeat a target with a
+    /// validated hydrated town, enters the authoritative death state in the same world lock.
+    /// Client death screens, loss application, persistence of death state, and respawn packets
+    /// remain outside this transition.
+    pub fn apply_player_melee_damage_with_death(
+        &self,
+        attacker_id: u64,
+        target_id: u64,
+        damage: u16,
+        world_map: &WorldMap,
+    ) -> Result<
+        (
+            forgotten_core::PlayerDamageOutcome,
+            PlayerVitals,
+            Option<forgotten_core::PlayerRespawnState>,
+        ),
+        HostError,
+    > {
+        let mut world = self.lock()?;
+        let vitals_before = world.player_vitals(target_id).map_err(HostError::Core)?;
+        let town_id = world.player_town(target_id).map_err(HostError::Core)?;
+        if damage > 0 && vitals_before.health <= damage {
+            if town_id == 0 {
+                return Err(HostError::Core(
+                    forgotten_core::CoreError::PlayerTownUnassigned(target_id),
+                ));
+            }
+            if world_map.temple_position_for_town(town_id).is_none() {
+                return Err(HostError::Core(forgotten_core::CoreError::UnknownTown(
+                    town_id,
+                )));
+            }
+        }
+        let outcome = world
+            .apply_player_melee_damage(attacker_id, target_id, damage)
+            .map_err(HostError::Core)?;
+        let death_state = if outcome.defeated {
+            Some(
+                world
+                    .apply_player_death(target_id, town_id, world_map)
+                    .map_err(HostError::Core)?,
+            )
+        } else {
+            None
+        };
+        let vitals = world.player_vitals(target_id).map_err(HostError::Core)?;
+        if outcome.applied_damage > 0 {
+            self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok((outcome, vitals, death_state))
     }
 
     pub fn active_static_spawns(&self) -> Result<FeTfsStaticSpawnCollection, HostError> {
@@ -1618,7 +1679,12 @@ fn handle_native_otclient_game(
                         }
                     }
                     if let Some((target_native_id, target_vitals, outcome)) =
-                        apply_native_selected_player_melee(&database, shared_world, character.id)?
+                        apply_native_selected_player_melee(
+                            &database,
+                            shared_world,
+                            character.id,
+                            world_map,
+                        )?
                     {
                         let health_update = encode_native_otclient_creature_health(
                             &config.client_profile,
@@ -2459,6 +2525,7 @@ fn apply_native_selected_player_melee(
     database: &EngineDatabase,
     shared_world: &SharedNativeWorld,
     attacker_id: u64,
+    world_map: &WorldMap,
 ) -> Result<
     Option<(
         u32,
@@ -2473,17 +2540,18 @@ fn apply_native_selected_player_melee(
     else {
         return Ok(None);
     };
-    let (outcome, vitals) = match shared_world.apply_player_melee_damage(
+    let (outcome, vitals, _death_state) = match shared_world.apply_player_melee_damage_with_death(
         attacker_id,
         target_id,
         NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE,
+        world_map,
     ) {
         Ok(result) => result,
         Err(HostError::Core(forgotten_core::CoreError::CombatOutOfRange { .. }))
         | Err(HostError::Core(forgotten_core::CoreError::UnknownPlayer(_)))
-        | Err(HostError::Core(forgotten_core::CoreError::SelfInteractionNotAllowed(_))) => {
-            return Ok(None)
-        }
+        | Err(HostError::Core(forgotten_core::CoreError::SelfInteractionNotAllowed(_)))
+        | Err(HostError::Core(forgotten_core::CoreError::PlayerTownUnassigned(_)))
+        | Err(HostError::Core(forgotten_core::CoreError::UnknownTown(_))) => return Ok(None),
         Err(error) => return Err(error),
     };
     if outcome.applied_damage == 0 {
@@ -3071,6 +3139,12 @@ mod tests {
                 .unwrap();
             }
         }
+        map.set_town(forgotten_core::WorldMapTown {
+            id: 1,
+            name: "Native Temple".into(),
+            temple_position: spawn,
+        })
+        .unwrap();
         map.validate().unwrap();
         Arc::new(map)
     }
@@ -3620,7 +3694,7 @@ mod tests {
         shared.set_player_target(101, Some(102)).unwrap();
 
         let (native_target_id, vitals, outcome) =
-            apply_native_selected_player_melee(&database, &shared, 101)
+            apply_native_selected_player_melee(&database, &shared, 101, &map)
                 .unwrap()
                 .unwrap();
         assert_eq!(native_target_id, NATIVE_OTCLIENT_PLAYER_ID_START + 102);
@@ -3640,6 +3714,102 @@ mod tests {
                 .vitals
                 .health,
             10
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn selected_player_melee_enters_server_side_death_state_for_hydrated_town() {
+        let path = database_path("selected-player-melee-death");
+        let database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("operator", "hash").unwrap();
+        let map = native_world_map();
+        for (id, name, position) in [
+            (201_u64, "Knight", map.spawn()),
+            (
+                202_u64,
+                "Druid",
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+        ] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: account_id as u64,
+                    name: name.into(),
+                    position,
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 201,
+                    account_id: account_id as u64,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .register_player_at_available_position_with_vitals(
+                Player {
+                    id: 202,
+                    account_id: account_id as u64,
+                    name: "Druid".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                PlayerVitals {
+                    health: NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE,
+                    max_health: NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE,
+                    ..PlayerVitals::default()
+                },
+                &map,
+            )
+            .unwrap();
+        shared.replace_player_town(202, 1).unwrap();
+        shared.set_player_target(201, Some(202)).unwrap();
+
+        let (_native_target_id, vitals, outcome) =
+            apply_native_selected_player_melee(&database, &shared, 201, &map)
+                .unwrap()
+                .unwrap();
+        assert!(outcome.defeated);
+        assert_eq!(vitals.health, 0);
+        assert_eq!(
+            shared.player_respawn_state(202).unwrap().respawn_at,
+            Some(map.spawn())
+        );
+        assert!(shared.player_respawn_state(202).unwrap().dead);
+        assert_eq!(
+            database
+                .characters_for_account(account_id)
+                .unwrap()
+                .into_iter()
+                .find(|character| character.id == 202)
+                .unwrap()
+                .vitals
+                .health,
+            0
         );
         let _ = fs::remove_file(path);
     }

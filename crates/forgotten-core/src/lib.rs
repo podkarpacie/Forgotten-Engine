@@ -2678,6 +2678,7 @@ pub enum CoreError {
     },
     UnknownPlayer(u64),
     UnknownTown(u32),
+    PlayerTownUnassigned(u64),
     PlayerIsNotDead(u64),
     MissingRespawnPosition(u64),
     DeathLossAlreadyApplied(u64),
