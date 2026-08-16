@@ -960,6 +960,13 @@ impl WorldState {
         self.players.get(&id)
     }
 
+    pub fn player_vitals(&self, player_id: u64) -> Result<PlayerVitals, CoreError> {
+        self.player_vitals
+            .get(&player_id)
+            .copied()
+            .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
     pub fn update_player_vitals(
         &mut self,
         player_id: u64,
@@ -1004,6 +1011,27 @@ impl WorldState {
             remaining_health: vitals.health,
             defeated: vitals.health == 0,
         })
+    }
+
+    pub fn apply_player_melee_damage(
+        &mut self,
+        attacker_id: u64,
+        target_id: u64,
+        requested_damage: u16,
+    ) -> Result<PlayerDamageOutcome, CoreError> {
+        let attacker = self
+            .player(attacker_id)
+            .ok_or(CoreError::UnknownPlayer(attacker_id))?;
+        let target = self
+            .player(target_id)
+            .ok_or(CoreError::UnknownPlayer(target_id))?;
+        if !attacker.position.is_adjacent_to(target.position) {
+            return Err(CoreError::CombatOutOfRange {
+                attacker_id,
+                target_id,
+            });
+        }
+        self.apply_player_damage(attacker_id, target_id, requested_damage)
     }
 
     pub fn move_player(&mut self, id: u64, destination: Position) -> Result<(), CoreError> {
@@ -1128,6 +1156,10 @@ pub enum CoreError {
     UnknownPlayer(u64),
     SelfInteractionNotAllowed(u64),
     InvalidPlayerVitals(u64),
+    CombatOutOfRange {
+        attacker_id: u64,
+        target_id: u64,
+    },
 }
 
 impl std::fmt::Display for CoreError {
@@ -1859,6 +1891,7 @@ mod tests {
                 defeated: false,
             }
         );
+        assert_eq!(world.player_vitals(8).unwrap().health, 18);
         assert_eq!(
             world.apply_player_damage(7, 8, 99).unwrap(),
             PlayerDamageOutcome {
@@ -1873,6 +1906,19 @@ mod tests {
         assert_eq!(
             world.apply_player_damage(7, 7, 1),
             Err(CoreError::SelfInteractionNotAllowed(7))
+        );
+
+        let mut distant = player();
+        distant.id = 9;
+        distant.name = "Sorcerer".into();
+        distant.position.x = 103;
+        world.add_player(distant).unwrap();
+        assert_eq!(
+            world.apply_player_melee_damage(7, 9, 5),
+            Err(CoreError::CombatOutOfRange {
+                attacker_id: 7,
+                target_id: 9,
+            })
         );
     }
 }

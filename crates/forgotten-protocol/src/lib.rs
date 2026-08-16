@@ -790,6 +790,7 @@ pub const NATIVE_OTCLIENT_GAME_PING: u8 = 0x1e;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATS: u8 = 0xa0;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_SKILLS: u8 = 0xa1;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATE: u8 = 0xa2;
+pub const NATIVE_OTCLIENT_GAME_CREATURE_HEALTH: u8 = 0x8c;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT: u8 = 0x8e;
 pub const NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT: u8 = 0xc8;
 pub const NATIVE_OTCLIENT_GAME_CANCEL_WALK: u8 = 0xb5;
@@ -1240,10 +1241,9 @@ pub fn encode_native_otclient_game_initialization_with_map_and_static_spawns_and
     Ok(Frame(payload))
 }
 
-/// Encodes the fixed-width classic 7.4 local-player records expected immediately after map
-/// delivery. Health, mana, capacity, experience, level, and magic level come from persisted
-/// player state; the generic skill baseline remains deferred to the skill-progression milestone.
-pub fn encode_native_otclient_player_bootstrap(
+/// Encodes the fixed-width classic 7.4 player-stats record. Health, mana, capacity, experience,
+/// level, and magic level come from persisted player state.
+pub fn encode_native_otclient_player_stats(
     profile: &NativeOtClientProfile,
     snapshot: &NativeOtClientEmptyWorldSnapshot,
 ) -> Result<Frame, ProtocolError> {
@@ -1262,6 +1262,17 @@ pub fn encode_native_otclient_player_bootstrap(
     writer.u16(vitals.max_mana);
     writer.byte(vitals.magic_level);
     writer.byte(0);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes the fixed-width classic 7.4 local-player records expected immediately after map
+/// delivery. The generic skill baseline remains deferred to the skill-progression milestone.
+pub fn encode_native_otclient_player_bootstrap(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+) -> Result<Frame, ProtocolError> {
+    let mut payload = encode_native_otclient_player_stats(profile, snapshot)?.0;
+    let mut writer = Writer::default();
 
     writer.byte(NATIVE_OTCLIENT_GAME_PLAYER_SKILLS);
     for _ in 0..7 {
@@ -1271,7 +1282,8 @@ pub fn encode_native_otclient_player_bootstrap(
 
     writer.byte(NATIVE_OTCLIENT_GAME_PLAYER_STATE);
     writer.byte(0);
-    Ok(Frame(writer.finish()))
+    payload.extend_from_slice(&writer.finish());
+    Ok(Frame(payload))
 }
 
 pub fn encode_native_otclient_empty_world_map(
@@ -1822,6 +1834,26 @@ pub fn encode_native_otclient_creature_outfit(
     writer.byte(NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT);
     writer.u32(creature_id);
     write_native_otclient_classic_outfit(&mut writer, outfit);
+    Ok(Frame(writer.finish()))
+}
+
+pub fn encode_native_otclient_creature_health(
+    profile: &NativeOtClientProfile,
+    creature_id: u32,
+    health: u16,
+    max_health: u16,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation()
+        || !(NATIVE_OTCLIENT_PLAYER_ID_START..NATIVE_OTCLIENT_PLAYER_ID_END).contains(&creature_id)
+        || max_health == 0
+    {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let health_percent = ((u32::from(health.min(max_health)) * 100) / u32::from(max_health)) as u8;
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_CREATURE_HEALTH);
+    writer.u32(creature_id);
+    writer.byte(health_percent);
     Ok(Frame(writer.finish()))
 }
 
@@ -2800,6 +2832,15 @@ mod tests {
                 3,
                 4
             ]
+        );
+        assert_eq!(
+            encode_native_otclient_creature_health(&profile, snapshot.player_id, 75, 150)
+                .unwrap()
+                .0,
+            vec![NATIVE_OTCLIENT_GAME_CREATURE_HEALTH, 42, 0, 0, 16, 50]
+        );
+        assert!(
+            encode_native_otclient_creature_health(&profile, snapshot.player_id, 1, 0).is_err()
         );
         assert!(encode_native_otclient_choose_outfit(&profile, classic_outfit, 131, 128).is_err());
         assert!(encode_native_otclient_creature_outfit(

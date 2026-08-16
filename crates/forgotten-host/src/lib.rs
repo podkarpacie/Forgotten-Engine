@@ -19,22 +19,22 @@ use forgotten_protocol::{
     encode_fe_otclient_world_tick, encode_legacy_74_character_list,
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
-    encode_native_otclient_choose_outfit, encode_native_otclient_creature_outfit,
-    encode_native_otclient_game_cancel_walk_facing,
+    encode_native_otclient_choose_outfit, encode_native_otclient_creature_health,
+    encode_native_otclient_creature_outfit, encode_native_otclient_game_cancel_walk_facing,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
     encode_native_otclient_map_step_with_static_spawns_and_players,
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
-    encode_native_otclient_move_creature_at, encode_status_binary, encode_status_xml,
-    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
-    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
-    NativeOtClientCardinalDirection, NativeOtClientClassicOutfit, NativeOtClientEmptyWorldSnapshot,
-    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
-    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
-    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    encode_native_otclient_move_creature_at, encode_native_otclient_player_stats,
+    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
+    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
+    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection, NativeOtClientClassicOutfit,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPlayerVitals,
+    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
+    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -57,6 +57,7 @@ const NATIVE_OTCLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const NATIVE_OTCLIENT_DEFAULT_GROUND_SPEED: u64 = 150;
 const NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY: Duration = Duration::from_secs(2);
 const NATIVE_OTCLIENT_SHARED_CHAT_QUEUE_CAPACITY: usize = 64;
+const NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE: u16 = 10;
 
 fn truncate_native_chat_text(message: &str) -> String {
     let mut output = String::new();
@@ -190,6 +191,7 @@ pub struct NativeOtClientEmptyWorldConfig {
 pub struct SharedNativeWorld {
     world: Arc<Mutex<WorldState>>,
     visibility_epoch: Arc<AtomicU64>,
+    vitals_epoch: Arc<AtomicU64>,
     chat_recipients: Arc<Mutex<BTreeMap<u64, mpsc::SyncSender<SharedPublicChatEvent>>>>,
 }
 
@@ -213,6 +215,7 @@ impl SharedNativeWorld {
         Ok(Self {
             world: Arc::new(Mutex::new(world)),
             visibility_epoch: Arc::new(AtomicU64::new(0)),
+            vitals_epoch: Arc::new(AtomicU64::new(0)),
             chat_recipients: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
@@ -227,6 +230,33 @@ impl SharedNativeWorld {
 
     pub fn visibility_epoch(&self) -> u64 {
         self.visibility_epoch.load(Ordering::SeqCst)
+    }
+
+    pub fn vitals_epoch(&self) -> u64 {
+        self.vitals_epoch.load(Ordering::SeqCst)
+    }
+
+    pub fn player_vitals(&self, player_id: u64) -> Result<PlayerVitals, HostError> {
+        self.lock()?
+            .player_vitals(player_id)
+            .map_err(HostError::Core)
+    }
+
+    pub fn apply_player_melee_damage(
+        &self,
+        attacker_id: u64,
+        target_id: u64,
+        damage: u16,
+    ) -> Result<(forgotten_core::PlayerDamageOutcome, PlayerVitals), HostError> {
+        let mut world = self.lock()?;
+        let outcome = world
+            .apply_player_melee_damage(attacker_id, target_id, damage)
+            .map_err(HostError::Core)?;
+        let vitals = world.player_vitals(target_id).map_err(HostError::Core)?;
+        if outcome.applied_damage > 0 {
+            self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok((outcome, vitals))
     }
 
     pub fn active_static_spawns(&self) -> Result<FeTfsStaticSpawnCollection, HostError> {
@@ -1104,7 +1134,7 @@ fn handle_native_otclient_game(
         database.update_player_position(character.id, initial_position)?;
     }
     let player_id = native_player_id(character.id)?;
-    let snapshot = NativeOtClientEmptyWorldSnapshot {
+    let mut snapshot = NativeOtClientEmptyWorldSnapshot {
         player_id,
         player_name: character.name.clone(),
         player_position: native_position(initial_position),
@@ -1158,6 +1188,7 @@ fn handle_native_otclient_game(
     let mut player_outfit = NativeOtClientClassicOutfit::from_snapshot(&snapshot);
     let mut active_click_walk: Option<NativeActiveClickWalk> = None;
     let mut observed_visibility_epoch = shared_world.visibility_epoch();
+    let mut observed_vitals_epoch = shared_world.vitals_epoch();
     loop {
         drain_shared_public_chat(
             stream,
@@ -1192,6 +1223,54 @@ fn handle_native_otclient_game(
                         config.extended_diagnostics,
                         peer,
                     )?;
+                    if let Some((target_native_id, target_vitals, outcome)) =
+                        apply_native_selected_player_melee(&database, shared_world, character.id)?
+                    {
+                        let health_update = encode_native_otclient_creature_health(
+                            &config.client_profile,
+                            target_native_id,
+                            target_vitals.health,
+                            target_vitals.max_health,
+                        )
+                        .map_err(HostError::Protocol)?;
+                        write_frame(stream, &health_update)?;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "combat=selected-player-melee target={} damage={} health={}/{}",
+                                outcome.target_id,
+                                outcome.applied_damage,
+                                target_vitals.health,
+                                target_vitals.max_health
+                            ),
+                        );
+                    }
+                    let vitals_epoch = shared_world.vitals_epoch();
+                    if vitals_epoch != observed_vitals_epoch {
+                        let vitals = shared_world.player_vitals(character.id)?;
+                        snapshot.player_vitals = NativeOtClientPlayerVitals {
+                            health: vitals.health,
+                            max_health: vitals.max_health,
+                            mana: vitals.mana,
+                            max_mana: vitals.max_mana,
+                            capacity: vitals.capacity,
+                            magic_level: vitals.magic_level,
+                        };
+                        let stats_update =
+                            encode_native_otclient_player_stats(&config.client_profile, &snapshot)
+                                .map_err(HostError::Protocol)?;
+                        write_frame(stream, &stats_update)?;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "outbound=player-stats-refresh epoch={vitals_epoch} bytes={}",
+                                stats_update.0.len()
+                            ),
+                        );
+                        observed_vitals_epoch = vitals_epoch;
+                    }
                     let visibility_epoch = shared_world.visibility_epoch();
                     if visibility_epoch != observed_visibility_epoch {
                         let mut refreshed_snapshot = snapshot.clone();
@@ -1965,6 +2044,65 @@ fn apply_native_player_interaction(
     }
 }
 
+fn apply_native_selected_player_melee(
+    database: &EngineDatabase,
+    shared_world: &SharedNativeWorld,
+    attacker_id: u64,
+) -> Result<
+    Option<(
+        u32,
+        NativeOtClientPlayerVitals,
+        forgotten_core::PlayerDamageOutcome,
+    )>,
+    HostError,
+> {
+    let Some(target_id) = shared_world
+        .player_interaction_intent(attacker_id)?
+        .target_player_id
+    else {
+        return Ok(None);
+    };
+    let (outcome, vitals) = match shared_world.apply_player_melee_damage(
+        attacker_id,
+        target_id,
+        NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE,
+    ) {
+        Ok(result) => result,
+        Err(HostError::Core(forgotten_core::CoreError::CombatOutOfRange { .. }))
+        | Err(HostError::Core(forgotten_core::CoreError::UnknownPlayer(_)))
+        | Err(HostError::Core(forgotten_core::CoreError::SelfInteractionNotAllowed(_))) => {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    };
+    if outcome.applied_damage == 0 {
+        return Ok(None);
+    }
+    database.update_player_vitals(
+        target_id,
+        forgotten_persistence::PlayerVitals {
+            health: vitals.health,
+            max_health: vitals.max_health,
+            mana: vitals.mana,
+            max_mana: vitals.max_mana,
+            capacity: vitals.capacity,
+            magic_level: vitals.magic_level,
+        },
+    )?;
+    Ok(Some((
+        native_player_id(target_id)?,
+        NativeOtClientPlayerVitals {
+            health: vitals.health,
+            max_health: vitals.max_health,
+            mana: vitals.mana,
+            max_mana: vitals.max_mana,
+            capacity: vitals.capacity,
+            magic_level: vitals.magic_level,
+        },
+        outcome,
+    )))
+}
+
 fn native_player_id_to_character_id(native_id: u32) -> Option<u64> {
     (NATIVE_OTCLIENT_PLAYER_ID_START..NATIVE_OTCLIENT_PLAYER_ID_END)
         .contains(&native_id)
@@ -2703,6 +2841,101 @@ mod tests {
                 follow_player_id: Some(102),
             }
         );
+    }
+
+    #[test]
+    fn selected_player_melee_persists_authoritative_vitals_and_returns_native_target() {
+        let path = database_path("selected-player-melee");
+        let database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("operator", "hash").unwrap();
+        let map = native_world_map();
+        for (id, name, position) in [
+            (101_u64, "Knight", map.spawn()),
+            (
+                102_u64,
+                "Druid",
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+        ] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: account_id as u64,
+                    name: name.into(),
+                    position,
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: account_id as u64,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .register_player_at_available_position_with_vitals(
+                Player {
+                    id: 102,
+                    account_id: account_id as u64,
+                    name: "Druid".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                PlayerVitals {
+                    health: 20,
+                    max_health: 20,
+                    ..PlayerVitals::default()
+                },
+                &map,
+            )
+            .unwrap();
+        shared.set_player_target(101, Some(102)).unwrap();
+
+        let (native_target_id, vitals, outcome) =
+            apply_native_selected_player_melee(&database, &shared, 101)
+                .unwrap()
+                .unwrap();
+        assert_eq!(native_target_id, NATIVE_OTCLIENT_PLAYER_ID_START + 102);
+        assert_eq!(
+            outcome.applied_damage,
+            NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE
+        );
+        assert_eq!(vitals.health, 10);
+        assert_eq!(shared.vitals_epoch(), 1);
+        assert_eq!(
+            database
+                .characters_for_account(account_id)
+                .unwrap()
+                .into_iter()
+                .find(|character| character.id == 102)
+                .unwrap()
+                .vitals
+                .health,
+            10
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]

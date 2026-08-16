@@ -168,5 +168,6 @@
 - [x] Add a versioned SQLite migration and native-session contract for persisted health, mana, capacity, and magic-level values, with backward-compatible defaults for existing worlds.
 - [x] Emit parser-safe native 740 player stats and skills from persisted player state instead of placeholder values, with full protocol/persistence/host regressions.
 - [x] Define and test a bounded combat resolution foundation that can modify persisted health and drive the native 740 HUD without claiming spell or monster-AI support.
+- [x] Add a parser-safe native 740 creature-health update encoder and a bounded selected-player combat path that persists resulting vitals without implementing spells, monsters, or automatic attacks.
 - [x] Validate, package, and publish the next parser-safe native 740 compatibility release with Linux, Windows, and SHA-256 assets.
 - [x] Validate, package, and publish FE 7.4.42 persistent player-state and bounded combat-foundation assets with Linux, Windows, and SHA-256 checksums.
