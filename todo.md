@@ -164,7 +164,9 @@
 - [x] Implement the native 740 outfit-window response and a safe bounded change-outfit round trip for the operator-supplied client appearance set.
 - [x] Add protocol and host regressions for native 740 chat/outfit packets, including absence of unsupported `0xAA` and invalid-mode `0xB4` records.
 - [ ] Establish and execute the tested playable-server roadmap: persistent player state, visible health/mana, combat, creatures, inventory/containers, and bounded Lua integration.
-- [ ] Add persistent player health, mana, experience, and skill-state fields to the authoritative core and SQLite contracts with safe migration behavior.
-- [ ] Emit parser-safe native 740 player stats and skills from persisted player state instead of placeholder values, with full protocol/persistence/host regressions.
-- [ ] Define and test a bounded combat resolution foundation that can modify persisted health and drive the native 740 HUD without claiming spell or monster-AI support.
+- [x] Add persistent player health, mana, experience, and skill-state fields to the authoritative core and SQLite contracts with safe migration behavior.
+- [x] Add a versioned SQLite migration and native-session contract for persisted health, mana, capacity, and magic-level values, with backward-compatible defaults for existing worlds.
+- [x] Emit parser-safe native 740 player stats and skills from persisted player state instead of placeholder values, with full protocol/persistence/host regressions.
+- [x] Define and test a bounded combat resolution foundation that can modify persisted health and drive the native 740 HUD without claiming spell or monster-AI support.
 - [x] Validate, package, and publish the next parser-safe native 740 compatibility release with Linux, Windows, and SHA-256 assets.
+- [x] Validate, package, and publish FE 7.4.42 persistent player-state and bounded combat-foundation assets with Linux, Windows, and SHA-256 checksums.

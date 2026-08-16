@@ -521,6 +521,45 @@ impl Player {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerVitals {
+    pub health: u16,
+    pub max_health: u16,
+    pub mana: u16,
+    pub max_mana: u16,
+    pub capacity: u16,
+    pub magic_level: u8,
+}
+
+impl PlayerVitals {
+    pub fn is_valid(self) -> bool {
+        self.max_health > 0 && self.health <= self.max_health && self.mana <= self.max_mana
+    }
+}
+
+impl Default for PlayerVitals {
+    fn default() -> Self {
+        Self {
+            health: 150,
+            max_health: 150,
+            mana: 50,
+            max_mana: 50,
+            capacity: 40_000,
+            magic_level: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerDamageOutcome {
+    pub attacker_id: u64,
+    pub target_id: u64,
+    pub requested_damage: u16,
+    pub applied_damage: u16,
+    pub remaining_health: u16,
+    pub defeated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerRenderSnapshot {
     pub id: u64,
@@ -540,6 +579,7 @@ pub struct PlayerInteractionIntent {
 #[derive(Debug, Default)]
 pub struct WorldState {
     players: BTreeMap<u64, Player>,
+    player_vitals: BTreeMap<u64, PlayerVitals>,
     player_interactions: BTreeMap<u64, PlayerInteractionIntent>,
     static_creatures: BTreeMap<u32, StaticCreatureRuntime>,
     static_occupied_positions: BTreeSet<Position>,
@@ -557,8 +597,19 @@ impl WorldState {
     }
 
     pub fn add_player(&mut self, player: Player) -> Result<(), CoreError> {
+        self.add_player_with_vitals(player, PlayerVitals::default())
+    }
+
+    pub fn add_player_with_vitals(
+        &mut self,
+        player: Player,
+        vitals: PlayerVitals,
+    ) -> Result<(), CoreError> {
         if player.name.trim().is_empty() {
             return Err(CoreError::EmptyPlayerName);
+        }
+        if !vitals.is_valid() {
+            return Err(CoreError::InvalidPlayerVitals(player.id));
         }
         if self.players.contains_key(&player.id) {
             return Err(CoreError::DuplicatePlayer(player.id));
@@ -573,6 +624,7 @@ impl WorldState {
         if self.is_static_creature_occupied(player.position) {
             return Err(CoreError::StaticCreatureOccupiesPosition(player.position));
         }
+        self.player_vitals.insert(player.id, vitals);
         self.players.insert(player.id, player);
         Ok(())
     }
@@ -582,6 +634,7 @@ impl WorldState {
             .players
             .remove(&id)
             .ok_or(CoreError::UnknownPlayer(id))?;
+        self.player_vitals.remove(&id);
         self.player_interactions.remove(&id);
         self.player_interactions.retain(|_, intent| {
             if intent.target_player_id == Some(id) {
@@ -907,6 +960,52 @@ impl WorldState {
         self.players.get(&id)
     }
 
+    pub fn update_player_vitals(
+        &mut self,
+        player_id: u64,
+        vitals: PlayerVitals,
+    ) -> Result<(), CoreError> {
+        if !vitals.is_valid() {
+            return Err(CoreError::InvalidPlayerVitals(player_id));
+        }
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        self.player_vitals.insert(player_id, vitals);
+        Ok(())
+    }
+
+    pub fn apply_player_damage(
+        &mut self,
+        attacker_id: u64,
+        target_id: u64,
+        requested_damage: u16,
+    ) -> Result<PlayerDamageOutcome, CoreError> {
+        if attacker_id == target_id {
+            return Err(CoreError::SelfInteractionNotAllowed(attacker_id));
+        }
+        if !self.players.contains_key(&attacker_id) {
+            return Err(CoreError::UnknownPlayer(attacker_id));
+        }
+        if !self.players.contains_key(&target_id) {
+            return Err(CoreError::UnknownPlayer(target_id));
+        }
+        let vitals = self
+            .player_vitals
+            .get_mut(&target_id)
+            .ok_or(CoreError::UnknownPlayer(target_id))?;
+        let applied_damage = requested_damage.min(vitals.health);
+        vitals.health = vitals.health.saturating_sub(applied_damage);
+        Ok(PlayerDamageOutcome {
+            attacker_id,
+            target_id,
+            requested_damage,
+            applied_damage,
+            remaining_health: vitals.health,
+            defeated: vitals.health == 0,
+        })
+    }
+
     pub fn move_player(&mut self, id: u64, destination: Position) -> Result<(), CoreError> {
         if self.is_static_creature_occupied(destination) {
             return Err(CoreError::StaticCreatureOccupiesPosition(destination));
@@ -1028,6 +1127,7 @@ pub enum CoreError {
     },
     UnknownPlayer(u64),
     SelfInteractionNotAllowed(u64),
+    InvalidPlayerVitals(u64),
 }
 
 impl std::fmt::Display for CoreError {
@@ -1701,5 +1801,78 @@ mod tests {
             Err(CoreError::PlayerOccupiesStaticCreaturePosition(position))
         );
         assert_eq!(world.static_creature_count(), 0);
+    }
+
+    #[test]
+    fn authoritative_player_vitals_validate_update_and_bound_damage() {
+        let mut world = WorldState::default();
+        let invalid = PlayerVitals {
+            health: 151,
+            max_health: 150,
+            ..PlayerVitals::default()
+        };
+        assert_eq!(
+            world.add_player_with_vitals(player(), invalid),
+            Err(CoreError::InvalidPlayerVitals(7))
+        );
+
+        world.add_player(player()).unwrap();
+        let mut target = player();
+        target.id = 8;
+        target.name = "Druid".into();
+        target.position.x = 101;
+        world
+            .add_player_with_vitals(
+                target,
+                PlayerVitals {
+                    health: 30,
+                    max_health: 50,
+                    mana: 20,
+                    max_mana: 50,
+                    capacity: 32_000,
+                    magic_level: 4,
+                },
+            )
+            .unwrap();
+        world
+            .update_player_vitals(
+                7,
+                PlayerVitals {
+                    health: 120,
+                    max_health: 150,
+                    mana: 42,
+                    max_mana: 50,
+                    capacity: 35_000,
+                    magic_level: 3,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            world.apply_player_damage(7, 8, 12).unwrap(),
+            PlayerDamageOutcome {
+                attacker_id: 7,
+                target_id: 8,
+                requested_damage: 12,
+                applied_damage: 12,
+                remaining_health: 18,
+                defeated: false,
+            }
+        );
+        assert_eq!(
+            world.apply_player_damage(7, 8, 99).unwrap(),
+            PlayerDamageOutcome {
+                attacker_id: 7,
+                target_id: 8,
+                requested_damage: 99,
+                applied_damage: 18,
+                remaining_health: 0,
+                defeated: true,
+            }
+        );
+        assert_eq!(
+            world.apply_player_damage(7, 7, 1),
+            Err(CoreError::SelfInteractionNotAllowed(7))
+        );
     }
 }

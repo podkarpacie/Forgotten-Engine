@@ -886,11 +886,36 @@ pub struct NativeOtClientEmptyWorldSnapshot {
     pub player_name: String,
     pub player_position: NativeOtClientPosition,
     pub player_level: u16,
+    pub player_experience: u64,
+    pub player_vitals: NativeOtClientPlayerVitals,
     pub ground_thing_id: u16,
     pub player_look_type: u8,
     pub player_direction: u8,
     pub player_speed: u16,
     pub server_beat: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeOtClientPlayerVitals {
+    pub health: u16,
+    pub max_health: u16,
+    pub mana: u16,
+    pub max_mana: u16,
+    pub capacity: u16,
+    pub magic_level: u8,
+}
+
+impl Default for NativeOtClientPlayerVitals {
+    fn default() -> Self {
+        Self {
+            health: 150,
+            max_health: 150,
+            mana: 50,
+            max_mana: 50,
+            capacity: 40_000,
+            magic_level: 0,
+        }
+    }
 }
 
 /// A bounded classic 7.4 creature appearance. The selected 740 OTCv8 feature profile uses an
@@ -1215,27 +1240,27 @@ pub fn encode_native_otclient_game_initialization_with_map_and_static_spawns_and
     Ok(Frame(payload))
 }
 
-/// Encodes the fixed-width 7.x local-player records expected immediately after map delivery.
-///
-/// The diagnostic world does not yet persist all of these values. The baseline values keep the
-/// stock client HUD usable until full persistent player state is implemented.
+/// Encodes the fixed-width classic 7.4 local-player records expected immediately after map
+/// delivery. Health, mana, capacity, experience, level, and magic level come from persisted
+/// player state; the generic skill baseline remains deferred to the skill-progression milestone.
 pub fn encode_native_otclient_player_bootstrap(
     profile: &NativeOtClientProfile,
     snapshot: &NativeOtClientEmptyWorldSnapshot,
 ) -> Result<Frame, ProtocolError> {
     validate_native_empty_world_snapshot(profile, snapshot)?;
     let mut writer = Writer::default();
+    let level = snapshot.player_level.clamp(1, u8::MAX as u16) as u8;
+    let vitals = snapshot.player_vitals;
     writer.byte(NATIVE_OTCLIENT_GAME_PLAYER_STATS);
-    writer.u16(150);
-    writer.u16(150);
-    writer.u16(40_000);
-    writer.u32(0);
-    writer.u16(snapshot.player_level.max(1));
+    writer.u16(vitals.health);
+    writer.u16(vitals.max_health);
+    writer.u16(vitals.capacity);
+    writer.u32(snapshot.player_experience.min(i32::MAX as u64) as u32);
+    writer.byte(level);
     writer.byte(0);
-    writer.u16(50);
-    writer.u16(50);
-    writer.byte(0);
-    writer.byte(0);
+    writer.u16(vitals.mana);
+    writer.u16(vitals.max_mana);
+    writer.byte(vitals.magic_level);
     writer.byte(0);
 
     writer.byte(NATIVE_OTCLIENT_GAME_PLAYER_SKILLS);
@@ -2442,6 +2467,8 @@ mod tests {
                 z: 7,
             },
             player_level: 8,
+            player_experience: 4_900,
+            player_vitals: NativeOtClientPlayerVitals::default(),
             ground_thing_id: 102,
             player_look_type: 128,
             player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
@@ -2705,12 +2732,32 @@ mod tests {
             150
         );
         assert_eq!(
-            u16::from_le_bytes(bootstrap.0[11..13].try_into().unwrap()),
-            snapshot.player_level
+            u16::from_le_bytes(bootstrap.0[3..5].try_into().unwrap()),
+            150
         );
-        assert_eq!(bootstrap.0[21], NATIVE_OTCLIENT_GAME_PLAYER_SKILLS);
-        assert_eq!(bootstrap.0[36], NATIVE_OTCLIENT_GAME_PLAYER_STATE);
-        assert_eq!(bootstrap.0[37], 0);
+        assert_eq!(
+            u16::from_le_bytes(bootstrap.0[5..7].try_into().unwrap()),
+            40_000
+        );
+        assert_eq!(
+            u32::from_le_bytes(bootstrap.0[7..11].try_into().unwrap()),
+            4_900
+        );
+        assert_eq!(bootstrap.0[11], 8);
+        assert_eq!(bootstrap.0[12], 0);
+        assert_eq!(
+            u16::from_le_bytes(bootstrap.0[13..15].try_into().unwrap()),
+            50
+        );
+        assert_eq!(
+            u16::from_le_bytes(bootstrap.0[15..17].try_into().unwrap()),
+            50
+        );
+        assert_eq!(bootstrap.0[17], 0);
+        assert_eq!(bootstrap.0[18], 0);
+        assert_eq!(bootstrap.0[19], NATIVE_OTCLIENT_GAME_PLAYER_SKILLS);
+        assert_eq!(bootstrap.0[34], NATIVE_OTCLIENT_GAME_PLAYER_STATE);
+        assert_eq!(bootstrap.0[35], 0);
         assert_eq!(
             &initialization.0[login.0.len() + map.0.len()..],
             bootstrap.0.as_slice()
@@ -3043,6 +3090,8 @@ mod tests {
                 z: 7,
             },
             player_level: 8,
+            player_experience: 0,
+            player_vitals: NativeOtClientPlayerVitals::default(),
             ground_thing_id: 102,
             player_look_type: 128,
             player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),

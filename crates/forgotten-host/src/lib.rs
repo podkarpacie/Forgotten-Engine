@@ -4,8 +4,8 @@
 
 use forgotten_core::{
     CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, Player,
-    PlayerInteractionIntent, Position, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy,
-    WorldMap, WorldState,
+    PlayerInteractionIntent, PlayerVitals, Position, StaticCreatureDecisionBatch,
+    StaticCreatureDecisionPolicy, WorldMap, WorldState,
 };
 use forgotten_persistence::EngineDatabase;
 use forgotten_protocol::{
@@ -32,10 +32,11 @@ use forgotten_protocol::{
     CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
     Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
     NativeOtClientCardinalDirection, NativeOtClientClassicOutfit, NativeOtClientEmptyWorldSnapshot,
-    NativeOtClientGameAction, NativeOtClientPosition, NativeOtClientProfile,
-    NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
-    StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES,
-    NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
+    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
+    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
+    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
+    NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
@@ -340,7 +341,20 @@ impl SharedNativeWorld {
 
     pub fn register_player_at_available_position(
         &self,
+        player: Player,
+        world_map: &WorldMap,
+    ) -> Result<Position, HostError> {
+        self.register_player_at_available_position_with_vitals(
+            player,
+            PlayerVitals::default(),
+            world_map,
+        )
+    }
+
+    pub fn register_player_at_available_position_with_vitals(
+        &self,
         mut player: Player,
+        vitals: PlayerVitals,
         world_map: &WorldMap,
     ) -> Result<Position, HostError> {
         let mut world = self.lock()?;
@@ -366,7 +380,9 @@ impl SharedNativeWorld {
                 )
             })?;
         player.position = position;
-        world.add_player(player).map_err(HostError::Core)?;
+        world
+            .add_player_with_vitals(player, vitals)
+            .map_err(HostError::Core)?;
         self.mark_visibility_changed();
         Ok(position)
     }
@@ -1047,15 +1063,23 @@ fn handle_native_otclient_game(
     let account_id = u64::try_from(account.id).map_err(|_| {
         HostError::InvalidConfiguration("native numeric account IDs must be non-negative".into())
     })?;
-    let initial_position = match shared_world.register_player_at_available_position(
+    let initial_position = match shared_world.register_player_at_available_position_with_vitals(
         Player {
             id: character.id,
             account_id,
             name: character.name.clone(),
             position: character.position,
             level: character.level,
-            experience: 0,
-            skill_points: 0,
+            experience: character.experience,
+            skill_points: character.skill_points,
+        },
+        PlayerVitals {
+            health: character.vitals.health,
+            max_health: character.vitals.max_health,
+            mana: character.vitals.mana,
+            max_mana: character.vitals.max_mana,
+            capacity: character.vitals.capacity,
+            magic_level: character.vitals.magic_level,
         },
         world_map,
     ) {
@@ -1085,6 +1109,15 @@ fn handle_native_otclient_game(
         player_name: character.name.clone(),
         player_position: native_position(initial_position),
         player_level: character.level.try_into().unwrap_or(u16::MAX),
+        player_experience: character.experience,
+        player_vitals: NativeOtClientPlayerVitals {
+            health: character.vitals.health,
+            max_health: character.vitals.max_health,
+            mana: character.vitals.mana,
+            max_mana: character.vitals.max_mana,
+            capacity: character.vitals.capacity,
+            magic_level: character.vitals.magic_level,
+        },
         ground_thing_id: empty_world.ground_thing_id,
         player_look_type: empty_world.player_look_type,
         player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
@@ -2717,6 +2750,8 @@ mod tests {
             player_name: "Knight".into(),
             player_position: native_position(knight_position),
             player_level: 8,
+            player_experience: 0,
+            player_vitals: NativeOtClientPlayerVitals::default(),
             ground_thing_id: 102,
             player_look_type: 128,
             player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
@@ -3136,6 +3171,19 @@ mod tests {
                 skill_points: 3,
             })
             .unwrap();
+        database
+            .update_player_vitals(
+                1,
+                forgotten_persistence::PlayerVitals {
+                    health: 95,
+                    max_health: 150,
+                    mana: 42,
+                    max_mana: 50,
+                    capacity: 32_000,
+                    magic_level: 4,
+                },
+            )
+            .unwrap();
         let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
         native_config.static_spawns = Some(Arc::new(
             FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
@@ -3218,6 +3266,31 @@ mod tests {
         assert!(initialization
             .0
             .contains(&forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_SKILLS));
+        let expected_stats = [
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_STATS,
+            95,
+            0,
+            150,
+            0,
+            0,
+            125,
+            36,
+            19,
+            0,
+            0,
+            8,
+            0,
+            42,
+            0,
+            50,
+            0,
+            4,
+            0,
+        ];
+        assert!(initialization
+            .0
+            .windows(expected_stats.len())
+            .any(|window| window == expected_stats));
 
         let heartbeat = read_frame(&mut stream).unwrap();
         assert_eq!(
@@ -3571,6 +3644,8 @@ mod tests {
                 z: 7,
             },
             player_level: 8,
+            player_experience: 0,
+            player_vitals: NativeOtClientPlayerVitals::default(),
             ground_thing_id: 102,
             player_look_type: 128,
             player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
@@ -3640,6 +3715,8 @@ mod tests {
                 z: 7,
             },
             player_level: 8,
+            player_experience: 0,
+            player_vitals: NativeOtClientPlayerVitals::default(),
             ground_thing_id: 102,
             player_look_type: 128,
             player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),

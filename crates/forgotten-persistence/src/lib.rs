@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const LATEST_SCHEMA_VERSION: i64 = 1;
+const LATEST_SCHEMA_VERSION: i64 = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct EngineDatabase {
@@ -142,7 +142,7 @@ impl EngineDatabase {
         account_id: i64,
     ) -> Result<Vec<LoginCharacter>, PersistenceError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, name, level, x, y, z FROM players WHERE account_id = ?1 ORDER BY name COLLATE NOCASE",
+            "SELECT id, name, level, experience, skill_points, health, max_health, mana, max_mana, capacity, magic_level, x, y, z FROM players WHERE account_id = ?1 ORDER BY name COLLATE NOCASE",
         )?;
         let characters = statement
             .query_map(params![account_id], |row| {
@@ -150,10 +150,20 @@ impl EngineDatabase {
                     id: row.get::<_, i64>(0)? as u64,
                     name: row.get(1)?,
                     level: row.get::<_, i64>(2)? as u32,
+                    experience: row.get::<_, i64>(3)? as u64,
+                    skill_points: row.get::<_, i64>(4)? as u32,
+                    vitals: PlayerVitals {
+                        health: row.get::<_, i64>(5)? as u16,
+                        max_health: row.get::<_, i64>(6)? as u16,
+                        mana: row.get::<_, i64>(7)? as u16,
+                        max_mana: row.get::<_, i64>(8)? as u16,
+                        capacity: row.get::<_, i64>(9)? as u16,
+                        magic_level: row.get::<_, i64>(10)? as u8,
+                    },
                     position: Position {
-                        x: row.get::<_, i64>(3)? as u16,
-                        y: row.get::<_, i64>(4)? as u16,
-                        z: row.get::<_, i64>(5)? as u8,
+                        x: row.get::<_, i64>(11)? as u16,
+                        y: row.get::<_, i64>(12)? as u16,
+                        z: row.get::<_, i64>(13)? as u8,
                     },
                 })
             })?
@@ -223,8 +233,37 @@ impl EngineDatabase {
             id: self.connection.last_insert_rowid() as u64,
             name: name.trim().to_owned(),
             level: 8,
+            experience: 0,
+            skill_points: 0,
+            vitals: PlayerVitals::default(),
             position,
         })
+    }
+
+    pub fn update_player_vitals(
+        &self,
+        player_id: u64,
+        vitals: PlayerVitals,
+    ) -> Result<(), PersistenceError> {
+        if !vitals.is_valid() {
+            return Err(PersistenceError::InvalidPlayerVitals);
+        }
+        let affected = self.connection.execute(
+            "UPDATE players SET health = ?1, max_health = ?2, mana = ?3, max_mana = ?4, capacity = ?5, magic_level = ?6 WHERE id = ?7",
+            params![
+                vitals.health as i64,
+                vitals.max_health as i64,
+                vitals.mana as i64,
+                vitals.max_mana as i64,
+                vitals.capacity as i64,
+                vitals.magic_level as i64,
+                player_id as i64,
+            ],
+        )?;
+        if affected == 0 {
+            return Err(PersistenceError::UnknownPlayer(player_id));
+        }
+        Ok(())
     }
 
     pub fn update_player_position(
@@ -265,14 +304,42 @@ impl EngineDatabase {
         self.connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);\
              CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL);\
-             CREATE TABLE IF NOT EXISTS players (id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, name TEXT NOT NULL UNIQUE, x INTEGER NOT NULL, y INTEGER NOT NULL, z INTEGER NOT NULL, level INTEGER NOT NULL, experience INTEGER NOT NULL, skill_points INTEGER NOT NULL);\
+             CREATE TABLE IF NOT EXISTS players (id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, name TEXT NOT NULL UNIQUE, x INTEGER NOT NULL, y INTEGER NOT NULL, z INTEGER NOT NULL, level INTEGER NOT NULL, experience INTEGER NOT NULL, skill_points INTEGER NOT NULL, health INTEGER NOT NULL DEFAULT 150, max_health INTEGER NOT NULL DEFAULT 150, mana INTEGER NOT NULL DEFAULT 50, max_mana INTEGER NOT NULL DEFAULT 50, capacity INTEGER NOT NULL DEFAULT 40000, magic_level INTEGER NOT NULL DEFAULT 0);\
              CREATE TABLE IF NOT EXISTS engine_events (id INTEGER PRIMARY KEY, level TEXT NOT NULL, message TEXT NOT NULL, created_at INTEGER NOT NULL);",
         )?;
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-            params![LATEST_SCHEMA_VERSION, unix_seconds()],
+            params![1_i64, unix_seconds()],
         )?;
+        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+            for (name, definition) in [
+                ("health", "INTEGER NOT NULL DEFAULT 150"),
+                ("max_health", "INTEGER NOT NULL DEFAULT 150"),
+                ("mana", "INTEGER NOT NULL DEFAULT 50"),
+                ("max_mana", "INTEGER NOT NULL DEFAULT 50"),
+                ("capacity", "INTEGER NOT NULL DEFAULT 40000"),
+                ("magic_level", "INTEGER NOT NULL DEFAULT 0"),
+            ] {
+                if !self.player_column_exists(name)? {
+                    self.connection.execute_batch(&format!(
+                        "ALTER TABLE players ADD COLUMN {name} {definition}"
+                    ))?;
+                }
+            }
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![2_i64, unix_seconds()],
+            )?;
+        }
         Ok(())
+    }
+
+    fn player_column_exists(&self, column: &str) -> Result<bool, PersistenceError> {
+        let mut statement = self.connection.prepare("PRAGMA table_info(players)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(columns.iter().any(|name| name == column))
     }
 }
 
@@ -318,7 +385,39 @@ pub struct LoginCharacter {
     pub id: u64,
     pub name: String,
     pub level: u32,
+    pub experience: u64,
+    pub skill_points: u32,
+    pub vitals: PlayerVitals,
     pub position: Position,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerVitals {
+    pub health: u16,
+    pub max_health: u16,
+    pub mana: u16,
+    pub max_mana: u16,
+    pub capacity: u16,
+    pub magic_level: u8,
+}
+
+impl PlayerVitals {
+    fn is_valid(self) -> bool {
+        self.max_health > 0 && self.health <= self.max_health && self.mana <= self.max_mana
+    }
+}
+
+impl Default for PlayerVitals {
+    fn default() -> Self {
+        Self {
+            health: 150,
+            max_health: 150,
+            mana: 50,
+            max_mana: 50,
+            capacity: 40_000,
+            magic_level: 0,
+        }
+    }
 }
 
 fn unix_seconds() -> u64 {
@@ -334,6 +433,7 @@ pub enum PersistenceError {
     Sql(rusqlite::Error),
     PasswordHash(String),
     InvalidPlayerName,
+    InvalidPlayerVitals,
     UnknownAccount(u32),
     UnknownPlayer(u64),
 }
@@ -374,6 +474,31 @@ mod tests {
         let path = temporary_path("migration");
         let database = EngineDatabase::open(&path).unwrap();
         assert_eq!(database.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrates_existing_v1_players_with_safe_native_vital_defaults() {
+        let path = temporary_path("v1-vitals-migration");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+                 CREATE TABLE accounts (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at INTEGER NOT NULL);
+                 CREATE TABLE players (id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL, name TEXT NOT NULL UNIQUE, x INTEGER NOT NULL, y INTEGER NOT NULL, z INTEGER NOT NULL, level INTEGER NOT NULL, experience INTEGER NOT NULL, skill_points INTEGER NOT NULL);
+                 CREATE TABLE engine_events (id INTEGER PRIMARY KEY, level TEXT NOT NULL, message TEXT NOT NULL, created_at INTEGER NOT NULL);
+                 INSERT INTO schema_migrations (version, applied_at) VALUES (1, 0);
+                 INSERT INTO accounts (id, name, password_hash, created_at) VALUES (1, 'admin', 'hash', 0);
+                 INSERT INTO players (id, account_id, name, x, y, z, level, experience, skill_points) VALUES (7, 1, 'Knight', 100, 100, 7, 8, 4900, 3);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = EngineDatabase::open(&path).unwrap();
+        assert_eq!(database.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        let character = database.characters_for_account(1).unwrap().remove(0);
+        assert_eq!(character.experience, 4_900);
+        assert_eq!(character.vitals, PlayerVitals::default());
         let _ = fs::remove_file(path);
     }
 
@@ -442,6 +567,9 @@ mod tests {
             "admin"
         );
         assert_eq!(account.characters[0].name, "Knight");
+        assert_eq!(account.characters[0].experience, 4_900);
+        assert_eq!(account.characters[0].skill_points, 3);
+        assert_eq!(account.characters[0].vitals, PlayerVitals::default());
         assert_eq!(
             account.characters[0].position,
             Position {
@@ -460,6 +588,29 @@ mod tests {
                 },
             )
             .unwrap();
+        let vitals = PlayerVitals {
+            health: 95,
+            max_health: 150,
+            mana: 42,
+            max_mana: 50,
+            capacity: 32_000,
+            magic_level: 4,
+        };
+        database.update_player_vitals(7, vitals).unwrap();
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].vitals,
+            vitals
+        );
+        assert!(matches!(
+            database.update_player_vitals(
+                7,
+                PlayerVitals {
+                    health: 151,
+                    ..vitals
+                }
+            ),
+            Err(PersistenceError::InvalidPlayerVitals)
+        ));
         assert_eq!(
             database.characters_for_account(account_id).unwrap()[0]
                 .position
