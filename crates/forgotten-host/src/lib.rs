@@ -1714,6 +1714,11 @@ fn handle_native_otclient_game(
                             Duration::from_secs(u64::from(condition_elapsed_seconds));
                         let outcome = shared_world
                             .apply_player_conditions(character.id, condition_elapsed_seconds)?;
+                        persist_runtime_player_conditions(
+                            &mut database,
+                            shared_world,
+                            character.id,
+                        )?;
                         if outcome.applied_damage > 0 {
                             let vitals = shared_world.player_vitals(character.id)?;
                             database.update_player_vitals(
@@ -2367,6 +2372,20 @@ pub fn reset_native_static_creatures_and_refresh(
     )
     .map_err(HostError::Protocol)?;
     Ok((summary, Some(frame)))
+}
+
+/// Persists the post-heartbeat authoritative condition set. This must run even when a condition
+/// has not damaged the player yet, because its elapsed interval remainder is part of deterministic
+/// restart behavior; an empty set also removes schedules that expired during the heartbeat.
+fn persist_runtime_player_conditions(
+    database: &mut EngineDatabase,
+    shared_world: &SharedNativeWorld,
+    player_id: u64,
+) -> Result<(), HostError> {
+    let conditions = shared_world.player_conditions(player_id)?;
+    database
+        .replace_player_conditions(player_id, &conditions)
+        .map_err(HostError::Persistence)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3663,6 +3682,59 @@ mod tests {
             shared.player_vitals(105).unwrap().health,
             initial_vitals.health - 7
         );
+    }
+
+    #[test]
+    fn native_condition_heartbeat_persists_elapsed_progress_and_expiry() {
+        let path = database_path("native-condition-heartbeat-persistence");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("operator", "hash").unwrap();
+        let map = native_world_map();
+        let player = Player {
+            id: 107,
+            account_id: account_id as u64,
+            name: "Knight".into(),
+            position: map.spawn(),
+            level: 8,
+            experience: 4_900,
+            skill_points: 3,
+        };
+        database.save_player(&player).unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let poison = PlayerCondition::new(PlayerConditionKind::Poison, 3, 7, 6).unwrap();
+        shared
+            .register_player_at_available_position_with_vitals_equipment_containers_progression_and_conditions(
+                player,
+                PlayerVitals::default(),
+                NativePlayerHydration {
+                    progression: PlayerProgression::default(),
+                    progression_attempts: PlayerProgressionAttempts::default(),
+                    town_id: 0,
+                    respawn_state: PlayerRespawnState::default(),
+                    equipment: PlayerEquipment::default(),
+                    containers: PlayerContainers::default(),
+                    conditions: BTreeMap::from([(PlayerConditionKind::Poison, poison)]),
+                },
+                &map,
+            )
+            .unwrap();
+
+        shared.apply_player_conditions(107, 1).unwrap();
+        persist_runtime_player_conditions(&mut database, &shared, 107).unwrap();
+        assert_eq!(
+            database
+                .player_conditions(107)
+                .unwrap()
+                .get(&PlayerConditionKind::Poison)
+                .copied()
+                .unwrap(),
+            PlayerCondition::from_persisted(PlayerConditionKind::Poison, 3, 7, 5, 1).unwrap()
+        );
+
+        shared.apply_player_conditions(107, 5).unwrap();
+        persist_runtime_player_conditions(&mut database, &shared, 107).unwrap();
+        assert!(database.player_conditions(107).unwrap().is_empty());
+        let _ = fs::remove_file(path);
     }
 
     #[test]

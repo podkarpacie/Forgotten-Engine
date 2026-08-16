@@ -234,6 +234,7 @@
 - [ ] Deliver bounded client-visible lifecycle state: condition health updates, death state, temple respawn, and only verified loss policies.
 - [x] Persist and hydrate authoritative dead/respawn/loss state across restarts without claiming client death screens, automatic timers, teleport packets, or unverified default-loss behavior.
 - [x] Persist and hydrate deterministic elapsed progress for bounded poison, burning, and energy schedules across restarts; client effect packets and condition-driven death behavior remain deferred.
+- [x] Persist authoritative runtime condition schedule transitions after each native heartbeat so elapsed progress and expired schedules survive restart.
 - [ ] Add profile-driven combat events for weapons, spells, damage types, cooldowns, PvP policy, and death/corpse handling after independent compatibility evidence.
 - [ ] Add authoritative item transfer, equipment/inventory synchronization, container windows, item use, actions, doors, switches, and map interactions.
 - [x] Add bounded authoritative transfer between one player equipment slot and one already owned container; client inventory packets, map-ground transfers, nested containers, stack splitting, and item-use semantics remain deferred.
