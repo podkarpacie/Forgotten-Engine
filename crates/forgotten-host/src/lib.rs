@@ -67,6 +67,56 @@ fn truncate_native_chat_text(message: &str) -> String {
     output
 }
 
+fn native_diagnostic_record(enabled: bool, peer: SocketAddr, event: &str) -> Option<String> {
+    enabled.then(|| format!("> Native OTCv8 trace peer={peer} {event}"))
+}
+
+fn native_diagnostic(enabled: bool, peer: SocketAddr, event: &str) {
+    if let Some(record) = native_diagnostic_record(enabled, peer, event) {
+        eprintln!("{record}");
+    }
+}
+
+fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String {
+    match action {
+        NativeOtClientGameAction::Ping => "action=ping".into(),
+        NativeOtClientGameAction::PingBack => "action=ping-back".into(),
+        NativeOtClientGameAction::EnterGame => "action=enter-game".into(),
+        NativeOtClientGameAction::LeaveGame => "action=leave-game".into(),
+        NativeOtClientGameAction::Stop => "action=stop".into(),
+        NativeOtClientGameAction::Turn(direction) => format!("action=turn direction={direction:?}"),
+        NativeOtClientGameAction::CardinalMove(direction) => {
+            format!("action=cardinal-move direction={direction:?}")
+        }
+        NativeOtClientGameAction::DiagonalMove(direction) => {
+            format!("action=diagonal-move direction={direction:?}")
+        }
+        NativeOtClientGameAction::AutoWalk(path) => format!(
+            "action=auto-walk path-directions={} expanded-steps={}",
+            path.len(),
+            path.iter()
+                .map(|direction| direction.cardinal_steps().len())
+                .sum::<usize>()
+        ),
+        NativeOtClientGameAction::Talk(message) => {
+            format!("action=talk text-bytes={}", message.len())
+        }
+        NativeOtClientGameAction::ChangeFightModes => "action=change-fight-modes".into(),
+        NativeOtClientGameAction::UseItem => "action=use-item".into(),
+        NativeOtClientGameAction::RequestOutfit => "action=request-outfit".into(),
+        NativeOtClientGameAction::ChangeOutfit => "action=change-outfit".into(),
+        NativeOtClientGameAction::IgnoredInteraction(opcode) => {
+            format!("action=ignored-interaction opcode=0x{opcode:02x}")
+        }
+        NativeOtClientGameAction::SelectTarget(native_id) => {
+            format!("action=select-target native-id={native_id}")
+        }
+        NativeOtClientGameAction::SelectFollow(native_id) => {
+            format!("action=select-follow native-id={native_id}")
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HostConfig {
     pub bind_addr: SocketAddr,
@@ -1063,7 +1113,13 @@ fn handle_native_otclient_game(
     let mut active_click_walk: Option<NativeActiveClickWalk> = None;
     let mut observed_visibility_epoch = shared_world.visibility_epoch();
     loop {
-        drain_shared_public_chat(stream, &config.client_profile, &chat_events)?;
+        drain_shared_public_chat(
+            stream,
+            &config.client_profile,
+            &chat_events,
+            config.extended_diagnostics,
+            peer,
+        )?;
         let read_timeout = active_click_walk
             .as_ref()
             .map(|task| {
@@ -1083,22 +1139,34 @@ fn handle_native_otclient_game(
                         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                     ) =>
                 {
-                    drain_shared_public_chat(stream, &config.client_profile, &chat_events)?;
+                    drain_shared_public_chat(
+                        stream,
+                        &config.client_profile,
+                        &chat_events,
+                        config.extended_diagnostics,
+                        peer,
+                    )?;
                     let visibility_epoch = shared_world.visibility_epoch();
                     if visibility_epoch != observed_visibility_epoch {
                         let mut refreshed_snapshot = snapshot.clone();
                         refreshed_snapshot.player_position = native_position(player_position);
                         refreshed_snapshot.player_direction = facing.protocol_direction();
-                        write_frame(
-                            stream,
-                            &encode_shared_native_world_viewport(
-                                &config.client_profile,
-                                &refreshed_snapshot,
-                                world_map,
-                                shared_world,
-                                character.id,
-                            )?,
+                        let refreshed_viewport = encode_shared_native_world_viewport(
+                            &config.client_profile,
+                            &refreshed_snapshot,
+                            world_map,
+                            shared_world,
+                            character.id,
                         )?;
+                        write_frame(stream, &refreshed_viewport)?;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "outbound=viewport-refresh reason=visibility-epoch epoch={visibility_epoch} bytes={}",
+                                refreshed_viewport.0.len()
+                            ),
+                        );
                         observed_visibility_epoch = visibility_epoch;
                         continue;
                     }
@@ -1110,6 +1178,11 @@ fn handle_native_otclient_game(
                             .as_mut()
                             .and_then(|task| task.queued_steps.pop_front());
                         let Some(direction) = next_step else {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "scheduler=click-walk-complete queued-steps=0",
+                            );
                             active_click_walk = None;
                             continue;
                         };
@@ -1125,6 +1198,14 @@ fn handle_native_otclient_game(
                             &mut facing,
                             direction,
                         )? {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "scheduler=click-walk-step direction={direction:?} outcome=moved position={},{},{}",
+                                    player_position.x, player_position.y, player_position.z
+                                ),
+                            );
                             observed_visibility_epoch = shared_world.visibility_epoch();
                             if let Some(task) = active_click_walk.as_mut() {
                                 task.next_step_deadline = Instant::now()
@@ -1134,6 +1215,14 @@ fn handle_native_otclient_game(
                                     );
                             }
                         } else {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "scheduler=click-walk-step direction={direction:?} outcome=blocked position={},{},{}",
+                                    player_position.x, player_position.y, player_position.z
+                                ),
+                            );
                             active_click_walk = None;
                         }
                         continue;
@@ -1143,6 +1232,11 @@ fn handle_native_otclient_game(
                         &encode_native_otclient_game_ping(&config.client_profile)
                             .map_err(HostError::Protocol)?,
                     )?;
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "outbound=ping opcode=0x1e",
+                    );
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -1154,8 +1248,14 @@ fn handle_native_otclient_game(
                     request.0.len()
                 );
             }
-            decode_native_otclient_game_action(&request, &config.client_profile)
-                .map_err(HostError::Protocol)?
+            let decoded = decode_native_otclient_game_action(&request, &config.client_profile)
+                .map_err(HostError::Protocol)?;
+            native_diagnostic(
+                config.extended_diagnostics,
+                peer,
+                &native_action_diagnostic_summary(&decoded),
+            );
+            decoded
         };
         match action {
             NativeOtClientGameAction::Ping => write_frame(
@@ -1200,11 +1300,24 @@ fn handle_native_otclient_game(
                         message.len()
                     );
                 }
-                drain_shared_public_chat(stream, &config.client_profile, &chat_events)?;
+                drain_shared_public_chat(
+                    stream,
+                    &config.client_profile,
+                    &chat_events,
+                    config.extended_diagnostics,
+                    peer,
+                )?;
             }
             NativeOtClientGameAction::LeaveGame => break,
             NativeOtClientGameAction::Stop => {
-                active_click_walk = None;
+                let cancelled_click_walk = active_click_walk.take().is_some();
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "scheduler=click-walk-cancel reason=stop active={cancelled_click_walk}"
+                    ),
+                );
                 write_frame(
                     stream,
                     &encode_native_otclient_game_cancel_walk_facing(
@@ -1215,7 +1328,14 @@ fn handle_native_otclient_game(
                 )?;
             }
             NativeOtClientGameAction::Turn(direction) => {
-                active_click_walk = None;
+                let cancelled_click_walk = active_click_walk.take().is_some();
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "scheduler=click-walk-cancel reason=turn active={cancelled_click_walk} direction={direction:?}"
+                    ),
+                );
                 facing = direction;
                 write_frame(
                     stream,
@@ -1228,12 +1348,30 @@ fn handle_native_otclient_game(
             }
             NativeOtClientGameAction::AutoWalk(path) => {
                 if let Some(task) = active_click_walk.as_mut() {
+                    let previous_steps = task.queued_steps.len();
+                    let replacement_steps = native_click_walk_steps(path.clone()).len();
                     task.replace_path(path);
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        &format!(
+                            "scheduler=click-walk-replace previous-steps={previous_steps} queued-steps={replacement_steps}"
+                        ),
+                    );
                 } else {
                     let step_delay =
                         native_autowalk_step_delay(snapshot.player_speed, snapshot.server_beat);
                     let mut task =
                         NativeActiveClickWalk::from_path(path, Instant::now() + step_delay);
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        &format!(
+                            "scheduler=click-walk-create queued-steps={} step-delay-ms={}",
+                            task.queued_steps.len(),
+                            step_delay.as_millis()
+                        ),
+                    );
                     if task.queued_steps.is_empty() {
                         continue;
                     }
@@ -1254,8 +1392,25 @@ fn handle_native_otclient_game(
                             &mut facing,
                             direction,
                         )? {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "scheduler=click-walk-step direction={direction:?} outcome=moved position={},{},{}",
+                                    player_position.x, player_position.y, player_position.z
+                                ),
+                            );
                             observed_visibility_epoch = shared_world.visibility_epoch();
                             active_click_walk = Some(task);
+                        } else {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "scheduler=click-walk-step direction={direction:?} outcome=blocked position={},{},{}",
+                                    player_position.x, player_position.y, player_position.z
+                                ),
+                            );
                         }
                     } else {
                         active_click_walk = Some(task);
@@ -1263,8 +1418,8 @@ fn handle_native_otclient_game(
                 }
             }
             NativeOtClientGameAction::CardinalMove(direction) => {
-                active_click_walk = None;
-                if move_native_map_player(
+                let cancelled_click_walk = active_click_walk.take().is_some();
+                let moved = move_native_map_player(
                     stream,
                     &config.client_profile,
                     &snapshot,
@@ -1275,13 +1430,33 @@ fn handle_native_otclient_game(
                     &mut player_position,
                     &mut facing,
                     direction,
-                )? {
+                )?;
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "movement=cardinal direction={direction:?} outcome={} position={},{},{} map-update={}",
+                        if moved { "moved" } else { "blocked" },
+                        player_position.x,
+                        player_position.y,
+                        player_position.z,
+                        if moved { "step" } else { "cancel-walk" }
+                    ),
+                );
+                if cancelled_click_walk {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "scheduler=click-walk-cancel reason=manual-cardinal active=true",
+                    );
+                }
+                if moved {
                     observed_visibility_epoch = shared_world.visibility_epoch();
                 }
             }
             NativeOtClientGameAction::DiagonalMove(direction) => {
-                active_click_walk = None;
-                if move_native_map_player_diagonal(
+                let cancelled_click_walk = active_click_walk.take().is_some();
+                let moved = move_native_map_player_diagonal(
                     stream,
                     &config.client_profile,
                     &snapshot,
@@ -1292,7 +1467,27 @@ fn handle_native_otclient_game(
                     &mut player_position,
                     &mut facing,
                     direction,
-                )? {
+                )?;
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "movement=diagonal direction={direction:?} outcome={} position={},{},{} map-update={}",
+                        if moved { "moved" } else { "blocked" },
+                        player_position.x,
+                        player_position.y,
+                        player_position.z,
+                        if moved { "double-step" } else { "cancel-walk" }
+                    ),
+                );
+                if cancelled_click_walk {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "scheduler=click-walk-cancel reason=manual-diagonal active=true",
+                    );
+                }
+                if moved {
                     observed_visibility_epoch = shared_world.visibility_epoch();
                 }
             }
@@ -1336,26 +1531,45 @@ fn drain_shared_public_chat(
     stream: &mut TcpStream,
     profile: &NativeOtClientProfile,
     events: &mpsc::Receiver<SharedPublicChatEvent>,
+    extended_diagnostics: bool,
+    peer: SocketAddr,
 ) -> Result<(), HostError> {
     loop {
         match events.try_recv() {
             Ok(event) => {
                 let visible_text =
                     truncate_native_chat_text(&format!("{}: {}", event.speaker_name, event.text));
-                write_frame(
-                    stream,
-                    &encode_native_otclient_game_status_message(profile, &visible_text)
-                        .map_err(HostError::Protocol)?,
-                )?;
-                write_frame(
-                    stream,
-                    &encode_native_otclient_animated_text(
-                        profile,
-                        event.speaker_position,
-                        &visible_text,
-                    )
-                    .map_err(HostError::Protocol)?,
-                )?;
+                let console = encode_native_otclient_game_status_message(profile, &visible_text)
+                    .map_err(HostError::Protocol)?;
+                write_frame(stream, &console)?;
+                native_diagnostic(
+                    extended_diagnostics,
+                    peer,
+                    &format!(
+                        "outbound=public-chat-console opcode=0xb4 bytes={} text-bytes={}",
+                        console.0.len(),
+                        visible_text.len()
+                    ),
+                );
+                let map_label = encode_native_otclient_animated_text(
+                    profile,
+                    event.speaker_position,
+                    &visible_text,
+                )
+                .map_err(HostError::Protocol)?;
+                write_frame(stream, &map_label)?;
+                native_diagnostic(
+                    extended_diagnostics,
+                    peer,
+                    &format!(
+                        "outbound=public-chat-map-label opcode=0x84 bytes={} position={},{},{} text-bytes={}",
+                        map_label.0.len(),
+                        event.speaker_position.x,
+                        event.speaker_position.y,
+                        event.speaker_position.z,
+                        visible_text.len()
+                    ),
+                );
             }
             Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return Ok(()),
         }
@@ -3533,5 +3747,40 @@ mod native_timing_tests {
             native_autowalk_step_delay(1000, 750),
             Duration::from_millis(750)
         );
+    }
+}
+
+#[cfg(test)]
+mod native_diagnostics_tests {
+    use super::{
+        native_action_diagnostic_summary, native_diagnostic_record, NativeOtClientGameAction,
+    };
+    use forgotten_protocol::NativeOtClientCardinalDirection;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn diagnostic_records_are_strictly_opt_in() {
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7175);
+        assert!(native_diagnostic_record(false, peer, "action=ping").is_none());
+        assert_eq!(
+            native_diagnostic_record(true, peer, "action=ping").as_deref(),
+            Some("> Native OTCv8 trace peer=127.0.0.1:7175 action=ping")
+        );
+    }
+
+    #[test]
+    fn action_summaries_report_metadata_without_chat_text_or_raw_bytes() {
+        assert_eq!(
+            native_action_diagnostic_summary(&NativeOtClientGameAction::CardinalMove(
+                NativeOtClientCardinalDirection::North
+            )),
+            "action=cardinal-move direction=North"
+        );
+        let secret_message = "correct horse battery staple".to_owned();
+        let talk_summary =
+            native_action_diagnostic_summary(&NativeOtClientGameAction::Talk(secret_message));
+        assert_eq!(talk_summary, "action=talk text-bytes=28");
+        assert!(!talk_summary.contains("correct"));
+        assert!(!talk_summary.contains("68 6f 72"));
     }
 }

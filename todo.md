@@ -149,6 +149,10 @@
 - [x] Correct native 740 shared public-chat delivery so OTCv8 consumes console and spatial feedback without `GameServerTalk` parser errors.
 - [x] Add parser-aligned end-to-end shared-chat regressions using the observed real-client failure shape.
 - [x] Package and publish the native 740 chat parser-fix release with Linux, Windows, and SHA-256 assets.
+- [x] Audit the current `run --ed` native diagnostic output and define bounded, privacy-safe trace categories.
+- [x] Add structured extended diagnostics for native session lifecycle, decoded actions, active click-walk state, movement outcomes, chat delivery, map updates, outbound packet metadata, and typed failures.
+- [x] Add regression coverage proving diagnostics remain opt-in and do not emit credentials or raw packet bodies.
+- [x] Package and publish the extended native diagnostic patch release with Linux, Windows, and SHA-256 assets.
 - [x] Replace native 740 `GameServerTalk` delivery, which unmodified OTCv8 rejects because its 740 message-mode map lacks public-say mode translation, with parser-safe no-client-modification delivery.
 - [x] Deliver shared public chat through the working default-console status message and a bounded map-visible effect at the authoritative speaker position.
 - [x] Add regression coverage proving native 740 shared chat emits no `GameServerTalk` record while retaining console and map-visible delivery.
