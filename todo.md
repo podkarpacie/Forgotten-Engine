@@ -236,6 +236,7 @@
 - [ ] Add authoritative item transfer, equipment/inventory synchronization, container windows, item use, actions, doors, switches, and map interactions.
 - [x] Add bounded authoritative transfer between one player equipment slot and one already owned container; client inventory packets, map-ground transfers, nested containers, stack splitting, and item-use semantics remain deferred.
 - [ ] Add validated monster/NPC runtime behavior, spawns, respawns, combat participation, loot, corpses, and script-event dispatch boundaries.
+- [x] Expose bounded authoritative reset of inactive imported static entities with native visibility refresh; monster/NPC AI, combat, timed respawns, loot, corpses, and scripts remain deferred.
 - [ ] Add sandboxed Lua execution with safe event dispatch, legacy registry adapters, and deterministic failure handling.
 - [ ] Add guilds, parties, channels, private messages, depots, banking/trading, houses, access lists, and administrator controls.
 - [ ] Add release-blocking load, soak, memory, fault-recovery, security, real-client interoperability, Windows, and migration validation evidence.

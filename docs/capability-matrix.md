@@ -30,7 +30,7 @@ This matrix is the source-controlled statement of **current behavior**, not an a
 | Movement and collision | partial — authoritative native player movement, map bounds/walkability/occupancy, and bounded click-walk scheduling | deferred | deferred |
 | Player interaction intent | partial — target/follow selection state and departure cleanup | deferred | deferred |
 | Combat | partial — fixed 10 HP adjacent selected-player melee, persisted vitals, native health update; no formulas/weapons/spells/automatic attacks | deferred | deferred |
-| Static creature rendering/occupancy | partial — catalog-derived static spawn representation and native visibility | deferred | deferred |
+| Static creature rendering/occupancy | partial — catalog-derived static spawn representation, native visibility, optional deterministic movement, and caller-triggered reactivation at an unoccupied spawn position with a native map refresh; timed respawns, AI, combat, loot, corpses, and scripts remain deferred | deferred | deferred |
 | Monster AI, respawn, combat, loot, corpses | deferred | deferred | deferred |
 | NPC conversation, shops, travel | deferred | deferred | deferred |
 | Lua execution and event dispatch | deferred — XML/script references are validated but never executed | deferred | deferred |

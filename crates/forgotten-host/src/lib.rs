@@ -8,8 +8,8 @@ use forgotten_core::{
     PlayerConditionOutcome, PlayerContainers, PlayerEquipment, PlayerExperienceAwardOutcome,
     PlayerInteractionIntent, PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
     PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerSkill, PlayerSkillTryOutcome,
-    PlayerVitals, Position, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, VocationId,
-    WorldMap, WorldState,
+    PlayerVitals, Position, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy,
+    StaticCreatureResetSummary, VocationId, WorldMap, WorldState,
 };
 use forgotten_persistence::{EngineDatabase, PlayerVitals as PersistedPlayerVitals};
 use forgotten_protocol::{
@@ -2330,6 +2330,30 @@ pub fn apply_native_static_creature_policy_and_refresh(
     )
     .map_err(HostError::Protocol)?;
     Ok((batch, Some(frame)))
+}
+
+/// Reactivates inactive imported static entities at their validated spawn positions and emits a
+/// native map refresh only when the active entity set changed. This is caller-triggered and adds
+/// no timed respawn scheduler, AI, combat, drops, corpse, Lua, or action behavior.
+pub fn reset_native_static_creatures_and_refresh(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    world: &mut WorldState,
+    world_map: &WorldMap,
+) -> Result<(StaticCreatureResetSummary, Option<Frame>), HostError> {
+    let summary = world.reset_static_creatures();
+    if summary.reactivated == 0 {
+        return Ok((summary, None));
+    }
+    let active_static_spawns = world.active_static_spawn_collection();
+    let frame = encode_native_otclient_map_viewport_with_static_spawns(
+        profile,
+        snapshot,
+        world_map,
+        Some(&active_static_spawns),
+    )
+    .map_err(HostError::Protocol)?;
+    Ok((summary, Some(frame)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5114,6 +5138,72 @@ mod tests {
                 z: 7,
             }
         );
+    }
+
+    #[test]
+    fn static_creature_reset_refreshes_only_when_an_entity_reactivates() {
+        let map = native_world_map();
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let creature = forgotten_core::FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut world = WorldState::default();
+        world
+            .install_static_creatures(&FeTfsStaticSpawnCollection::new(vec![creature]).unwrap())
+            .unwrap();
+        world.deactivate_static_creature(creature_id).unwrap();
+        let snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_id: NATIVE_OTCLIENT_PLAYER_ID_START,
+            player_name: "Knight".into(),
+            player_position: NativeOtClientPosition {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            player_level: 8,
+            player_experience: 0,
+            player_vitals: NativeOtClientPlayerVitals::default(),
+            player_skills: forgotten_core::PlayerSkills::default(),
+            ground_thing_id: 102,
+            player_look_type: 128,
+            player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
+            player_speed: 220,
+            server_beat: 50,
+        };
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+
+        let (summary, refresh) =
+            reset_native_static_creatures_and_refresh(&profile, &snapshot, &mut world, &map)
+                .unwrap();
+        assert_eq!(summary.reactivated, 1);
+        let refresh = refresh.expect("a reactivated entity must refresh the map");
+        assert_eq!(
+            refresh.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert!(refresh.0.windows(3).any(|window| window == b"Rat"));
+        assert!(world.static_creature_lifecycle(creature_id).unwrap().active);
+
+        let (unchanged, refresh) =
+            reset_native_static_creatures_and_refresh(&profile, &snapshot, &mut world, &map)
+                .unwrap();
+        assert_eq!(unchanged.reactivated, 0);
+        assert!(refresh.is_none());
     }
 
     #[test]
