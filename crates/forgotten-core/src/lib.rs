@@ -1333,6 +1333,7 @@ pub struct WorldState {
     player_vitals: BTreeMap<u64, PlayerVitals>,
     player_progressions: BTreeMap<u64, PlayerProgression>,
     player_progression_attempts: BTreeMap<u64, PlayerProgressionAttempts>,
+    player_towns: BTreeMap<u64, u32>,
     player_regeneration_schedules: BTreeMap<u64, PlayerRegenerationSchedule>,
     player_conditions: BTreeMap<u64, BTreeMap<PlayerConditionKind, PlayerCondition>>,
     player_respawn_states: BTreeMap<u64, PlayerRespawnState>,
@@ -1404,6 +1405,7 @@ impl WorldState {
         self.player_progressions.insert(player.id, progression);
         self.player_progression_attempts
             .insert(player.id, PlayerProgressionAttempts::default());
+        self.player_towns.insert(player.id, 0);
         self.player_regeneration_schedules
             .insert(player.id, PlayerRegenerationSchedule::default());
         self.player_conditions.insert(player.id, BTreeMap::new());
@@ -1426,6 +1428,7 @@ impl WorldState {
         self.player_vitals.remove(&id);
         self.player_progressions.remove(&id);
         self.player_progression_attempts.remove(&id);
+        self.player_towns.remove(&id);
         self.player_regeneration_schedules.remove(&id);
         self.player_conditions.remove(&id);
         self.player_respawn_states.remove(&id);
@@ -1808,6 +1811,29 @@ impl WorldState {
             return Ok(false);
         }
         self.player_progression_attempts.insert(player_id, attempts);
+        self.mark_changed();
+        Ok(true)
+    }
+
+    /// Returns the persisted town identifier selected for a known player. Zero represents an
+    /// unassigned town and cannot later resolve a temple position.
+    pub fn player_town(&self, player_id: u64) -> Result<u32, CoreError> {
+        self.player_towns
+            .get(&player_id)
+            .copied()
+            .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
+    /// Replaces a known player's authoritative town assignment. Imported-map validation is
+    /// intentionally deferred until a death transition resolves a concrete temple position.
+    pub fn replace_player_town(&mut self, player_id: u64, town_id: u32) -> Result<bool, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        if self.player_town(player_id)? == town_id {
+            return Ok(false);
+        }
+        self.player_towns.insert(player_id, town_id);
         self.mark_changed();
         Ok(true)
     }

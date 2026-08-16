@@ -237,6 +237,7 @@ pub struct NativeOtClientEmptyWorldConfig {
 pub struct NativePlayerHydration {
     pub progression: PlayerProgression,
     pub progression_attempts: PlayerProgressionAttempts,
+    pub town_id: u32,
     pub equipment: PlayerEquipment,
     pub containers: PlayerContainers,
     pub conditions: BTreeMap<PlayerConditionKind, PlayerCondition>,
@@ -354,6 +355,16 @@ impl SharedNativeWorld {
     ) -> Result<bool, HostError> {
         self.lock()?
             .replace_player_progression_attempts(player_id, attempts)
+            .map_err(HostError::Core)
+    }
+
+    pub fn player_town(&self, player_id: u64) -> Result<u32, HostError> {
+        self.lock()?.player_town(player_id).map_err(HostError::Core)
+    }
+
+    pub fn replace_player_town(&self, player_id: u64, town_id: u32) -> Result<bool, HostError> {
+        self.lock()?
+            .replace_player_town(player_id, town_id)
             .map_err(HostError::Core)
     }
 
@@ -721,6 +732,7 @@ impl SharedNativeWorld {
                 world_map,
             )?;
         self.replace_player_progression_attempts(player_id, hydration.progression_attempts)?;
+        self.replace_player_town(player_id, hydration.town_id)?;
         self.replace_player_conditions(player_id, hydration.conditions)?;
         Ok(position)
     }
@@ -1433,6 +1445,7 @@ fn handle_native_otclient_game(
             NativePlayerHydration {
                 progression: character.progression,
                 progression_attempts: character.progression_attempts,
+                town_id: character.town_id,
                 equipment,
                 containers,
                 conditions,
@@ -3336,6 +3349,7 @@ mod tests {
                 NativePlayerHydration {
                     progression: PlayerProgression::default(),
                     progression_attempts: PlayerProgressionAttempts::default(),
+                    town_id: 0,
                     equipment: PlayerEquipment::default(),
                     containers: PlayerContainers::default(),
                     conditions: conditions.clone(),
@@ -3366,6 +3380,7 @@ mod tests {
                 NativePlayerHydration {
                     progression: PlayerProgression::default(),
                     progression_attempts: attempts,
+                    town_id: 42,
                     equipment: PlayerEquipment::default(),
                     containers: PlayerContainers::default(),
                     conditions: BTreeMap::new(),
@@ -3374,6 +3389,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(shared.player_progression_attempts(105).unwrap(), attempts);
+        assert_eq!(shared.player_town(105).unwrap(), 42);
     }
 
     #[test]
