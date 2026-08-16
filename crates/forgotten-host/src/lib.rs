@@ -4,11 +4,11 @@
 
 use forgotten_core::{
     CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, ItemInstance,
-    NativeItemPresentationCatalog, Player, PlayerCondition, PlayerConditionKind, PlayerContainers,
-    PlayerEquipment, PlayerInteractionIntent, PlayerProgression, PlayerProgressionAttempts,
-    PlayerProgressionRules, PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerVitals,
-    Position, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, VocationId, WorldMap,
-    WorldState,
+    NativeItemPresentationCatalog, Player, PlayerCondition, PlayerConditionKind,
+    PlayerConditionOutcome, PlayerContainers, PlayerEquipment, PlayerInteractionIntent,
+    PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
+    PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerVitals, Position,
+    StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, VocationId, WorldMap, WorldState,
 };
 use forgotten_persistence::{EngineDatabase, PlayerVitals as PersistedPlayerVitals};
 use forgotten_protocol::{
@@ -214,7 +214,8 @@ pub struct NativeOtClientHostConfig {
     /// attached at this host boundary.
     pub static_spawns: Option<Arc<FeTfsStaticSpawnCollection>>,
     /// Optional validated vocation recovery rules. Without this catalog automatic recovery is
-    /// disabled; soul, conditions, death, and scripted lifecycle hooks remain deferred.
+    /// disabled; soul, condition client effects, death activation from conditions, and scripted
+    /// lifecycle hooks remain deferred.
     pub regeneration_rules: Option<Arc<BTreeMap<VocationId, PlayerRegenerationRules>>>,
     /// Optional validated vocation progression rules. The host stores these data-driven formula
     /// inputs for explicit authoritative awards; weapons, spells, training, and Lua are not yet
@@ -232,7 +233,8 @@ pub struct NativeOtClientEmptyWorldConfig {
 
 /// Validated persisted player state admitted to the authoritative native world during session
 /// registration. It is a state-transfer payload only; neither client inventory nor condition
-/// effects are enabled by constructing it.
+/// effects are enabled by constructing it. Native heartbeat scheduling may later advance its
+/// already validated condition state authoritatively.
 #[derive(Debug, Clone)]
 pub struct NativePlayerHydration {
     pub progression: PlayerProgression,
@@ -388,6 +390,21 @@ impl SharedNativeWorld {
             .apply_player_regeneration(player_id, rules, elapsed_seconds)
             .map_err(HostError::Core)?;
         if outcome.health_gained > 0 || outcome.mana_gained > 0 {
+            self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(outcome)
+    }
+
+    pub fn apply_player_conditions(
+        &self,
+        player_id: u64,
+        elapsed_seconds: u16,
+    ) -> Result<PlayerConditionOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .apply_player_conditions(player_id, elapsed_seconds)
+            .map_err(HostError::Core)?;
+        if outcome.applied_damage > 0 {
             self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok(outcome)
@@ -1599,6 +1616,7 @@ fn handle_native_otclient_game(
     let mut player_outfit = NativeOtClientClassicOutfit::from_snapshot(&snapshot);
     let mut active_click_walk: Option<NativeActiveClickWalk> = None;
     let mut last_regeneration_tick = Instant::now();
+    let mut last_condition_tick = Instant::now();
     let mut observed_visibility_epoch = shared_world.visibility_epoch();
     let mut observed_vitals_epoch = shared_world.vitals_epoch();
     let mut observed_progression_epoch = shared_world.progression_epoch();
@@ -1636,8 +1654,42 @@ fn handle_native_otclient_game(
                         config.extended_diagnostics,
                         peer,
                     )?;
+                    let now = Instant::now();
+                    let condition_elapsed_seconds =
+                        now.saturating_duration_since(last_condition_tick)
+                            .as_secs()
+                            .min(u64::from(u16::MAX)) as u16;
+                    if condition_elapsed_seconds > 0 {
+                        last_condition_tick +=
+                            Duration::from_secs(u64::from(condition_elapsed_seconds));
+                        let outcome = shared_world
+                            .apply_player_conditions(character.id, condition_elapsed_seconds)?;
+                        if outcome.applied_damage > 0 {
+                            let vitals = shared_world.player_vitals(character.id)?;
+                            database.update_player_vitals(
+                                character.id,
+                                PersistedPlayerVitals {
+                                    health: vitals.health,
+                                    max_health: vitals.max_health,
+                                    mana: vitals.mana,
+                                    max_mana: vitals.max_mana,
+                                    capacity: vitals.capacity,
+                                    magic_level: vitals.magic_level,
+                                },
+                            )?;
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "lifecycle=conditions damage={} health={} expired={}",
+                                    outcome.applied_damage,
+                                    outcome.remaining_health,
+                                    outcome.expired_conditions
+                                ),
+                            );
+                        }
+                    }
                     if let Some(rules_by_vocation) = config.regeneration_rules.as_deref() {
-                        let now = Instant::now();
                         let elapsed_seconds =
                             now.saturating_duration_since(last_regeneration_tick)
                                 .as_secs()
@@ -3432,6 +3484,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(shared.player_conditions(104).unwrap(), conditions);
+    }
+
+    #[test]
+    fn shared_native_condition_tick_updates_vitals_epoch_and_expires_schedule() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        let poison = PlayerCondition::new(PlayerConditionKind::Poison, 2, 7, 2).unwrap();
+        let initial_vitals = PlayerVitals::default();
+        shared
+            .register_player_at_available_position_with_vitals_equipment_containers_progression_and_conditions(
+                Player {
+                    id: 105,
+                    account_id: 1,
+                    name: "Druid".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                initial_vitals,
+                NativePlayerHydration {
+                    progression: PlayerProgression::default(),
+                    progression_attempts: PlayerProgressionAttempts::default(),
+                    town_id: 0,
+                    equipment: PlayerEquipment::default(),
+                    containers: PlayerContainers::default(),
+                    conditions: BTreeMap::from([(PlayerConditionKind::Poison, poison)]),
+                },
+                &map,
+            )
+            .unwrap();
+
+        assert_eq!(shared.vitals_epoch(), 0);
+        let outcome = shared.apply_player_conditions(105, 2).unwrap();
+
+        assert_eq!(outcome.applied_damage, 7);
+        assert_eq!(outcome.remaining_health, initial_vitals.health - 7);
+        assert_eq!(outcome.expired_conditions, 1);
+        assert_eq!(shared.vitals_epoch(), 1);
+        assert!(shared.player_conditions(105).unwrap().is_empty());
+        assert_eq!(
+            shared.player_vitals(105).unwrap().health,
+            initial_vitals.health - 7
+        );
     }
 
     #[test]
