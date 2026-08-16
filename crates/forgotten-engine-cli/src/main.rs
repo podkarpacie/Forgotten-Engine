@@ -5,8 +5,8 @@ use forgotten_config::{
     resolve_tfs_spawn_references, validate_content, world_map_path, write_template,
 };
 use forgotten_core::{
-    EquipmentSlot, ItemInstance, PlayerContainer, PlayerRegenerationRules, PlayerSkill,
-    RegenerationRule, SkillProgress, VocationId, WorldMapSource,
+    EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules, PlayerSkill,
+    RegenerationRule, SkillProgress, VocationId, WorldMapSource, WorldState,
 };
 use forgotten_host::{
     start, start_game_session, start_native_otclient_game, start_native_otclient_login,
@@ -502,6 +502,10 @@ fn run_host(
             })
             .transpose()?
             .map(Arc::new);
+        let experience_award_policy = Arc::new(match config.experience_stages.as_ref() {
+            Some(stages) => stages.award_policy(config.experience_rate)?,
+            None => forgotten_core::ExperienceAwardPolicy::new(config.experience_rate, Vec::new())?,
+        });
         let static_spawns = materialize_tfs_static_spawns(&companions, &entity_catalog)?;
         if !static_spawns.entities.is_empty() {
             println!(
@@ -526,6 +530,7 @@ fn run_host(
             static_spawns: (!static_spawns.entities.is_empty()).then(|| Arc::new(static_spawns)),
             regeneration_rules,
             progression_rules,
+            experience_award_policy: Some(experience_award_policy),
         })
     } else {
         None
@@ -916,6 +921,50 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             );
             Ok(())
         }
+        "experience" => {
+            if arguments.len() != 5 {
+                return Err(
+                    "usage: player experience <directory> <player-id> <raw-experience>".into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let raw_experience = arguments
+                .get(4)
+                .ok_or("raw experience is required")?
+                .parse::<u64>()
+                .map_err(|_| "raw experience must be an unsigned 64-bit integer")?;
+            let config = load(&directory)?;
+            let policy = match config.experience_stages.as_ref() {
+                Some(stages) => stages.award_policy(config.experience_rate)?,
+                None => {
+                    forgotten_core::ExperienceAwardPolicy::new(config.experience_rate, Vec::new())?
+                }
+            };
+            let database = EngineDatabase::open(&config.database_path)?;
+            let character = database.player_by_id(player_id)?;
+            let mut world = WorldState::default();
+            world.add_player(Player {
+                id: character.id,
+                account_id: 0,
+                name: character.name,
+                position: character.position,
+                level: character.level,
+                experience: character.experience,
+                skill_points: character.skill_points,
+            })?;
+            let outcome = world.award_player_experience(player_id, raw_experience, &policy)?;
+            database.update_player_experience(player_id, outcome.level, outcome.experience)?;
+            println!(
+                "awarded player experience player-id={player_id} raw={} awarded={} experience={} level={} gained-levels={}",
+                outcome.raw_experience,
+                outcome.awarded_experience,
+                outcome.experience,
+                outcome.level,
+                outcome.gained_levels,
+            );
+            Ok(())
+        }
         "container-create" => {
             if arguments.len() < 8 {
                 return Err(
@@ -1139,7 +1188,35 @@ fn version() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn help_text() -> &'static str {
-    "Forgotten Engine\n\nCompatibility profiles:\n  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)\n  fe-8.0  — Tibia 8.0 (protocol foundation)\n  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)\n\nCommands:\n  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]\n  validate <directory>\n  tfs-audit <directory>\n  run <directory> [--ed]\n  status <directory>\n  generate-key <directory>\n  backup <directory>\n  account create <directory> <account-name> <password>\n  player create <directory> <account-id> <character-name>\n  player equip <directory> <player-id> <slot> <server-item-id> [count]\n  player unequip <directory> <player-id> <slot>\n  player vocation <directory> <player-id> <vocation-id>\n  player town <directory> <player-id> <town-id>\n  player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]\n  player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>\n  player container-add <directory> <player-id> <container-id> <server-item-id> [count]\n  player container-remove <directory> <player-id> <container-id> <item-index>\n  command <directory> broadcast <message>\n  compatibility [--json]\n  version"
+    r#"Forgotten Engine
+
+Compatibility profiles:
+  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)
+  fe-8.0  — Tibia 8.0 (protocol foundation)
+  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)
+
+Commands:
+  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]
+  validate <directory>
+  tfs-audit <directory>
+  run <directory> [--ed]
+  status <directory>
+  generate-key <directory>
+  backup <directory>
+  account create <directory> <account-name> <password>
+  player create <directory> <account-id> <character-name>
+  player equip <directory> <player-id> <slot> <server-item-id> [count]
+  player unequip <directory> <player-id> <slot>
+  player vocation <directory> <player-id> <vocation-id>
+  player town <directory> <player-id> <town-id>
+  player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]
+  player experience <directory> <player-id> <raw-experience>
+  player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>
+  player container-add <directory> <player-id> <container-id> <server-item-id> [count]
+  player container-remove <directory> <player-id> <container-id> <item-index>
+  command <directory> broadcast <message>
+  compatibility [--json]
+  version"#
 }
 
 fn print_help() {
@@ -1211,6 +1288,7 @@ mod tests {
             "player vocation <directory> <player-id> <vocation-id>",
             "player town <directory> <player-id> <town-id>",
             "player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]",
+            "player experience <directory> <player-id> <raw-experience>",
             "player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>",
             "player container-add <directory> <player-id> <container-id> <server-item-id> [count]",
             "player container-remove <directory> <player-id> <container-id> <item-index>",

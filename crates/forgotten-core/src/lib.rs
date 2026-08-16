@@ -730,6 +730,7 @@ pub struct PlayerProgression {
 
 pub const MINIMUM_PLAYER_SKILL_LEVEL: u16 = 10;
 pub const MAX_PROGRESSION_MULTIPLIER_MILLI: u32 = 100_000;
+pub const MAX_EXPERIENCE_AWARD_RATE: u32 = 100_000;
 const PROGRESSION_MULTIPLIER_SCALE: u64 = 1_000;
 const SKILL_BASE_TRIES: [u64; 7] = [50, 50, 50, 50, 30, 100, 20];
 const MAGIC_LEVEL_BASE_MANA: u64 = 1_600;
@@ -752,6 +753,86 @@ impl ProgressionMultiplier {
     pub const fn milli(self) -> u32 {
         self.milli
     }
+}
+
+/// One inclusive level range used by an authoritative experience-award policy. Values are stored
+/// in thousandths so a stage multiplier remains deterministic across platforms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExperienceAwardStage {
+    pub min_level: u32,
+    pub max_level: u32,
+    pub multiplier_milli: u32,
+}
+
+impl ExperienceAwardStage {
+    pub fn new(min_level: u32, max_level: u32, multiplier_milli: u32) -> Result<Self, CoreError> {
+        if min_level == 0
+            || max_level < min_level
+            || multiplier_milli == 0
+            || multiplier_milli > MAX_PROGRESSION_MULTIPLIER_MILLI
+        {
+            return Err(CoreError::InvalidExperienceAwardPolicy);
+        }
+        Ok(Self {
+            min_level,
+            max_level,
+            multiplier_milli,
+        })
+    }
+}
+
+/// Validated operator-owned experience-award inputs. `flat_rate` corresponds to a configured
+/// global rate such as `rateExp`; a matching stage additionally scales the award. A zero flat
+/// rate is valid and intentionally yields no awarded experience.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExperienceAwardPolicy {
+    flat_rate: u32,
+    stages: Vec<ExperienceAwardStage>,
+}
+
+impl ExperienceAwardPolicy {
+    pub fn new(flat_rate: u32, stages: Vec<ExperienceAwardStage>) -> Result<Self, CoreError> {
+        if flat_rate > MAX_EXPERIENCE_AWARD_RATE
+            || stages
+                .windows(2)
+                .any(|pair| pair[0].max_level >= pair[1].min_level)
+        {
+            return Err(CoreError::InvalidExperienceAwardPolicy);
+        }
+        Ok(Self { flat_rate, stages })
+    }
+
+    pub const fn flat_rate(&self) -> u32 {
+        self.flat_rate
+    }
+
+    pub fn stages(&self) -> &[ExperienceAwardStage] {
+        &self.stages
+    }
+
+    pub fn award_for(&self, level: u32, raw_experience: u64) -> u64 {
+        let stage_multiplier_milli = self
+            .stages
+            .iter()
+            .find(|stage| stage.min_level <= level && level <= stage.max_level)
+            .map_or(PROGRESSION_MULTIPLIER_SCALE, |stage| {
+                u64::from(stage.multiplier_milli)
+            });
+        raw_experience
+            .saturating_mul(u64::from(self.flat_rate))
+            .saturating_mul(stage_multiplier_milli)
+            / PROGRESSION_MULTIPLIER_SCALE
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerExperienceAwardOutcome {
+    pub player_id: u64,
+    pub raw_experience: u64,
+    pub awarded_experience: u64,
+    pub experience: u64,
+    pub level: u32,
+    pub gained_levels: u32,
 }
 
 /// Formula inputs derived from one validated vocation definition. The formula is intentionally
@@ -1772,6 +1853,45 @@ impl WorldState {
         self.players.get(&id)
     }
 
+    /// Applies a prevalidated global/stage experience policy to a known player in one
+    /// authoritative transition. Event sources such as weapons, spells, quests, or monsters are
+    /// intentionally separate from this arithmetic and client delivery remains a host concern.
+    pub fn award_player_experience(
+        &mut self,
+        player_id: u64,
+        raw_experience: u64,
+        policy: &ExperienceAwardPolicy,
+    ) -> Result<PlayerExperienceAwardOutcome, CoreError> {
+        let (awarded_experience, experience, level, gained_levels) = {
+            let player = self
+                .players
+                .get_mut(&player_id)
+                .ok_or(CoreError::UnknownPlayer(player_id))?;
+            let previous_level = player.level;
+            let awarded_experience = policy.award_for(player.level, raw_experience);
+            if awarded_experience > 0 {
+                player.add_experience(awarded_experience);
+            }
+            (
+                awarded_experience,
+                player.experience,
+                player.level,
+                player.level.saturating_sub(previous_level),
+            )
+        };
+        if awarded_experience > 0 {
+            self.mark_changed();
+        }
+        Ok(PlayerExperienceAwardOutcome {
+            player_id,
+            raw_experience,
+            awarded_experience,
+            experience,
+            level,
+            gained_levels,
+        })
+    }
+
     pub fn player_vitals(&self, player_id: u64) -> Result<PlayerVitals, CoreError> {
         self.player_vitals
             .get(&player_id)
@@ -2686,6 +2806,7 @@ pub enum CoreError {
     SelfInteractionNotAllowed(u64),
     InvalidPlayerVitals(u64),
     InvalidProgressionMultiplier(u32),
+    InvalidExperienceAwardPolicy,
     InvalidSkillProgress {
         level: u16,
         percent: u8,
@@ -3104,6 +3225,49 @@ mod tests {
         let mut value = player();
         value.add_experience(900);
         assert_eq!(value.level, 4);
+    }
+
+    #[test]
+    fn authoritative_experience_awards_apply_validated_rate_and_level_stages() {
+        let stages = vec![
+            ExperienceAwardStage::new(1, 1, 2_000).unwrap(),
+            ExperienceAwardStage::new(2, u32::MAX, 3_000).unwrap(),
+        ];
+        let policy = ExperienceAwardPolicy::new(5, stages).unwrap();
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        let revision_before_award = world.revision();
+
+        let first = world.award_player_experience(7, 100, &policy).unwrap();
+        assert_eq!(first.raw_experience, 100);
+        assert_eq!(first.awarded_experience, 1_000);
+        assert_eq!(first.experience, 1_000);
+        assert_eq!(first.level, 4);
+        assert_eq!(first.gained_levels, 3);
+        assert_eq!(world.revision(), revision_before_award + 1);
+
+        let second = world.award_player_experience(7, 100, &policy).unwrap();
+        assert_eq!(second.awarded_experience, 1_500);
+        assert_eq!(second.experience, 2_500);
+        assert_eq!(second.level, 6);
+
+        let disabled = ExperienceAwardPolicy::new(0, Vec::new()).unwrap();
+        let revision_before_disabled = world.revision();
+        let disabled_outcome = world.award_player_experience(7, 100, &disabled).unwrap();
+        assert_eq!(disabled_outcome.awarded_experience, 0);
+        assert_eq!(disabled_outcome.experience, 2_500);
+        assert_eq!(world.revision(), revision_before_disabled);
+
+        assert_eq!(
+            ExperienceAwardPolicy::new(
+                1,
+                vec![
+                    ExperienceAwardStage::new(1, 10, 1_000).unwrap(),
+                    ExperienceAwardStage::new(10, u32::MAX, 1_000).unwrap(),
+                ],
+            ),
+            Err(CoreError::InvalidExperienceAwardPolicy)
+        );
     }
 
     #[test]

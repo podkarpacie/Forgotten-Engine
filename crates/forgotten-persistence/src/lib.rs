@@ -188,6 +188,22 @@ impl EngineDatabase {
         Ok(characters)
     }
 
+    pub fn player_by_id(&self, player_id: u64) -> Result<LoginCharacter, PersistenceError> {
+        let account_id = self
+            .connection
+            .query_row(
+                "SELECT account_id FROM players WHERE id = ?1",
+                params![player_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(PersistenceError::UnknownPlayer(player_id))?;
+        self.characters_for_account(account_id)?
+            .into_iter()
+            .find(|character| character.id == player_id)
+            .ok_or(PersistenceError::UnknownPlayer(player_id))
+    }
+
     pub fn save_player(&self, player: &Player) -> Result<(), PersistenceError> {
         self.connection.execute(
             "INSERT INTO players (id, account_id, name, x, y, z, level, experience, skill_points)\
@@ -291,6 +307,24 @@ impl EngineDatabase {
                 vitals.magic_level as i64,
                 player_id as i64,
             ],
+        )?;
+        if affected == 0 {
+            return Err(PersistenceError::UnknownPlayer(player_id));
+        }
+        Ok(())
+    }
+
+    /// Persists the authoritative player level and experience without replacing unrelated player
+    /// state such as vitals, position, equipment, conditions, or progression attempts.
+    pub fn update_player_experience(
+        &self,
+        player_id: u64,
+        level: u32,
+        experience: u64,
+    ) -> Result<(), PersistenceError> {
+        let affected = self.connection.execute(
+            "UPDATE players SET level = ?1, experience = ?2 WHERE id = ?3",
+            params![level as i64, experience as i64, player_id as i64],
         )?;
         if affected == 0 {
             return Err(PersistenceError::UnknownPlayer(player_id));
@@ -1331,6 +1365,24 @@ mod tests {
             .unwrap();
         database.record_event("info", "player saved").unwrap();
         assert_eq!(database.event_count().unwrap(), 1);
+        database.update_player_experience(1, 12, 14_400).unwrap();
+        let character = database
+            .characters_for_account(account_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(character.level, 12);
+        assert_eq!(character.experience, 14_400);
+        assert_eq!(database.player_by_id(1).unwrap().name, "Knight");
+        assert!(matches!(
+            database.update_player_experience(99, 1, 0),
+            Err(PersistenceError::UnknownPlayer(99))
+        ));
+        assert!(matches!(
+            database.player_by_id(99),
+            Err(PersistenceError::UnknownPlayer(99))
+        ));
         let _ = fs::remove_file(path);
     }
 

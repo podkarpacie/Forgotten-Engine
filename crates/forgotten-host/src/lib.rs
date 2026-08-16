@@ -3,10 +3,10 @@
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
 use forgotten_core::{
-    CardinalDirection, EmptyWorldManifest, FeTfsStaticSpawnCollection, ItemInstance,
-    NativeItemPresentationCatalog, Player, PlayerCondition, PlayerConditionKind,
-    PlayerConditionOutcome, PlayerContainers, PlayerEquipment, PlayerInteractionIntent,
-    PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
+    CardinalDirection, EmptyWorldManifest, ExperienceAwardPolicy, FeTfsStaticSpawnCollection,
+    ItemInstance, NativeItemPresentationCatalog, Player, PlayerCondition, PlayerConditionKind,
+    PlayerConditionOutcome, PlayerContainers, PlayerEquipment, PlayerExperienceAwardOutcome,
+    PlayerInteractionIntent, PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
     PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerVitals, Position,
     StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, VocationId, WorldMap, WorldState,
 };
@@ -221,6 +221,9 @@ pub struct NativeOtClientHostConfig {
     /// inputs for explicit authoritative awards; weapons, spells, training, and Lua are not yet
     /// event sources.
     pub progression_rules: Option<Arc<BTreeMap<VocationId, PlayerProgressionRules>>>,
+    /// Validated configured flat experience rate and optional level-stage policy. Concrete
+    /// gameplay reward sources remain separate from this immutable host input.
+    pub experience_award_policy: Option<Arc<ExperienceAwardPolicy>>,
 }
 
 #[derive(Debug, Clone)]
@@ -406,6 +409,22 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)?;
         if outcome.applied_damage > 0 {
             self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(outcome)
+    }
+
+    pub fn award_player_experience(
+        &self,
+        player_id: u64,
+        raw_experience: u64,
+        policy: &ExperienceAwardPolicy,
+    ) -> Result<PlayerExperienceAwardOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .award_player_experience(player_id, raw_experience, policy)
+            .map_err(HostError::Core)?;
+        if outcome.awarded_experience > 0 {
+            self.progression_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok(outcome)
     }
@@ -3169,6 +3188,7 @@ mod tests {
             static_spawns: None,
             regeneration_rules: None,
             progression_rules: None,
+            experience_award_policy: None,
         }
     }
 
@@ -3452,6 +3472,42 @@ mod tests {
         assert!(shared.replace_player_progression(103, changed).unwrap());
         assert_eq!(shared.progression_epoch(), 1);
         assert_eq!(shared.player_progression(103).unwrap(), changed);
+    }
+
+    #[test]
+    fn shared_native_experience_award_updates_refresh_epoch_only_on_gain() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 106,
+                    account_id: 1,
+                    name: "Paladin".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                &map,
+            )
+            .unwrap();
+        let policy = ExperienceAwardPolicy::new(
+            5,
+            vec![forgotten_core::ExperienceAwardStage::new(1, 8, 2_000).unwrap()],
+        )
+        .unwrap();
+
+        assert_eq!(shared.progression_epoch(), 0);
+        let awarded = shared.award_player_experience(106, 100, &policy).unwrap();
+        assert_eq!(awarded.awarded_experience, 1_000);
+        assert_eq!(awarded.experience, 5_900);
+        assert_eq!(shared.progression_epoch(), 1);
+
+        let disabled = ExperienceAwardPolicy::new(0, Vec::new()).unwrap();
+        let disabled_outcome = shared.award_player_experience(106, 100, &disabled).unwrap();
+        assert_eq!(disabled_outcome.awarded_experience, 0);
+        assert_eq!(shared.progression_epoch(), 1);
     }
 
     #[test]

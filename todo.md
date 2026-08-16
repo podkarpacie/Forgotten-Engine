@@ -224,7 +224,25 @@
 - [x] Document production-release blockers and evidence requirements for a future production-readiness decision.
 - [ ] Define weighted, evidence-based FE 7.4 completion categories so “more than 50% complete” means implemented, tested runtime scope rather than an unsupported claim.
 - [ ] Complete the next bounded FE 7.4 progression slice by applying configured experience rates and stages to authoritative experience awards.
+- [x] Add a bounded authoritative operator experience award that applies `rateExp` and optional `data/XML/stages.xml` ranges, updates exact level/experience state, and persists it; combat, quest, monster, and client reward event sources remain deferred.
 - [ ] Complete the next bounded FE 7.4 melee progression slice by awarding configured vocation-based skill tries without claiming weapon or spell formula support.
 - [ ] Continue FE 7.4 world-interaction, content-runtime, social, and operational milestones with regression coverage and explicit capability reporting until the documented completion model exceeds 50%.
+- [ ] Publish a weighted FE 7.4 completion ledger with evidence requirements for each system category and a rule for reporting progress above 50%.
+- [ ] Apply configured experience rates and `stages.xml` ranges to authoritative experience awards, with exact regression coverage.
+- [ ] Apply configured vocation progression formulas to melee skill-try awards, with no claim of weapon or spell formulas.
+- [ ] Deliver bounded client-visible lifecycle state: condition health updates, death state, temple respawn, and only verified loss policies.
+- [ ] Add profile-driven combat events for weapons, spells, damage types, cooldowns, PvP policy, and death/corpse handling after independent compatibility evidence.
+- [ ] Add authoritative item transfer, equipment/inventory synchronization, container windows, item use, actions, doors, switches, and map interactions.
+- [ ] Add validated monster/NPC runtime behavior, spawns, respawns, combat participation, loot, corpses, and script-event dispatch boundaries.
+- [ ] Add sandboxed Lua execution with safe event dispatch, legacy registry adapters, and deterministic failure handling.
+- [ ] Add guilds, parties, channels, private messages, depots, banking/trading, houses, access lists, and administrator controls.
+- [ ] Add release-blocking load, soak, memory, fault-recovery, security, real-client interoperability, Windows, and migration validation evidence.
+- [ ] Fix the native 740 player-stats (`0xA0`) record layout that the real client reports as end-of-input after the initial map payload; treat this parser error as a release blocker.
+- [ ] Correct authoritative player HUD initialization and refresh so level, experience, mana, maximum mana, and magic level match persisted server state after login.
+- [ ] Persist the authoritative player position on supported movement and restore it on relog rather than returning the character to the default spawn.
+- [ ] Persist accepted player outfit changes and hydrate the stored outfit on the next native session; current creature-outfit acknowledgement is session-only.
+- [ ] Implement or safely acknowledge profile-verified native 740 look/inspect actions for map things and creatures; current use/look handling does not provide a visible inspection result.
+- [ ] Implement a verified native 740 public-chat message layout; extended diagnostics confirm chat is currently intentionally suppressed because the profile message-mode map is incomplete.
+- [ ] Decode and safely handle the native 740 Quest Log request without ending the game session; until content exists it must return a safe empty/deferred response.
 - [x] Build, package, checksum, and publish fresh Linux and Windows artifacts from the latest verified Forgotten Engine commit for manual testing.
 - [ ] Establish and satisfy production-readiness gates for complete declared TFS feature conformance, profile-specific protocol validation, reliability, bounded memory/performance, security, and reproducible TFS-to-FE migration before describing any profile as mainstream-ready.

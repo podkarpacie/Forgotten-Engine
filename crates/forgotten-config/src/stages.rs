@@ -1,4 +1,5 @@
 use crate::ConfigError;
+use forgotten_core::{CoreError, ExperienceAwardPolicy, ExperienceAwardStage};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
@@ -14,6 +15,21 @@ pub struct ExperienceStage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExperienceStages(pub Vec<ExperienceStage>);
+
+impl ExperienceStages {
+    /// Converts parsed stage data and a configured global rate into the core's deterministic
+    /// award policy. Runtime event sources and client delivery remain outside this adapter.
+    pub fn award_policy(&self, experience_rate: u32) -> Result<ExperienceAwardPolicy, CoreError> {
+        let stages = self
+            .0
+            .iter()
+            .map(|stage| {
+                ExperienceAwardStage::new(stage.min_level, stage.max_level, stage.multiplier_milli)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ExperienceAwardPolicy::new(experience_rate, stages)
+    }
+}
 
 pub fn parse_tfs_stages_xml(bytes: &[u8]) -> Result<ExperienceStages, ConfigError> {
     if bytes.len() > MAX_STAGE_BYTES {
@@ -110,6 +126,9 @@ mod tests {
         assert_eq!(stages.0[0].multiplier_milli, 7_000);
         assert_eq!(stages.0[1].min_level, 9);
         assert_eq!(stages.0[1].max_level, u32::MAX);
+        let policy = stages.award_policy(5).unwrap();
+        assert_eq!(policy.award_for(1, 10), 350);
+        assert_eq!(policy.award_for(9, 10), 150);
     }
 
     #[test]

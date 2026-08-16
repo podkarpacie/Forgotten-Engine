@@ -67,6 +67,7 @@ pub struct EngineConfig {
     pub status_protocol_port: u16,
     pub max_players: u32,
     pub experience_rate: u32,
+    pub experience_stages: Option<ExperienceStages>,
     pub death_loss_percent: i32,
     pub server_name: String,
     pub map_name: String,
@@ -210,6 +211,8 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
     let status_protocol_port = optional_u16(&values, "statusProtocolPort", 7171)?;
     let max_players = optional_u32(&values, "maxPlayers", 0)?;
     let experience_rate = optional_u32(&values, "rateExp", 5)?;
+    let content_directory = world_directory.join("data");
+    let experience_stages = load_optional_experience_stages(&content_directory)?;
     let death_loss_percent = optional_i32(&values, "deathLosePercent", -1)?;
     if !(-1..=100).contains(&death_loss_percent) {
         return Err(ConfigError::InvalidValue {
@@ -297,6 +300,7 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         status_protocol_port,
         max_players,
         experience_rate,
+        experience_stages,
         death_loss_percent,
         server_name: optional_string(&values, "serverName", "Forgotten Engine")?.to_owned(),
         map_name: optional_string(&values, "mapName", "forgotten")?.to_owned(),
@@ -308,7 +312,7 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
             database: optional_string(&values, "mysqlDatabase", "forgottenserver")?.to_owned(),
         },
         profile,
-        content_directory: world_directory.join("data"),
+        content_directory,
         database_path: world_directory.join("data/forgotten-engine.db"),
         legacy_login_enabled: optional_boolean(&values, "legacyLoginEnabled", false)?,
         rsa_private_key_path: world_directory.join(optional_string(
@@ -336,6 +340,17 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         otclient_v8_player_speed,
         otclient_v8_server_beat,
     })
+}
+
+fn load_optional_experience_stages(
+    content_directory: &Path,
+) -> Result<Option<ExperienceStages>, ConfigError> {
+    let path = content_directory.join("XML/stages.xml");
+    match fs::read(&path) {
+        Ok(bytes) => parse_tfs_stages_xml(&bytes).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ConfigError::Io(error)),
+    }
 }
 
 pub fn write_template(
@@ -1423,6 +1438,25 @@ experienceStages = {
         assert_eq!(config.experience_rate, 5);
         assert_eq!(config.death_loss_percent, -1);
         assert!(!config.otclient_v8_native_enabled);
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn loads_optional_tfs_style_experience_stages() {
+        let world = temporary_world("experience-stages");
+        fs::create_dir_all(world.join("data/XML")).unwrap();
+        fs::write(world.join(CONFIG_FILE_NAME), template(FE_7_4_PROFILE)).unwrap();
+        fs::write(
+            world.join("data/XML/stages.xml"),
+            r#"<stages><stage minlevel="1" maxlevel="8" multiplier="7"/><stage minlevel="9" multiplier="3"/></stages>"#,
+        )
+        .unwrap();
+
+        let config = load(&world).unwrap();
+        let stages = config.experience_stages.as_ref().unwrap();
+        assert_eq!(stages.0.len(), 2);
+        let policy = stages.award_policy(config.experience_rate).unwrap();
+        assert_eq!(policy.award_for(1, 10), 350);
         let _ = fs::remove_dir_all(world);
     }
 
