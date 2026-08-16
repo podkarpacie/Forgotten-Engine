@@ -160,3 +160,11 @@
 - [x] Audit TFS-style configuration, map/content conversion, persistence, and CLI error paths using malformed and boundary-case fixtures.
 - [x] Add regression tests and corrective patches for every verified defect discovered by the current bug-hunt.
 - [x] Validate, package, and publish the verified FE 7.4 bug-fix release with Linux, Windows, and SHA-256 assets.
+- [x] Replace native 740 public-chat output with a parser-accepted, non-animated UI delivery path; remove every outbound record that produces OTCv8 mode 255.
+- [x] Implement the native 740 outfit-window response and a safe bounded change-outfit round trip for the operator-supplied client appearance set.
+- [x] Add protocol and host regressions for native 740 chat/outfit packets, including absence of unsupported `0xAA` and invalid-mode `0xB4` records.
+- [ ] Establish and execute the tested playable-server roadmap: persistent player state, visible health/mana, combat, creatures, inventory/containers, and bounded Lua integration.
+- [ ] Add persistent player health, mana, experience, and skill-state fields to the authoritative core and SQLite contracts with safe migration behavior.
+- [ ] Emit parser-safe native 740 player stats and skills from persisted player state instead of placeholder values, with full protocol/persistence/host regressions.
+- [ ] Define and test a bounded combat resolution foundation that can modify persisted health and drive the native 740 HUD without claiming spell or monster-AI support.
+- [x] Validate, package, and publish the next parser-safe native 740 compatibility release with Linux, Windows, and SHA-256 assets.

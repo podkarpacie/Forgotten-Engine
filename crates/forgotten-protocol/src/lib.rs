@@ -790,11 +790,9 @@ pub const NATIVE_OTCLIENT_GAME_PING: u8 = 0x1e;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATS: u8 = 0xa0;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_SKILLS: u8 = 0xa1;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATE: u8 = 0xa2;
-pub const NATIVE_OTCLIENT_GAME_ANIMATED_TEXT: u8 = 0x84;
-pub const NATIVE_OTCLIENT_GAME_TEXT_MESSAGE: u8 = 0xb4;
+pub const NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT: u8 = 0x8e;
+pub const NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT: u8 = 0xc8;
 pub const NATIVE_OTCLIENT_GAME_CANCEL_WALK: u8 = 0xb5;
-/// Classic 7.x status-console blue: a text-only message shown in the default client console.
-pub const NATIVE_OTCLIENT_MESSAGE_STATUS_CONSOLE_BLUE: u8 = 4;
 pub const NATIVE_OTCLIENT_ENTER_GAME: u8 = 0x0f;
 pub const NATIVE_OTCLIENT_LEAVE_GAME: u8 = 0x14;
 pub const NATIVE_OTCLIENT_CLIENT_PING: u8 = 0x1d;
@@ -814,9 +812,8 @@ pub const NATIVE_OTCLIENT_CLIENT_SELECT_TARGET: u8 = 0xa1;
 pub const NATIVE_OTCLIENT_CLIENT_SELECT_FOLLOW: u8 = 0xa2;
 pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM: u8 = 0x82;
-pub const NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT: u8 = 0x78;
 pub const NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT: u8 = 0xd2;
-pub const NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT_STANDARD: u8 = 0xd3;
+pub const NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT: u8 = 0xd3;
 pub const NATIVE_OTCLIENT_MAX_IGNORED_INTERACTION_BYTES: usize = 512;
 pub const NATIVE_OTCLIENT_UNKNOWN_CREATURE: u16 = 0x0061;
 pub const NATIVE_OTCLIENT_MAPPED_CREATURE: u16 = 0xffff;
@@ -894,6 +891,29 @@ pub struct NativeOtClientEmptyWorldSnapshot {
     pub player_direction: u8,
     pub player_speed: u16,
     pub server_beat: u16,
+}
+
+/// A bounded classic 7.4 creature appearance. The selected 740 OTCv8 feature profile uses an
+/// 8-bit look type followed by four color bytes and has no addon or mount fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeOtClientClassicOutfit {
+    pub look_type: u8,
+    pub head: u8,
+    pub body: u8,
+    pub legs: u8,
+    pub feet: u8,
+}
+
+impl NativeOtClientClassicOutfit {
+    pub fn from_snapshot(snapshot: &NativeOtClientEmptyWorldSnapshot) -> Self {
+        Self {
+            look_type: snapshot.player_look_type,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+        }
+    }
 }
 
 /// Immutable rendering data for an active player other than the local snapshot owner.
@@ -1019,7 +1039,7 @@ pub enum NativeOtClientGameAction {
     Talk(String),
     UseItem,
     RequestOutfit,
-    ChangeOutfit,
+    ChangeOutfit(NativeOtClientClassicOutfit),
     SelectTarget(u32),
     SelectFollow(u32),
     IgnoredInteraction(u8),
@@ -1631,20 +1651,18 @@ pub fn decode_native_otclient_game_action(
             NativeOtClientGameAction::UseItem
         }
         NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT => {
-            if reader.remaining() > 64 {
+            if reader.remaining() != 5 {
                 return Err(ProtocolError::InvalidNativeGameRequest);
             }
-            reader.take(reader.remaining())?;
-            NativeOtClientGameAction::ChangeOutfit
+            NativeOtClientGameAction::ChangeOutfit(NativeOtClientClassicOutfit {
+                look_type: reader.byte()?,
+                head: reader.byte()?,
+                body: reader.byte()?,
+                legs: reader.byte()?,
+                feet: reader.byte()?,
+            })
         }
         NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT => NativeOtClientGameAction::RequestOutfit,
-        NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT_STANDARD => {
-            if !(5..=6).contains(&reader.remaining()) {
-                return Err(ProtocolError::InvalidNativeGameRequest);
-            }
-            reader.take(reader.remaining())?;
-            NativeOtClientGameAction::ChangeOutfit
-        }
         NATIVE_OTCLIENT_CLIENT_TALK => {
             let mode = reader.byte()?;
             let message = match mode {
@@ -1700,7 +1718,7 @@ pub fn decode_native_otclient_game_action(
 fn is_native_otclient_compatibility_interaction(opcode: u8) -> bool {
     matches!(
         opcode,
-        0x77
+        0x77 | 0x78
             | 0x83..=0x8d
             | 0x97..=0x9f
             | 0xa3..=0xad
@@ -1743,41 +1761,42 @@ pub fn encode_native_otclient_game_cancel_walk_facing(
     Ok(Frame(vec![NATIVE_OTCLIENT_GAME_CANCEL_WALK, direction]))
 }
 
-pub fn encode_native_otclient_game_status_message(
+pub fn encode_native_otclient_choose_outfit(
     profile: &NativeOtClientProfile,
-    message: &str,
+    current_outfit: NativeOtClientClassicOutfit,
+    first_look_type: u8,
+    last_look_type: u8,
 ) -> Result<Frame, ProtocolError> {
     if !profile.supports_current_native_foundation()
-        || message.is_empty()
-        || message.len() > NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES
+        || current_outfit.look_type == 0
+        || first_look_type == 0
+        || first_look_type > last_look_type
     {
         return Err(ProtocolError::UnsupportedNativeClientProfile);
     }
     let mut writer = Writer::default();
-    writer.byte(NATIVE_OTCLIENT_GAME_TEXT_MESSAGE);
-    writer.byte(NATIVE_OTCLIENT_MESSAGE_STATUS_CONSOLE_BLUE);
-    writer.string(message);
+    writer.byte(NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT);
+    write_native_otclient_classic_outfit(&mut writer, current_outfit);
+    writer.byte(first_look_type);
+    writer.byte(last_look_type);
     Ok(Frame(writer.finish()))
 }
 
-/// Encodes a classic map text effect. This avoids the version-specific generic text-message
-/// mode table, which OTCv8's protocol-740 profile does not populate.
-pub fn encode_native_otclient_animated_text(
+pub fn encode_native_otclient_creature_outfit(
     profile: &NativeOtClientProfile,
-    position: NativeOtClientPosition,
-    message: &str,
+    creature_id: u32,
+    outfit: NativeOtClientClassicOutfit,
 ) -> Result<Frame, ProtocolError> {
     if !profile.supports_current_native_foundation()
-        || message.is_empty()
-        || message.len() > NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES
+        || !(NATIVE_OTCLIENT_PLAYER_ID_START..NATIVE_OTCLIENT_PLAYER_ID_END).contains(&creature_id)
+        || outfit.look_type == 0
     {
         return Err(ProtocolError::UnsupportedNativeClientProfile);
     }
     let mut writer = Writer::default();
-    writer.byte(NATIVE_OTCLIENT_GAME_ANIMATED_TEXT);
-    write_native_otclient_position(&mut writer, position);
-    writer.byte(215);
-    writer.string(message);
+    writer.byte(NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT);
+    writer.u32(creature_id);
+    write_native_otclient_classic_outfit(&mut writer, outfit);
     Ok(Frame(writer.finish()))
 }
 
@@ -1864,6 +1883,14 @@ fn write_native_otclient_unknown_player(
     writer.u16(snapshot.player_speed);
     writer.byte(0);
     writer.byte(0);
+}
+
+fn write_native_otclient_classic_outfit(writer: &mut Writer, outfit: NativeOtClientClassicOutfit) {
+    writer.byte(outfit.look_type);
+    writer.byte(outfit.head);
+    writer.byte(outfit.body);
+    writer.byte(outfit.legs);
+    writer.byte(outfit.feet);
 }
 
 fn write_native_otclient_unknown_visible_player(
@@ -2688,41 +2715,55 @@ mod tests {
             &initialization.0[login.0.len() + map.0.len()..],
             bootstrap.0.as_slice()
         );
+        let classic_outfit = NativeOtClientClassicOutfit {
+            look_type: 128,
+            head: 1,
+            body: 2,
+            legs: 3,
+            feet: 4,
+        };
         assert_eq!(
-            encode_native_otclient_animated_text(&profile, snapshot.player_position, "hi",)
+            encode_native_otclient_choose_outfit(&profile, classic_outfit, 128, 131)
                 .unwrap()
                 .0,
             vec![
-                NATIVE_OTCLIENT_GAME_ANIMATED_TEXT,
-                100,
-                0,
-                100,
-                0,
-                7,
-                215,
+                NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT,
+                128,
+                1,
                 2,
-                0,
-                b'h',
-                b'i'
+                3,
+                4,
+                128,
+                131
             ]
         );
-        assert!(
-            encode_native_otclient_animated_text(&profile, snapshot.player_position, "",).is_err()
-        );
         assert_eq!(
-            encode_native_otclient_game_status_message(&profile, "hi")
+            encode_native_otclient_creature_outfit(&profile, snapshot.player_id, classic_outfit)
                 .unwrap()
                 .0,
             vec![
-                NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
-                NATIVE_OTCLIENT_MESSAGE_STATUS_CONSOLE_BLUE,
-                2,
+                NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT,
+                42,
                 0,
-                b'h',
-                b'i'
+                0,
+                16,
+                128,
+                1,
+                2,
+                3,
+                4
             ]
         );
-        assert!(encode_native_otclient_game_status_message(&profile, "").is_err());
+        assert!(encode_native_otclient_choose_outfit(&profile, classic_outfit, 131, 128).is_err());
+        assert!(encode_native_otclient_creature_outfit(
+            &profile,
+            snapshot.player_id,
+            NativeOtClientClassicOutfit {
+                look_type: 0,
+                ..classic_outfit
+            }
+        )
+        .is_err());
 
         assert_eq!(
             decode_native_otclient_cardinal_move_request(&Frame(vec![0x66]), &profile).unwrap(),
@@ -2786,27 +2827,11 @@ mod tests {
         );
         assert_eq!(
             decode_native_otclient_game_action(
-                &Frame(vec![
-                    NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT,
-                    0,
-                    1,
-                    2,
-                    3,
-                    4,
-                    5,
-                    6,
-                    7,
-                    8,
-                    9,
-                    10,
-                    11,
-                    12,
-                    13,
-                ]),
+                &Frame(vec![0x78, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
                 &profile,
             )
             .unwrap(),
-            NativeOtClientGameAction::ChangeOutfit
+            NativeOtClientGameAction::IgnoredInteraction(0x78)
         );
         assert_eq!(
             decode_native_otclient_game_action(
@@ -2818,28 +2843,20 @@ mod tests {
         );
         assert_eq!(
             decode_native_otclient_game_action(
-                &Frame(vec![
-                    NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT_STANDARD,
-                    128,
-                    1,
-                    2,
-                    3,
-                    4,
-                    0,
-                ]),
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT, 128, 1, 2, 3, 4,]),
                 &profile,
             )
             .unwrap(),
-            NativeOtClientGameAction::ChangeOutfit
+            NativeOtClientGameAction::ChangeOutfit(NativeOtClientClassicOutfit {
+                look_type: 128,
+                head: 1,
+                body: 2,
+                legs: 3,
+                feet: 4,
+            })
         );
         assert!(decode_native_otclient_game_action(
-            &Frame(vec![
-                NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT_STANDARD,
-                128,
-                1,
-                2,
-                3,
-            ]),
+            &Frame(vec![NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT, 128, 1, 2, 3,]),
             &profile,
         )
         .is_err());

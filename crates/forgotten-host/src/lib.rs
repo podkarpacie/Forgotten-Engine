@@ -18,12 +18,12 @@ use forgotten_protocol::{
     encode_fe_otclient_initial_world, encode_fe_otclient_movement_ack,
     encode_fe_otclient_world_tick, encode_legacy_74_character_list,
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
-    encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_animated_text,
-    encode_native_otclient_character_list, encode_native_otclient_game_cancel_walk_facing,
+    encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
+    encode_native_otclient_choose_outfit, encode_native_otclient_creature_outfit,
+    encode_native_otclient_game_cancel_walk_facing,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
-    encode_native_otclient_game_ping_back, encode_native_otclient_game_status_message,
-    encode_native_otclient_login_error,
+    encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
     encode_native_otclient_map_step_with_static_spawns_and_players,
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
@@ -31,11 +31,11 @@ use forgotten_protocol::{
     generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
     CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
     Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
-    NativeOtClientCardinalDirection, NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction,
-    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
-    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
-    NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
-    NATIVE_OTCLIENT_PLAYER_ID_START,
+    NativeOtClientCardinalDirection, NativeOtClientClassicOutfit, NativeOtClientEmptyWorldSnapshot,
+    NativeOtClientGameAction, NativeOtClientPosition, NativeOtClientProfile,
+    NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
+    StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES,
+    NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
@@ -105,7 +105,10 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         NativeOtClientGameAction::ChangeFightModes => "action=change-fight-modes".into(),
         NativeOtClientGameAction::UseItem => "action=use-item".into(),
         NativeOtClientGameAction::RequestOutfit => "action=request-outfit".into(),
-        NativeOtClientGameAction::ChangeOutfit => "action=change-outfit".into(),
+        NativeOtClientGameAction::ChangeOutfit(outfit) => format!(
+            "action=change-outfit look-type={} colors={},{},{},{}",
+            outfit.look_type, outfit.head, outfit.body, outfit.legs, outfit.feet
+        ),
         NativeOtClientGameAction::IgnoredInteraction(opcode) => {
             format!("action=ignored-interaction opcode=0x{opcode:02x}")
         }
@@ -1119,6 +1122,7 @@ fn handle_native_otclient_game(
 
     let mut player_position = initial_position;
     let mut facing = NativeOtClientCardinalDirection::South;
+    let mut player_outfit = NativeOtClientClassicOutfit::from_snapshot(&snapshot);
     let mut active_click_walk: Option<NativeActiveClickWalk> = None;
     let mut observed_visibility_epoch = shared_world.visibility_epoch();
     loop {
@@ -1275,9 +1279,48 @@ fn handle_native_otclient_game(
             NativeOtClientGameAction::PingBack
             | NativeOtClientGameAction::EnterGame
             | NativeOtClientGameAction::ChangeFightModes
-            | NativeOtClientGameAction::UseItem
-            | NativeOtClientGameAction::RequestOutfit
-            | NativeOtClientGameAction::ChangeOutfit => {}
+            | NativeOtClientGameAction::UseItem => {}
+            NativeOtClientGameAction::RequestOutfit => {
+                let outfit_window = encode_native_otclient_choose_outfit(
+                    &config.client_profile,
+                    player_outfit,
+                    player_outfit.look_type,
+                    player_outfit.look_type,
+                )
+                .map_err(HostError::Protocol)?;
+                write_frame(stream, &outfit_window)?;
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "outbound=choose-outfit opcode=0xc8 bytes={} look-type={}",
+                        outfit_window.0.len(),
+                        player_outfit.look_type
+                    ),
+                );
+            }
+            NativeOtClientGameAction::ChangeOutfit(requested_outfit) => {
+                if requested_outfit.look_type == player_outfit.look_type {
+                    player_outfit = requested_outfit;
+                }
+                let applied_outfit = encode_native_otclient_creature_outfit(
+                    &config.client_profile,
+                    snapshot.player_id,
+                    player_outfit,
+                )
+                .map_err(HostError::Protocol)?;
+                write_frame(stream, &applied_outfit)?;
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "outbound=creature-outfit opcode=0x8e bytes={} accepted={} look-type={}",
+                        applied_outfit.0.len(),
+                        requested_outfit.look_type == player_outfit.look_type,
+                        player_outfit.look_type
+                    ),
+                );
+            }
             NativeOtClientGameAction::IgnoredInteraction(opcode) => {
                 if config.extended_diagnostics {
                     eprintln!("> Native OTCv8 compatibility action ignored opcode=0x{opcode:02x}");
@@ -1537,8 +1580,8 @@ fn encode_shared_native_world_viewport(
 }
 
 fn drain_shared_public_chat(
-    stream: &mut TcpStream,
-    profile: &NativeOtClientProfile,
+    _stream: &mut TcpStream,
+    _profile: &NativeOtClientProfile,
     events: &mpsc::Receiver<SharedPublicChatEvent>,
     extended_diagnostics: bool,
     peer: SocketAddr,
@@ -1546,37 +1589,12 @@ fn drain_shared_public_chat(
     loop {
         match events.try_recv() {
             Ok(event) => {
-                let visible_text =
-                    truncate_native_chat_text(&format!("{}: {}", event.speaker_name, event.text));
-                let console = encode_native_otclient_game_status_message(profile, &visible_text)
-                    .map_err(HostError::Protocol)?;
-                write_frame(stream, &console)?;
                 native_diagnostic(
                     extended_diagnostics,
                     peer,
                     &format!(
-                        "outbound=public-chat-console opcode=0xb4 bytes={} text-bytes={}",
-                        console.0.len(),
-                        visible_text.len()
-                    ),
-                );
-                let map_label = encode_native_otclient_animated_text(
-                    profile,
-                    event.speaker_position,
-                    &visible_text,
-                )
-                .map_err(HostError::Protocol)?;
-                write_frame(stream, &map_label)?;
-                native_diagnostic(
-                    extended_diagnostics,
-                    peer,
-                    &format!(
-                        "outbound=public-chat-map-label opcode=0x84 bytes={} position={},{},{} text-bytes={}",
-                        map_label.0.len(),
-                        event.speaker_position.x,
-                        event.speaker_position.y,
-                        event.speaker_position.z,
-                        visible_text.len()
+                        "outbound=public-chat-suppressed reason=740-no-message-mode-map text-bytes={}",
+                        event.text.len()
                     ),
                 );
             }
@@ -3343,50 +3361,66 @@ mod tests {
         );
 
         write_frame(&mut stream, &Frame(vec![0x96, 1, 2, 0, b'h', b'i'])).unwrap();
-        let chat_console = read_frame(&mut stream).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        assert!(matches!(
+            read_frame(&mut stream),
+            Err(HostError::Io(error))
+                if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
+        ));
+        stream.set_read_timeout(None).unwrap();
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT,
+            ]),
+        )
+        .unwrap();
+        let outfit_window = read_frame(&mut stream).unwrap();
         assert_eq!(
-            chat_console.0,
+            outfit_window.0,
             vec![
-                forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
-                forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_CONSOLE_BLUE,
-                10,
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT,
+                128,
                 0,
-                b'K',
-                b'n',
-                b'i',
-                b'g',
-                b'h',
-                b't',
-                b':',
-                b' ',
-                b'h',
-                b'i',
+                0,
+                0,
+                0,
+                128,
+                128,
             ]
         );
-        assert!(!chat_console.0.contains(&0xaa));
-        let chat_map_label = read_frame(&mut stream).unwrap();
+        assert!(!outfit_window.0.contains(&0xaa));
+        assert!(!outfit_window.0.contains(&0xb4));
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT,
+                128,
+                1,
+                2,
+                3,
+                4,
+            ]),
+        )
+        .unwrap();
+        let applied_outfit = read_frame(&mut stream).unwrap();
         assert_eq!(
-            chat_map_label.0,
+            applied_outfit.0,
             vec![
-                forgotten_protocol::NATIVE_OTCLIENT_GAME_ANIMATED_TEXT,
-                101,
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT,
+                1,
                 0,
-                100,
                 0,
-                7,
-                215,
-                10,
-                0,
-                b'K',
-                b'n',
-                b'i',
-                b'g',
-                b'h',
-                b't',
-                b':',
-                b' ',
-                b'h',
-                b'i',
+                16,
+                128,
+                1,
+                2,
+                3,
+                4,
             ]
         );
         write_frame(
