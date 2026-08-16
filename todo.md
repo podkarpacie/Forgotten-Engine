@@ -219,4 +219,7 @@
 - [x] Hydrate persisted player town assignments into authoritative native shared-world state and clear them on disconnect; runtime death/respawn packet delivery remains deferred.
 - [x] Activate the existing authoritative death state when bounded selected-player melee reaches zero health and the target has a validated hydrated town/temple; client death screens, automatic respawn packets, and unverified default loss behavior remain deferred.
 - [x] Apply hydrated bounded poison, burning, and energy conditions on the native heartbeat through authoritative vitals transitions; client effect packets, death-state activation from condition damage, and condition persistence after runtime ticks remain deferred.
+- [x] Define a repeatable validation matrix for each currently implemented FE 7.4 behavior, separating automated assertions from required unmodified-OTClientV8 manual checks.
+- [x] Add a bounded local validation harness for the supported CLI, SQLite migration, configuration, world import, and native protocol smoke-test paths; do not claim production coverage for deferred gameplay systems.
+- [x] Document production-release blockers and evidence requirements for a future production-readiness decision.
 - [ ] Establish and satisfy production-readiness gates for complete declared TFS feature conformance, profile-specific protocol validation, reliability, bounded memory/performance, security, and reproducible TFS-to-FE migration before describing any profile as mainstream-ready.
