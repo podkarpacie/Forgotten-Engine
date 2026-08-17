@@ -1471,7 +1471,17 @@ impl WorldState {
     }
 
     pub fn advance_tick(&mut self) -> u64 {
-        self.tick = self.tick.saturating_add(1);
+        self.advance_ticks(1)
+    }
+
+    /// Advances the authoritative server clock by a bounded caller-measured elapsed duration.
+    /// A zero-duration update is intentionally a no-op, while any positive elapsed value advances
+    /// the clock once atomically and produces one world revision for downstream snapshots.
+    pub fn advance_ticks(&mut self, elapsed_seconds: u16) -> u64 {
+        if elapsed_seconds == 0 {
+            return self.tick;
+        }
+        self.tick = self.tick.saturating_add(u64::from(elapsed_seconds));
         self.mark_changed();
         self.tick
     }
@@ -3324,6 +3334,21 @@ mod tests {
 
         world.remove_player(7).unwrap();
         assert_eq!(world.revision(), 5);
+    }
+
+    #[test]
+    fn authoritative_world_clock_batches_elapsed_seconds_without_zero_tick_mutation() {
+        let mut world = WorldState::default();
+        assert_eq!(world.advance_ticks(0), 0);
+        assert_eq!(world.tick(), 0);
+        assert_eq!(world.revision(), 0);
+
+        assert_eq!(world.advance_ticks(3), 3);
+        assert_eq!(world.tick(), 3);
+        assert_eq!(world.revision(), 1);
+
+        assert_eq!(world.advance_tick(), 4);
+        assert_eq!(world.revision(), 2);
     }
 
     #[test]

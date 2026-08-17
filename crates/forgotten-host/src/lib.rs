@@ -297,6 +297,10 @@ impl SharedNativeWorld {
         Ok(self.lock()?.advance_tick())
     }
 
+    pub fn advance_ticks(&self, elapsed_seconds: u16) -> Result<u64, HostError> {
+        Ok(self.lock()?.advance_ticks(elapsed_seconds))
+    }
+
     pub fn tick(&self) -> Result<u64, HostError> {
         Ok(self.lock()?.tick())
     }
@@ -1693,6 +1697,7 @@ fn handle_native_otclient_game(
     let mut facing = NativeOtClientCardinalDirection::South;
     let mut player_outfit = NativeOtClientClassicOutfit::from_snapshot(&snapshot);
     let mut active_click_walk: Option<NativeActiveClickWalk> = None;
+    let mut last_authoritative_tick = Instant::now();
     let mut last_regeneration_tick = Instant::now();
     let mut last_condition_tick = Instant::now();
     let mut observed_visibility_epoch = shared_world.visibility_epoch();
@@ -1733,6 +1738,15 @@ fn handle_native_otclient_game(
                         peer,
                     )?;
                     let now = Instant::now();
+                    let authoritative_elapsed_seconds =
+                        now.saturating_duration_since(last_authoritative_tick)
+                            .as_secs()
+                            .min(u64::from(u16::MAX)) as u16;
+                    if authoritative_elapsed_seconds > 0 {
+                        last_authoritative_tick +=
+                            Duration::from_secs(u64::from(authoritative_elapsed_seconds));
+                        shared_world.advance_ticks(authoritative_elapsed_seconds)?;
+                    }
                     let condition_elapsed_seconds =
                         now.saturating_duration_since(last_condition_tick)
                             .as_secs()
@@ -3460,8 +3474,12 @@ mod tests {
         let second_position = second.join().unwrap();
         assert_ne!(first_position, second_position);
         assert_eq!(shared.tick().unwrap(), 0);
-        assert_eq!(shared.advance_tick().unwrap(), 1);
-        assert_eq!(shared.tick().unwrap(), 1);
+        assert_eq!(shared.advance_ticks(0).unwrap(), 0);
+        assert_eq!(shared.world_revision().unwrap(), 2);
+        assert_eq!(shared.advance_ticks(3).unwrap(), 3);
+        assert_eq!(shared.world_revision().unwrap(), 3);
+        assert_eq!(shared.advance_tick().unwrap(), 4);
+        assert_eq!(shared.tick().unwrap(), 4);
         shared.remove_player(101).unwrap();
         let recycled = shared
             .register_player_at_available_position(
