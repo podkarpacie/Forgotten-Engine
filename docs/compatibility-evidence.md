@@ -31,6 +31,10 @@ For the selected 740 profile, the public client parser consumes a `u16` level, l
 
 The maintained OTCv8 project reports an open 7.4 defect: its message-mode map is not constructed for protocol versions below 760, causing both talk and text-message modes to resolve as invalid.[8] This independently explains the earlier `unknown message mode` client errors. FE therefore keeps native 740 visible chat and visible look output explicitly deferred. Treating a server-side mode byte as a substitute would require a client change, which conflicts with FE’s unmodified-OTClientV8 compatibility target.
 
+## Physical mitigation research boundary
+
+Public historical OpenTibia discussion describes shield defense and armor as separate physical-mitigation stages, with defense considered before armor and each potentially reducing the same incoming hit.[9] Current public TFS combat code also exposes independent armor and shield block switches in combat parameters.[10] The available sources span different eras and do not establish a complete profile-740 formula, blocking count, skill interaction, stance effect, or random-range contract. FE therefore retains its existing bounded profile-neutral flat mitigation foundation and does not claim TFS 7.4 armor or shielding parity from this evidence alone.
+
 ## References
 
 [1] [TFS legacy weapon registry path](https://github.com/otland/forgottenserver/blob/master/data/weapons/weapons.xml).
@@ -48,3 +52,7 @@ The maintained OTCv8 project reports an open 7.4 defect: its message-mode map is
 [7] [Public OTClientV8 look sender](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/protocolgamesend.cpp) and [message-mode map](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/protocolcodes.cpp). Read-only behavioral evidence; no client source is copied into FE.
 
 [8] [OTCv8 issue #218: 7.4 protocol cannot parse creature talk/speak](https://github.com/OTCv8/otclientv8/issues/218). Read-only compatibility evidence; no client source is copied into FE.
+
+[9] [OTLand discussion: Defense and armour](https://otland.net/threads/defense-and-armour.287950/). Community historical analysis; used only to identify research questions and stage ordering, not as a complete formula specification.
+
+[10] [Public TFS combat parameter declarations](https://raw.githubusercontent.com/otland/forgottenserver/master/src/combat.cpp). Read-only behavioral evidence from a later TFS codebase; no source is copied into FE.
