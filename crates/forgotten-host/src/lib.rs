@@ -807,6 +807,21 @@ impl SharedNativeWorld {
         Ok(self.lock()?.active_static_spawn_collection())
     }
 
+    pub fn set_static_creature_health_percent(
+        &self,
+        creature_id: u32,
+        health_percent: u8,
+    ) -> Result<bool, HostError> {
+        let changed = self
+            .lock()?
+            .set_static_creature_health_percent(creature_id, health_percent)
+            .map_err(HostError::Core)?;
+        if changed {
+            self.mark_visibility_changed();
+        }
+        Ok(changed)
+    }
+
     pub fn player_interaction_intent(
         &self,
         player_id: u64,
@@ -1928,6 +1943,8 @@ fn handle_native_otclient_game(
         &bootstrap_containers,
     )
     .map_err(HostError::Protocol)?;
+    let static_health_frames =
+        native_static_creature_health_frames(&config.client_profile, &active_static_spawns)?;
     write_frame(stream, &initialization)?;
     let mut player_outfit =
         native_hydrated_classic_outfit(empty_world.player_look_type, character.outfit);
@@ -1955,10 +1972,13 @@ fn handle_native_otclient_game(
     for frame in &container_frames {
         write_frame(stream, frame)?;
     }
+    for frame in &static_health_frames {
+        write_frame(stream, frame)?;
+    }
     stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
     if config.extended_diagnostics {
         eprintln!(
-            "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} equipment-records={}/{} skipped-unmapped={} container-records={}/{} skipped-unmapped-or-nested={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
+            "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} equipment-records={}/{} skipped-unmapped={} container-records={}/{} skipped-unmapped-or-nested={} static-health-records={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
             character.name,
             initialization.0.len(),
             equipment_frames.len(),
@@ -1967,6 +1987,7 @@ fn handle_native_otclient_game(
             container_frames.len(),
             bootstrap_containers.len(),
             bootstrap_containers.len().saturating_sub(container_frames.len()),
+            static_health_frames.len(),
             world_map.identifier(),
             world_map.tile_count(),
             active_static_spawns.entities.len(),
@@ -2206,13 +2227,22 @@ fn handle_native_otclient_game(
                             shared_world,
                             character.id,
                         )?;
+                        let refreshed_static_spawns = shared_world.active_static_spawns()?;
+                        let refreshed_static_health_frames = native_static_creature_health_frames(
+                            &config.client_profile,
+                            &refreshed_static_spawns,
+                        )?;
                         write_frame(stream, &refreshed_viewport)?;
+                        for frame in &refreshed_static_health_frames {
+                            write_frame(stream, frame)?;
+                        }
                         native_diagnostic(
                             config.extended_diagnostics,
                             peer,
                             &format!(
-                                "outbound=viewport-refresh reason=visibility-epoch epoch={visibility_epoch} bytes={}",
-                                refreshed_viewport.0.len()
+                                "outbound=viewport-refresh reason=visibility-epoch epoch={visibility_epoch} bytes={} static-health-records={}",
+                                refreshed_viewport.0.len(),
+                                refreshed_static_health_frames.len()
                             ),
                         );
                         observed_visibility_epoch = visibility_epoch;
@@ -2613,6 +2643,25 @@ fn handle_native_otclient_game(
         ),
     );
     Ok(())
+}
+
+fn native_static_creature_health_frames(
+    profile: &NativeOtClientProfile,
+    static_spawns: &FeTfsStaticSpawnCollection,
+) -> Result<Vec<Frame>, HostError> {
+    static_spawns
+        .entities
+        .iter()
+        .map(|entity| {
+            encode_native_otclient_creature_health(
+                profile,
+                entity.id,
+                u16::from(entity.health_percent),
+                100,
+            )
+            .map_err(HostError::Protocol)
+        })
+        .collect()
 }
 
 fn encode_shared_native_world_viewport(
@@ -4729,6 +4778,59 @@ mod tests {
     }
 
     #[test]
+    fn static_creature_health_refreshes_visibility_and_native_display_frame() {
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let static_spawns =
+            FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
+                id: creature_id,
+                name: "Rat".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 75,
+                direction: 2,
+            }])
+            .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        assert_eq!(shared.visibility_epoch(), 0);
+        assert!(!shared
+            .set_static_creature_health_percent(creature_id, 75)
+            .unwrap());
+        assert_eq!(shared.visibility_epoch(), 0);
+        assert!(shared
+            .set_static_creature_health_percent(creature_id, 40)
+            .unwrap());
+        assert_eq!(shared.visibility_epoch(), 1);
+        let active_static_spawns = shared.active_static_spawns().unwrap();
+        assert_eq!(active_static_spawns.entities[0].health_percent, 40);
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+        assert_eq!(
+            native_static_creature_health_frames(&profile, &active_static_spawns)
+                .unwrap()
+                .into_iter()
+                .map(|frame| frame.0)
+                .collect::<Vec<_>>(),
+            vec![vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH,
+                1,
+                0,
+                0,
+                64,
+                40,
+            ]]
+        );
+    }
+
+    #[test]
     fn selected_player_melee_persists_authoritative_vitals_and_returns_native_target() {
         let path = database_path("selected-player-melee");
         let mut database = EngineDatabase::open(&path).unwrap();
@@ -5812,6 +5914,17 @@ mod tests {
             .0
             .windows(expected_stats.len())
             .any(|window| window == expected_stats));
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH,
+                1,
+                0,
+                0,
+                64,
+                100,
+            ]
+        );
 
         write_frame(
             &mut stream,
@@ -6290,6 +6403,17 @@ mod tests {
         .unwrap();
         let initialization = read_frame(&mut stream).unwrap();
         assert!(initialization.0.windows(3).any(|window| window == b"Rat"));
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH,
+                1,
+                0,
+                0,
+                64,
+                100,
+            ]
+        );
         let heartbeat = read_frame(&mut stream).unwrap();
         assert_eq!(
             heartbeat.0,

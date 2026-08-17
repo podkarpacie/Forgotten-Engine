@@ -137,6 +137,11 @@ impl FeTfsStaticSpawnCollection {
             if entity.name.trim().is_empty() {
                 return Err(CoreError::EmptyStaticSpawnName);
             }
+            if entity.health_percent > 100 {
+                return Err(CoreError::InvalidStaticCreatureHealthPercent(
+                    entity.health_percent,
+                ));
+            }
             if !ids.insert(entity.id) {
                 return Err(CoreError::DuplicateStaticSpawnId(entity.id));
             }
@@ -172,6 +177,7 @@ pub struct StaticCreatureLifecycle {
     pub spawn_position: Position,
     pub position: Position,
     pub active: bool,
+    pub health_percent: u8,
     pub activated_at_tick: u64,
     pub inactive_since_tick: Option<u64>,
     pub respawn_interval_seconds: u32,
@@ -209,6 +215,7 @@ struct StaticCreatureRuntime {
     entity: FeTfsStaticEntity,
     spawn_position: Position,
     active: bool,
+    health_percent: u8,
     activated_at_tick: u64,
     inactive_since_tick: Option<u64>,
     respawn_interval_seconds: u32,
@@ -1968,6 +1975,7 @@ impl WorldState {
                         entity: entity.clone(),
                         spawn_position: entity.position,
                         active: true,
+                        health_percent: entity.health_percent,
                         activated_at_tick: self.tick,
                         inactive_since_tick: None,
                         respawn_interval_seconds: collection.respawn_interval_seconds(entity.id),
@@ -2011,6 +2019,7 @@ impl WorldState {
                 spawn_position: runtime.spawn_position,
                 position: runtime.entity.position,
                 active: runtime.active,
+                health_percent: runtime.health_percent,
                 activated_at_tick: runtime.activated_at_tick,
                 inactive_since_tick: runtime.inactive_since_tick,
                 respawn_interval_seconds: runtime.respawn_interval_seconds,
@@ -2024,6 +2033,41 @@ impl WorldState {
             .count()
     }
 
+    pub fn static_creature_health_percent(&self, id: u32) -> Result<u8, CoreError> {
+        self.static_creatures
+            .get(&id)
+            .map(|runtime| runtime.health_percent)
+            .ok_or(CoreError::UnknownStaticCreature(id))
+    }
+
+    /// Changes one active static creature's display health only. This bounded state is not
+    /// connected to damage, death, targeting consequences, loot, corpses, AI, or scripts.
+    /// A zero value remains a valid display percentage and does not deactivate the creature.
+    pub fn set_static_creature_health_percent(
+        &mut self,
+        id: u32,
+        health_percent: u8,
+    ) -> Result<bool, CoreError> {
+        if health_percent > 100 {
+            return Err(CoreError::InvalidStaticCreatureHealthPercent(
+                health_percent,
+            ));
+        }
+        let runtime = self
+            .static_creatures
+            .get_mut(&id)
+            .ok_or(CoreError::UnknownStaticCreature(id))?;
+        if !runtime.active {
+            return Err(CoreError::InactiveStaticCreature(id));
+        }
+        if runtime.health_percent == health_percent {
+            return Ok(false);
+        }
+        runtime.health_percent = health_percent;
+        self.mark_changed();
+        Ok(true)
+    }
+
     /// Returns only active authoritative entities for a protocol viewport. This derives a
     /// temporary immutable collection rather than exposing runtime mutation through the codec.
     pub fn active_static_spawn_collection(&self) -> FeTfsStaticSpawnCollection {
@@ -2032,7 +2076,11 @@ impl WorldState {
                 .static_creatures
                 .values()
                 .filter(|runtime| runtime.active)
-                .map(|runtime| runtime.entity.clone())
+                .map(|runtime| {
+                    let mut entity = runtime.entity.clone();
+                    entity.health_percent = runtime.health_percent;
+                    entity
+                })
                 .collect(),
             respawn_intervals_seconds: BTreeMap::new(),
         }
@@ -2171,6 +2219,7 @@ impl WorldState {
                 continue;
             }
             runtime.entity.position = runtime.spawn_position;
+            runtime.health_percent = runtime.entity.health_percent;
             runtime.active = true;
             runtime.activated_at_tick = self.tick;
             runtime.inactive_since_tick = None;
@@ -2219,6 +2268,7 @@ impl WorldState {
                 continue;
             }
             runtime.entity.position = runtime.spawn_position;
+            runtime.health_percent = runtime.entity.health_percent;
             runtime.active = true;
             runtime.activated_at_tick = self.tick;
             runtime.inactive_since_tick = None;
@@ -3514,6 +3564,7 @@ pub enum CoreError {
     StaticSpawnLimit(usize),
     DuplicateStaticSpawnId(u32),
     EmptyStaticSpawnName,
+    InvalidStaticCreatureHealthPercent(u8),
     UnknownStaticCreatureSchedule,
     StaticCreatureOccupiesPosition(Position),
     PlayerOccupiesStaticCreaturePosition(Position),
@@ -4107,6 +4158,71 @@ mod tests {
     }
 
     #[test]
+    fn static_creature_display_health_is_bounded_runtime_state_without_combat_behavior() {
+        let creature_id = 0x4000_0001;
+        let creature = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 75,
+            direction: 2,
+        };
+        let mut invalid_creature = creature.clone();
+        invalid_creature.health_percent = 101;
+        assert_eq!(
+            FeTfsStaticSpawnCollection::new(vec![invalid_creature]),
+            Err(CoreError::InvalidStaticCreatureHealthPercent(101))
+        );
+
+        let mut world = WorldState::default();
+        world
+            .install_static_creatures(&FeTfsStaticSpawnCollection::new(vec![creature]).unwrap())
+            .unwrap();
+        assert_eq!(world.static_creature_health_percent(creature_id), Ok(75));
+        let revision = world.revision();
+        assert!(world
+            .set_static_creature_health_percent(creature_id, 40)
+            .unwrap());
+        assert_eq!(world.static_creature_health_percent(creature_id), Ok(40));
+        assert_eq!(world.revision(), revision + 1);
+        assert_eq!(
+            world.active_static_spawn_collection().entities[0].health_percent,
+            40
+        );
+        assert!(!world
+            .set_static_creature_health_percent(creature_id, 40)
+            .unwrap());
+        assert_eq!(world.revision(), revision + 1);
+        assert_eq!(
+            world.set_static_creature_health_percent(creature_id, 101),
+            Err(CoreError::InvalidStaticCreatureHealthPercent(101))
+        );
+        assert!(world
+            .set_static_creature_health_percent(creature_id, 0)
+            .unwrap());
+        assert!(world.static_creature_lifecycle(creature_id).unwrap().active);
+        assert_eq!(world.static_creature_health_percent(creature_id), Ok(0));
+        assert!(world.deactivate_static_creature(creature_id).unwrap());
+        assert_eq!(
+            world.set_static_creature_health_percent(creature_id, 1),
+            Err(CoreError::InactiveStaticCreature(creature_id))
+        );
+        assert_eq!(world.reset_static_creatures().reactivated, 1);
+        assert_eq!(world.static_creature_health_percent(creature_id), Ok(75));
+    }
+
+    #[test]
     fn authoritative_map_item_use_is_bounded_side_effect_free_and_position_validated() {
         let mut world = WorldState::default();
         world.add_player(player()).unwrap();
@@ -4516,6 +4632,7 @@ mod tests {
                 spawn_position,
                 position: spawn_position,
                 active: true,
+                health_percent: 100,
                 activated_at_tick: 0,
                 inactive_since_tick: None,
                 respawn_interval_seconds: 3,

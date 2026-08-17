@@ -1977,7 +1977,7 @@ pub fn encode_native_otclient_creature_health(
     max_health: u16,
 ) -> Result<Frame, ProtocolError> {
     if !profile.supports_current_native_foundation()
-        || !(NATIVE_OTCLIENT_PLAYER_ID_START..NATIVE_OTCLIENT_PLAYER_ID_END).contains(&creature_id)
+        || !is_native_otclient_creature_id(creature_id)
         || max_health == 0
     {
         return Err(ProtocolError::UnsupportedNativeClientProfile);
@@ -1988,6 +1988,11 @@ pub fn encode_native_otclient_creature_health(
     writer.u32(creature_id);
     writer.byte(health_percent);
     Ok(Frame(writer.finish()))
+}
+
+fn is_native_otclient_creature_id(creature_id: u32) -> bool {
+    (NATIVE_OTCLIENT_PLAYER_ID_START..NATIVE_OTCLIENT_PLAYER_ID_END).contains(&creature_id)
+        || creature_id > NATIVE_OTCLIENT_PLAYER_ID_END
 }
 
 pub fn encode_native_otclient_move_creature(
@@ -2987,9 +2992,27 @@ mod tests {
                 .0,
             vec![NATIVE_OTCLIENT_GAME_CREATURE_HEALTH, 42, 0, 0, 16, 50]
         );
+        assert_eq!(
+            encode_native_otclient_creature_health(
+                &profile,
+                NATIVE_OTCLIENT_PLAYER_ID_END + 1,
+                40,
+                100,
+            )
+            .unwrap()
+            .0,
+            vec![NATIVE_OTCLIENT_GAME_CREATURE_HEALTH, 1, 0, 0, 64, 40]
+        );
         assert!(
             encode_native_otclient_creature_health(&profile, snapshot.player_id, 1, 0).is_err()
         );
+        assert!(encode_native_otclient_creature_health(
+            &profile,
+            NATIVE_OTCLIENT_PLAYER_ID_END,
+            100,
+            100,
+        )
+        .is_err());
         assert!(encode_native_otclient_choose_outfit(&profile, classic_outfit, 131, 128).is_err());
         assert!(encode_native_otclient_creature_outfit(
             &profile,
