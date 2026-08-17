@@ -198,6 +198,15 @@ pub enum StaticCreatureDecisionPolicy {
     ClockwiseAdjacent,
 }
 
+pub const MAX_STATIC_CREATURE_TARGET_RANGE: u8 = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticCreatureTargetSelection {
+    pub creature_id: u32,
+    pub target_player_id: Option<u64>,
+    pub max_range: u8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticCreatureMoveDecision {
     pub creature_id: u32,
@@ -219,6 +228,7 @@ struct StaticCreatureRuntime {
     activated_at_tick: u64,
     inactive_since_tick: Option<u64>,
     respawn_interval_seconds: u32,
+    target_player_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1882,6 +1892,11 @@ impl WorldState {
                 || intent.target_static_creature_id.is_some()
                 || intent.follow_player_id.is_some()
         });
+        for runtime in self.static_creatures.values_mut() {
+            if runtime.target_player_id == Some(id) {
+                runtime.target_player_id = None;
+            }
+        }
         self.mark_changed();
         Ok(player)
     }
@@ -2042,6 +2057,7 @@ impl WorldState {
                         activated_at_tick: self.tick,
                         inactive_since_tick: None,
                         respawn_interval_seconds: collection.respawn_interval_seconds(entity.id),
+                        target_player_id: None,
                     },
                 )
                 .is_some()
@@ -2149,6 +2165,82 @@ impl WorldState {
         }
     }
 
+    /// Selects the nearest living registered player on the same floor within a bounded Chebyshev
+    /// range. Equal-distance candidates resolve by stable player ID. This updates typed target
+    /// state only; movement, follow behavior, pathfinding, combat, scripts, and packet delivery
+    /// remain separate systems.
+    pub fn select_static_creature_target(
+        &mut self,
+        creature_id: u32,
+        max_range: u8,
+    ) -> Result<StaticCreatureTargetSelection, CoreError> {
+        if max_range == 0 || max_range > MAX_STATIC_CREATURE_TARGET_RANGE {
+            return Err(CoreError::InvalidStaticCreatureTargetRange(max_range));
+        }
+        let position = {
+            let runtime = self
+                .static_creatures
+                .get(&creature_id)
+                .ok_or(CoreError::UnknownStaticCreature(creature_id))?;
+            if !runtime.active {
+                return Err(CoreError::InactiveStaticCreature(creature_id));
+            }
+            runtime.entity.position
+        };
+        let max_range_distance = u16::from(max_range);
+        let target_player_id = self
+            .players
+            .iter()
+            .filter(|(player_id, player)| {
+                player.position.z == position.z
+                    && self
+                        .player_respawn_states
+                        .get(player_id)
+                        .map_or(true, |state| !state.dead)
+            })
+            .filter_map(|(player_id, player)| {
+                let distance = player
+                    .position
+                    .x
+                    .abs_diff(position.x)
+                    .max(player.position.y.abs_diff(position.y));
+                (distance <= max_range_distance).then_some((distance, *player_id))
+            })
+            .min()
+            .map(|(_, player_id)| player_id);
+        let changed = {
+            let runtime = self
+                .static_creatures
+                .get_mut(&creature_id)
+                .ok_or(CoreError::UnknownStaticCreature(creature_id))?;
+            if runtime.target_player_id == target_player_id {
+                false
+            } else {
+                runtime.target_player_id = target_player_id;
+                true
+            }
+        };
+        if changed {
+            self.mark_changed();
+        }
+        Ok(StaticCreatureTargetSelection {
+            creature_id,
+            target_player_id,
+            max_range,
+        })
+    }
+
+    pub fn static_creature_target(&self, creature_id: u32) -> Result<Option<u64>, CoreError> {
+        let runtime = self
+            .static_creatures
+            .get(&creature_id)
+            .ok_or(CoreError::UnknownStaticCreature(creature_id))?;
+        if !runtime.active {
+            return Err(CoreError::InactiveStaticCreature(creature_id));
+        }
+        Ok(runtime.target_player_id)
+    }
+
     /// Selects safe adjacent steps without mutating state. Direction preference rotates by the
     /// stable creature ID and current world tick, while creature IDs provide a deterministic
     /// serial order for contention. This is not target selection, AI, or pathfinding.
@@ -2232,6 +2324,7 @@ impl WorldState {
                 .ok_or(CoreError::UnknownStaticCreature(id))?;
             let changed = runtime.active;
             runtime.active = false;
+            runtime.target_player_id = None;
             if changed {
                 runtime.inactive_since_tick = Some(tick);
             }
@@ -3785,6 +3878,7 @@ pub enum CoreError {
     },
     InvalidItemId(u16),
     InvalidClientThingId(u16),
+    InvalidStaticCreatureTargetRange(u8),
     EmptyEquipmentSlot {
         player_id: u64,
         slot: EquipmentSlot,
@@ -5308,6 +5402,99 @@ mod tests {
                 deferred_by_player_occupancy: 0,
                 deferred_by_static_creature_occupancy: 0,
             }
+        );
+    }
+
+    #[test]
+    fn static_creature_target_selection_is_bounded_deterministic_and_cleanup_safe() {
+        let creature_id = 0x4000_0001;
+        let creature = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: Position {
+                x: 104,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut first = player();
+        first.position = Position {
+            x: 102,
+            y: 100,
+            z: 7,
+        };
+        let mut second = first.clone();
+        second.id = 8;
+        second.name = "Paladin".into();
+        second.position = Position {
+            x: 106,
+            y: 100,
+            z: 7,
+        };
+        let mut world = WorldState::default();
+        world.add_player(first).unwrap();
+        world.add_player(second).unwrap();
+        world
+            .install_static_creatures(&FeTfsStaticSpawnCollection::new(vec![creature]).unwrap())
+            .unwrap();
+
+        let revision_before_target = world.revision();
+        assert_eq!(
+            world.select_static_creature_target(creature_id, 2),
+            Ok(StaticCreatureTargetSelection {
+                creature_id,
+                target_player_id: Some(7),
+                max_range: 2,
+            })
+        );
+        assert_eq!(world.static_creature_target(creature_id), Ok(Some(7)));
+        assert_eq!(world.revision(), revision_before_target + 1);
+        assert_eq!(
+            world.select_static_creature_target(creature_id, 2),
+            Ok(StaticCreatureTargetSelection {
+                creature_id,
+                target_player_id: Some(7),
+                max_range: 2,
+            })
+        );
+        assert_eq!(world.revision(), revision_before_target + 1);
+
+        assert_eq!(
+            world.select_static_creature_target(creature_id, 1),
+            Ok(StaticCreatureTargetSelection {
+                creature_id,
+                target_player_id: None,
+                max_range: 1,
+            })
+        );
+        assert_eq!(world.static_creature_target(creature_id), Ok(None));
+        assert_eq!(
+            world.select_static_creature_target(creature_id, 0),
+            Err(CoreError::InvalidStaticCreatureTargetRange(0))
+        );
+        assert_eq!(
+            world.select_static_creature_target(creature_id, MAX_STATIC_CREATURE_TARGET_RANGE + 1,),
+            Err(CoreError::InvalidStaticCreatureTargetRange(
+                MAX_STATIC_CREATURE_TARGET_RANGE + 1
+            ))
+        );
+
+        world.select_static_creature_target(creature_id, 2).unwrap();
+        world.remove_player(7).unwrap();
+        assert_eq!(world.static_creature_target(creature_id), Ok(None));
+        assert!(world.deactivate_static_creature(creature_id).unwrap());
+        assert_eq!(
+            world.static_creature_target(creature_id),
+            Err(CoreError::InactiveStaticCreature(creature_id))
         );
     }
 

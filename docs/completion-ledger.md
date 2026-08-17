@@ -61,6 +61,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 ### Milestone C — Complete creature, NPC, spawn, loot, and corpse runtime: target 58%
 
 - [x] Establish bounded static spawn materialization, occupancy, safe deterministic movement, and reset foundations.
+- [x] Add bounded deterministic static target selection that records the nearest living same-floor player under an explicit capped range, with stable tie-breaking and lifecycle cleanup; pursuit, combat, and client delivery remain deferred.
 - [ ] Add deterministic monster/NPC state, spawn timing, movement, target selection, pathfinding boundaries, and combat participation.
 - [ ] Add death, corpse, loot, decay, and respawn runtime behavior with owner and persistence rules.
 - [ ] Add bounded NPC dialogue, shops, travel, and typed event boundaries.
