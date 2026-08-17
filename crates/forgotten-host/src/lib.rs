@@ -65,8 +65,48 @@ pub const PROBE_ERROR_MAGIC: &[u8; 4] = b"FEER";
 pub const PROBE_VERSION: u8 = 1;
 const MAX_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
 const NATIVE_OTCLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const NATIVE_OTCLIENT_HEARTBEAT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const NATIVE_OTCLIENT_DEFAULT_GROUND_SPEED: u64 = 150;
 const NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeWorldHeartbeatOutcome {
+    tick: u64,
+    reactivated_static_creatures: usize,
+}
+
+fn advance_native_shared_world_heartbeat(
+    shared_world: &SharedNativeWorld,
+    elapsed_seconds: u16,
+) -> Result<NativeWorldHeartbeatOutcome, HostError> {
+    let tick = shared_world.advance_ticks(elapsed_seconds)?;
+    let reactivated_static_creatures = shared_world.reactivate_due_static_creatures()?.reactivated;
+    Ok(NativeWorldHeartbeatOutcome {
+        tick,
+        reactivated_static_creatures,
+    })
+}
+
+fn run_native_shared_world_heartbeat(
+    shared_world: SharedNativeWorld,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), HostError> {
+    let mut last_tick = Instant::now();
+    while !shutdown.load(Ordering::SeqCst) {
+        thread::sleep(NATIVE_OTCLIENT_HEARTBEAT_POLL_INTERVAL);
+        let now = Instant::now();
+        let elapsed_seconds = now
+            .saturating_duration_since(last_tick)
+            .as_secs()
+            .min(u64::from(u16::MAX)) as u16;
+        if elapsed_seconds == 0 {
+            continue;
+        }
+        last_tick += Duration::from_secs(u64::from(elapsed_seconds));
+        advance_native_shared_world_heartbeat(&shared_world, elapsed_seconds)?;
+    }
+    Ok(())
+}
 const NATIVE_OTCLIENT_SHARED_CHAT_QUEUE_CAPACITY: usize = 64;
 const NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE: u16 = 10;
 
@@ -1600,7 +1640,15 @@ fn serve_native_otclient_game(
             config.client_profile.protocol_version
         ),
     );
-    while !shutdown.load(Ordering::SeqCst) {
+    let heartbeat_shutdown = Arc::clone(&shutdown);
+    let heartbeat_world = shared_world.clone();
+    let heartbeat = thread::spawn(move || {
+        run_native_shared_world_heartbeat(heartbeat_world, heartbeat_shutdown)
+    });
+    let service_result = loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break Ok(());
+        }
         match listener.accept() {
             Ok((mut stream, peer)) => {
                 let active = active_connections.fetch_add(1, Ordering::SeqCst);
@@ -1634,9 +1682,16 @@ fn serve_native_otclient_game(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Err(error) => return Err(HostError::Io(error)),
+            Err(error) => break Err(HostError::Io(error)),
         }
-    }
+    };
+    shutdown.store(true, Ordering::SeqCst);
+    let heartbeat_result = match heartbeat.join() {
+        Ok(result) => result,
+        Err(_) => Err(HostError::HostThreadPanicked),
+    };
+    service_result?;
+    heartbeat_result?;
     record_event(&database_path, "info", "native client game service stopped");
     Ok(())
 }
@@ -1912,7 +1967,6 @@ fn handle_native_otclient_game(
     let mut player_position = initial_position;
     let mut facing = NativeOtClientCardinalDirection::South;
     let mut active_click_walk: Option<NativeActiveClickWalk> = None;
-    let mut last_authoritative_tick = Instant::now();
     let mut last_regeneration_tick = Instant::now();
     let mut last_condition_tick = Instant::now();
     let mut observed_visibility_epoch = shared_world.visibility_epoch();
@@ -1953,15 +2007,6 @@ fn handle_native_otclient_game(
                         peer,
                     )?;
                     let now = Instant::now();
-                    let authoritative_elapsed_seconds =
-                        now.saturating_duration_since(last_authoritative_tick)
-                            .as_secs()
-                            .min(u64::from(u16::MAX)) as u16;
-                    if authoritative_elapsed_seconds > 0 {
-                        last_authoritative_tick +=
-                            Duration::from_secs(u64::from(authoritative_elapsed_seconds));
-                        shared_world.advance_ticks(authoritative_elapsed_seconds)?;
-                    }
                     let condition_elapsed_seconds =
                         now.saturating_duration_since(last_condition_tick)
                             .as_secs()
@@ -6303,7 +6348,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_due_static_reactivation_refreshes_visibility_only_after_interval() {
+    fn native_shared_heartbeat_reactivates_static_creatures_only_after_interval() {
         let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
         let collection = FeTfsStaticSpawnCollection::with_respawn_intervals(
             vec![forgotten_core::FeTfsStaticEntity {
@@ -6334,22 +6379,20 @@ mod tests {
             .deactivate_static_creature(creature_id)
             .unwrap();
         let epoch_before = shared.visibility_epoch();
-        shared.advance_tick().unwrap();
         assert_eq!(
-            shared
-                .reactivate_due_static_creatures()
-                .unwrap()
-                .reactivated,
-            0
+            advance_native_shared_world_heartbeat(&shared, 1).unwrap(),
+            NativeWorldHeartbeatOutcome {
+                tick: 1,
+                reactivated_static_creatures: 0,
+            }
         );
         assert_eq!(shared.visibility_epoch(), epoch_before);
-        shared.advance_tick().unwrap();
         assert_eq!(
-            shared
-                .reactivate_due_static_creatures()
-                .unwrap()
-                .reactivated,
-            1
+            advance_native_shared_world_heartbeat(&shared, 1).unwrap(),
+            NativeWorldHeartbeatOutcome {
+                tick: 2,
+                reactivated_static_creatures: 1,
+            }
         );
         assert_eq!(shared.visibility_epoch(), epoch_before + 1);
     }
