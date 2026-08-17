@@ -857,6 +857,16 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)
     }
 
+    pub fn set_player_static_target(
+        &self,
+        player_id: u64,
+        target_static_creature_id: Option<u32>,
+    ) -> Result<PlayerInteractionIntent, HostError> {
+        self.lock()?
+            .set_player_static_target(player_id, target_static_creature_id)
+            .map_err(HostError::Core)
+    }
+
     pub fn set_player_follow(
         &self,
         player_id: u64,
@@ -2980,41 +2990,68 @@ fn apply_native_player_interaction(
     kind: NativePlayerInteractionKind,
     extended_diagnostics: bool,
 ) -> Result<(), HostError> {
-    let selected_player_id = if native_selected_id == 0 {
-        Some(None)
-    } else {
-        native_player_id_to_character_id(native_selected_id).map(Some)
-    };
-    let Some(selected_player_id) = selected_player_id else {
+    if native_selected_id == 0 {
+        let result = match kind {
+            NativePlayerInteractionKind::Target => {
+                shared_world.set_player_target(source_player_id, None)
+            }
+            NativePlayerInteractionKind::Follow => {
+                shared_world.set_player_follow(source_player_id, None)
+            }
+        };
+        return result.map(|_| ());
+    }
+    if let Some(selected_player_id) = native_player_id_to_character_id(native_selected_id) {
+        let result = match kind {
+            NativePlayerInteractionKind::Target => {
+                shared_world.set_player_target(source_player_id, Some(selected_player_id))
+            }
+            NativePlayerInteractionKind::Follow => {
+                shared_world.set_player_follow(source_player_id, Some(selected_player_id))
+            }
+        };
+        return match result {
+            Ok(_) => Ok(()),
+            Err(HostError::Core(forgotten_core::CoreError::UnknownPlayer(_)))
+            | Err(HostError::Core(forgotten_core::CoreError::SelfInteractionNotAllowed(_))) => {
+                if extended_diagnostics {
+                    eprintln!(
+                        "> Native OTCv8 {:?} selection ignored native-id={native_selected_id}",
+                        kind
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+    }
+    if matches!(kind, NativePlayerInteractionKind::Target) {
+        return match shared_world
+            .set_player_static_target(source_player_id, Some(native_selected_id))
+        {
+            Ok(_) => Ok(()),
+            Err(HostError::Core(
+                forgotten_core::CoreError::UnknownStaticCreature(_)
+                | forgotten_core::CoreError::InactiveStaticCreature(_),
+            )) => {
+                if extended_diagnostics {
+                    eprintln!(
+                        "> Native OTCv8 static target selection ignored native-id={native_selected_id}"
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+    }
+    {
         if extended_diagnostics {
             eprintln!(
                 "> Native OTCv8 {:?} selection deferred native-id={native_selected_id}",
                 kind
             );
         }
-        return Ok(());
-    };
-    let result = match kind {
-        NativePlayerInteractionKind::Target => {
-            shared_world.set_player_target(source_player_id, selected_player_id)
-        }
-        NativePlayerInteractionKind::Follow => {
-            shared_world.set_player_follow(source_player_id, selected_player_id)
-        }
-    };
-    match result {
-        Ok(_) => Ok(()),
-        Err(HostError::Core(forgotten_core::CoreError::UnknownPlayer(_)))
-        | Err(HostError::Core(forgotten_core::CoreError::SelfInteractionNotAllowed(_))) => {
-            if extended_diagnostics {
-                eprintln!(
-                    "> Native OTCv8 {:?} selection ignored native-id={native_selected_id}",
-                    kind
-                );
-            }
-            Ok(())
-        }
-        Err(error) => Err(error),
+        Ok(())
     }
 }
 
@@ -4523,6 +4560,7 @@ mod tests {
             shared.set_player_target(101, Some(102)).unwrap(),
             PlayerInteractionIntent {
                 target_player_id: Some(102),
+                target_static_creature_id: None,
                 follow_player_id: None,
             }
         );
@@ -4530,6 +4568,7 @@ mod tests {
             shared.set_player_follow(101, Some(102)).unwrap(),
             PlayerInteractionIntent {
                 target_player_id: Some(102),
+                target_static_creature_id: None,
                 follow_player_id: Some(102),
             }
         );
@@ -4610,7 +4649,81 @@ mod tests {
             shared.player_interaction_intent(101).unwrap(),
             PlayerInteractionIntent {
                 target_player_id: None,
+                target_static_creature_id: None,
                 follow_player_id: Some(102),
+            }
+        );
+    }
+
+    #[test]
+    fn native_target_selection_accepts_active_static_entities_but_follow_remains_player_only() {
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let static_spawns =
+            FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
+                id: creature_id,
+                name: "Rat".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 100,
+                direction: 2,
+            }])
+            .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        apply_native_player_interaction(
+            &shared,
+            101,
+            creature_id,
+            NativePlayerInteractionKind::Target,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            shared.player_interaction_intent(101).unwrap(),
+            PlayerInteractionIntent {
+                target_player_id: None,
+                target_static_creature_id: Some(creature_id),
+                follow_player_id: None,
+            }
+        );
+        apply_native_player_interaction(
+            &shared,
+            101,
+            creature_id,
+            NativePlayerInteractionKind::Follow,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            shared.player_interaction_intent(101).unwrap(),
+            PlayerInteractionIntent {
+                target_player_id: None,
+                target_static_creature_id: Some(creature_id),
+                follow_player_id: None,
             }
         );
     }

@@ -1621,6 +1621,7 @@ pub struct PlayerRenderSnapshot {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PlayerInteractionIntent {
     pub target_player_id: Option<u64>,
+    pub target_static_creature_id: Option<u32>,
     pub follow_player_id: Option<u64>,
 }
 
@@ -1807,7 +1808,9 @@ impl WorldState {
             if intent.follow_player_id == Some(id) {
                 intent.follow_player_id = None;
             }
-            intent.target_player_id.is_some() || intent.follow_player_id.is_some()
+            intent.target_player_id.is_some()
+                || intent.target_static_creature_id.is_some()
+                || intent.follow_player_id.is_some()
         });
         self.mark_changed();
         Ok(player)
@@ -1897,6 +1900,42 @@ impl WorldState {
         target_player_id: Option<u64>,
     ) -> Result<PlayerInteractionIntent, CoreError> {
         self.set_player_interaction(player_id, target_player_id, None, true)
+    }
+
+    /// Selects an active static creature as a target only. It does not move, follow, attack,
+    /// damage, despawn, loot, execute scripts, or produce a client packet.
+    pub fn set_player_static_target(
+        &mut self,
+        player_id: u64,
+        target_static_creature_id: Option<u32>,
+    ) -> Result<PlayerInteractionIntent, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        if let Some(target_static_creature_id) = target_static_creature_id {
+            let target = self
+                .static_creatures
+                .get(&target_static_creature_id)
+                .ok_or(CoreError::UnknownStaticCreature(target_static_creature_id))?;
+            if !target.active {
+                return Err(CoreError::InactiveStaticCreature(target_static_creature_id));
+            }
+        }
+        let previous = self.player_interaction_intent(player_id)?;
+        let intent = {
+            let intent = self.player_interactions.entry(player_id).or_default();
+            intent.target_player_id = None;
+            intent.target_static_creature_id = target_static_creature_id;
+            intent.follow_player_id = None;
+            *intent
+        };
+        if intent == PlayerInteractionIntent::default() {
+            self.player_interactions.remove(&player_id);
+        }
+        if previous != intent {
+            self.mark_changed();
+        }
+        Ok(intent)
     }
 
     pub fn set_player_follow(
@@ -2075,14 +2114,27 @@ impl WorldState {
     /// recorded so an explicit due-reactivation caller can later evaluate its configured interval.
     pub fn deactivate_static_creature(&mut self, id: u32) -> Result<bool, CoreError> {
         let tick = self.tick;
-        let runtime = self
-            .static_creatures
-            .get_mut(&id)
-            .ok_or(CoreError::UnknownStaticCreature(id))?;
-        let changed = runtime.active;
-        runtime.active = false;
+        let changed = {
+            let runtime = self
+                .static_creatures
+                .get_mut(&id)
+                .ok_or(CoreError::UnknownStaticCreature(id))?;
+            let changed = runtime.active;
+            runtime.active = false;
+            if changed {
+                runtime.inactive_since_tick = Some(tick);
+            }
+            changed
+        };
         if changed {
-            runtime.inactive_since_tick = Some(tick);
+            self.player_interactions.retain(|_, intent| {
+                if intent.target_static_creature_id == Some(id) {
+                    intent.target_static_creature_id = None;
+                }
+                intent.target_player_id.is_some()
+                    || intent.target_static_creature_id.is_some()
+                    || intent.follow_player_id.is_some()
+            });
         }
         self.refresh_static_creature_occupancy();
         if changed {
@@ -3252,8 +3304,10 @@ impl WorldState {
             let intent = self.player_interactions.entry(player_id).or_default();
             if replace_target {
                 intent.target_player_id = target_player_id;
+                intent.target_static_creature_id = None;
             } else {
                 intent.follow_player_id = follow_player_id;
+                intent.target_static_creature_id = None;
             }
             *intent
         };
@@ -3963,6 +4017,7 @@ mod tests {
             world.set_player_target(source.id, Some(selected.id)),
             Ok(PlayerInteractionIntent {
                 target_player_id: Some(selected.id),
+                target_static_creature_id: None,
                 follow_player_id: None,
             })
         );
@@ -3970,6 +4025,7 @@ mod tests {
             world.set_player_follow(source.id, Some(selected.id)),
             Ok(PlayerInteractionIntent {
                 target_player_id: Some(selected.id),
+                target_static_creature_id: None,
                 follow_player_id: Some(selected.id),
             })
         );
@@ -3990,6 +4046,63 @@ mod tests {
         assert_eq!(
             world.set_player_target(source.id, None),
             Ok(PlayerInteractionIntent::default())
+        );
+    }
+
+    #[test]
+    fn static_creature_target_intent_requires_an_active_authoritative_entity() {
+        let source = player();
+        let creature_id = 0x4000_0001;
+        let creature = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut world = WorldState::default();
+        world
+            .install_static_creatures(&FeTfsStaticSpawnCollection::new(vec![creature]).unwrap())
+            .unwrap();
+        world.add_player(source.clone()).unwrap();
+        assert_eq!(
+            world.set_player_static_target(source.id, Some(creature_id)),
+            Ok(PlayerInteractionIntent {
+                target_player_id: None,
+                target_static_creature_id: Some(creature_id),
+                follow_player_id: None,
+            })
+        );
+        assert_eq!(
+            world.set_player_target(source.id, None),
+            Ok(PlayerInteractionIntent::default())
+        );
+        world
+            .set_player_static_target(source.id, Some(creature_id))
+            .unwrap();
+        assert!(world.deactivate_static_creature(creature_id).unwrap());
+        assert_eq!(
+            world.player_interaction_intent(source.id),
+            Ok(PlayerInteractionIntent::default())
+        );
+        assert_eq!(
+            world.set_player_static_target(source.id, Some(creature_id)),
+            Err(CoreError::InactiveStaticCreature(creature_id))
+        );
+        assert_eq!(
+            world.set_player_static_target(source.id, Some(creature_id + 1)),
+            Err(CoreError::UnknownStaticCreature(creature_id + 1))
         );
     }
 
