@@ -1,8 +1,9 @@
 use forgotten_config::{
-    apply_legacy_item_metadata, ensure_content_skeleton, load, load_legacy_item_catalog,
-    load_tfs_content_inventory, load_tfs_entity_catalog, load_tfs_vocation_registry,
-    load_world_companions, load_world_map, materialize_tfs_static_spawns,
-    resolve_tfs_spawn_references, validate_content, world_map_path, write_template,
+    apply_legacy_item_metadata, ensure_content_skeleton, load, load_declarative_weapon_catalog,
+    load_legacy_item_catalog, load_tfs_content_inventory, load_tfs_entity_catalog,
+    load_tfs_vocation_registry, load_world_companions, load_world_map,
+    materialize_tfs_static_spawns, resolve_tfs_spawn_references, validate_content, world_map_path,
+    write_template,
 };
 use forgotten_core::{
     EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules, PlayerSkill,
@@ -506,6 +507,13 @@ fn run_host(
             Some(stages) => stages.award_policy(config.experience_rate)?,
             None => forgotten_core::ExperienceAwardPolicy::new(config.experience_rate, Vec::new())?,
         });
+        let declarative_weapon_catalog = load_declarative_weapon_catalog(&config)?.map(Arc::new);
+        if let Some(catalog) = &declarative_weapon_catalog {
+            println!(
+                "> Loaded {} scriptless declarative weapon definitions; equipped-item binding remains limited to the native selected-melee foundation.",
+                catalog.len()
+            );
+        }
         let static_spawns = materialize_tfs_static_spawns(&companions, &entity_catalog)?;
         if !static_spawns.entities.is_empty() {
             println!(
@@ -531,6 +539,7 @@ fn run_host(
             regeneration_rules,
             progression_rules,
             experience_award_policy: Some(experience_award_policy),
+            declarative_weapon_catalog,
         })
     } else {
         None

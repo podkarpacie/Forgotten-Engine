@@ -2,8 +2,9 @@
 //!
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
+use forgotten_config::DeclarativeWeaponCatalog;
 use forgotten_core::{
-    CardinalDirection, CombatAttackTiming, CombatDamageType, EmptyWorldManifest,
+    CardinalDirection, CombatAttackTiming, CombatDamageType, EmptyWorldManifest, EquipmentSlot,
     ExperienceAwardPolicy, FeTfsStaticSpawnCollection, ItemInstance, NativeItemPresentationCatalog,
     Player, PlayerCombatEvent, PlayerCombatEventOutcome, PlayerCondition, PlayerConditionKind,
     PlayerConditionOutcome, PlayerContainers, PlayerEquipment, PlayerExperienceAwardOutcome,
@@ -226,6 +227,9 @@ pub struct NativeOtClientHostConfig {
     /// Validated configured flat experience rate and optional level-stage policy. Concrete
     /// gameplay reward sources remain separate from this immutable host input.
     pub experience_award_policy: Option<Arc<ExperienceAwardPolicy>>,
+    /// Optional operator-owned scriptless weapon catalog. It is only eligible for the existing
+    /// server-selected adjacent-melee action when a matching main-hand item is equipped.
+    pub declarative_weapon_catalog: Option<Arc<DeclarativeWeaponCatalog>>,
 }
 
 #[derive(Debug, Clone)]
@@ -659,6 +663,37 @@ impl SharedNativeWorld {
         self.lock()?
             .player_interaction_intent(player_id)
             .map_err(HostError::Core)
+    }
+
+    /// Builds a typed event only when the authoritative right-hand equipment slot contains an
+    /// item declared in the operator-owned scriptless catalog. The client never supplies an item
+    /// identifier to this path, and missing or unknown items intentionally produce no event.
+    pub fn equipped_declarative_melee_event(
+        &self,
+        attacker_id: u64,
+        target_id: u64,
+        catalog: &DeclarativeWeaponCatalog,
+    ) -> Result<Option<PlayerCombatEvent>, HostError> {
+        let world = self.lock()?;
+        let Some(item) = world
+            .player_equipment(attacker_id)
+            .map_err(HostError::Core)?
+            .item(EquipmentSlot::RightHand)
+        else {
+            return Ok(None);
+        };
+        catalog
+            .get(item.server_id)
+            .map(|definition| {
+                definition
+                    .adjacent_melee_event(attacker_id, target_id)
+                    .map_err(|_| {
+                        HostError::InvalidConfiguration(
+                            "validated declarative weapon did not build a combat event".into(),
+                        )
+                    })
+            })
+            .transpose()
     }
 
     pub fn set_player_target(
@@ -1893,6 +1928,7 @@ fn handle_native_otclient_game(
                             character.id,
                             world_map,
                             config.progression_rules.as_deref(),
+                            config.declarative_weapon_catalog.as_deref(),
                         )?
                     {
                         let health_update = encode_native_otclient_creature_health(
@@ -2774,6 +2810,7 @@ fn apply_native_selected_player_melee(
     attacker_id: u64,
     world_map: &WorldMap,
     progression_rules: Option<&BTreeMap<VocationId, PlayerProgressionRules>>,
+    declarative_weapon_catalog: Option<&DeclarativeWeaponCatalog>,
 ) -> Result<
     Option<(
         u32,
@@ -2788,12 +2825,24 @@ fn apply_native_selected_player_melee(
     else {
         return Ok(None);
     };
-    let (outcome, vitals, death_state) = match shared_world.apply_player_melee_damage_with_death(
-        attacker_id,
-        target_id,
-        NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE,
-        world_map,
-    ) {
+    let combat_result = if let Some(catalog) = declarative_weapon_catalog {
+        let Some(event) =
+            shared_world.equipped_declarative_melee_event(attacker_id, target_id, catalog)?
+        else {
+            return Ok(None);
+        };
+        shared_world
+            .apply_player_combat_event_with_death(event, world_map)
+            .map(|(outcome, vitals, death_state)| (outcome.damage, vitals, death_state))
+    } else {
+        shared_world.apply_player_melee_damage_with_death(
+            attacker_id,
+            target_id,
+            NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE,
+            world_map,
+        )
+    };
+    let (outcome, vitals, death_state) = match combat_result {
         Ok(result) => result,
         Err(HostError::Core(forgotten_core::CoreError::CombatOutOfRange { .. }))
         | Err(HostError::Core(forgotten_core::CoreError::UnknownPlayer(_)))
@@ -3318,6 +3367,7 @@ impl std::error::Error for HostError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forgotten_config::parse_declarative_weapons_xml;
     use forgotten_core::{Player, Position, WorldMapTile};
     use forgotten_protocol::FE_7_4_PROFILE;
     use std::fs;
@@ -3390,6 +3440,7 @@ mod tests {
             regeneration_rules: None,
             progression_rules: None,
             experience_award_policy: None,
+            declarative_weapon_catalog: None,
         }
     }
 
@@ -4227,7 +4278,7 @@ mod tests {
         shared.set_player_target(101, Some(102)).unwrap();
 
         let (native_target_id, vitals, outcome) =
-            apply_native_selected_player_melee(&mut database, &shared, 101, &map, None)
+            apply_native_selected_player_melee(&mut database, &shared, 101, &map, None, None)
                 .unwrap()
                 .unwrap();
         assert_eq!(native_target_id, NATIVE_OTCLIENT_PLAYER_ID_START + 102);
@@ -4247,6 +4298,123 @@ mod tests {
                 .vitals
                 .health,
             10
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn selected_player_melee_uses_only_an_equipped_declarative_weapon() {
+        let path = database_path("selected-player-declarative-weapon");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("operator", "hash").unwrap();
+        let map = native_world_map();
+        for (id, name, position) in [
+            (111_u64, "Knight", map.spawn()),
+            (
+                112_u64,
+                "Druid",
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+        ] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: account_id as u64,
+                    name: name.into(),
+                    position,
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 111,
+                    account_id: account_id as u64,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .register_player_at_available_position_with_vitals(
+                Player {
+                    id: 112,
+                    account_id: account_id as u64,
+                    name: "Druid".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                PlayerVitals {
+                    health: 20,
+                    max_health: 20,
+                    ..PlayerVitals::default()
+                },
+                &map,
+            )
+            .unwrap();
+        let catalog = parse_declarative_weapons_xml(
+            br#"<fe-weapons><weapon itemid="2376" damage="12" intervalticks="1"/></fe-weapons>"#,
+        )
+        .unwrap();
+        shared.set_player_target(111, Some(112)).unwrap();
+        assert!(apply_native_selected_player_melee(
+            &mut database,
+            &shared,
+            111,
+            &map,
+            None,
+            Some(&catalog),
+        )
+        .unwrap()
+        .is_none());
+
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(
+            EquipmentSlot::RightHand,
+            ItemInstance::new(2376, 1).unwrap(),
+        );
+        shared.replace_player_equipment(111, equipment).unwrap();
+        let (_native_target_id, vitals, outcome) = apply_native_selected_player_melee(
+            &mut database,
+            &shared,
+            111,
+            &map,
+            None,
+            Some(&catalog),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(outcome.requested_damage, 12);
+        assert_eq!(outcome.applied_damage, 12);
+        assert_eq!(vitals.health, 8);
+        assert_eq!(
+            database
+                .characters_for_account(account_id)
+                .unwrap()
+                .into_iter()
+                .find(|character| character.id == 112)
+                .unwrap()
+                .vitals
+                .health,
+            8
         );
         let _ = fs::remove_file(path);
     }
@@ -4323,6 +4491,7 @@ mod tests {
             301,
             &map,
             Some(&rules_by_vocation),
+            None,
         )
         .unwrap()
         .unwrap();
@@ -4417,7 +4586,7 @@ mod tests {
         shared.set_player_target(201, Some(202)).unwrap();
 
         let (_native_target_id, vitals, outcome) =
-            apply_native_selected_player_melee(&mut database, &shared, 201, &map, None)
+            apply_native_selected_player_melee(&mut database, &shared, 201, &map, None, None)
                 .unwrap()
                 .unwrap();
         assert!(outcome.defeated);

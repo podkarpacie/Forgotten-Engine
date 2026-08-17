@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 forgotten-core = { path = "../forgotten-core" }
+forgotten-config = { path = "../forgotten-config" }
 forgotten-persistence = { path = "../forgotten-persistence" }
 forgotten-protocol = { path = "../forgotten-protocol" }
 

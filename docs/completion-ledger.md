@@ -35,7 +35,8 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Define bounded profile-neutral flat physical mitigation without silently inventing TFS formulas.
 - [ ] Map verified profile-specific armor, shielding, equipment, weapon, and resistance formulas into the typed mitigation contract.
 - [x] Parse bounded FE-owned scriptless weapon declarations that can construct typed physical adjacent-melee events.
-- [ ] Bind validated declarative weapons to equipped items and profile-approved action paths without executing scripts or claiming unverified TFS behavior.
+- [x] Bind validated declarative weapons only to authoritative right-hand equipment on the profile-approved native selected-melee path, without executing scripts.
+- [ ] Add verified profile-specific action paths and legacy-compatible semantics without claiming unverified TFS behavior.
 - [ ] Add profile-gated spell definitions, cooldowns, mana use, target validation, and effects only after packet evidence.
 - [ ] Deliver verified client-visible condition health, death, temple-respawn, and approved loss state for every supported profile.
 - [ ] Add PvP legality, skulls, frags, death/corpse ownership rules, and explicit policy configuration.

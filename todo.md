@@ -239,6 +239,7 @@
 - [x] Define typed bounded physical adjacent-melee events, validated attack timing, and deterministic player cooldown state as the next combat-event foundation; weapon, spell, PvP, defensive-value, and client-effect behavior remain deferred.
 - [x] Define bounded profile-neutral defense ratings and deterministic physical mitigation for typed adjacent melee events; TFS armor, shielding, equipment, weapon, PvP, persistence, and client-effect formula parity remain deferred.
 - [x] Parse and validate a bounded declarative scriptless weapon catalog for typed adjacent melee events; TFS Lua weapon scripts, legacy XML formula semantics, equipment binding, and client weapon-use packets remain deferred.
+- [x] Bind a validated declarative weapon only to the equipped main-hand item on the existing profile-approved selected-melee path; scripts, legacy formula semantics, map use, and client weapon-use packets remain deferred.
 - [x] Advance the native authoritative world tick from elapsed heartbeat time so lifecycle timestamps and future combat cooldowns share one deterministic server clock; client packet semantics remain unchanged.
 - [ ] Add profile-driven combat events for weapons, spells, damage types, cooldowns, PvP policy, and death/corpse handling after independent compatibility evidence.
 - [ ] Add authoritative item transfer, equipment/inventory synchronization, container windows, item use, actions, doors, switches, and map interactions.
