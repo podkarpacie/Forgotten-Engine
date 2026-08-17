@@ -37,7 +37,8 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Parse bounded FE-owned scriptless weapon declarations that can construct typed physical adjacent-melee events.
 - [x] Bind validated declarative weapons only to authoritative right-hand equipment on the profile-approved native selected-melee path, without executing scripts.
 - [ ] Add verified profile-specific action paths and legacy-compatible semantics without claiming unverified TFS behavior.
-- [ ] Add profile-gated spell definitions, cooldowns, mana use, target validation, and effects only after packet evidence.
+- [x] Define typed bounded spell-cast resource and cooldown accounting with no packet, target, formula, effect, or script behavior.
+- [ ] Add profile-gated spell definitions, client request validation, target handling, formulas, effects, and safe script boundaries only after packet evidence.
 - [ ] Deliver verified client-visible condition health, death, temple-respawn, and approved loss state for every supported profile.
 - [ ] Add PvP legality, skulls, frags, death/corpse ownership rules, and explicit policy configuration.
 

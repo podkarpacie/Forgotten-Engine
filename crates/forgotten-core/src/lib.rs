@@ -1446,6 +1446,7 @@ pub enum CombatDelivery {
 
 pub const MAX_COMBAT_EVENT_DAMAGE: u16 = 10_000;
 pub const MAX_COMBAT_INTERVAL_TICKS: u16 = 60;
+pub const MAX_SPELL_MANA_COST: u16 = 10_000;
 
 /// A deliberately small, profile-neutral mitigation surface. It does not interpret TFS armor,
 /// shield, equipment, skill, vocation, or PvP formulas; those require separate compatibility
@@ -1535,6 +1536,53 @@ pub struct PlayerCombatEventOutcome {
     pub next_attack_tick: u64,
 }
 
+/// A server-owned spell-cast request. This foundation performs only bounded resource and timing
+/// accounting. Profile-specific names, words, rune IDs, targets, formulas, effects, Lua hooks,
+/// PvP rules, and client delivery are deliberately outside this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerSpellCastEvent {
+    pub caster_id: u64,
+    pub spell_id: u16,
+    pub mana_cost: u16,
+    pub timing: CombatAttackTiming,
+}
+
+impl PlayerSpellCastEvent {
+    pub fn new(
+        caster_id: u64,
+        spell_id: u16,
+        mana_cost: u16,
+        timing: CombatAttackTiming,
+    ) -> Result<Self, CoreError> {
+        if spell_id == 0 || mana_cost == 0 || mana_cost > MAX_SPELL_MANA_COST {
+            return Err(CoreError::InvalidSpellCastEvent);
+        }
+        Ok(Self {
+            caster_id,
+            spell_id,
+            mana_cost,
+            timing,
+        })
+    }
+}
+
+/// Ephemeral authoritative readiness for the next successful bounded spell-cast event. It is
+/// intentionally separate from attack readiness and non-persistent until a reconnect contract is
+/// defined by an active compatibility profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayerSpellCooldown {
+    pub next_cast_tick: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerSpellCastOutcome {
+    pub caster_id: u64,
+    pub spell_id: u16,
+    pub mana_spent: u16,
+    pub remaining_mana: u16,
+    pub next_cast_tick: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerRenderSnapshot {
     pub id: u64,
@@ -1565,6 +1613,7 @@ pub struct WorldState {
     player_containers: BTreeMap<u64, PlayerContainers>,
     player_combat_defenses: BTreeMap<u64, PlayerCombatDefense>,
     player_combat_cooldowns: BTreeMap<u64, PlayerCombatCooldown>,
+    player_spell_cooldowns: BTreeMap<u64, PlayerSpellCooldown>,
     player_interactions: BTreeMap<u64, PlayerInteractionIntent>,
     static_creatures: BTreeMap<u32, StaticCreatureRuntime>,
     static_occupied_positions: BTreeSet<Position>,
@@ -1655,6 +1704,8 @@ impl WorldState {
             .insert(player.id, PlayerCombatDefense::default());
         self.player_combat_cooldowns
             .insert(player.id, PlayerCombatCooldown::default());
+        self.player_spell_cooldowns
+            .insert(player.id, PlayerSpellCooldown::default());
         self.players.insert(player.id, player);
         self.mark_changed();
         Ok(())
@@ -1676,6 +1727,7 @@ impl WorldState {
         self.player_containers.remove(&id);
         self.player_combat_defenses.remove(&id);
         self.player_combat_cooldowns.remove(&id);
+        self.player_spell_cooldowns.remove(&id);
         self.player_interactions.remove(&id);
         self.player_interactions.retain(|_, intent| {
             if intent.target_player_id == Some(id) {
@@ -2065,6 +2117,13 @@ impl WorldState {
         player_id: u64,
     ) -> Result<PlayerCombatCooldown, CoreError> {
         self.player_combat_cooldowns
+            .get(&player_id)
+            .copied()
+            .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
+    pub fn player_spell_cooldown(&self, player_id: u64) -> Result<PlayerSpellCooldown, CoreError> {
+        self.player_spell_cooldowns
             .get(&player_id)
             .copied()
             .ok_or(CoreError::UnknownPlayer(player_id))
@@ -2851,6 +2910,59 @@ impl WorldState {
         })
     }
 
+    /// Applies only the resource and timing portion of a typed spell cast. No target resolution,
+    /// combat damage, healing, projectile, visual effect, script, PvP, profile packet, or legacy
+    /// spell behavior is implied by a successful result.
+    pub fn apply_player_spell_cast_event(
+        &mut self,
+        event: PlayerSpellCastEvent,
+    ) -> Result<PlayerSpellCastOutcome, CoreError> {
+        if event.spell_id == 0
+            || event.mana_cost == 0
+            || event.mana_cost > MAX_SPELL_MANA_COST
+            || event.timing.interval_ticks == 0
+            || event.timing.interval_ticks > MAX_COMBAT_INTERVAL_TICKS
+        {
+            return Err(CoreError::InvalidSpellCastEvent);
+        }
+        let cooldown = self.player_spell_cooldown(event.caster_id)?;
+        if self.tick < cooldown.next_cast_tick {
+            return Err(CoreError::SpellCooldownActive {
+                caster_id: event.caster_id,
+                current_tick: self.tick,
+                next_cast_tick: cooldown.next_cast_tick,
+            });
+        }
+        let remaining_mana = {
+            let vitals = self
+                .player_vitals
+                .get_mut(&event.caster_id)
+                .ok_or(CoreError::UnknownPlayer(event.caster_id))?;
+            if vitals.mana < event.mana_cost {
+                return Err(CoreError::InsufficientMana {
+                    player_id: event.caster_id,
+                    required_mana: event.mana_cost,
+                    available_mana: vitals.mana,
+                });
+            }
+            vitals.mana -= event.mana_cost;
+            vitals.mana
+        };
+        let next_cast_tick = self
+            .tick
+            .saturating_add(u64::from(event.timing.interval_ticks));
+        self.player_spell_cooldowns
+            .insert(event.caster_id, PlayerSpellCooldown { next_cast_tick });
+        self.mark_changed();
+        Ok(PlayerSpellCastOutcome {
+            caster_id: event.caster_id,
+            spell_id: event.spell_id,
+            mana_spent: event.mana_cost,
+            remaining_mana,
+            next_cast_tick,
+        })
+    }
+
     fn apply_damage_to_known_target(
         &mut self,
         target_id: u64,
@@ -3203,6 +3315,17 @@ pub enum CoreError {
     InvalidDeathLossPolicy,
     InvalidCombatEvent,
     InvalidCombatDefense,
+    InvalidSpellCastEvent,
+    InsufficientMana {
+        player_id: u64,
+        required_mana: u16,
+        available_mana: u16,
+    },
+    SpellCooldownActive {
+        caster_id: u64,
+        current_tick: u64,
+        next_cast_tick: u64,
+    },
     TargetAlreadyDefeated(u64),
     CombatCooldownActive {
         attacker_id: u64,
@@ -4473,6 +4596,91 @@ mod tests {
         assert_eq!(
             world.player_combat_defense(8),
             Err(CoreError::UnknownPlayer(8))
+        );
+    }
+
+    #[test]
+    fn typed_spell_casts_enforce_authoritative_mana_and_cooldown_state() {
+        let timing = CombatAttackTiming::new(2).unwrap();
+        assert_eq!(
+            PlayerSpellCastEvent::new(7, 0, 10, timing),
+            Err(CoreError::InvalidSpellCastEvent)
+        );
+        assert_eq!(
+            PlayerSpellCastEvent::new(7, 1, 0, timing),
+            Err(CoreError::InvalidSpellCastEvent)
+        );
+        assert_eq!(
+            PlayerSpellCastEvent::new(7, 1, MAX_SPELL_MANA_COST + 1, timing),
+            Err(CoreError::InvalidSpellCastEvent)
+        );
+
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        world
+            .update_player_vitals(
+                7,
+                PlayerVitals {
+                    mana: 40,
+                    ..PlayerVitals::default()
+                },
+            )
+            .unwrap();
+        let event = PlayerSpellCastEvent::new(7, 100, 30, timing).unwrap();
+        let outcome = world.apply_player_spell_cast_event(event).unwrap();
+        assert_eq!(
+            outcome,
+            PlayerSpellCastOutcome {
+                caster_id: 7,
+                spell_id: 100,
+                mana_spent: 30,
+                remaining_mana: 10,
+                next_cast_tick: 2,
+            }
+        );
+        assert_eq!(world.player_vitals(7).unwrap().mana, 10);
+        assert_eq!(world.player_spell_cooldown(7).unwrap().next_cast_tick, 2);
+        assert_eq!(
+            world.apply_player_spell_cast_event(event),
+            Err(CoreError::SpellCooldownActive {
+                caster_id: 7,
+                current_tick: 0,
+                next_cast_tick: 2,
+            })
+        );
+
+        world.advance_ticks(2);
+        assert_eq!(
+            world.apply_player_spell_cast_event(event),
+            Err(CoreError::InsufficientMana {
+                player_id: 7,
+                required_mana: 30,
+                available_mana: 10,
+            })
+        );
+        assert_eq!(world.player_spell_cooldown(7).unwrap().next_cast_tick, 2);
+
+        world
+            .update_player_vitals(
+                7,
+                PlayerVitals {
+                    mana: 35,
+                    ..world.player_vitals(7).unwrap()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            world
+                .apply_player_spell_cast_event(event)
+                .unwrap()
+                .remaining_mana,
+            5
+        );
+        assert_eq!(world.player_spell_cooldown(7).unwrap().next_cast_tick, 4);
+        world.remove_player(7).unwrap();
+        assert_eq!(
+            world.player_spell_cooldown(7),
+            Err(CoreError::UnknownPlayer(7))
         );
     }
 
