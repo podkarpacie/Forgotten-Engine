@@ -32,6 +32,8 @@
       "inventory": "partial",
       "mapItemUse": "partial",
       "mapItemUseDetail": "typed server-side validation accepts only same-tile or adjacent use of an exact top-level authoritative map item stack and returns immutable metadata without mutation; the same validation is available through synchronized host state. Action execution, doors, switches, containers, charges, Lua, persistence, and client item-use packets remain deferred",
+      "equipmentBootstrap": "partial",
+      "equipmentBootstrapDetail": "catalog-mapped persisted equipment is emitted at native 740 login in deterministic multi-slot order. Extended diagnostics report the count of omitted unmapped items without packet bodies; live inventory updates and container windows remain deferred",
       "questLog": "partial",
       "questLogDetail": "the native 740 request is decoded and receives a parser-shaped empty quest count response; quest storage, mission lines, scripting, gameplay semantics, and unmodified-client confirmation remain deferred",
       "creaturesDetail": "catalog-derived static spawn representation, native visibility, optional deterministic movement, and caller-triggered reactivation at an unoccupied spawn position with a native map refresh; timed respawns, AI, combat, loot, corpses, and scripts remain deferred",

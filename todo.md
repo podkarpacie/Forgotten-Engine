@@ -186,7 +186,7 @@
 - [x] Add a dependency-neutral validated item-presentation catalog so configuration can pass classic client-ID and subtype requirements to the native host without a crate cycle.
 - [x] Pass the validated item-presentation catalog through native host configuration without emitting inventory packets yet.
 - [x] Resolve authoritative player items through the validated native host catalog into classic record metadata without emitting packet writes yet.
-- [x] Append only catalog-validated classic-740 equipment records to native bootstrap delivery, omitting unmapped items without guessed packet output.
+- [x] Append only catalog-validated classic-740 equipment records to native bootstrap delivery in deterministic multi-slot order, omitting unmapped items without guessed packet output.
 - [x] Add a strict classic-740 container-open encoder with golden parser-layout tests, without enabling client item-use or container-window actions yet.
 - [x] Add additive local player equipment provisioning commands that persist bounded item instances without altering existing player command syntax.
 - [x] Define authoritative player-owned named containers with bounded IDs and items as the foundation for persistence and future parser-safe window delivery.

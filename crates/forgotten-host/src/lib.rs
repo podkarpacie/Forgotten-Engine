@@ -1841,10 +1841,12 @@ fn handle_native_otclient_game(
     stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
     if config.extended_diagnostics {
         eprintln!(
-            "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} equipment-records={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
+            "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} equipment-records={}/{} skipped-unmapped={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
             character.name,
             initialization.0.len(),
             equipment_frames.len(),
+            bootstrap_equipment.len(),
+            bootstrap_equipment.len().saturating_sub(equipment_frames.len()),
             world_map.identifier(),
             world_map.tile_count(),
             active_static_spawns.entities.len(),
@@ -3608,8 +3610,21 @@ mod tests {
                 subtype: Some(25),
             })
         );
+        catalog
+            .insert(
+                2463,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 2463,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
 
         let mut equipment = PlayerEquipment::default();
+        equipment.equip(
+            forgotten_core::EquipmentSlot::Armor,
+            ItemInstance::new(2463, 1).unwrap(),
+        );
         equipment.equip(forgotten_core::EquipmentSlot::RightHand, item);
         equipment.equip(
             forgotten_core::EquipmentSlot::LeftHand,
@@ -3619,8 +3634,9 @@ mod tests {
         let frames =
             native_classic_equipment_frames(&config.client_profile, Some(&catalog), &equipment)
                 .unwrap();
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].0, vec![0x78, 5, 102, 0, 25]);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].0, vec![0x78, 4, 159, 9]);
+        assert_eq!(frames[1].0, vec![0x78, 5, 102, 0, 25]);
 
         let incompatible_profile = NativeOtClientProfile {
             protocol_version: 800,
