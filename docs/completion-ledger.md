@@ -40,6 +40,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [ ] Add verified profile-specific action paths and legacy-compatible semantics without claiming unverified TFS behavior.
 - [x] Define typed bounded spell-cast resource and cooldown accounting with no packet, target, formula, effect, or script behavior.
 - [x] Parse bounded FE-owned scriptless spell declarations that construct typed mana-and-cooldown events.
+- [x] Establish a direct side-effect-free Lua expression sandbox with no standard libraries, typed primitive-only output, and bounded source/memory/instruction limits; imported script execution, callbacks, and APIs remain deferred.
 - [x] Load the optional declarative spell catalog as immutable native-host input without enabling any client cast path.
 - [x] Resolve a declared spell through synchronized host state for bounded mana and cooldown accounting only.
 - [ ] Add profile-gated spell definitions, client request validation, target handling, formulas, effects, and safe script boundaries only after packet evidence.
@@ -69,7 +70,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 
 ### Milestone D — Complete scripting, social, economy, housing, and administration: target 73%
 
-- [ ] Add sandboxed Lua execution with permission limits, typed API contracts, time/resource limits, deterministic failure behavior, and safe script loading.
+- [ ] Add sandboxed Lua event execution with permission limits, typed TFS/FE API contracts, safe script loading, compatibility adapters, and explicit event-family semantics. The completed expression sandbox is intentionally not an imported-script or callback runner.
 - [ ] Add typed creature, player, item, movement, combat, and global event dispatch with compatibility adapters where evidence supports them.
 - [ ] Add parties, channels, private messages, moderation controls, and persistence.
 - [ ] Add guild baseline, banking/trading baseline, houses, beds, rent, access lists, depots, and operator administration APIs.

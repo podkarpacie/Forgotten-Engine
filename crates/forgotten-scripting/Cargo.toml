@@ -7,3 +7,6 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+mlua = { version = "0.9.9", features = ["lua54", "vendored"] }

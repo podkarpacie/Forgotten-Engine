@@ -50,6 +50,7 @@ Use a lawful, unmodified OTClientV8 build configured for the selected 740 profil
 | Lifecycle foundations | Regeneration, selected melee, hydrated conditions, death-state activation with a valid town/temple, and persistence across expected supported boundaries behave exactly as documented. | Any behavior outside the documented boundary must be reported as a defect or deferred—not accepted as parity. |
 | Imported private content | `tfs-audit` and `validate` identify imported map/config/item/registry findings without executing scripts. | Audit errors, missing required files, or a false “compatible” claim is a blocker. |
 | Deferred script boundary | `tfs-audit` may report typed category/count metadata through the no-op dispatcher, but it must not read a script path or body, load Lua, execute a callback, or change world state. | Any script file access, runtime execution, private source disclosure, or gameplay side effect is a release blocker. |
+| Direct expression sandbox | Evaluate finite arithmetic and primitive text expressions only through the direct sandbox. Confirm `io`, `os`, `package`, `debug`, and host/TFS names are absent; confirm source, memory, instruction, parse, and unsupported-value cases return typed states without raw source or runtime-error disclosure. | Any filesystem, network, process, package, debug, host mutation, event callback, imported-script loading, resource-limit bypass, raw source disclosure, or legacy API claim is a release blocker. |
 
 ## Production-release blockers
 
