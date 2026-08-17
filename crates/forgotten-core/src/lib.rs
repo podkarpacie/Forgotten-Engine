@@ -183,6 +183,22 @@ pub struct StaticCreatureLifecycle {
     pub respawn_interval_seconds: u32,
 }
 
+/// The compact restart snapshot for an installed static creature. This deliberately excludes
+/// spawn identity, appearance, targets, scheduling timestamps, combat, loot, and scripts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticCreatureRuntimeSnapshot {
+    pub id: u32,
+    pub position: Position,
+    pub active: bool,
+    pub health_percent: u8,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StaticCreatureRuntimeRestoreSummary {
+    pub restored: usize,
+    pub ignored_unknown: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticCreatureResetSummary {
     pub reactivated: usize,
@@ -2120,6 +2136,111 @@ impl WorldState {
                 inactive_since_tick: runtime.inactive_since_tick,
                 respawn_interval_seconds: runtime.respawn_interval_seconds,
             })
+    }
+
+    /// Returns an ordered, bounded restart snapshot for every installed static creature.
+    pub fn static_creature_runtime_snapshot(&self) -> Vec<StaticCreatureRuntimeSnapshot> {
+        self.static_creatures
+            .iter()
+            .map(|(id, runtime)| StaticCreatureRuntimeSnapshot {
+                id: *id,
+                position: runtime.entity.position,
+                active: runtime.active,
+                health_percent: runtime.health_percent,
+            })
+            .collect()
+    }
+
+    /// Restores runtime state for matching installed static spawn IDs after a restart. Unknown
+    /// records are ignored to make map/catalog upgrades safe. Target state and timing metadata
+    /// are explicitly non-durable and are cleared/reset. This method validates all matching
+    /// records and their prospective occupancy before it changes any authoritative state.
+    pub fn restore_static_creature_runtime(
+        &mut self,
+        records: &[StaticCreatureRuntimeSnapshot],
+    ) -> Result<StaticCreatureRuntimeRestoreSummary, CoreError> {
+        let mut seen = BTreeSet::new();
+        let mut known_records = Vec::new();
+        let mut ignored_unknown = 0;
+        for record in records {
+            if !seen.insert(record.id) {
+                return Err(CoreError::DuplicateStaticSpawnId(record.id));
+            }
+            if record.health_percent > 100 {
+                return Err(CoreError::InvalidStaticCreatureHealthPercent(
+                    record.health_percent,
+                ));
+            }
+            if self.static_creatures.contains_key(&record.id) {
+                known_records.push(*record);
+            } else {
+                ignored_unknown += 1;
+            }
+        }
+
+        let restored_ids = known_records
+            .iter()
+            .map(|record| record.id)
+            .collect::<BTreeSet<_>>();
+        let mut occupied = self
+            .static_creatures
+            .iter()
+            .filter(|(id, runtime)| runtime.active && !restored_ids.contains(id))
+            .map(|(_, runtime)| runtime.entity.position)
+            .collect::<BTreeSet<_>>();
+        for record in &known_records {
+            if !record.active {
+                continue;
+            }
+            if self.is_player_occupied(record.position) {
+                return Err(CoreError::PlayerOccupiesStaticCreaturePosition(
+                    record.position,
+                ));
+            }
+            if !occupied.insert(record.position) {
+                return Err(CoreError::StaticCreatureOccupiesPosition(record.position));
+            }
+        }
+
+        let mut changed = false;
+        for record in known_records {
+            let runtime = self
+                .static_creatures
+                .get_mut(&record.id)
+                .expect("matching static creature ID must remain installed");
+            if runtime.entity.position != record.position
+                || runtime.active != record.active
+                || runtime.health_percent != record.health_percent
+                || runtime.target_player_id.is_some()
+            {
+                changed = true;
+            }
+            runtime.entity.position = record.position;
+            runtime.active = record.active;
+            runtime.health_percent = record.health_percent;
+            runtime.target_player_id = None;
+            if record.active {
+                runtime.activated_at_tick = self.tick;
+                runtime.inactive_since_tick = None;
+            } else {
+                runtime.inactive_since_tick = Some(self.tick);
+            }
+        }
+        if changed {
+            self.refresh_static_creature_occupancy();
+            self.player_interactions.retain(|_, intent| {
+                intent.target_static_creature_id.map_or(true, |id| {
+                    self.static_creatures
+                        .get(&id)
+                        .is_some_and(|runtime| runtime.active)
+                })
+            });
+            self.mark_changed();
+        }
+        Ok(StaticCreatureRuntimeRestoreSummary {
+            restored: restored_ids.len(),
+            ignored_unknown,
+        })
     }
 
     pub fn active_static_creature_count(&self) -> usize {
@@ -5837,6 +5958,103 @@ mod tests {
         assert_eq!(
             world.move_static_creature_cardinal(0x4000_0002, CardinalDirection::West, &map),
             Err(CoreError::InactiveStaticCreature(0x4000_0002))
+        );
+    }
+
+    #[test]
+    fn static_creature_runtime_restore_is_validated_idempotent_and_clears_targets() {
+        let creature_id = 0x4000_0001;
+        let initial_position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let restored_position = Position {
+            x: 102,
+            y: 100,
+            z: 7,
+        };
+        let creature = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: initial_position,
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let source = player();
+        let mut world = WorldState::default();
+        world.add_player(source.clone()).unwrap();
+        world
+            .install_static_creatures(&FeTfsStaticSpawnCollection::new(vec![creature]).unwrap())
+            .unwrap();
+        world
+            .set_player_static_target(source.id, Some(creature_id))
+            .unwrap();
+        world.select_static_creature_target(creature_id, 8).unwrap();
+
+        let records = [
+            StaticCreatureRuntimeSnapshot {
+                id: creature_id,
+                position: restored_position,
+                active: false,
+                health_percent: 70,
+            },
+            StaticCreatureRuntimeSnapshot {
+                id: 0x4000_9999,
+                position: initial_position,
+                active: true,
+                health_percent: 100,
+            },
+        ];
+        assert_eq!(
+            world.restore_static_creature_runtime(&records),
+            Ok(StaticCreatureRuntimeRestoreSummary {
+                restored: 1,
+                ignored_unknown: 1,
+            })
+        );
+        assert_eq!(
+            world.static_creature_runtime_snapshot(),
+            vec![StaticCreatureRuntimeSnapshot {
+                id: creature_id,
+                position: restored_position,
+                active: false,
+                health_percent: 70,
+            }]
+        );
+        assert_eq!(
+            world.static_creature_target(creature_id),
+            Err(CoreError::InactiveStaticCreature(creature_id))
+        );
+        assert_eq!(
+            world.player_interaction_intent(source.id),
+            Ok(PlayerInteractionIntent::default())
+        );
+        assert!(!world.is_static_creature_occupied(initial_position));
+        assert!(!world.is_static_creature_occupied(restored_position));
+
+        let snapshot_before_invalid = world.static_creature_runtime_snapshot();
+        assert_eq!(
+            world.restore_static_creature_runtime(&[StaticCreatureRuntimeSnapshot {
+                id: creature_id,
+                position: source.position,
+                active: true,
+                health_percent: 100,
+            }]),
+            Err(CoreError::PlayerOccupiesStaticCreaturePosition(
+                source.position
+            ))
+        );
+        assert_eq!(
+            world.static_creature_runtime_snapshot(),
+            snapshot_before_invalid
         );
     }
 

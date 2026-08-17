@@ -13,10 +13,13 @@ use forgotten_core::{
     PlayerProgressionRules, PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState,
     PlayerSkill, PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
     StaticCreatureDamageOutcome, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy,
-    StaticCreatureResetSummary, StaticCreatureTargetStepOutcome, VocationId, VocationLevelUpGains,
-    WorldMap, WorldState,
+    StaticCreatureResetSummary, StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
+    StaticCreatureTargetStepOutcome, VocationId, VocationLevelUpGains, WorldMap, WorldState,
 };
-use forgotten_persistence::{EngineDatabase, PlayerOutfit, PlayerVitals as PersistedPlayerVitals};
+use forgotten_persistence::{
+    EngineDatabase, PlayerOutfit, PlayerVitals as PersistedPlayerVitals,
+    StaticCreatureRuntimeRecord,
+};
 use forgotten_protocol::{
     decode, decode_fe_otclient_capability_ack, decode_fe_otclient_move_request,
     decode_legacy_74_envelope, decode_legacy_74_game_session_bootstrap_plaintext,
@@ -1116,6 +1119,26 @@ impl SharedNativeWorld {
         Ok(changed)
     }
 
+    pub fn static_creature_runtime_snapshot(
+        &self,
+    ) -> Result<Vec<StaticCreatureRuntimeSnapshot>, HostError> {
+        Ok(self.lock()?.static_creature_runtime_snapshot())
+    }
+
+    pub fn restore_static_creature_runtime(
+        &self,
+        records: &[StaticCreatureRuntimeSnapshot],
+    ) -> Result<StaticCreatureRuntimeRestoreSummary, HostError> {
+        let summary = self
+            .lock()?
+            .restore_static_creature_runtime(records)
+            .map_err(HostError::Core)?;
+        if summary.restored > 0 {
+            self.mark_visibility_changed();
+        }
+        Ok(summary)
+    }
+
     pub fn apply_static_creature_melee_damage(
         &self,
         attacker_id: u64,
@@ -1731,6 +1754,7 @@ pub fn start_native_otclient_game(
     let active_connections = Arc::new(AtomicUsize::new(0));
     let database_path = database_path.as_ref().to_path_buf();
     let shared_world = SharedNativeWorld::from_static_spawns(config.static_spawns.as_deref())?;
+    restore_static_creature_runtime_from_database(&shared_world, &database_path)?;
     let thread_shutdown = Arc::clone(&shutdown);
     let thread = thread::spawn(move || {
         serve_native_otclient_game(
@@ -2045,8 +2069,49 @@ fn serve_native_otclient_game(
     };
     service_result?;
     heartbeat_result?;
+    persist_static_creature_runtime_to_database(&shared_world, &database_path)?;
     record_event(&database_path, "info", "native client game service stopped");
     Ok(())
+}
+
+fn restore_static_creature_runtime_from_database(
+    shared_world: &SharedNativeWorld,
+    database_path: &Path,
+) -> Result<StaticCreatureRuntimeRestoreSummary, HostError> {
+    let database = EngineDatabase::open(database_path).map_err(HostError::Persistence)?;
+    let records = database
+        .static_creature_runtime()
+        .map_err(HostError::Persistence)?;
+    let snapshots = records
+        .into_iter()
+        .map(|record| StaticCreatureRuntimeSnapshot {
+            id: record.creature_id,
+            position: record.position,
+            active: record.active,
+            health_percent: record.health_percent,
+        })
+        .collect::<Vec<_>>();
+    shared_world.restore_static_creature_runtime(&snapshots)
+}
+
+fn persist_static_creature_runtime_to_database(
+    shared_world: &SharedNativeWorld,
+    database_path: &Path,
+) -> Result<(), HostError> {
+    let snapshots = shared_world.static_creature_runtime_snapshot()?;
+    let records = snapshots
+        .into_iter()
+        .map(|snapshot| StaticCreatureRuntimeRecord {
+            creature_id: snapshot.id,
+            position: snapshot.position,
+            active: snapshot.active,
+            health_percent: snapshot.health_percent,
+        })
+        .collect::<Vec<_>>();
+    let mut database = EngineDatabase::open(database_path).map_err(HostError::Persistence)?;
+    database
+        .replace_static_creature_runtime(&records)
+        .map_err(HostError::Persistence)
 }
 
 fn handle_native_otclient_login(
@@ -5639,6 +5704,65 @@ mod tests {
                 40,
             ]]
         );
+    }
+
+    #[test]
+    fn static_creature_runtime_snapshot_persists_across_fresh_shared_worlds() {
+        let path = database_path("static-creature-runtime-persistence");
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let static_spawns =
+            FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
+                id: creature_id,
+                name: "Rat".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 75,
+                direction: 2,
+            }])
+            .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        shared
+            .set_static_creature_health_percent(creature_id, 42)
+            .unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .deactivate_static_creature(creature_id)
+            .unwrap();
+        persist_static_creature_runtime_to_database(&shared, &path).unwrap();
+
+        let fresh = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        assert_eq!(
+            restore_static_creature_runtime_from_database(&fresh, &path).unwrap(),
+            StaticCreatureRuntimeRestoreSummary {
+                restored: 1,
+                ignored_unknown: 0,
+            }
+        );
+        assert_eq!(
+            fresh.static_creature_runtime_snapshot().unwrap(),
+            vec![StaticCreatureRuntimeSnapshot {
+                id: creature_id,
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                active: false,
+                health_percent: 42,
+            }]
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]

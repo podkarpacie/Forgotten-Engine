@@ -25,12 +25,23 @@ const SCHEMA_VERSION_PROGRESSION_ATTEMPTS: i64 = 8;
 const SCHEMA_VERSION_LIFECYCLE: i64 = 9;
 const SCHEMA_VERSION_CONDITION_ELAPSED: i64 = 10;
 const SCHEMA_VERSION_OUTFIT: i64 = 11;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_OUTFIT;
+const SCHEMA_VERSION_STATIC_CREATURE_RUNTIME: i64 = 12;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_STATIC_CREATURE_RUNTIME;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct EngineDatabase {
     connection: Connection,
     path: PathBuf,
+}
+
+/// The durable subset of known static-creature runtime state. Spawn definitions, appearance,
+/// targets, scheduling, combat, loot, and scripts remain content/runtime concerns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticCreatureRuntimeRecord {
+    pub creature_id: u32,
+    pub position: Position,
+    pub active: bool,
+    pub health_percent: u8,
 }
 
 impl EngineDatabase {
@@ -1083,6 +1094,115 @@ impl EngineDatabase {
             .query_row("SELECT COUNT(*) FROM engine_events", [], |row| row.get(0))?)
     }
 
+    /// Replaces the complete static-creature runtime snapshot atomically. Callers must supply
+    /// only known static spawn IDs; identity validation remains in the authoritative world when
+    /// this storage record is applied.
+    pub fn replace_static_creature_runtime(
+        &mut self,
+        records: &[StaticCreatureRuntimeRecord],
+    ) -> Result<(), PersistenceError> {
+        let mut seen = BTreeMap::new();
+        for record in records {
+            if record.health_percent > 100 {
+                return Err(PersistenceError::InvalidStaticCreatureRuntimeRecord(
+                    "health percent must be at most 100".into(),
+                ));
+            }
+            if seen.insert(record.creature_id, ()).is_some() {
+                return Err(PersistenceError::InvalidStaticCreatureRuntimeRecord(
+                    "duplicate static creature ID".into(),
+                ));
+            }
+        }
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM static_creature_runtime", [])?;
+        for record in records {
+            transaction.execute(
+                "INSERT INTO static_creature_runtime (creature_id, x, y, z, active, health_percent) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    i64::from(record.creature_id),
+                    i64::from(record.position.x),
+                    i64::from(record.position.y),
+                    i64::from(record.position.z),
+                    i64::from(u8::from(record.active)),
+                    i64::from(record.health_percent),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Loads the complete bounded static-creature runtime snapshot. Rows are independently
+    /// validated so malformed external SQLite edits never enter the authoritative world.
+    pub fn static_creature_runtime(
+        &self,
+    ) -> Result<Vec<StaticCreatureRuntimeRecord>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT creature_id, x, y, z, active, health_percent FROM static_creature_runtime ORDER BY creature_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (creature_id, x, y, z, active, health_percent) = row?;
+            let creature_id = u32::try_from(creature_id).map_err(|_| {
+                PersistenceError::InvalidStaticCreatureRuntimeRecord(
+                    "creature ID does not fit u32".into(),
+                )
+            })?;
+            let position = Position {
+                x: u16::try_from(x).map_err(|_| {
+                    PersistenceError::InvalidStaticCreatureRuntimeRecord(
+                        "x does not fit u16".into(),
+                    )
+                })?,
+                y: u16::try_from(y).map_err(|_| {
+                    PersistenceError::InvalidStaticCreatureRuntimeRecord(
+                        "y does not fit u16".into(),
+                    )
+                })?,
+                z: u8::try_from(z).map_err(|_| {
+                    PersistenceError::InvalidStaticCreatureRuntimeRecord("z does not fit u8".into())
+                })?,
+            };
+            let active = match active {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(PersistenceError::InvalidStaticCreatureRuntimeRecord(
+                        "active flag must be zero or one".into(),
+                    ))
+                }
+            };
+            let health_percent = u8::try_from(health_percent).map_err(|_| {
+                PersistenceError::InvalidStaticCreatureRuntimeRecord(
+                    "health percent does not fit u8".into(),
+                )
+            })?;
+            if health_percent > 100 {
+                return Err(PersistenceError::InvalidStaticCreatureRuntimeRecord(
+                    "health percent must be at most 100".into(),
+                ));
+            }
+            records.push(StaticCreatureRuntimeRecord {
+                creature_id,
+                position,
+                active,
+                health_percent,
+            });
+        }
+        Ok(records)
+    }
+
     fn migrate(&mut self) -> Result<(), PersistenceError> {
         self.connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);\
@@ -1213,6 +1333,15 @@ impl EngineDatabase {
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![SCHEMA_VERSION_OUTFIT, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < SCHEMA_VERSION_STATIC_CREATURE_RUNTIME {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS static_creature_runtime (creature_id INTEGER PRIMARY KEY, x INTEGER NOT NULL, y INTEGER NOT NULL, z INTEGER NOT NULL, active INTEGER NOT NULL, health_percent INTEGER NOT NULL);",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_STATIC_CREATURE_RUNTIME, unix_seconds()],
             )?;
         }
         Ok(())
@@ -1487,6 +1616,7 @@ pub enum PersistenceError {
     InvalidProgressionRecord(String),
     InvalidProgressionAttemptRecord(String),
     InvalidLifecycleRecord(String),
+    InvalidStaticCreatureRuntimeRecord(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
 }
@@ -1615,6 +1745,70 @@ mod tests {
         assert!(matches!(
             database.update_player_outfit(999, outfit),
             Err(PersistenceError::UnknownPlayer(999))
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_and_validates_static_creature_runtime_snapshot_transactionally() {
+        let path = temporary_path("static-creature-runtime");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let records = [
+            StaticCreatureRuntimeRecord {
+                creature_id: 0x1000_0001,
+                position: Position {
+                    x: 101,
+                    y: 102,
+                    z: 7,
+                },
+                active: true,
+                health_percent: 100,
+            },
+            StaticCreatureRuntimeRecord {
+                creature_id: 0x1000_0002,
+                position: Position {
+                    x: 103,
+                    y: 104,
+                    z: 6,
+                },
+                active: false,
+                health_percent: 0,
+            },
+        ];
+        database.replace_static_creature_runtime(&records).unwrap();
+        assert_eq!(database.static_creature_runtime().unwrap(), records);
+
+        let invalid_health = [StaticCreatureRuntimeRecord {
+            health_percent: 101,
+            ..records[0]
+        }];
+        assert!(matches!(
+            database.replace_static_creature_runtime(&invalid_health),
+            Err(PersistenceError::InvalidStaticCreatureRuntimeRecord(_))
+        ));
+        assert_eq!(database.static_creature_runtime().unwrap(), records);
+
+        let duplicate_ids = [records[0], records[0]];
+        assert!(matches!(
+            database.replace_static_creature_runtime(&duplicate_ids),
+            Err(PersistenceError::InvalidStaticCreatureRuntimeRecord(_))
+        ));
+        assert_eq!(database.static_creature_runtime().unwrap(), records);
+
+        database
+            .connection
+            .execute("DELETE FROM static_creature_runtime", [])
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "INSERT INTO static_creature_runtime (creature_id, x, y, z, active, health_percent) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![0x1000_0001_i64, 101_i64, 102_i64, 7_i64, 2_i64, 100_i64],
+            )
+            .unwrap();
+        assert!(matches!(
+            database.static_creature_runtime(),
+            Err(PersistenceError::InvalidStaticCreatureRuntimeRecord(_))
         ));
         let _ = fs::remove_file(path);
     }
