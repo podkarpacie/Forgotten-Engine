@@ -7,11 +7,13 @@ use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, EmptyWorldManifest, EquipmentSlot,
     ExperienceAwardPolicy, FeTfsStaticSpawnCollection, ItemInstance, NativeItemPresentationCatalog,
     Player, PlayerCombatEvent, PlayerCombatEventOutcome, PlayerCondition, PlayerConditionKind,
-    PlayerConditionOutcome, PlayerContainerToEquipmentOutcome, PlayerContainers, PlayerEquipment,
-    PlayerEquipmentToContainerOutcome, PlayerExperienceAwardOutcome, PlayerInteractionIntent,
-    PlayerItemUseIntent, PlayerItemUseOutcome, PlayerProgression, PlayerProgressionAttempts,
-    PlayerProgressionRules, PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState,
-    PlayerSkill, PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
+    PlayerConditionOutcome, PlayerContainerStackToEquipmentOutcome,
+    PlayerContainerToEquipmentOutcome, PlayerContainers, PlayerEquipment,
+    PlayerEquipmentStackToContainerOutcome, PlayerEquipmentToContainerOutcome,
+    PlayerExperienceAwardOutcome, PlayerInteractionIntent, PlayerItemUseIntent,
+    PlayerItemUseOutcome, PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
+    PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState, PlayerSkill,
+    PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
     StaticCreatureDamageOutcome, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy,
     StaticCreatureResetSummary, StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
     StaticCreatureTargetStepOutcome, VocationId, VocationLevelUpGains, WorldMap, WorldState,
@@ -836,6 +838,46 @@ impl SharedNativeWorld {
         let outcome = self
             .lock()?
             .move_container_item_to_equipment(player_id, container_id, item_index, to_slot)
+            .map_err(HostError::Core)?;
+        self.equipment_epoch.fetch_add(1, Ordering::SeqCst);
+        self.containers_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(outcome)
+    }
+
+    /// Applies one bounded partial equipment stack movement under the shared world lock. It
+    /// advances the two existing inventory epochs only after the core accepts the atomic update;
+    /// request decoding, persistence routing, slot rules, and ground/nested inventory remain out
+    /// of scope.
+    pub fn move_equipment_stack_to_container(
+        &self,
+        player_id: u64,
+        from_slot: EquipmentSlot,
+        container_id: u8,
+        count: u16,
+    ) -> Result<PlayerEquipmentStackToContainerOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .move_equipment_stack_to_container(player_id, from_slot, container_id, count)
+            .map_err(HostError::Core)?;
+        self.equipment_epoch.fetch_add(1, Ordering::SeqCst);
+        self.containers_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(outcome)
+    }
+
+    /// Applies one bounded partial top-level-container stack movement under the shared world
+    /// lock. It shares the established inventory refresh contract with full-item transfers and
+    /// deliberately does not claim native client request or general inventory semantics.
+    pub fn move_container_stack_to_equipment(
+        &self,
+        player_id: u64,
+        container_id: u8,
+        item_index: usize,
+        to_slot: EquipmentSlot,
+        count: u16,
+    ) -> Result<PlayerContainerStackToEquipmentOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .move_container_stack_to_equipment(player_id, container_id, item_index, to_slot, count)
             .map_err(HostError::Core)?;
         self.equipment_epoch.fetch_add(1, Ordering::SeqCst);
         self.containers_epoch.fetch_add(1, Ordering::SeqCst);
@@ -4628,6 +4670,74 @@ mod tests {
             shared.move_equipment_item_to_container(111, EquipmentSlot::RightHand, 2),
             Err(HostError::Core(
                 forgotten_core::CoreError::EmptyEquipmentSlot { .. }
+            ))
+        ));
+        assert_eq!(shared.equipment_epoch(), equipment_epoch + 2);
+        assert_eq!(shared.containers_epoch(), containers_epoch + 2);
+    }
+
+    #[test]
+    fn shared_stack_transfers_advance_both_native_refresh_epochs_only_on_success() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 112,
+                    account_id: 1,
+                    name: "Paladin".into(),
+                    position: map.spawn(),
+                    level: 1,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(
+            EquipmentSlot::RightHand,
+            ItemInstance::new(2148, 40).unwrap(),
+        );
+        shared.replace_player_equipment(112, equipment).unwrap();
+        let mut container = forgotten_core::PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        container
+            .items
+            .insert(ItemInstance::new(2148, 10).unwrap())
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(container).unwrap();
+        shared.replace_player_containers(112, containers).unwrap();
+
+        let equipment_epoch = shared.equipment_epoch();
+        let containers_epoch = shared.containers_epoch();
+        let moved = shared
+            .move_equipment_stack_to_container(112, EquipmentSlot::RightHand, 2, 15)
+            .unwrap();
+        assert_eq!(moved.source_remaining_count, Some(25));
+        assert_eq!(moved.destination_count, 25);
+        assert_eq!(shared.equipment_epoch(), equipment_epoch + 1);
+        assert_eq!(shared.containers_epoch(), containers_epoch + 1);
+
+        let merged = shared
+            .move_container_stack_to_equipment(112, 2, 0, EquipmentSlot::RightHand, 20)
+            .unwrap();
+        assert_eq!(merged.source_remaining_count, Some(5));
+        assert_eq!(merged.destination_count, 45);
+        assert_eq!(shared.equipment_epoch(), equipment_epoch + 2);
+        assert_eq!(shared.containers_epoch(), containers_epoch + 2);
+
+        assert!(matches!(
+            shared.move_container_stack_to_equipment(112, 2, 0, EquipmentSlot::RightHand, 0),
+            Err(HostError::Core(
+                forgotten_core::CoreError::InvalidItemTransferCount { .. }
             ))
         ));
         assert_eq!(shared.equipment_epoch(), equipment_epoch + 2);

@@ -1254,6 +1254,49 @@ impl ItemInstance {
             unique_id: None,
         })
     }
+
+    /// Returns true only when two runtime instances have the same type and persistent attributes.
+    /// Item-definition stackability remains outside this bounded core layer, so callers opt into
+    /// merge semantics only by invoking the explicit stack transfer methods below.
+    pub fn is_stack_compatible_with(&self, other: &Self) -> bool {
+        self.server_id == other.server_id
+            && self.action_id == other.action_id
+            && self.unique_id == other.unique_id
+    }
+
+    fn split_off(&mut self, count: u16) -> Result<Self, CoreError> {
+        if count == 0 || count > self.count {
+            return Err(CoreError::InvalidItemTransferCount {
+                requested: count,
+                available: self.count,
+            });
+        }
+        self.count -= count;
+        let mut split = self.clone();
+        split.count = count;
+        Ok(split)
+    }
+
+    fn merge_stack(&mut self, incoming: &Self) -> Result<(), CoreError> {
+        if !self.is_stack_compatible_with(incoming) {
+            return Err(CoreError::IncompatibleItemStacks);
+        }
+        let count =
+            self.count
+                .checked_add(incoming.count)
+                .ok_or(CoreError::ItemStackCountOverflow {
+                    existing: self.count,
+                    incoming: incoming.count,
+                })?;
+        if count > MAX_ITEM_STACK_COUNT {
+            return Err(CoreError::ItemStackCountOverflow {
+                existing: self.count,
+                incoming: incoming.count,
+            });
+        }
+        self.count = count;
+        Ok(())
+    }
 }
 
 /// Result of an authoritative, non-recursive player inventory transfer. Client inventory window
@@ -1276,6 +1319,33 @@ pub struct PlayerContainerToEquipmentOutcome {
     pub item_index: usize,
     pub to_slot: EquipmentSlot,
     pub item: ItemInstance,
+}
+
+/// Result of a bounded partial-stack movement from equipment to an existing top-level container.
+/// It does not imply item metadata stackability, ownership checks beyond the current player,
+/// capacity rules, ground transfer, recursive containers, client requests, or client delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerEquipmentStackToContainerOutcome {
+    pub player_id: u64,
+    pub from_slot: EquipmentSlot,
+    pub container_id: u8,
+    pub destination_index: usize,
+    pub moved_item: ItemInstance,
+    pub source_remaining_count: Option<u16>,
+    pub destination_count: u16,
+}
+
+/// Result of a bounded partial-stack movement from one existing top-level container into a fixed
+/// equipment slot. It retains the same deliberately narrow behavior as the forward transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerContainerStackToEquipmentOutcome {
+    pub player_id: u64,
+    pub container_id: u8,
+    pub item_index: usize,
+    pub to_slot: EquipmentSlot,
+    pub moved_item: ItemInstance,
+    pub source_remaining_count: Option<u16>,
+    pub destination_count: u16,
 }
 
 /// Presentation metadata validated from an operator-supplied item catalog. It deliberately holds
@@ -1451,6 +1521,31 @@ impl ItemContainer {
         }
         self.items.push(item);
         Ok(())
+    }
+
+    /// Merges into the first compatible bounded stack that has room, or inserts a new stack.
+    /// If compatible stacks exist but all would overflow, no new stack is created because that
+    /// would hide an invalid merge behind arbitrary stack fragmentation.
+    fn merge_or_insert_stack(&mut self, item: ItemInstance) -> Result<(usize, u16), CoreError> {
+        if let Some((index, existing)) = self.items.iter_mut().enumerate().find(|(_, existing)| {
+            existing.is_stack_compatible_with(&item)
+                && existing.count.saturating_add(item.count) <= MAX_ITEM_STACK_COUNT
+        }) {
+            existing.merge_stack(&item)?;
+            return Ok((index, existing.count));
+        }
+        if let Some(existing) = self
+            .items
+            .iter()
+            .find(|existing| existing.is_stack_compatible_with(&item))
+        {
+            return Err(CoreError::ItemStackCountOverflow {
+                existing: existing.count,
+                incoming: item.count,
+            });
+        }
+        self.insert(item.clone())?;
+        Ok((self.items.len() - 1, item.count))
     }
 
     pub fn remove(&mut self, index: usize) -> Option<ItemInstance> {
@@ -3309,6 +3404,113 @@ impl WorldState {
         })
     }
 
+    /// Moves a requested bounded count from one equipment item into an existing top-level
+    /// container. The destination merges only with an identical item instance and otherwise
+    /// creates a new bounded stack. No item metadata-driven stackability is inferred.
+    pub fn move_equipment_stack_to_container(
+        &mut self,
+        player_id: u64,
+        from_slot: EquipmentSlot,
+        container_id: u8,
+        count: u16,
+    ) -> Result<PlayerEquipmentStackToContainerOutcome, CoreError> {
+        let mut equipment = self.player_equipment(player_id)?.clone();
+        let mut source = equipment
+            .unequip(from_slot)
+            .ok_or(CoreError::EmptyEquipmentSlot {
+                player_id,
+                slot: from_slot,
+            })?;
+        let moved_item = source.split_off(count)?;
+        let source_remaining_count = (source.count > 0).then_some(source.count);
+        if source_remaining_count.is_some() {
+            equipment.equip(from_slot, source);
+        }
+        let mut containers = self.player_containers(player_id)?.clone();
+        let mut container =
+            containers
+                .remove(container_id)
+                .ok_or(CoreError::UnknownPlayerContainer {
+                    player_id,
+                    container_id,
+                })?;
+        let (destination_index, destination_count) =
+            container.items.merge_or_insert_stack(moved_item.clone())?;
+        containers.insert(container)?;
+        self.player_equipments.insert(player_id, equipment);
+        self.player_containers.insert(player_id, containers);
+        self.mark_changed();
+        Ok(PlayerEquipmentStackToContainerOutcome {
+            player_id,
+            from_slot,
+            container_id,
+            destination_index,
+            moved_item,
+            source_remaining_count,
+            destination_count,
+        })
+    }
+
+    /// Moves a requested bounded count from one existing top-level container item into a fixed
+    /// equipment slot. An occupied slot can accept the move only when it has identical item
+    /// attributes and enough space within the existing 100-count bound.
+    pub fn move_container_stack_to_equipment(
+        &mut self,
+        player_id: u64,
+        container_id: u8,
+        item_index: usize,
+        to_slot: EquipmentSlot,
+        count: u16,
+    ) -> Result<PlayerContainerStackToEquipmentOutcome, CoreError> {
+        let mut equipment = self.player_equipment(player_id)?.clone();
+        let mut containers = self.player_containers(player_id)?.clone();
+        let mut container =
+            containers
+                .remove(container_id)
+                .ok_or(CoreError::UnknownPlayerContainer {
+                    player_id,
+                    container_id,
+                })?;
+        let source =
+            container
+                .items
+                .remove(item_index)
+                .ok_or(CoreError::UnknownPlayerContainerItem {
+                    player_id,
+                    container_id,
+                    item_index,
+                })?;
+        let mut remaining = source;
+        let moved_item = remaining.split_off(count)?;
+        let destination_count = if let Some(destination) = equipment.item(to_slot).cloned() {
+            let mut destination = destination;
+            destination.merge_stack(&moved_item)?;
+            let count = destination.count;
+            equipment.equip(to_slot, destination);
+            count
+        } else {
+            equipment.equip(to_slot, moved_item.clone());
+            moved_item.count
+        };
+        let source_remaining_count = (remaining.count > 0).then_some(remaining.count);
+        if source_remaining_count.is_some() {
+            container.items.items.insert(item_index, remaining);
+        }
+        containers.insert(container)?;
+        self.player_equipments.insert(player_id, equipment);
+        self.player_containers.insert(player_id, containers);
+        self.mark_changed();
+        Ok(PlayerContainerStackToEquipmentOutcome {
+            player_id,
+            container_id,
+            item_index,
+            to_slot,
+            moved_item,
+            source_remaining_count,
+            destination_count,
+        })
+    }
+
     pub fn update_player_vitals(
         &mut self,
         player_id: u64,
@@ -4116,6 +4318,15 @@ pub enum CoreError {
     },
     DuplicateItemPresentation(u16),
     InvalidItemStackCount(u16),
+    InvalidItemTransferCount {
+        requested: u16,
+        available: u16,
+    },
+    IncompatibleItemStacks,
+    ItemStackCountOverflow {
+        existing: u16,
+        incoming: u16,
+    },
     InvalidMovement {
         from: Position,
         to: Position,
@@ -4527,6 +4738,172 @@ mod tests {
                 .items
                 .item(0),
             Some(&shield)
+        );
+    }
+
+    #[test]
+    fn authoritative_item_stack_transfers_split_merge_and_reject_invalid_state() {
+        let gold = 2148;
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(
+            EquipmentSlot::RightHand,
+            ItemInstance::new(gold, 80).unwrap(),
+        );
+        world.replace_player_equipment(7, equipment).unwrap();
+        let mut backpack =
+            PlayerContainer::new(0, ItemInstance::new(1988, 1).unwrap(), "Backpack", false, 2)
+                .unwrap();
+        backpack
+            .items
+            .insert(ItemInstance::new(gold, 10).unwrap())
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(backpack).unwrap();
+        world.replace_player_containers(7, containers).unwrap();
+
+        assert_eq!(
+            world
+                .move_equipment_stack_to_container(7, EquipmentSlot::RightHand, 0, 15)
+                .unwrap(),
+            PlayerEquipmentStackToContainerOutcome {
+                player_id: 7,
+                from_slot: EquipmentSlot::RightHand,
+                container_id: 0,
+                destination_index: 0,
+                moved_item: ItemInstance::new(gold, 15).unwrap(),
+                source_remaining_count: Some(65),
+                destination_count: 25,
+            }
+        );
+        assert_eq!(
+            world
+                .player_equipment(7)
+                .unwrap()
+                .item(EquipmentSlot::RightHand)
+                .unwrap()
+                .count,
+            65
+        );
+        assert_eq!(
+            world
+                .player_containers(7)
+                .unwrap()
+                .container(0)
+                .unwrap()
+                .items
+                .item(0)
+                .unwrap()
+                .count,
+            25
+        );
+
+        let revision_before_invalid_count = world.revision();
+        assert_eq!(
+            world.move_equipment_stack_to_container(7, EquipmentSlot::RightHand, 0, 0),
+            Err(CoreError::InvalidItemTransferCount {
+                requested: 0,
+                available: 65,
+            })
+        );
+        assert_eq!(world.revision(), revision_before_invalid_count);
+
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(
+            EquipmentSlot::LeftHand,
+            ItemInstance::new(gold, 70).unwrap(),
+        );
+        world.replace_player_equipment(7, equipment).unwrap();
+        let mut backpack =
+            PlayerContainer::new(0, ItemInstance::new(1988, 1).unwrap(), "Backpack", false, 2)
+                .unwrap();
+        backpack
+            .items
+            .insert(ItemInstance::new(gold, 20).unwrap())
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(backpack).unwrap();
+        world.replace_player_containers(7, containers).unwrap();
+
+        assert_eq!(
+            world
+                .move_container_stack_to_equipment(7, 0, 0, EquipmentSlot::LeftHand, 15)
+                .unwrap(),
+            PlayerContainerStackToEquipmentOutcome {
+                player_id: 7,
+                container_id: 0,
+                item_index: 0,
+                to_slot: EquipmentSlot::LeftHand,
+                moved_item: ItemInstance::new(gold, 15).unwrap(),
+                source_remaining_count: Some(5),
+                destination_count: 85,
+            }
+        );
+        assert_eq!(
+            world
+                .player_equipment(7)
+                .unwrap()
+                .item(EquipmentSlot::LeftHand)
+                .unwrap()
+                .count,
+            85
+        );
+        assert_eq!(
+            world
+                .player_containers(7)
+                .unwrap()
+                .container(0)
+                .unwrap()
+                .items
+                .item(0)
+                .unwrap()
+                .count,
+            5
+        );
+
+        let revision_before_incompatible = world.revision();
+        let equipment_before_incompatible = world.player_equipment(7).unwrap().clone();
+        let containers_before_incompatible = world.player_containers(7).unwrap().clone();
+        let mut equipment = equipment_before_incompatible.clone();
+        equipment.equip(EquipmentSlot::LeftHand, ItemInstance::new(2376, 1).unwrap());
+        world.replace_player_equipment(7, equipment).unwrap();
+        assert_eq!(
+            world.move_container_stack_to_equipment(7, 0, 0, EquipmentSlot::LeftHand, 5),
+            Err(CoreError::IncompatibleItemStacks)
+        );
+        assert_eq!(
+            world.player_containers(7).unwrap(),
+            &containers_before_incompatible
+        );
+        assert_eq!(world.revision(), revision_before_incompatible + 1);
+
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(
+            EquipmentSlot::LeftHand,
+            ItemInstance::new(gold, 96).unwrap(),
+        );
+        world.replace_player_equipment(7, equipment).unwrap();
+        let revision_before_overflow = world.revision();
+        assert_eq!(
+            world.move_container_stack_to_equipment(7, 0, 0, EquipmentSlot::LeftHand, 5),
+            Err(CoreError::ItemStackCountOverflow {
+                existing: 96,
+                incoming: 5,
+            })
+        );
+        assert_eq!(world.revision(), revision_before_overflow);
+        assert_eq!(
+            world
+                .player_containers(7)
+                .unwrap()
+                .container(0)
+                .unwrap()
+                .items
+                .item(0)
+                .unwrap()
+                .count,
+            5
         );
     }
 
