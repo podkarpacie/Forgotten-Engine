@@ -278,3 +278,4 @@
 - [x] Add bounded operator-configured native 7.4 outfit start/end look-type fields for the classic dialog; require an inclusive valid range around the configured current look type without validating or distributing client assets.
 - [x] Persist a concrete native classic outfit change only when its look type falls within the configured inclusive range; reject out-of-range changes without altering stored appearance or claiming asset/addon/mount support.
 - [x] Reuse the existing one-tick player combat cooldown for bounded native static-creature melee so repeated input cannot accelerate fixed percentage damage; weapon timing, formulas, mitigation, rewards, AI, loot, corpses, and scripts remain deferred.
+- [x] Add a bounded pure FE 8.0 RSA/XTEA transport-envelope primitive for future parser-backed session work; it must not decrypt client input, parse protocol-800 messages, enable a listener, or expose key material in diagnostics.

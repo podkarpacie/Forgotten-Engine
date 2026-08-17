@@ -357,6 +357,33 @@ pub fn xtea_decrypt_packet(payload: &[u8], key: XteaKey) -> Result<Vec<u8>, Prot
     Ok(packet[2..length + 2].to_vec())
 }
 
+/// Maximum plaintext bytes accepted by the bounded FE 8.0 transport envelope. The two-byte
+/// encrypted-packet length must remain within the outer FE frame budget; padding is applied only
+/// after this limit is checked.
+pub const FE_8_0_XTEA_TRANSPORT_MAX_PLAINTEXT_BYTES: usize = MAX_FRAME_SIZE - 2;
+
+/// Encodes an opaque outbound XTEA envelope for the explicitly classified FE 8.0 transport
+/// foundation. This is intentionally a transport primitive only: it does not accept client input,
+/// decrypt packets, parse login or game records, start a listener, or expose key material.
+pub fn encode_fe_8_0_xtea_transport_envelope(
+    profile: &NativeOtClientProfile,
+    plaintext: &Frame,
+    key: XteaKey,
+) -> Result<Frame, ProtocolError> {
+    if profile.foundation() != NativeOtClientFoundation::Classic800RequiresRsaXtea
+        || !profile.login_packet_encryption
+        || plaintext.0.is_empty()
+        || plaintext.0.len() > FE_8_0_XTEA_TRANSPORT_MAX_PLAINTEXT_BYTES
+    {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let encrypted = xtea_encrypt_packet(&plaintext.0, key)?;
+    if encrypted.len() > MAX_FRAME_SIZE {
+        return Err(ProtocolError::InvalidLength(encrypted.len()));
+    }
+    Ok(Frame(encrypted))
+}
+
 /// `0x01`, client version, then a raw 128-byte RSA block. The decrypted block has a zero marker,
 /// four XTEA words, then bounded account and password strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2426,6 +2453,47 @@ mod tests {
         );
         assert!(!encrypted_800.supports_current_native_foundation());
     }
+
+    #[test]
+    fn fe_8_0_xtea_transport_envelope_is_outbound_only_and_profile_bounded() {
+        let plain_740 = NativeOtClientProfile {
+            protocol_version: 740,
+            numeric_account_ids: true,
+            login_packet_encryption: false,
+            protocol_checksum: false,
+            challenge_on_login: false,
+            max_padding_bytes: 128,
+        };
+        let encrypted_800 = NativeOtClientProfile {
+            protocol_version: 800,
+            login_packet_encryption: true,
+            ..plain_740
+        };
+        let key = [1, 2, 3, 4];
+        let plaintext = Frame(vec![0x0a, 0x34, 0x12]);
+        let envelope =
+            encode_fe_8_0_xtea_transport_envelope(&encrypted_800, &plaintext, key).unwrap();
+        assert_ne!(envelope.0, plaintext.0);
+        assert_eq!(envelope.0.len() % 8, 0);
+        assert_eq!(xtea_decrypt_packet(&envelope.0, key).unwrap(), plaintext.0);
+        assert!(matches!(
+            encode_fe_8_0_xtea_transport_envelope(&plain_740, &plaintext, key),
+            Err(ProtocolError::UnsupportedNativeClientProfile)
+        ));
+        assert!(matches!(
+            encode_fe_8_0_xtea_transport_envelope(&encrypted_800, &Frame(Vec::new()), key),
+            Err(ProtocolError::UnsupportedNativeClientProfile)
+        ));
+        assert!(matches!(
+            encode_fe_8_0_xtea_transport_envelope(
+                &encrypted_800,
+                &Frame(vec![0; FE_8_0_XTEA_TRANSPORT_MAX_PLAINTEXT_BYTES + 1]),
+                key,
+            ),
+            Err(ProtocolError::UnsupportedNativeClientProfile)
+        ));
+    }
+
     #[test]
     fn status_contract_decodes_and_escapes_xml() {
         assert!(matches!(
