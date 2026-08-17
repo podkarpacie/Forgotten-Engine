@@ -2,7 +2,7 @@
 //!
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
-use forgotten_config::DeclarativeWeaponCatalog;
+use forgotten_config::{DeclarativeSpellCatalog, DeclarativeWeaponCatalog};
 use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, EmptyWorldManifest, EquipmentSlot,
     ExperienceAwardPolicy, FeTfsStaticSpawnCollection, ItemInstance, NativeItemPresentationCatalog,
@@ -230,6 +230,9 @@ pub struct NativeOtClientHostConfig {
     /// Optional operator-owned scriptless weapon catalog. It is only eligible for the existing
     /// server-selected adjacent-melee action when a matching main-hand item is equipped.
     pub declarative_weapon_catalog: Option<Arc<DeclarativeWeaponCatalog>>,
+    /// Optional operator-owned scriptless spell catalog. It is retained as immutable input for a
+    /// future profile-approved cast path and does not enable client spell invocation by itself.
+    pub declarative_spell_catalog: Option<Arc<DeclarativeSpellCatalog>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3441,6 +3444,7 @@ mod tests {
             progression_rules: None,
             experience_award_policy: None,
             declarative_weapon_catalog: None,
+            declarative_spell_catalog: None,
         }
     }
 

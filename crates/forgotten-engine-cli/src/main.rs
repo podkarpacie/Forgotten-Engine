@@ -1,7 +1,7 @@
 use forgotten_config::{
-    apply_legacy_item_metadata, ensure_content_skeleton, load, load_declarative_weapon_catalog,
-    load_legacy_item_catalog, load_tfs_content_inventory, load_tfs_entity_catalog,
-    load_tfs_vocation_registry, load_world_companions, load_world_map,
+    apply_legacy_item_metadata, ensure_content_skeleton, load, load_declarative_spell_catalog,
+    load_declarative_weapon_catalog, load_legacy_item_catalog, load_tfs_content_inventory,
+    load_tfs_entity_catalog, load_tfs_vocation_registry, load_world_companions, load_world_map,
     materialize_tfs_static_spawns, resolve_tfs_spawn_references, validate_content, world_map_path,
     write_template,
 };
@@ -514,6 +514,13 @@ fn run_host(
                 catalog.len()
             );
         }
+        let declarative_spell_catalog = load_declarative_spell_catalog(&config)?.map(Arc::new);
+        if let Some(catalog) = &declarative_spell_catalog {
+            println!(
+                "> Loaded {} scriptless declarative spell definitions; client invocation, effects, and Lua remain deferred.",
+                catalog.len()
+            );
+        }
         let static_spawns = materialize_tfs_static_spawns(&companions, &entity_catalog)?;
         if !static_spawns.entities.is_empty() {
             println!(
@@ -540,6 +547,7 @@ fn run_host(
             progression_rules,
             experience_award_policy: Some(experience_award_policy),
             declarative_weapon_catalog,
+            declarative_spell_catalog,
         })
     } else {
         None
