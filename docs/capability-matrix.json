@@ -19,6 +19,8 @@
       "runtimeItemsAndInventoryDetail": "bounded item/equipment/container core, SQLite equipment/container persistence, native-session hydration, catalog-validated classic-740 initial equipment delivery, and an operator command for atomic complete-item transfer from one equipment slot into one already owned bounded container; no native live inventory updates, map-ground transfer, recursive nesting, stack splitting, container windows, or item actions",
       "playerState": "partial",
       "playerStateDetail": "persisted health, mana, capacity, and magic level feed a parser-shaped classic 740 HUD record with a 16-bit level and bounded soul byte; unmodified-client confirmation remains required",
+      "playerOutfit": "partial",
+      "playerOutfitDetail": "schema-v11 persists accepted matching classic-740 look type and color values, then hydrates them after map initialization with a configured look-type fallback for legacy or mismatched records. Look-type selection, addons, mounts, asset validation, and unmodified-client confirmation remain deferred",
       "lifecycle": "partial",
       "lifecycleDetail": "server-side death, temple respawn, and fixed-loss foundations plus schema-v9 persisted dead/respawn/loss state and strict native hydration; client death screens, automatic timers, teleport packets, default-loss formula, and blessings/promotions remain deferred",
       "progression": "partial",

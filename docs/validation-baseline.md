@@ -33,6 +33,7 @@ Use a lawful, unmodified OTClientV8 build configured for the selected 740 profil
 | Game entry and map | The selected character joins the native 740 map with valid position, visible player state, and non-negative HUD values. | A black viewport, missing local player, invalid HUD values, or return to character list is a blocker. |
 | Player-stats framing | The initial `0xA0` player-stats record parses without end-of-input errors and reports the persisted level, health, mana, capacity, magic level, and bounded zero soul value. | Any `0xA0` parser EOF, shifted next opcode, or invalid HUD value is a release blocker. |
 | Quest Log acknowledgement | Opening Quest Log sends one parser-shaped empty `0xF0` response and leaves the native session connected. | A parser error, disconnect, or claimed quest content is a release blocker. |
+| Outfit persistence | Change accepted color values through the native outfit dialog, relog the same character, and confirm the stored look is visible after map initialization. | A parser error, disconnect, lost stored colors, or acceptance of an unsupported look type is a release blocker. |
 | Movement | Cardinal and diagonal movement, turns, click-walk replacement, manual interruption, map edges, and reconnects remain responsive under normal and rapid input. | Teleporting, desynchronization, unintended rotation, disconnect, or sustained input lag is a blocker. |
 | Shared sessions | Two players can join, see movement/leave updates, and retain independent authoritative positions. | Missing, stale, or duplicate player state is a blocker. |
 | Supported chat | Public chat reaches active sessions through the supported client-visible path without parser errors. | A client parser error or host session failure is a blocker. |
@@ -48,6 +49,7 @@ The following systems are still missing or only foundational and therefore block
 | Full protocol coverage | Only the experimental profile-driven native 740 route is partially implemented; FE 8.0 and 1.2 remain foundations. |
 | Native 740 player-stats confirmation | The local encoder now has a parser-shaped 16-bit level and soul byte regression contract. A real unmodified-OTClientV8 run has not yet confirmed the reported initial `0xA0` EOF is resolved. |
 | Native 740 Quest Log confirmation | The local decoder and host emit a parser-shaped empty response with a zero quest count. A real unmodified-OTClientV8 run has not yet confirmed the Quest Log window opens without disconnecting. |
+| Native 740 outfit confirmation | Schema-v11 migrations, persistence, matching-look hydration, and host-session regression tests are present. A real unmodified-OTClientV8 relog has not yet confirmed the stored appearance is rendered without a parser error. |
 | Core gameplay | Formula combat, weapons, spells, combat rules, skills awarded by gameplay, experience stages/rates, soul, PvP rules, and skull/frags are not complete. |
 | World simulation | Monster AI, NPC behavior, spawns, respawns, loot, corpses, actions, doors, levers, housing, guilds, and economy systems are not complete. |
 | Scripting | Lua is not a general runtime; referenced scripts are audited but not executed. |

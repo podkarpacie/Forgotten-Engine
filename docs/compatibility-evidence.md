@@ -25,6 +25,10 @@ The current FE work has added authoritative/persistent equipment foundations but
 
 The public client protocol declarations identify both the classic Quest Log request and response as `0xF0`; the parser consumes a little-endian `u16` quest count before attempting to read entries.[5] FE therefore accepts only the zero-payload request and responds with an independently authored three-byte record containing `0xF0` and a zero count. This is a session-safety acknowledgement only. It does not claim quest storage, mission lines, Lua hooks, reward logic, or client confirmation beyond the automated wire contract.
 
+## Player-stats and inspect protocol boundaries
+
+For the selected 740 profile, the public client parser consumes a `u16` level, level percent, `u16` mana, `u16` maximum mana, magic level, magic-level percent, and a soul byte after the common health, capacity, and experience fields.[6] FE’s native `0xA0` regression contract now reflects that observed classic record boundary; it does not claim the later-protocol total-capacity, stamina, or soul gameplay systems. The public client sender describes a classic map look request as `0x8C`, position, thing ID, and stack position.[7] FE continues to tolerate that request without a visible result because a profile-specific, parser-confirmed 740 text-response mode must be established before enabling one. It must not reuse the previously invalid generic mode value.
+
 ## References
 
 [1] [TFS legacy weapon registry path](https://github.com/otland/forgottenserver/blob/master/data/weapons/weapons.xml).
@@ -36,3 +40,7 @@ The public client protocol declarations identify both the classic Quest Log requ
 [4] [Local public OTClientV8 parser reference](file:///tmp/otcv8-dev-source/src/client/protocolgameparse.cpp) and [opcode definitions](file:///tmp/otcv8-dev-source/src/client/protocolcodes.h). Read-only behavioral evidence; no client source is copied into FE.
 
 [5] [Public OTClientV8 parser](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/protocolgameparse.cpp) and [opcode declarations](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/protocolcodes.h). Read-only behavioral evidence; no client source is copied into FE.
+
+[6] [Public OTClientV8 player-stats parser](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/protocolgameparse.cpp). Read-only behavioral evidence; no client source is copied into FE.
+
+[7] [Public OTClientV8 look sender](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/protocolgamesend.cpp) and [message-mode map](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/protocolcodes.cpp). Read-only behavioral evidence; no client source is copied into FE.

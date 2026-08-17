@@ -14,7 +14,7 @@ use forgotten_core::{
     PlayerSpellCastOutcome, PlayerVitals, Position, StaticCreatureDecisionBatch,
     StaticCreatureDecisionPolicy, StaticCreatureResetSummary, VocationId, WorldMap, WorldState,
 };
-use forgotten_persistence::{EngineDatabase, PlayerVitals as PersistedPlayerVitals};
+use forgotten_persistence::{EngineDatabase, PlayerOutfit, PlayerVitals as PersistedPlayerVitals};
 use forgotten_protocol::{
     decode, decode_fe_otclient_capability_ack, decode_fe_otclient_move_request,
     decode_legacy_74_envelope, decode_legacy_74_game_session_bootstrap_plaintext,
@@ -108,6 +108,29 @@ fn truncate_native_chat_text(message: &str) -> String {
         output.push(character);
     }
     output
+}
+
+fn native_hydrated_classic_outfit(
+    configured_look_type: u8,
+    persisted: PlayerOutfit,
+) -> NativeOtClientClassicOutfit {
+    if configured_look_type != 0 && persisted.look_type == configured_look_type {
+        NativeOtClientClassicOutfit {
+            look_type: persisted.look_type,
+            head: persisted.head,
+            body: persisted.body,
+            legs: persisted.legs,
+            feet: persisted.feet,
+        }
+    } else {
+        NativeOtClientClassicOutfit {
+            look_type: configured_look_type,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+        }
+    }
 }
 
 fn native_diagnostic_record(enabled: bool, peer: SocketAddr, event: &str) -> Option<String> {
@@ -1792,6 +1815,26 @@ fn handle_native_otclient_game(
     )
     .map_err(HostError::Protocol)?;
     write_frame(stream, &initialization)?;
+    let mut player_outfit =
+        native_hydrated_classic_outfit(empty_world.player_look_type, character.outfit);
+    if character.outfit.look_type == player_outfit.look_type && player_outfit.look_type != 0 {
+        let hydrated_outfit = encode_native_otclient_creature_outfit(
+            &config.client_profile,
+            snapshot.player_id,
+            player_outfit,
+        )
+        .map_err(HostError::Protocol)?;
+        write_frame(stream, &hydrated_outfit)?;
+        native_diagnostic(
+            config.extended_diagnostics,
+            peer,
+            &format!(
+                "outbound=hydrated-creature-outfit opcode=0x8e bytes={} look-type={}",
+                hydrated_outfit.0.len(),
+                player_outfit.look_type
+            ),
+        );
+    }
     for frame in &equipment_frames {
         write_frame(stream, frame)?;
     }
@@ -1811,7 +1854,6 @@ fn handle_native_otclient_game(
 
     let mut player_position = initial_position;
     let mut facing = NativeOtClientCardinalDirection::South;
-    let mut player_outfit = NativeOtClientClassicOutfit::from_snapshot(&snapshot);
     let mut active_click_walk: Option<NativeActiveClickWalk> = None;
     let mut last_authoritative_tick = Instant::now();
     let mut last_regeneration_tick = Instant::now();
@@ -2194,7 +2236,18 @@ fn handle_native_otclient_game(
                 );
             }
             NativeOtClientGameAction::ChangeOutfit(requested_outfit) => {
-                if requested_outfit.look_type == player_outfit.look_type {
+                let accepted = requested_outfit.look_type == player_outfit.look_type;
+                if accepted {
+                    database.update_player_outfit(
+                        character.id,
+                        PlayerOutfit {
+                            look_type: requested_outfit.look_type,
+                            head: requested_outfit.head,
+                            body: requested_outfit.body,
+                            legs: requested_outfit.legs,
+                            feet: requested_outfit.feet,
+                        },
+                    )?;
                     player_outfit = requested_outfit;
                 }
                 let applied_outfit = encode_native_otclient_creature_outfit(
@@ -2210,7 +2263,7 @@ fn handle_native_otclient_game(
                     &format!(
                         "outbound=creature-outfit opcode=0x8e bytes={} accepted={} look-type={}",
                         applied_outfit.0.len(),
-                        requested_outfit.look_type == player_outfit.look_type,
+                        accepted,
                         player_outfit.look_type
                     ),
                 );
@@ -5036,6 +5089,53 @@ mod tests {
         config
     }
 
+    #[test]
+    fn native_hydrated_outfit_restores_only_configured_matching_appearance() {
+        let persisted = PlayerOutfit {
+            look_type: 128,
+            head: 1,
+            body: 2,
+            legs: 3,
+            feet: 4,
+        };
+        assert_eq!(
+            native_hydrated_classic_outfit(128, persisted),
+            NativeOtClientClassicOutfit {
+                look_type: 128,
+                head: 1,
+                body: 2,
+                legs: 3,
+                feet: 4,
+            }
+        );
+        assert_eq!(
+            native_hydrated_classic_outfit(128, PlayerOutfit::default()),
+            NativeOtClientClassicOutfit {
+                look_type: 128,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+            }
+        );
+        assert_eq!(
+            native_hydrated_classic_outfit(
+                128,
+                PlayerOutfit {
+                    look_type: 129,
+                    ..persisted
+                },
+            ),
+            NativeOtClientClassicOutfit {
+                look_type: 128,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+            }
+        );
+    }
+
     fn add_string(payload: &mut Vec<u8>, value: &str) {
         payload.extend_from_slice(&(value.len() as u16).to_le_bytes());
         payload.extend_from_slice(value.as_bytes());
@@ -5636,6 +5736,16 @@ mod tests {
                 3,
                 4,
             ]
+        );
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].outfit,
+            PlayerOutfit {
+                look_type: 128,
+                head: 1,
+                body: 2,
+                legs: 3,
+                feet: 4,
+            }
         );
         write_frame(
             &mut stream,

@@ -23,7 +23,9 @@ const SCHEMA_VERSION_TOWNS: i64 = 6;
 const SCHEMA_VERSION_CONDITIONS: i64 = 7;
 const SCHEMA_VERSION_PROGRESSION_ATTEMPTS: i64 = 8;
 const SCHEMA_VERSION_LIFECYCLE: i64 = 9;
-const LATEST_SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION_CONDITION_ELAPSED: i64 = 10;
+const SCHEMA_VERSION_OUTFIT: i64 = 11;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_OUTFIT;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct EngineDatabase {
@@ -154,7 +156,7 @@ impl EngineDatabase {
         account_id: i64,
     ) -> Result<Vec<LoginCharacter>, PersistenceError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, name, level, experience, skill_points, health, max_health, mana, max_mana, capacity, magic_level, x, y, z, town_id FROM players WHERE account_id = ?1 ORDER BY name COLLATE NOCASE",
+            "SELECT id, name, level, experience, skill_points, health, max_health, mana, max_mana, capacity, magic_level, x, y, z, town_id, look_type, look_head, look_body, look_legs, look_feet FROM players WHERE account_id = ?1 ORDER BY name COLLATE NOCASE",
         )?;
         let mut characters = statement
             .query_map(params![account_id], |row| {
@@ -180,6 +182,13 @@ impl EngineDatabase {
                         z: row.get::<_, i64>(13)? as u8,
                     },
                     town_id: row.get::<_, i64>(14)? as u32,
+                    outfit: PlayerOutfit {
+                        look_type: row.get::<_, i64>(15)? as u8,
+                        head: row.get::<_, i64>(16)? as u8,
+                        body: row.get::<_, i64>(17)? as u8,
+                        legs: row.get::<_, i64>(18)? as u8,
+                        feet: row.get::<_, i64>(19)? as u8,
+                    },
                     respawn_state: PlayerRespawnState::default(),
                 })
             })?
@@ -289,8 +298,36 @@ impl EngineDatabase {
             vitals: PlayerVitals::default(),
             position,
             town_id: 0,
+            outfit: PlayerOutfit::default(),
             respawn_state: PlayerRespawnState::default(),
         })
+    }
+
+    /// Persists an accepted classic outfit. A zero look type is reserved for the migration
+    /// fallback, so live native sessions may only save a concrete appearance.
+    pub fn update_player_outfit(
+        &self,
+        player_id: u64,
+        outfit: PlayerOutfit,
+    ) -> Result<(), PersistenceError> {
+        if !outfit.is_concrete() {
+            return Err(PersistenceError::InvalidPlayerOutfit);
+        }
+        let affected = self.connection.execute(
+            "UPDATE players SET look_type = ?1, look_head = ?2, look_body = ?3, look_legs = ?4, look_feet = ?5 WHERE id = ?6",
+            params![
+                outfit.look_type as i64,
+                outfit.head as i64,
+                outfit.body as i64,
+                outfit.legs as i64,
+                outfit.feet as i64,
+                player_id as i64,
+            ],
+        )?;
+        if affected == 0 {
+            return Err(PersistenceError::UnknownPlayer(player_id));
+        }
+        Ok(())
     }
 
     pub fn update_player_vitals(
@@ -1115,7 +1152,7 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_LIFECYCLE, unix_seconds()],
             )?;
         }
-        if self.schema_version()? < LATEST_SCHEMA_VERSION {
+        if self.schema_version()? < SCHEMA_VERSION_CONDITION_ELAPSED {
             if !self.player_conditions_column_exists("elapsed_seconds")? {
                 self.connection.execute_batch(
                     "ALTER TABLE player_conditions ADD COLUMN elapsed_seconds INTEGER NOT NULL DEFAULT 0",
@@ -1123,7 +1160,26 @@ impl EngineDatabase {
             }
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-                params![LATEST_SCHEMA_VERSION, unix_seconds()],
+                params![SCHEMA_VERSION_CONDITION_ELAPSED, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < SCHEMA_VERSION_OUTFIT {
+            for (name, definition) in [
+                ("look_type", "INTEGER NOT NULL DEFAULT 0"),
+                ("look_head", "INTEGER NOT NULL DEFAULT 0"),
+                ("look_body", "INTEGER NOT NULL DEFAULT 0"),
+                ("look_legs", "INTEGER NOT NULL DEFAULT 0"),
+                ("look_feet", "INTEGER NOT NULL DEFAULT 0"),
+            ] {
+                if !self.player_column_exists(name)? {
+                    self.connection.execute_batch(&format!(
+                        "ALTER TABLE players ADD COLUMN {name} {definition}"
+                    ))?;
+                }
+            }
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_OUTFIT, unix_seconds()],
             )?;
         }
         Ok(())
@@ -1211,6 +1267,9 @@ pub struct LoginCharacter {
     pub position: Position,
     /// Imported map town identifier, or zero when no town has been assigned.
     pub town_id: u32,
+    /// Persisted appearance values. A zero `look_type` means the host must use its configured
+    /// profile fallback because the record predates schema-v11 outfit storage.
+    pub outfit: PlayerOutfit,
     /// Persisted authoritative lifecycle state. Client death and respawn delivery remain outside
     /// the storage layer.
     pub respawn_state: PlayerRespawnState,
@@ -1242,6 +1301,21 @@ impl Default for PlayerVitals {
             capacity: 40_000,
             magic_level: 0,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlayerOutfit {
+    pub look_type: u8,
+    pub head: u8,
+    pub body: u8,
+    pub legs: u8,
+    pub feet: u8,
+}
+
+impl PlayerOutfit {
+    fn is_concrete(self) -> bool {
+        self.look_type != 0
     }
 }
 
@@ -1373,6 +1447,7 @@ pub enum PersistenceError {
     PasswordHash(String),
     InvalidPlayerName,
     InvalidPlayerVitals,
+    InvalidPlayerOutfit,
     InvalidEquipmentRecord(String),
     InvalidContainerRecord(String),
     InvalidConditionRecord(String),
@@ -1450,6 +1525,7 @@ mod tests {
             PlayerProgressionAttempts::default()
         );
         assert_eq!(character.town_id, 0);
+        assert_eq!(character.outfit, PlayerOutfit::default());
         assert!(database.player_equipment(7).unwrap().is_empty());
         assert!(database.player_conditions(7).unwrap().is_empty());
         let _ = fs::remove_file(path);
@@ -1472,6 +1548,39 @@ mod tests {
         );
         assert!(matches!(
             database.update_player_town(999, 1),
+            Err(PersistenceError::UnknownPlayer(999))
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_player_outfit_with_a_safe_migration_default() {
+        let path = temporary_path("outfit");
+        let database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("admin", "hash").unwrap();
+        let character = database
+            .create_player_for_account(account_id as u32, "Knight")
+            .unwrap();
+        assert_eq!(character.outfit, PlayerOutfit::default());
+
+        let outfit = PlayerOutfit {
+            look_type: 128,
+            head: 1,
+            body: 2,
+            legs: 3,
+            feet: 4,
+        };
+        database.update_player_outfit(character.id, outfit).unwrap();
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].outfit,
+            outfit
+        );
+        assert!(matches!(
+            database.update_player_outfit(character.id, PlayerOutfit::default()),
+            Err(PersistenceError::InvalidPlayerOutfit)
+        ));
+        assert!(matches!(
+            database.update_player_outfit(999, outfit),
             Err(PersistenceError::UnknownPlayer(999))
         ));
         let _ = fs::remove_file(path);
