@@ -425,6 +425,34 @@ impl SharedNativeWorld {
         Ok(outcome)
     }
 
+    /// Advances bounded conditions and enters authoritative death state only when the resulting
+    /// damage is lethal at a validated assigned town. Client death effects and packet delivery
+    /// remain separate host responsibilities.
+    pub fn apply_player_conditions_with_death(
+        &self,
+        player_id: u64,
+        world_map: &WorldMap,
+        elapsed_seconds: u16,
+    ) -> Result<
+        (
+            PlayerConditionOutcome,
+            PlayerVitals,
+            Option<forgotten_core::PlayerRespawnState>,
+        ),
+        HostError,
+    > {
+        let mut world = self.lock()?;
+        let town_id = world.player_town(player_id).map_err(HostError::Core)?;
+        let (outcome, death_state) = world
+            .apply_player_conditions_with_death(player_id, town_id, world_map, elapsed_seconds)
+            .map_err(HostError::Core)?;
+        let vitals = world.player_vitals(player_id).map_err(HostError::Core)?;
+        if outcome.applied_damage > 0 {
+            self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok((outcome, vitals, death_state))
+    }
+
     pub fn award_player_experience(
         &self,
         player_id: u64,
@@ -1712,34 +1740,58 @@ fn handle_native_otclient_game(
                     if condition_elapsed_seconds > 0 {
                         last_condition_tick +=
                             Duration::from_secs(u64::from(condition_elapsed_seconds));
-                        let outcome = shared_world
-                            .apply_player_conditions(character.id, condition_elapsed_seconds)?;
+                        let (outcome, vitals, death_state) = match shared_world
+                            .apply_player_conditions_with_death(
+                                character.id,
+                                world_map,
+                                condition_elapsed_seconds,
+                            ) {
+                            Ok(result) => result,
+                            Err(HostError::Core(
+                                forgotten_core::CoreError::PlayerTownUnassigned(_)
+                                | forgotten_core::CoreError::UnknownTown(_),
+                            )) => {
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    "lifecycle=conditions outcome=paused-invalid-death-temple",
+                                );
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                         persist_runtime_player_conditions(
                             &mut database,
                             shared_world,
                             character.id,
                         )?;
                         if outcome.applied_damage > 0 {
-                            let vitals = shared_world.player_vitals(character.id)?;
-                            database.update_player_vitals(
-                                character.id,
-                                PersistedPlayerVitals {
-                                    health: vitals.health,
-                                    max_health: vitals.max_health,
-                                    mana: vitals.mana,
-                                    max_mana: vitals.max_mana,
-                                    capacity: vitals.capacity,
-                                    magic_level: vitals.magic_level,
-                                },
-                            )?;
+                            let persisted_vitals = PersistedPlayerVitals {
+                                health: vitals.health,
+                                max_health: vitals.max_health,
+                                mana: vitals.mana,
+                                max_mana: vitals.max_mana,
+                                capacity: vitals.capacity,
+                                magic_level: vitals.magic_level,
+                            };
+                            if let Some(death_state) = death_state {
+                                database.update_player_vitals_and_respawn_state(
+                                    character.id,
+                                    persisted_vitals,
+                                    death_state,
+                                )?;
+                            } else {
+                                database.update_player_vitals(character.id, persisted_vitals)?;
+                            }
                             native_diagnostic(
                                 config.extended_diagnostics,
                                 peer,
                                 &format!(
-                                    "lifecycle=conditions damage={} health={} expired={}",
+                                    "lifecycle=conditions damage={} health={} expired={} dead={}",
                                     outcome.applied_damage,
                                     outcome.remaining_health,
-                                    outcome.expired_conditions
+                                    outcome.expired_conditions,
+                                    death_state.is_some(),
                                 ),
                             );
                         }
@@ -3734,6 +3786,85 @@ mod tests {
         shared.apply_player_conditions(107, 5).unwrap();
         persist_runtime_player_conditions(&mut database, &shared, 107).unwrap();
         assert!(database.player_conditions(107).unwrap().is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_condition_damage_persists_authoritative_death_state() {
+        let path = database_path("native-condition-death-persistence");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("operator", "hash").unwrap();
+        let map = native_world_map();
+        let player = Player {
+            id: 108,
+            account_id: account_id as u64,
+            name: "Druid".into(),
+            position: map.spawn(),
+            level: 8,
+            experience: 4_900,
+            skill_points: 3,
+        };
+        database.save_player(&player).unwrap();
+        let poison = PlayerCondition::new(PlayerConditionKind::Poison, 1, 7, 1).unwrap();
+        database
+            .replace_player_conditions(
+                player.id,
+                &BTreeMap::from([(PlayerConditionKind::Poison, poison)]),
+            )
+            .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        shared
+            .register_player_at_available_position_with_vitals_equipment_containers_progression_and_conditions(
+                player,
+                PlayerVitals {
+                    health: 7,
+                    ..PlayerVitals::default()
+                },
+                NativePlayerHydration {
+                    progression: PlayerProgression::default(),
+                    progression_attempts: PlayerProgressionAttempts::default(),
+                    town_id: 1,
+                    respawn_state: PlayerRespawnState::default(),
+                    equipment: PlayerEquipment::default(),
+                    containers: PlayerContainers::default(),
+                    conditions: BTreeMap::from([(PlayerConditionKind::Poison, poison)]),
+                },
+                &map,
+            )
+            .unwrap();
+
+        let (outcome, vitals, death_state) = shared
+            .apply_player_conditions_with_death(108, &map, 1)
+            .unwrap();
+        assert_eq!(outcome.applied_damage, 7);
+        assert_eq!(vitals.health, 0);
+        let death_state = death_state.unwrap();
+        assert!(death_state.dead);
+        persist_runtime_player_conditions(&mut database, &shared, 108).unwrap();
+        database
+            .update_player_vitals_and_respawn_state(
+                108,
+                PersistedPlayerVitals {
+                    health: vitals.health,
+                    max_health: vitals.max_health,
+                    mana: vitals.mana,
+                    max_mana: vitals.max_mana,
+                    capacity: vitals.capacity,
+                    magic_level: vitals.magic_level,
+                },
+                death_state,
+            )
+            .unwrap();
+
+        let reloaded = database
+            .characters_for_account(account_id)
+            .unwrap()
+            .into_iter()
+            .find(|character| character.id == 108)
+            .unwrap();
+        assert_eq!(reloaded.vitals.health, 0);
+        assert!(reloaded.respawn_state.dead);
+        assert!(database.player_conditions(108).unwrap().is_empty());
         let _ = fs::remove_file(path);
     }
 

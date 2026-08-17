@@ -235,6 +235,7 @@
 - [x] Persist and hydrate authoritative dead/respawn/loss state across restarts without claiming client death screens, automatic timers, teleport packets, or unverified default-loss behavior.
 - [x] Persist and hydrate deterministic elapsed progress for bounded poison, burning, and energy schedules across restarts; client effect packets and condition-driven death behavior remain deferred.
 - [x] Persist authoritative runtime condition schedule transitions after each native heartbeat so elapsed progress and expired schedules survive restart.
+- [x] Activate and persist authoritative death state when bounded poison, burning, or energy damage reaches zero health at a validated town temple; client death screens and condition effects remain deferred.
 - [ ] Add profile-driven combat events for weapons, spells, damage types, cooldowns, PvP policy, and death/corpse handling after independent compatibility evidence.
 - [ ] Add authoritative item transfer, equipment/inventory synchronization, container windows, item use, actions, doors, switches, and map interactions.
 - [x] Add bounded authoritative transfer between one player equipment slot and one already owned container; client inventory packets, map-ground transfers, nested containers, stack splitting, and item-use semantics remain deferred.
@@ -252,3 +253,4 @@
 - [ ] Decode and safely handle the native 740 Quest Log request without ending the game session; until content exists it must return a safe empty/deferred response.
 - [x] Build, package, checksum, and publish fresh Linux and Windows artifacts from the latest verified Forgotten Engine commit for manual testing.
 - [ ] Establish and satisfy production-readiness gates for complete declared TFS feature conformance, profile-specific protocol validation, reliability, bounded memory/performance, security, and reproducible TFS-to-FE migration before describing any profile as mainstream-ready.
+- [ ] Expand the completion ledger from its interim 51% target into a full evidence-based 100% production-readiness plan covering every declared FE system, compatibility profile, migration boundary, and operational gate.

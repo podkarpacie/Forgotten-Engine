@@ -47,7 +47,7 @@ The following systems are still missing or only foundational and therefore block
 | Core gameplay | Formula combat, weapons, spells, combat rules, skills awarded by gameplay, experience stages/rates, soul, PvP rules, and skull/frags are not complete. |
 | World simulation | Monster AI, NPC behavior, spawns, respawns, loot, corpses, actions, doors, levers, housing, guilds, and economy systems are not complete. |
 | Scripting | Lua is not a general runtime; referenced scripts are audited but not executed. |
-| Lifecycle delivery | Condition visual effects, condition-driven death activation, death screens, automatic respawn packets, and the default loss formula remain deferred. Bounded condition schedule interval progress is persisted and restored, but its client-visible effect delivery is not. |
+| Lifecycle delivery | Condition visual effects, death screens, automatic respawn packets, and the default loss formula remain deferred. Bounded condition schedule interval progress is persisted and restored; lethal condition damage activates and persists server-side death state only for a validated assigned town temple, but client-visible effect and death delivery are not implemented. |
 | Operational validation | Sustained multi-player load, soak, fault recovery, backup restoration under load, Windows release smoke tests, and independent real-client interoperability testing have not established a production SLO. |
 
 ## Decision rule

@@ -2410,6 +2410,7 @@ impl WorldState {
     ) -> Result<PlayerConditionOutcome, CoreError> {
         let current_vitals = self.player_vitals(player_id)?;
         let elapsed_seconds = elapsed_seconds.min(MAX_REGENERATION_ELAPSED_SECONDS);
+        let requested_damage = self.pending_player_condition_damage(player_id, elapsed_seconds)?;
         let conditions = self
             .player_conditions
             .get_mut(&player_id)
@@ -2422,17 +2423,13 @@ impl WorldState {
                 expired_conditions: 0,
             });
         }
-        let mut requested_damage = 0_u32;
         let mut expired = Vec::new();
         for (kind, condition) in conditions.iter_mut() {
             let active_seconds = elapsed_seconds.min(condition.remaining_seconds);
             let total = condition.elapsed_seconds.saturating_add(active_seconds);
-            let events = total / condition.interval_seconds;
             condition.elapsed_seconds = total % condition.interval_seconds;
             condition.remaining_seconds =
                 condition.remaining_seconds.saturating_sub(active_seconds);
-            requested_damage = requested_damage
-                .saturating_add(u32::from(events).saturating_mul(u32::from(condition.damage)));
             if condition.remaining_seconds == 0 {
                 expired.push(*kind);
             }
@@ -2440,7 +2437,7 @@ impl WorldState {
         for kind in &expired {
             conditions.remove(kind);
         }
-        let applied_damage = requested_damage.min(u32::from(current_vitals.health)) as u16;
+        let applied_damage = requested_damage;
         let remaining_health = current_vitals.health.saturating_sub(applied_damage);
         if applied_damage > 0 {
             self.player_vitals.insert(
@@ -2460,6 +2457,52 @@ impl WorldState {
             remaining_health,
             expired_conditions: expired.len().min(usize::from(u8::MAX)) as u8,
         })
+    }
+
+    /// Applies a bounded condition heartbeat and, only when it is lethal, enters the already
+    /// established authoritative death state. Town and temple validity are checked before any
+    /// schedule or vitality mutation, allowing callers to retry after correcting configuration.
+    /// Client effects, death screens, timers, and respawn packets remain outside this core path.
+    pub fn apply_player_conditions_with_death(
+        &mut self,
+        player_id: u64,
+        town_id: u32,
+        world_map: &WorldMap,
+        elapsed_seconds: u16,
+    ) -> Result<(PlayerConditionOutcome, Option<PlayerRespawnState>), CoreError> {
+        let elapsed_seconds = elapsed_seconds.min(MAX_REGENERATION_ELAPSED_SECONDS);
+        let pending_damage = self.pending_player_condition_damage(player_id, elapsed_seconds)?;
+        let vitals = self.player_vitals(player_id)?;
+        if pending_damage > 0 && pending_damage >= vitals.health {
+            if town_id == 0 {
+                return Err(CoreError::PlayerTownUnassigned(player_id));
+            }
+            if world_map.temple_position_for_town(town_id).is_none() {
+                return Err(CoreError::UnknownTown(town_id));
+            }
+        }
+        let outcome = self.apply_player_conditions(player_id, elapsed_seconds)?;
+        let death_state = (outcome.applied_damage > 0 && outcome.remaining_health == 0)
+            .then(|| self.apply_player_death(player_id, town_id, world_map))
+            .transpose()?;
+        Ok((outcome, death_state))
+    }
+
+    fn pending_player_condition_damage(
+        &self,
+        player_id: u64,
+        elapsed_seconds: u16,
+    ) -> Result<u16, CoreError> {
+        let current_vitals = self.player_vitals(player_id)?;
+        let conditions = self.player_conditions(player_id)?;
+        let requested_damage = conditions.values().fold(0_u32, |total_damage, condition| {
+            let active_seconds = elapsed_seconds.min(condition.remaining_seconds);
+            let elapsed = condition.elapsed_seconds.saturating_add(active_seconds);
+            let events = elapsed / condition.interval_seconds;
+            total_damage
+                .saturating_add(u32::from(events).saturating_mul(u32::from(condition.damage)))
+        });
+        Ok(requested_damage.min(u32::from(current_vitals.health)) as u16)
     }
 
     /// Replaces player vocation and all typed skills atomically in the authoritative world. No-op
@@ -4366,6 +4409,67 @@ mod tests {
             world.player_respawn_state(7),
             Err(CoreError::UnknownPlayer(7))
         );
+    }
+
+    #[test]
+    fn lethal_condition_damage_enters_validated_authoritative_death_state() {
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        world
+            .update_player_vitals(
+                7,
+                PlayerVitals {
+                    health: 7,
+                    ..PlayerVitals::default()
+                },
+            )
+            .unwrap();
+        world
+            .apply_player_condition(
+                7,
+                PlayerCondition::new(PlayerConditionKind::Poison, 1, 7, 1).unwrap(),
+            )
+            .unwrap();
+        let temple = Position {
+            x: 110,
+            y: 120,
+            z: 7,
+        };
+        let mut map = WorldMap::new("condition-death", temple);
+        map.set_town(WorldMapTown {
+            id: 42,
+            name: "Thais".to_owned(),
+            temple_position: temple,
+        })
+        .unwrap();
+
+        assert_eq!(
+            world.apply_player_conditions_with_death(7, 0, &map, 1),
+            Err(CoreError::PlayerTownUnassigned(7))
+        );
+        assert_eq!(world.player_vitals(7).unwrap().health, 7);
+        assert!(world
+            .player_conditions(7)
+            .unwrap()
+            .contains_key(&PlayerConditionKind::Poison));
+
+        world.advance_tick();
+        let (outcome, death_state) = world
+            .apply_player_conditions_with_death(7, 42, &map, 1)
+            .unwrap();
+        assert_eq!(outcome.applied_damage, 7);
+        assert_eq!(outcome.remaining_health, 0);
+        assert_eq!(
+            death_state,
+            Some(PlayerRespawnState {
+                dead: true,
+                respawn_at: Some(temple),
+                death_time: Some(1),
+                loss_applied: false,
+            })
+        );
+        assert_eq!(world.player_vitals(7).unwrap().health, 0);
+        assert!(world.player_conditions(7).unwrap().is_empty());
     }
 
     #[test]
