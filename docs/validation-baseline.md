@@ -53,7 +53,7 @@ The following systems are still missing or only foundational and therefore block
 | Blocking area | Current status |
 |---|---|
 | Full protocol coverage | Only the experimental profile-driven native 740 route is partially implemented; FE 8.0 and 1.2 remain foundations. |
-| Native 740 player-stats confirmation | The local encoder now has a parser-shaped 16-bit level and soul byte regression contract. A real unmodified-OTClientV8 run has not yet confirmed the reported initial `0xA0` EOF is resolved. |
+| Native 740 player-stats confirmation | The local encoder has a parser-shaped 16-bit level and soul byte contract, including a regression that keeps persisted `42 / 50` mana separate from `32,000` capacity. A real unmodified-OTClientV8 run has not yet confirmed the reported initial `0xA0` EOF and implausible mana display are resolved. |
 | Native 740 Quest Log confirmation | The local decoder and host emit a parser-shaped empty response with a zero quest count. A real unmodified-OTClientV8 run has not yet confirmed the Quest Log window opens without disconnecting. |
 | Native 740 outfit confirmation | Schema-v11 migrations, persistence, matching-look hydration, and host-session regression tests are present. A real unmodified-OTClientV8 relog has not yet confirmed the stored appearance is rendered without a parser error. |
 | Native 740 position confirmation | Automated movement plus orderly and abrupt-disconnect native-session relog coverage restores the persisted destination. A real unmodified-OTClientV8 relog has not yet confirmed the reported spawn reset is resolved. |

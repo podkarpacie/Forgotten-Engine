@@ -2906,6 +2906,30 @@ mod tests {
             &initialization.0[login.0.len()..login.0.len() + map.0.len()],
             map.0.as_slice()
         );
+        let mut persisted_vitals_snapshot = snapshot.clone();
+        persisted_vitals_snapshot.player_vitals = NativeOtClientPlayerVitals {
+            health: 95,
+            max_health: 150,
+            mana: 42,
+            max_mana: 50,
+            capacity: 32_000,
+            magic_level: 4,
+        };
+        let persisted_stats =
+            encode_native_otclient_player_stats(&profile, &persisted_vitals_snapshot).unwrap();
+        assert_eq!(
+            u16::from_le_bytes(persisted_stats.0[5..7].try_into().unwrap()),
+            32_000
+        );
+        assert_eq!(
+            u16::from_le_bytes(persisted_stats.0[14..16].try_into().unwrap()),
+            42
+        );
+        assert_eq!(
+            u16::from_le_bytes(persisted_stats.0[16..18].try_into().unwrap()),
+            50
+        );
+        assert_eq!(persisted_stats.0[18], 4);
         let bootstrap = encode_native_otclient_player_bootstrap(&profile, &snapshot).unwrap();
         assert_eq!(bootstrap.0[0], NATIVE_OTCLIENT_GAME_PLAYER_STATS);
         assert_eq!(

@@ -256,6 +256,7 @@
 - [ ] Add guilds, parties, channels, private messages, depots, banking/trading, houses, access lists, and administrator controls.
 - [ ] Add release-blocking load, soak, memory, fault-recovery, security, real-client interoperability, Windows, and migration validation evidence.
 - [x] Fix the native 740 player-stats (`0xA0`) record layout that the real client reports as end-of-input after the initial map payload; the parser-shaped record now has a 16-bit level and soul byte.
+- [x] Audit the reported `12800` native mana display against persistence and public OTCv8 740 field conditions; add a byte-level regression proving persisted `42 / 50` mana remains distinct from `32,000` capacity after the corrected player-stats layout.
 - [ ] Verify the corrected native 740 player-stats record with an unmodified OTClientV8 build; do not clear the real-client release blocker until the initial payload parses without an EOF error.
 - [ ] Correct authoritative player HUD initialization and refresh so level, experience, mana, maximum mana, and magic level match persisted server state after login.
 - [x] Persist the authoritative player position on supported movement and restore it after orderly or abrupt native-session relog rather than returning the character to the default spawn.
