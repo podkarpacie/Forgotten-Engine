@@ -3291,7 +3291,8 @@ fn apply_native_selected_static_creature_melee(
         Err(HostError::Core(
             forgotten_core::CoreError::StaticCreatureCombatOutOfRange { .. }
             | forgotten_core::CoreError::InactiveStaticCreature(_)
-            | forgotten_core::CoreError::UnknownStaticCreature(_),
+            | forgotten_core::CoreError::UnknownStaticCreature(_)
+            | forgotten_core::CoreError::CombatCooldownActive { .. },
         )) => Ok(None),
         Err(error) => Err(error),
     }
@@ -4977,6 +4978,16 @@ mod tests {
             shared.active_static_spawns().unwrap().entities[0].health_percent,
             5
         );
+        assert_eq!(
+            apply_native_selected_static_creature_melee(&shared, 101, &map).unwrap(),
+            None
+        );
+        assert_eq!(shared.visibility_epoch(), 2);
+        assert_eq!(
+            shared.active_static_spawns().unwrap().entities[0].health_percent,
+            5
+        );
+        advance_native_shared_world_heartbeat(&shared, 1).unwrap();
 
         let final_hit = apply_native_selected_static_creature_melee(&shared, 101, &map)
             .unwrap()

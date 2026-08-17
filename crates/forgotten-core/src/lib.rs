@@ -2205,8 +2205,9 @@ impl WorldState {
     }
 
     /// Applies a bounded adjacent-melee transition to an active static creature. The requested
-    /// value is capped at 100 percentage points. Only a hit that lowers positive health to zero
-    /// deactivates the entity; externally assigned zero display health remains display-only.
+    /// value is capped at 100 percentage points. A real hit consumes the existing one-tick
+    /// per-player combat cooldown. Only a hit that lowers positive health to zero deactivates the
+    /// entity; externally assigned zero display health remains display-only.
     pub fn apply_static_creature_melee_damage(
         &mut self,
         attacker_id: u64,
@@ -2232,6 +2233,14 @@ impl WorldState {
                 target_id,
             });
         }
+        let cooldown = self.player_combat_cooldown(attacker_id)?;
+        if self.tick < cooldown.next_attack_tick {
+            return Err(CoreError::CombatCooldownActive {
+                attacker_id,
+                current_tick: self.tick,
+                next_attack_tick: cooldown.next_attack_tick,
+            });
+        }
         let (applied_damage, remaining_health_percent, deactivated) = {
             let runtime = self
                 .static_creatures
@@ -2250,6 +2259,12 @@ impl WorldState {
             }
         };
         if applied_damage > 0 {
+            self.player_combat_cooldowns.insert(
+                attacker_id,
+                PlayerCombatCooldown {
+                    next_attack_tick: self.tick.saturating_add(1),
+                },
+            );
             if deactivated {
                 self.deactivate_static_creature(target_id)?;
             } else {
@@ -4354,6 +4369,23 @@ mod tests {
         assert_eq!(first.applied_damage, 10);
         assert_eq!(first.remaining_health_percent, 5);
         assert!(!first.deactivated);
+        assert_eq!(
+            world
+                .player_combat_cooldown(attacker.id)
+                .unwrap()
+                .next_attack_tick,
+            1
+        );
+        assert_eq!(
+            world.apply_static_creature_melee_damage(attacker.id, creature_id, 10),
+            Err(CoreError::CombatCooldownActive {
+                attacker_id: attacker.id,
+                current_tick: 0,
+                next_attack_tick: 1,
+            })
+        );
+        assert_eq!(world.static_creature_health_percent(creature_id), Ok(5));
+        world.advance_tick();
         let final_hit = world
             .apply_static_creature_melee_damage(attacker.id, creature_id, 10)
             .unwrap();
