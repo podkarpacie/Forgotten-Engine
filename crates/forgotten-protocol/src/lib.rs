@@ -1273,25 +1273,27 @@ pub fn encode_native_otclient_game_initialization_with_map_and_static_spawns_and
 }
 
 /// Encodes the fixed-width classic 7.4 player-stats record. Health, mana, capacity, experience,
-/// level, and magic level come from persisted player state.
+/// level, and magic level come from persisted player state. The classic record carries a u16
+/// level and trailing soul byte; newer-protocol total-capacity and stamina fields are excluded.
 pub fn encode_native_otclient_player_stats(
     profile: &NativeOtClientProfile,
     snapshot: &NativeOtClientEmptyWorldSnapshot,
 ) -> Result<Frame, ProtocolError> {
     validate_native_empty_world_snapshot(profile, snapshot)?;
     let mut writer = Writer::default();
-    let level = snapshot.player_level.clamp(1, u8::MAX as u16) as u8;
+    let level = snapshot.player_level.max(1);
     let vitals = snapshot.player_vitals;
     writer.byte(NATIVE_OTCLIENT_GAME_PLAYER_STATS);
     writer.u16(vitals.health);
     writer.u16(vitals.max_health);
     writer.u16(vitals.capacity);
     writer.u32(snapshot.player_experience.min(i32::MAX as u64) as u32);
-    writer.byte(level);
+    writer.u16(level);
     writer.byte(0);
     writer.u16(vitals.mana);
     writer.u16(vitals.max_mana);
     writer.byte(vitals.magic_level);
+    writer.byte(0);
     writer.byte(0);
     Ok(Frame(writer.finish()))
 }
@@ -2895,21 +2897,25 @@ mod tests {
             u32::from_le_bytes(bootstrap.0[7..11].try_into().unwrap()),
             4_900
         );
-        assert_eq!(bootstrap.0[11], 8);
-        assert_eq!(bootstrap.0[12], 0);
         assert_eq!(
-            u16::from_le_bytes(bootstrap.0[13..15].try_into().unwrap()),
+            u16::from_le_bytes(bootstrap.0[11..13].try_into().unwrap()),
+            8
+        );
+        assert_eq!(bootstrap.0[13], 0);
+        assert_eq!(
+            u16::from_le_bytes(bootstrap.0[14..16].try_into().unwrap()),
             50
         );
         assert_eq!(
-            u16::from_le_bytes(bootstrap.0[15..17].try_into().unwrap()),
+            u16::from_le_bytes(bootstrap.0[16..18].try_into().unwrap()),
             50
         );
-        assert_eq!(bootstrap.0[17], 0);
         assert_eq!(bootstrap.0[18], 0);
-        assert_eq!(bootstrap.0[19], NATIVE_OTCLIENT_GAME_PLAYER_SKILLS);
-        assert_eq!(bootstrap.0[34], NATIVE_OTCLIENT_GAME_PLAYER_STATE);
-        assert_eq!(bootstrap.0[35], 0);
+        assert_eq!(bootstrap.0[19], 0);
+        assert_eq!(bootstrap.0[20], 0);
+        assert_eq!(bootstrap.0[21], NATIVE_OTCLIENT_GAME_PLAYER_SKILLS);
+        assert_eq!(bootstrap.0[36], NATIVE_OTCLIENT_GAME_PLAYER_STATE);
+        assert_eq!(bootstrap.0[37], 0);
         assert_eq!(
             &initialization.0[login.0.len() + map.0.len()..],
             bootstrap.0.as_slice()

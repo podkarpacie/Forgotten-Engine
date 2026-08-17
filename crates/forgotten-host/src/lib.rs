@@ -5392,11 +5392,13 @@ mod tests {
             0,
             8,
             0,
+            0,
             42,
             0,
             50,
             0,
             4,
+            0,
             0,
         ];
         assert!(initialization

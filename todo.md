@@ -255,7 +255,8 @@
 - [ ] Add sandboxed Lua execution with safe event dispatch, legacy registry adapters, and deterministic failure handling.
 - [ ] Add guilds, parties, channels, private messages, depots, banking/trading, houses, access lists, and administrator controls.
 - [ ] Add release-blocking load, soak, memory, fault-recovery, security, real-client interoperability, Windows, and migration validation evidence.
-- [ ] Fix the native 740 player-stats (`0xA0`) record layout that the real client reports as end-of-input after the initial map payload; treat this parser error as a release blocker.
+- [x] Fix the native 740 player-stats (`0xA0`) record layout that the real client reports as end-of-input after the initial map payload; the parser-shaped record now has a 16-bit level and soul byte.
+- [ ] Verify the corrected native 740 player-stats record with an unmodified OTClientV8 build; do not clear the real-client release blocker until the initial payload parses without an EOF error.
 - [ ] Correct authoritative player HUD initialization and refresh so level, experience, mana, maximum mana, and magic level match persisted server state after login.
 - [ ] Persist the authoritative player position on supported movement and restore it on relog rather than returning the character to the default spawn.
 - [ ] Persist accepted player outfit changes and hydrate the stored outfit on the next native session; current creature-outfit acknowledgement is session-only.
