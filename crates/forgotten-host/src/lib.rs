@@ -340,6 +340,8 @@ pub struct NativeOtClientHostConfig {
 pub struct NativeOtClientEmptyWorldConfig {
     pub ground_thing_id: u16,
     pub player_look_type: u8,
+    pub outfit_first_look_type: u8,
+    pub outfit_last_look_type: u8,
     pub player_speed: u16,
     pub server_beat: u16,
 }
@@ -2383,8 +2385,8 @@ fn handle_native_otclient_game(
                 let outfit_window = encode_native_otclient_choose_outfit(
                     &config.client_profile,
                     player_outfit,
-                    player_outfit.look_type,
-                    player_outfit.look_type,
+                    empty_world.outfit_first_look_type,
+                    empty_world.outfit_last_look_type,
                 )
                 .map_err(HostError::Protocol)?;
                 write_frame(stream, &outfit_window)?;
@@ -5604,6 +5606,8 @@ mod tests {
         config.empty_world = Some(NativeOtClientEmptyWorldConfig {
             ground_thing_id: 102,
             player_look_type: 128,
+            outfit_first_look_type: 128,
+            outfit_last_look_type: 128,
             player_speed: 220,
             server_beat: 50,
         });
@@ -5934,6 +5938,9 @@ mod tests {
             )
             .unwrap();
         let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        let empty_world = native_config.empty_world.as_mut().unwrap();
+        empty_world.outfit_first_look_type = 128;
+        empty_world.outfit_last_look_type = 131;
         native_config.static_spawns = Some(Arc::new(
             FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
                 id: NATIVE_OTCLIENT_PLAYER_ID_END + 1,
@@ -6236,7 +6243,7 @@ mod tests {
                 0,
                 0,
                 128,
-                128,
+                131,
             ]
         );
         assert!(!outfit_window.0.contains(&0xaa));

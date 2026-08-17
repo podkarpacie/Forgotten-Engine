@@ -108,6 +108,8 @@ pub struct EngineConfig {
     pub otclient_v8_native_empty_world_enabled: bool,
     pub otclient_v8_empty_world_ground_thing_id: u16,
     pub otclient_v8_player_look_type: u16,
+    pub otclient_v8_outfit_first_look_type: u16,
+    pub otclient_v8_outfit_last_look_type: u16,
     pub otclient_v8_player_speed: u16,
     pub otclient_v8_server_beat: u16,
 }
@@ -277,6 +279,23 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
     let otclient_v8_empty_world_ground_thing_id =
         optional_u16(&values, "otclientV8EmptyWorldGroundThingId", 0)?;
     let otclient_v8_player_look_type = optional_u16(&values, "otclientV8PlayerLookType", 0)?;
+    let configured_otclient_v8_outfit_first_look_type =
+        optional_u16(&values, "otclientV8OutfitFirstLookType", 0)?;
+    let configured_otclient_v8_outfit_last_look_type =
+        optional_u16(&values, "otclientV8OutfitLastLookType", 0)?;
+    let otclient_v8_outfit_first_look_type = if otclient_v8_player_look_type != 0
+        && configured_otclient_v8_outfit_first_look_type == 0
+    {
+        otclient_v8_player_look_type
+    } else {
+        configured_otclient_v8_outfit_first_look_type
+    };
+    let otclient_v8_outfit_last_look_type =
+        if otclient_v8_player_look_type != 0 && configured_otclient_v8_outfit_last_look_type == 0 {
+            otclient_v8_player_look_type
+        } else {
+            configured_otclient_v8_outfit_last_look_type
+        };
     let otclient_v8_player_speed = optional_u16(&values, "otclientV8PlayerSpeed", 220)?;
     let otclient_v8_server_beat = optional_u16(&values, "otclientV8ServerBeat", 50)?;
     let native_profile = NativeOtClientProfile {
@@ -309,6 +328,15 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         && (!otclient_v8_native_enabled
             || !native_profile.supports_current_native_foundation()
             || otclient_v8_player_look_type > u8::MAX as u16
+            || otclient_v8_outfit_first_look_type > u8::MAX as u16
+            || otclient_v8_outfit_last_look_type > u8::MAX as u16
+            || (otclient_v8_player_look_type == 0
+                && (otclient_v8_outfit_first_look_type != 0
+                    || otclient_v8_outfit_last_look_type != 0))
+            || (otclient_v8_player_look_type != 0
+                && (otclient_v8_outfit_first_look_type == 0
+                    || otclient_v8_outfit_first_look_type > otclient_v8_player_look_type
+                    || otclient_v8_player_look_type > otclient_v8_outfit_last_look_type))
             || otclient_v8_player_speed == 0
             || otclient_v8_server_beat == 0)
     {
@@ -361,6 +389,8 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         otclient_v8_native_empty_world_enabled,
         otclient_v8_empty_world_ground_thing_id,
         otclient_v8_player_look_type,
+        otclient_v8_outfit_first_look_type,
+        otclient_v8_outfit_last_look_type,
         otclient_v8_player_speed,
         otclient_v8_server_beat,
     })
@@ -1063,7 +1093,7 @@ pub fn validate_content(world_directory: impl AsRef<Path>) -> Result<ContentRepo
 
 pub fn template(profile: CompatibilityProfile) -> String {
     format!(
-        "-- Forgotten Engine configuration\n-- TFS-style layout; parsed as a bounded assignment subset during P0.\n\n-- Connection Config\nip = \"127.0.0.1\"\ngameProtocolPort = 7172\nstatusProtocolPort = 7171\nmaxPlayers = 0\nserverName = \"Forgotten Engine\"\n\n-- Legacy login foundation\n-- Set true only after providing an original 1024-bit RSA private key.\nlegacyLoginEnabled = false\nrsaPrivateKey = \"key.pem\"\n\n-- Legacy game-session foundation\n-- Separate opt-in port until official session compatibility is proven.\ngameSessionEnabled = false\ngameSessionPort = 7173\n-- Public endpoint advertised to a custom OTClient module; may be a proxy/domain/IP-changing endpoint.\nadvertisedGameSessionHost = \"127.0.0.1\"\nadvertisedGameSessionPort = 7173\n\n-- Native stock OTClientV8 foundation\n-- Select the compatible protocol and feature switches for this world; do not assume FE release versions.\notclientV8NativeEnabled = false\notclientV8LoginPort = 7174\notclientV8GamePort = 7175\notclientV8ProtocolVersion = 0\notclientV8NumericAccountIds = true\notclientV8LoginPacketEncryption = false\notclientV8ProtocolChecksum = false\notclientV8ChallengeOnLogin = false\n-- Address returned in the native legacy character list.\nadvertisedOtClientV8Host = \"127.0.0.1\"\nadvertisedOtClientV8GamePort = 7175\n\n-- Native empty-world fixture. Nonzero IDs must exist in operator-owned matching OTCv8 data; zero selects an asset-free fallback.\notclientV8NativeEmptyWorldEnabled = false\notclientV8EmptyWorldGroundThingId = 0\notclientV8PlayerLookType = 0\notclientV8PlayerSpeed = 220\notclientV8ServerBeat = 50\n\n-- Map\nmapName = \"forgotten\"\nworldType = \"pvp\"\n\n-- MySQL compatibility contract (SQLite remains the current storage backend)\nmysqlHost = \"127.0.0.1\"\nmysqlUser = \"forgottenengine\"\nmysqlDatabase = \"forgottenengine\"\n\n-- Forgotten Engine profile\nfeProfile = \"{}\"\ntibiaProtocol = \"{}\"\n",
+        "-- Forgotten Engine configuration\n-- TFS-style layout; parsed as a bounded assignment subset during P0.\n\n-- Connection Config\nip = \"127.0.0.1\"\ngameProtocolPort = 7172\nstatusProtocolPort = 7171\nmaxPlayers = 0\nserverName = \"Forgotten Engine\"\n\n-- Legacy login foundation\n-- Set true only after providing an original 1024-bit RSA private key.\nlegacyLoginEnabled = false\nrsaPrivateKey = \"key.pem\"\n\n-- Legacy game-session foundation\n-- Separate opt-in port until official session compatibility is proven.\ngameSessionEnabled = false\ngameSessionPort = 7173\n-- Public endpoint advertised to a custom OTClient module; may be a proxy/domain/IP-changing endpoint.\nadvertisedGameSessionHost = \"127.0.0.1\"\nadvertisedGameSessionPort = 7173\n\n-- Native stock OTClientV8 foundation\n-- Select the compatible protocol and feature switches for this world; do not assume FE release versions.\notclientV8NativeEnabled = false\notclientV8LoginPort = 7174\notclientV8GamePort = 7175\notclientV8ProtocolVersion = 0\notclientV8NumericAccountIds = true\notclientV8LoginPacketEncryption = false\notclientV8ProtocolChecksum = false\notclientV8ChallengeOnLogin = false\n-- Address returned in the native legacy character list.\nadvertisedOtClientV8Host = \"127.0.0.1\"\nadvertisedOtClientV8GamePort = 7175\n\n-- Native empty-world fixture. Nonzero IDs must exist in operator-owned matching OTCv8 data; zero selects an asset-free fallback.\notclientV8NativeEmptyWorldEnabled = false\notclientV8EmptyWorldGroundThingId = 0\notclientV8PlayerLookType = 0\n-- For classic 740 only: inclusive current-outfit chooser range. Defaults to PlayerLookType.\notclientV8OutfitFirstLookType = 0\notclientV8OutfitLastLookType = 0\notclientV8PlayerSpeed = 220\notclientV8ServerBeat = 50\n\n-- Map\nmapName = \"forgotten\"\nworldType = \"pvp\"\n\n-- MySQL compatibility contract (SQLite remains the current storage backend)\nmysqlHost = \"127.0.0.1\"\nmysqlUser = \"forgottenengine\"\nmysqlDatabase = \"forgottenengine\"\n\n-- Forgotten Engine profile\nfeProfile = \"{}\"\ntibiaProtocol = \"{}\"\n",
         profile.id, profile.tibia_protocol
     )
 }
@@ -1162,6 +1192,8 @@ fn is_recognized_config_key(key: &str) -> bool {
             | "otclientV8NativeEmptyWorldEnabled"
             | "otclientV8EmptyWorldGroundThingId"
             | "otclientV8PlayerLookType"
+            | "otclientV8OutfitFirstLookType"
+            | "otclientV8OutfitLastLookType"
             | "otclientV8PlayerSpeed"
             | "otclientV8ServerBeat"
     )
@@ -1400,7 +1432,7 @@ mod tests {
         fs::write(
             world.join(CONFIG_FILE_NAME),
             format!(
-                "{}otclientV8NativeEnabled = true\notclientV8LoginPort = 7264\notclientV8GamePort = 7265\nadvertisedOtClientV8Host = \"203.0.113.24\"\nadvertisedOtClientV8GamePort = 7265\notclientV8ProtocolVersion = 740\notclientV8NumericAccountIds = true\notclientV8LoginPacketEncryption = false\notclientV8ProtocolChecksum = false\notclientV8ChallengeOnLogin = false\notclientV8NativeEmptyWorldEnabled = true\notclientV8EmptyWorldGroundThingId = 102\notclientV8PlayerLookType = 128\notclientV8PlayerSpeed = 220\notclientV8ServerBeat = 50\n",
+                "{}otclientV8NativeEnabled = true\notclientV8LoginPort = 7264\notclientV8GamePort = 7265\nadvertisedOtClientV8Host = \"203.0.113.24\"\nadvertisedOtClientV8GamePort = 7265\notclientV8ProtocolVersion = 740\notclientV8NumericAccountIds = true\notclientV8LoginPacketEncryption = false\notclientV8ProtocolChecksum = false\notclientV8ChallengeOnLogin = false\notclientV8NativeEmptyWorldEnabled = true\notclientV8EmptyWorldGroundThingId = 102\notclientV8PlayerLookType = 128\notclientV8OutfitFirstLookType = 128\notclientV8OutfitLastLookType = 131\notclientV8PlayerSpeed = 220\notclientV8ServerBeat = 50\n",
                 template(FE_7_4_PROFILE)
             ),
         )
@@ -1415,11 +1447,36 @@ mod tests {
         assert!(config.otclient_v8_native_empty_world_enabled);
         assert_eq!(config.otclient_v8_empty_world_ground_thing_id, 102);
         assert_eq!(config.otclient_v8_player_look_type, 128);
+        assert_eq!(config.otclient_v8_outfit_first_look_type, 128);
+        assert_eq!(config.otclient_v8_outfit_last_look_type, 131);
         assert_eq!(config.otclient_v8_player_speed, 220);
         assert_eq!(config.otclient_v8_server_beat, 50);
         assert!(config
             .otclient_v8_native_profile()
             .supports_current_native_foundation());
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn rejects_a_native_outfit_range_that_excludes_the_current_look_type() {
+        let world = temporary_world("invalid-native-outfit-range");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}otclientV8NativeEnabled = true\notclientV8ProtocolVersion = 740\notclientV8NativeEmptyWorldEnabled = true\notclientV8PlayerLookType = 128\notclientV8OutfitFirstLookType = 129\notclientV8OutfitLastLookType = 131\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            load(&world),
+            Err(ConfigError::InvalidValue {
+                key: "otclientV8NativeEmptyWorldEnabled",
+                ..
+            })
+        ));
         let _ = fs::remove_dir_all(world);
     }
 

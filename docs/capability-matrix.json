@@ -22,7 +22,7 @@
       "playerPosition": "partial",
       "playerPositionDetail": "authoritative native movement persists SQLite position and orderly plus abrupt-disconnect native-session relog regressions restore the saved tile. Unmodified-client confirmation remains required",
       "playerOutfit": "partial",
-      "playerOutfitDetail": "schema-v11 persists accepted matching classic-740 look type and color values, then hydrates them after map initialization with a configured look-type fallback for legacy or mismatched records. Look-type selection, addons, mounts, asset validation, and unmodified-client confirmation remain deferred",
+      "playerOutfitDetail": "schema-v11 persists accepted matching classic-740 look type and color values, then hydrates them after map initialization with a configured look-type fallback for legacy or mismatched records. A native 0xD2 request receives a classic 0xC8 current-outfit plus one-byte inclusive start/end look-type range. Operators may set otclientV8OutfitFirstLookType and otclientV8OutfitLastLookType; both must fit the classic byte form and contain the configured current look type, while zero values preserve the current-look default for existing worlds. No newer outfit-list, addon, or mount fields are emitted. Look-type selection semantics, addons, mounts, asset validation, and unmodified-client confirmation remain deferred",
       "lifecycle": "partial",
       "lifecycleDetail": "server-side death, temple respawn, and fixed-loss foundations plus schema-v9 persisted dead/respawn/loss state and strict native hydration; client death screens, automatic timers, teleport packets, default-loss formula, and blessings/promotions remain deferred",
       "progression": "partial",

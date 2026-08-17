@@ -484,6 +484,18 @@ fn run_host(
                     .otclient_v8_player_look_type
                     .try_into()
                     .map_err(|_| "otclientV8PlayerLookType must fit the selected native profile")?,
+                outfit_first_look_type: config
+                    .otclient_v8_outfit_first_look_type
+                    .try_into()
+                    .map_err(|_| {
+                        "otclientV8OutfitFirstLookType must fit the selected native profile"
+                    })?,
+                outfit_last_look_type: config
+                    .otclient_v8_outfit_last_look_type
+                    .try_into()
+                    .map_err(|_| {
+                        "otclientV8OutfitLastLookType must fit the selected native profile"
+                    })?,
                 player_speed: config.otclient_v8_player_speed,
                 server_beat: config.otclient_v8_server_beat,
             })
