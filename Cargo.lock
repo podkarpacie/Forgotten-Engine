@@ -212,6 +212,7 @@ dependencies = [
 name = "forgotten-host"
 version = "7.4.44"
 dependencies = [
+ "forgotten-config",
  "forgotten-core",
  "forgotten-persistence",
  "forgotten-protocol",
