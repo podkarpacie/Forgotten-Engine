@@ -38,7 +38,7 @@ This matrix is the source-controlled statement of **current behavior**, not an a
 | NPC conversation, shops, travel | deferred | deferred | deferred |
 | Lua execution and event dispatch | deferred — XML/script references are validated but never executed | deferred | deferred |
 | Actions, movements, use/use-with, doors, levers | deferred — input is safely tolerated where implemented, not semantically executed. A native 740 Quest Log request returns an explicit empty response; client-visible look/inspect stays deferred until a verified message-mode contract exists | deferred | deferred |
-| Chat and social systems | partial — bounded shared 740 delivery with parser-safe limitations | deferred | deferred |
+| Chat and social systems | partial — bounded shared public-chat ingestion, sanitization, recipient registration, and queue behavior. Client-visible 740 delivery is deferred because the unmodified OTCv8 message-mode map is absent below protocol 760; FE intentionally emits no parser-invalid `0xAA` or generic text-message record | deferred | deferred |
 | Guilds, parties, trade, mail, VIP | deferred | deferred | deferred |
 | Houses, rent, beds, bank/economy | deferred | deferred | deferred |
 | PvP skulls/frags/bans/death policy | deferred | deferred | deferred |

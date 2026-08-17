@@ -264,6 +264,7 @@
 - [ ] Verify native 740 outfit persistence with an unmodified OTClientV8 build: change accepted colors, relog, and confirm the stored appearance is visible without a parser error or disconnect.
 - [ ] Implement or safely acknowledge profile-verified native 740 look/inspect actions for map things and creatures; current use/look handling does not provide a visible inspection result.
 - [ ] Implement a verified native 740 public-chat message layout; extended diagnostics confirm chat is currently intentionally suppressed because the profile message-mode map is incomplete.
+- [x] Confirm through public OTCv8 issue #218 that unmodified clients do not construct a message-mode map below protocol 760; retain safe native 740 visible-chat suppression rather than emitting an invalid server-side mode byte.
 - [x] Decode and safely handle the native 740 Quest Log request without ending the game session; until content exists it returns a parser-shaped empty/deferred response.
 - [ ] Verify the native 740 empty Quest Log response with an unmodified OTClientV8 build; do not clear the client-facing blocker until the window opens without a parser error or disconnect.
 - [x] Build, package, checksum, and publish fresh Linux and Windows artifacts from the latest verified Forgotten Engine commit for manual testing.
