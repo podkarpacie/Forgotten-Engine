@@ -11,8 +11,9 @@ use forgotten_core::{
     PlayerInteractionIntent, PlayerItemUseIntent, PlayerItemUseOutcome, PlayerProgression,
     PlayerProgressionAttempts, PlayerProgressionRules, PlayerRegenerationOutcome,
     PlayerRegenerationRules, PlayerRespawnState, PlayerSkill, PlayerSkillTryOutcome,
-    PlayerSpellCastOutcome, PlayerVitals, Position, StaticCreatureDecisionBatch,
-    StaticCreatureDecisionPolicy, StaticCreatureResetSummary, VocationId, WorldMap, WorldState,
+    PlayerSpellCastOutcome, PlayerVitals, Position, StaticCreatureDamageOutcome,
+    StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, StaticCreatureResetSummary,
+    VocationId, WorldMap, WorldState,
 };
 use forgotten_persistence::{EngineDatabase, PlayerOutfit, PlayerVitals as PersistedPlayerVitals};
 use forgotten_protocol::{
@@ -820,6 +821,22 @@ impl SharedNativeWorld {
             self.mark_visibility_changed();
         }
         Ok(changed)
+    }
+
+    pub fn apply_static_creature_melee_damage(
+        &self,
+        attacker_id: u64,
+        target_id: u32,
+        requested_damage: u16,
+    ) -> Result<StaticCreatureDamageOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .apply_static_creature_melee_damage(attacker_id, target_id, requested_damage)
+            .map_err(HostError::Core)?;
+        if outcome.applied_damage > 0 {
+            self.mark_visibility_changed();
+        }
+        Ok(outcome)
     }
 
     pub fn player_interaction_intent(
@@ -2172,6 +2189,23 @@ fn handle_native_otclient_game(
                             ),
                         );
                     }
+                    if let Some(outcome) = apply_native_selected_static_creature_melee(
+                        shared_world,
+                        character.id,
+                        world_map,
+                    )? {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "combat=selected-static-melee target={} damage={} health-percent={} deactivated={}",
+                                outcome.target_id,
+                                outcome.applied_damage,
+                                outcome.remaining_health_percent,
+                                outcome.deactivated
+                            ),
+                        );
+                    }
                     let vitals_epoch = shared_world.vitals_epoch();
                     if vitals_epoch != observed_vitals_epoch {
                         let vitals = shared_world.player_vitals(character.id)?;
@@ -3201,6 +3235,33 @@ fn apply_native_selected_player_melee(
         },
         outcome,
     )))
+}
+
+fn apply_native_selected_static_creature_melee(
+    shared_world: &SharedNativeWorld,
+    attacker_id: u64,
+    _world_map: &WorldMap,
+) -> Result<Option<StaticCreatureDamageOutcome>, HostError> {
+    let Some(target_id) = shared_world
+        .player_interaction_intent(attacker_id)?
+        .target_static_creature_id
+    else {
+        return Ok(None);
+    };
+    match shared_world.apply_static_creature_melee_damage(
+        attacker_id,
+        target_id,
+        NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE,
+    ) {
+        Ok(outcome) if outcome.applied_damage > 0 => Ok(Some(outcome)),
+        Ok(_) => Ok(None),
+        Err(HostError::Core(
+            forgotten_core::CoreError::StaticCreatureCombatOutOfRange { .. }
+            | forgotten_core::CoreError::InactiveStaticCreature(_)
+            | forgotten_core::CoreError::UnknownStaticCreature(_),
+        )) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn native_player_id_to_character_id(native_id: u32) -> Option<u64> {
@@ -4827,6 +4888,73 @@ mod tests {
                 64,
                 40,
             ]]
+        );
+    }
+
+    #[test]
+    fn selected_static_melee_refreshes_visibility_and_removes_a_defeated_static_target() {
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let static_spawns =
+            FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
+                id: creature_id,
+                name: "Rat".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 15,
+                direction: 2,
+            }])
+            .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .set_player_static_target(101, Some(creature_id))
+            .unwrap();
+        let first = apply_native_selected_static_creature_melee(&shared, 101, &map)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.applied_damage, 10);
+        assert_eq!(first.remaining_health_percent, 5);
+        assert!(!first.deactivated);
+        assert_eq!(shared.visibility_epoch(), 2);
+        assert_eq!(
+            shared.active_static_spawns().unwrap().entities[0].health_percent,
+            5
+        );
+
+        let final_hit = apply_native_selected_static_creature_melee(&shared, 101, &map)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_hit.applied_damage, 5);
+        assert!(final_hit.deactivated);
+        assert_eq!(shared.visibility_epoch(), 3);
+        assert!(shared.active_static_spawns().unwrap().entities.is_empty());
+        assert_eq!(
+            shared.player_interaction_intent(101).unwrap(),
+            PlayerInteractionIntent::default()
         );
     }
 

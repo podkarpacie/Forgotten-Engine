@@ -1455,6 +1455,19 @@ pub struct PlayerDamageOutcome {
     pub defeated: bool,
 }
 
+/// A bounded damage transition for an imported static creature. Health is expressed in integer
+/// percentage points, not TFS creature hit points; formula combat, mitigation, rewards, corpses,
+/// AI, and script callbacks remain outside this foundation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticCreatureDamageOutcome {
+    pub attacker_id: u64,
+    pub target_id: u32,
+    pub requested_damage: u16,
+    pub applied_damage: u8,
+    pub remaining_health_percent: u8,
+    pub deactivated: bool,
+}
+
 /// Damage families remain typed even before their profile-specific formulas, resistances, visual
 /// effects, and client delivery are implemented. The current bounded combat-event foundation
 /// admits only physical adjacent melee resolution.
@@ -2189,6 +2202,68 @@ impl WorldState {
             self.mark_changed();
         }
         Ok(changed)
+    }
+
+    /// Applies a bounded adjacent-melee transition to an active static creature. The requested
+    /// value is capped at 100 percentage points. Only a hit that lowers positive health to zero
+    /// deactivates the entity; externally assigned zero display health remains display-only.
+    pub fn apply_static_creature_melee_damage(
+        &mut self,
+        attacker_id: u64,
+        target_id: u32,
+        requested_damage: u16,
+    ) -> Result<StaticCreatureDamageOutcome, CoreError> {
+        if requested_damage == 0 {
+            return Err(CoreError::InvalidCombatEvent);
+        }
+        let attacker = self
+            .player(attacker_id)
+            .ok_or(CoreError::UnknownPlayer(attacker_id))?;
+        let target = self
+            .static_creatures
+            .get(&target_id)
+            .ok_or(CoreError::UnknownStaticCreature(target_id))?;
+        if !target.active {
+            return Err(CoreError::InactiveStaticCreature(target_id));
+        }
+        if !attacker.position.is_adjacent_to(target.entity.position) {
+            return Err(CoreError::StaticCreatureCombatOutOfRange {
+                attacker_id,
+                target_id,
+            });
+        }
+        let (applied_damage, remaining_health_percent, deactivated) = {
+            let runtime = self
+                .static_creatures
+                .get_mut(&target_id)
+                .ok_or(CoreError::UnknownStaticCreature(target_id))?;
+            let applied_damage = runtime.health_percent.min(requested_damage.min(100) as u8);
+            if applied_damage == 0 {
+                (0, runtime.health_percent, false)
+            } else {
+                runtime.health_percent -= applied_damage;
+                (
+                    applied_damage,
+                    runtime.health_percent,
+                    runtime.health_percent == 0,
+                )
+            }
+        };
+        if applied_damage > 0 {
+            if deactivated {
+                self.deactivate_static_creature(target_id)?;
+            } else {
+                self.mark_changed();
+            }
+        }
+        Ok(StaticCreatureDamageOutcome {
+            attacker_id,
+            target_id,
+            requested_damage,
+            applied_damage,
+            remaining_health_percent,
+            deactivated,
+        })
     }
 
     /// Attempts a deterministic static-creature reset. An inactive creature whose spawn tile is
@@ -3631,6 +3706,10 @@ pub enum CoreError {
         attacker_id: u64,
         target_id: u64,
     },
+    StaticCreatureCombatOutOfRange {
+        attacker_id: u64,
+        target_id: u32,
+    },
 }
 
 impl std::fmt::Display for CoreError {
@@ -4220,6 +4299,85 @@ mod tests {
         );
         assert_eq!(world.reset_static_creatures().reactivated, 1);
         assert_eq!(world.static_creature_health_percent(creature_id), Ok(75));
+    }
+
+    #[test]
+    fn static_creature_melee_uses_percentage_damage_and_deactivates_only_on_a_real_zero_hit() {
+        let attacker = player();
+        let creature_id = 0x4000_0001;
+        let creature = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 15,
+            direction: 2,
+        };
+        let mut world = WorldState::default();
+        world
+            .install_static_creatures(&FeTfsStaticSpawnCollection::new(vec![creature]).unwrap())
+            .unwrap();
+        world.add_player(attacker.clone()).unwrap();
+        assert_eq!(
+            world.apply_static_creature_melee_damage(attacker.id, creature_id, 0),
+            Err(CoreError::InvalidCombatEvent)
+        );
+        world
+            .set_static_creature_health_percent(creature_id, 0)
+            .unwrap();
+        let no_op = world
+            .apply_static_creature_melee_damage(attacker.id, creature_id, 10)
+            .unwrap();
+        assert_eq!(no_op.applied_damage, 0);
+        assert!(!no_op.deactivated);
+        assert!(world.static_creature_lifecycle(creature_id).unwrap().active);
+
+        world
+            .set_static_creature_health_percent(creature_id, 15)
+            .unwrap();
+        world
+            .set_player_static_target(attacker.id, Some(creature_id))
+            .unwrap();
+        let first = world
+            .apply_static_creature_melee_damage(attacker.id, creature_id, 10)
+            .unwrap();
+        assert_eq!(first.applied_damage, 10);
+        assert_eq!(first.remaining_health_percent, 5);
+        assert!(!first.deactivated);
+        let final_hit = world
+            .apply_static_creature_melee_damage(attacker.id, creature_id, 10)
+            .unwrap();
+        assert_eq!(final_hit.applied_damage, 5);
+        assert_eq!(final_hit.remaining_health_percent, 0);
+        assert!(final_hit.deactivated);
+        assert!(!world.static_creature_lifecycle(creature_id).unwrap().active);
+        assert_eq!(
+            world.player_interaction_intent(attacker.id),
+            Ok(PlayerInteractionIntent::default())
+        );
+
+        world.reset_static_creatures();
+        let mut distant = attacker;
+        distant.id = 8;
+        distant.position.x = 103;
+        world.add_player(distant).unwrap();
+        assert_eq!(
+            world.apply_static_creature_melee_damage(8, creature_id, 1),
+            Err(CoreError::StaticCreatureCombatOutOfRange {
+                attacker_id: 8,
+                target_id: creature_id,
+            })
+        );
     }
 
     #[test]
