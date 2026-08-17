@@ -432,6 +432,39 @@ impl EngineDatabase {
         Ok(())
     }
 
+    /// Commits an authoritative level/experience transition and matching vitality state together.
+    /// This is used for validated vocation-aware level-ups so a restart cannot observe the new
+    /// level without its corresponding current/max health, mana, and capacity gains.
+    pub fn update_player_experience_and_vitals(
+        &mut self,
+        player_id: u64,
+        level: u32,
+        experience: u64,
+        vitals: PlayerVitals,
+    ) -> Result<(), PersistenceError> {
+        if !vitals.is_valid() {
+            return Err(PersistenceError::InvalidPlayerVitals);
+        }
+        self.ensure_player_exists(player_id)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE players SET level = ?1, experience = ?2, health = ?3, max_health = ?4, mana = ?5, max_mana = ?6, capacity = ?7, magic_level = ?8 WHERE id = ?9",
+            params![
+                i64::from(level),
+                experience as i64,
+                i64::from(vitals.health),
+                i64::from(vitals.max_health),
+                i64::from(vitals.mana),
+                i64::from(vitals.max_mana),
+                i64::from(vitals.capacity),
+                i64::from(vitals.magic_level),
+                player_id as i64,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Replaces all active bounded conditions for one known player in a single transaction. The
     /// core condition type already validates timing and damage; stored values are validated again
     /// when loaded to defend against malformed database records.
@@ -1828,7 +1861,7 @@ mod tests {
     #[test]
     fn persists_a_player_and_event() {
         let path = temporary_path("player");
-        let database = EngineDatabase::open(&path).unwrap();
+        let mut database = EngineDatabase::open(&path).unwrap();
         let account_id = database.create_account("admin", "hash").unwrap();
         database
             .save_player(&Player {
@@ -1856,6 +1889,21 @@ mod tests {
             .unwrap();
         assert_eq!(character.level, 12);
         assert_eq!(character.experience, 14_400);
+        let advanced_vitals = PlayerVitals {
+            health: 165,
+            max_health: 165,
+            mana: 55,
+            max_mana: 55,
+            capacity: 40_025,
+            magic_level: 0,
+        };
+        database
+            .update_player_experience_and_vitals(1, 13, 16_900, advanced_vitals)
+            .unwrap();
+        let advanced = database.player_by_id(1).unwrap();
+        assert_eq!(advanced.level, 13);
+        assert_eq!(advanced.experience, 16_900);
+        assert_eq!(advanced.vitals, advanced_vitals);
         assert_eq!(database.player_by_id(1).unwrap().name, "Knight");
         assert!(matches!(
             database.update_player_experience(99, 1, 0),

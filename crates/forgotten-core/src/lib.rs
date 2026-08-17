@@ -865,6 +865,44 @@ pub struct PlayerExperienceAwardOutcome {
     pub experience: u64,
     pub level: u32,
     pub gained_levels: u32,
+    pub vitals: PlayerVitals,
+}
+
+/// Validated per-level vitality and capacity gains derived by a configuration boundary from one
+/// operator-owned vocation. The core does not infer values from a numeric vocation identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VocationLevelUpGains {
+    pub health: u16,
+    pub mana: u16,
+    pub capacity: u16,
+}
+
+impl VocationLevelUpGains {
+    pub const fn new(health: u16, mana: u16, capacity: u16) -> Self {
+        Self {
+            health,
+            mana,
+            capacity,
+        }
+    }
+
+    fn scaled_amount(amount: u16, gained_levels: u32) -> u16 {
+        u16::try_from(u32::from(amount).saturating_mul(gained_levels)).unwrap_or(u16::MAX)
+    }
+
+    fn apply(self, vitals: PlayerVitals, gained_levels: u32) -> PlayerVitals {
+        let health = Self::scaled_amount(self.health, gained_levels);
+        let mana = Self::scaled_amount(self.mana, gained_levels);
+        let capacity = Self::scaled_amount(self.capacity, gained_levels);
+        PlayerVitals {
+            health: vitals.health.saturating_add(health),
+            max_health: vitals.max_health.saturating_add(health),
+            mana: vitals.mana.saturating_add(mana),
+            max_mana: vitals.max_mana.saturating_add(mana),
+            capacity: vitals.capacity.saturating_add(capacity),
+            ..vitals
+        }
+    }
 }
 
 /// Formula inputs derived from one validated vocation definition. The formula is intentionally
@@ -2444,6 +2482,30 @@ impl WorldState {
         raw_experience: u64,
         policy: &ExperienceAwardPolicy,
     ) -> Result<PlayerExperienceAwardOutcome, CoreError> {
+        self.award_player_experience_with_vocation_gains(
+            player_id,
+            raw_experience,
+            policy,
+            VocationLevelUpGains::default(),
+        )
+    }
+
+    /// Applies a prevalidated experience policy and explicit per-level vocation gains in one
+    /// authoritative core transition. Gains are added to current and maximum health/mana plus
+    /// capacity only when the corrected level resolver reports a real positive level increase.
+    /// Client HUD delivery, promotion effects, formulas, and scripting remain separate concerns.
+    pub fn award_player_experience_with_vocation_gains(
+        &mut self,
+        player_id: u64,
+        raw_experience: u64,
+        policy: &ExperienceAwardPolicy,
+        gains: VocationLevelUpGains,
+    ) -> Result<PlayerExperienceAwardOutcome, CoreError> {
+        let current_vitals = self
+            .player_vitals
+            .get(&player_id)
+            .copied()
+            .ok_or(CoreError::UnknownPlayer(player_id))?;
         let (awarded_experience, experience, level, gained_levels) = {
             let player = self
                 .players
@@ -2461,6 +2523,10 @@ impl WorldState {
                 player.level.saturating_sub(previous_level),
             )
         };
+        let vitals = gains.apply(current_vitals, gained_levels);
+        if gained_levels > 0 {
+            self.player_vitals.insert(player_id, vitals);
+        }
         if awarded_experience > 0 {
             self.mark_changed();
         }
@@ -2471,6 +2537,7 @@ impl WorldState {
             experience,
             level,
             gained_levels,
+            vitals,
         })
     }
 
@@ -4638,6 +4705,7 @@ mod tests {
         assert_eq!(first.experience, 1_000);
         assert_eq!(first.level, 5);
         assert_eq!(first.gained_levels, 4);
+        assert_eq!(first.vitals, PlayerVitals::default());
         assert_eq!(world.revision(), revision_before_award + 1);
 
         let second = world.award_player_experience(7, 100, &policy).unwrap();
@@ -4662,6 +4730,88 @@ mod tests {
             ),
             Err(CoreError::InvalidExperienceAwardPolicy)
         );
+    }
+
+    #[test]
+    fn vocation_aware_experience_awards_apply_gains_only_for_real_level_increases() {
+        let policy = ExperienceAwardPolicy::new(10, Vec::new()).unwrap();
+        let initial_vitals = PlayerVitals {
+            health: 50,
+            max_health: 100,
+            mana: 20,
+            max_mana: 50,
+            capacity: 500,
+            magic_level: 4,
+        };
+        let gains = VocationLevelUpGains::new(15, 5, 25);
+        let mut world = WorldState::default();
+        world
+            .add_player_with_vitals_and_progression(
+                player(),
+                initial_vitals,
+                PlayerProgression {
+                    vocation: BaseVocation::Knight.id(),
+                    ..PlayerProgression::default()
+                },
+            )
+            .unwrap();
+
+        let no_award = world
+            .award_player_experience_with_vocation_gains(
+                7,
+                100,
+                &ExperienceAwardPolicy::new(0, Vec::new()).unwrap(),
+                gains,
+            )
+            .unwrap();
+        assert_eq!(no_award.gained_levels, 0);
+        assert_eq!(no_award.vitals, initial_vitals);
+
+        let advanced = world
+            .award_player_experience_with_vocation_gains(7, 100, &policy, gains)
+            .unwrap();
+        assert_eq!(advanced.gained_levels, 4);
+        assert_eq!(advanced.level, 5);
+        assert_eq!(
+            advanced.vitals,
+            PlayerVitals {
+                health: 110,
+                max_health: 160,
+                mana: 40,
+                max_mana: 70,
+                capacity: 600,
+                magic_level: 4,
+            }
+        );
+        assert_eq!(world.player_vitals(7).unwrap(), advanced.vitals);
+
+        world
+            .update_player_vitals(
+                7,
+                PlayerVitals {
+                    health: u16::MAX - 1,
+                    max_health: u16::MAX - 1,
+                    mana: u16::MAX - 1,
+                    max_mana: u16::MAX - 1,
+                    capacity: u16::MAX - 1,
+                    magic_level: 4,
+                },
+            )
+            .unwrap();
+        let saturated = world
+            .award_player_experience_with_vocation_gains(
+                7,
+                u64::MAX,
+                &ExperienceAwardPolicy::new(1, Vec::new()).unwrap(),
+                gains,
+            )
+            .unwrap();
+        assert!(saturated.gained_levels > 0);
+        assert_eq!(saturated.vitals.health, u16::MAX);
+        assert_eq!(saturated.vitals.max_health, u16::MAX);
+        assert_eq!(saturated.vitals.mana, u16::MAX);
+        assert_eq!(saturated.vitals.max_mana, u16::MAX);
+        assert_eq!(saturated.vitals.capacity, u16::MAX);
     }
 
     #[test]

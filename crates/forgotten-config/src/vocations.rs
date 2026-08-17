@@ -1,6 +1,7 @@
 use super::{ConfigError, EngineConfig};
 use forgotten_core::{
     CoreError, PlayerProgressionRules, PlayerSkill, ProgressionMultiplier, VocationId,
+    VocationLevelUpGains,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
@@ -65,6 +66,13 @@ impl TfsVocationDefinition {
             )?,
             skill_multipliers,
         })
+    }
+
+    /// Converts the already bounded `gainhp`, `gainmana`, and `gaincap` metadata into explicit
+    /// core inputs. The caller selects the definition for the persisted player vocation; this
+    /// adapter neither changes player state nor claims profile-specific client delivery.
+    pub const fn level_up_gains(&self) -> VocationLevelUpGains {
+        VocationLevelUpGains::new(self.gain_health, self.gain_mana, self.gain_capacity)
     }
 }
 
@@ -404,6 +412,10 @@ mod tests {
         assert_eq!(knight.gain_capacity, 25);
         assert_eq!(knight.gain_health, 15);
         assert_eq!(knight.gain_mana, 5);
+        assert_eq!(
+            knight.level_up_gains(),
+            VocationLevelUpGains::new(15, 5, 25)
+        );
         assert_eq!(
             knight.health_regeneration,
             VocationRegeneration {

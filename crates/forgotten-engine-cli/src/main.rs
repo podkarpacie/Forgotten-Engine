@@ -7,7 +7,7 @@ use forgotten_config::{
 };
 use forgotten_core::{
     EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules, PlayerSkill,
-    RegenerationRule, SkillProgress, VocationId, WorldMapSource, WorldState,
+    PlayerVitals, RegenerationRule, SkillProgress, VocationId, WorldMapSource, WorldState,
 };
 use forgotten_host::{
     start, start_game_session, start_native_otclient_game, start_native_otclient_login,
@@ -996,20 +996,53 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                     forgotten_core::ExperienceAwardPolicy::new(config.experience_rate, Vec::new())?
                 }
             };
-            let database = EngineDatabase::open(&config.database_path)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
             let character = database.player_by_id(player_id)?;
+            let gains = load_tfs_vocation_registry(&config)?
+                .as_ref()
+                .and_then(|registry| registry.get(character.progression.vocation))
+                .map(|definition| definition.level_up_gains())
+                .unwrap_or_default();
             let mut world = WorldState::default();
-            world.add_player(Player {
-                id: character.id,
-                account_id: 0,
-                name: character.name,
-                position: character.position,
-                level: character.level,
-                experience: character.experience,
-                skill_points: character.skill_points,
-            })?;
-            let outcome = world.award_player_experience(player_id, raw_experience, &policy)?;
-            database.update_player_experience(player_id, outcome.level, outcome.experience)?;
+            world.add_player_with_vitals_and_progression(
+                Player {
+                    id: character.id,
+                    account_id: 0,
+                    name: character.name,
+                    position: character.position,
+                    level: character.level,
+                    experience: character.experience,
+                    skill_points: character.skill_points,
+                },
+                PlayerVitals {
+                    health: character.vitals.health,
+                    max_health: character.vitals.max_health,
+                    mana: character.vitals.mana,
+                    max_mana: character.vitals.max_mana,
+                    capacity: character.vitals.capacity,
+                    magic_level: character.vitals.magic_level,
+                },
+                character.progression,
+            )?;
+            let outcome = world.award_player_experience_with_vocation_gains(
+                player_id,
+                raw_experience,
+                &policy,
+                gains,
+            )?;
+            database.update_player_experience_and_vitals(
+                player_id,
+                outcome.level,
+                outcome.experience,
+                forgotten_persistence::PlayerVitals {
+                    health: outcome.vitals.health,
+                    max_health: outcome.vitals.max_health,
+                    mana: outcome.vitals.mana,
+                    max_mana: outcome.vitals.max_mana,
+                    capacity: outcome.vitals.capacity,
+                    magic_level: outcome.vitals.magic_level,
+                },
+            )?;
             println!(
                 "awarded player experience player-id={player_id} raw={} awarded={} experience={} level={} gained-levels={}",
                 outcome.raw_experience,

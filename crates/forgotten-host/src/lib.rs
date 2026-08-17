@@ -13,7 +13,7 @@ use forgotten_core::{
     PlayerRegenerationRules, PlayerRespawnState, PlayerSkill, PlayerSkillTryOutcome,
     PlayerSpellCastOutcome, PlayerVitals, Position, StaticCreatureDamageOutcome,
     StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, StaticCreatureResetSummary,
-    VocationId, WorldMap, WorldState,
+    VocationId, VocationLevelUpGains, WorldMap, WorldState,
 };
 use forgotten_persistence::{EngineDatabase, PlayerOutfit, PlayerVitals as PersistedPlayerVitals};
 use forgotten_protocol::{
@@ -611,6 +611,28 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)?;
         if outcome.awarded_experience > 0 {
             self.progression_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(outcome)
+    }
+
+    /// Additive wrapper for configuration-selected vocation gains. The existing no-gain method
+    /// remains available for callers that do not yet hydrate a legacy vocation registry.
+    pub fn award_player_experience_with_vocation_gains(
+        &self,
+        player_id: u64,
+        raw_experience: u64,
+        policy: &ExperienceAwardPolicy,
+        gains: VocationLevelUpGains,
+    ) -> Result<PlayerExperienceAwardOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .award_player_experience_with_vocation_gains(player_id, raw_experience, policy, gains)
+            .map_err(HostError::Core)?;
+        if outcome.awarded_experience > 0 {
+            self.progression_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        if outcome.gained_levels > 0 {
+            self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok(outcome)
     }

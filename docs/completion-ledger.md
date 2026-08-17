@@ -28,6 +28,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 ### Milestone A — Complete bounded player lifecycle and combat foundations: target 30%
 
 - [x] Apply `rateExp` and bounded `stages.xml` ranges to authoritative experience awards.
+- [x] Apply matching bounded `vocations.xml` `gainhp`, `gainmana`, and `gaincap` values to the stable CLI's atomic authoritative experience-level-up persistence transaction; native HUD delivery and full advancement parity remain deferred.
 - [x] Award configured vocation-based fist tries from supported fixed melee events.
 - [x] Persist authoritative condition state, including exact elapsed interval remainder, across restart.
 - [x] Activate persisted server-side death state for lethal bounded condition damage at a validated assigned town temple.
@@ -103,4 +104,4 @@ A ledger item can be marked complete only when all applicable conditions are met
 
 ## Current next slice
 
-The next implementation slice is **data-driven weapon use and vocation formulas**. It will extend typed combat only through verified configuration and runtime evidence, and will not claim spell, PvP, or full TFS formula parity until each has its own tested runtime and profile-specific evidence.
+The next implementation slice is **native 740 level-up HUD delivery**, followed by **inventory synchronization**. The new core/persistence transaction must first be rendered through a profile-verified player-stats refresh without reintroducing the reported client parser error. Inventory work will then expose already authoritative equipment safely before broader transfer rules. Neither slice claims full formula, spell, PvP, or TFS parity.
