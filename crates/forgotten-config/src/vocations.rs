@@ -401,6 +401,9 @@ mod tests {
         let registry = parse_tfs_vocations_xml(VOCATIONS).unwrap();
         let knight = registry.get(VocationId::new(4)).unwrap();
         assert_eq!(knight.name, "Knight");
+        assert_eq!(knight.gain_capacity, 25);
+        assert_eq!(knight.gain_health, 15);
+        assert_eq!(knight.gain_mana, 5);
         assert_eq!(
             knight.health_regeneration,
             VocationRegeneration {

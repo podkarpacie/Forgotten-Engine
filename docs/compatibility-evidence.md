@@ -43,6 +43,10 @@ Public historical OpenTibia discussion describes shield defense and armor as sep
 
 The public Wireshark Tibia dissector marks client versions from 761 as using RSA and XTEA, and marks 780 and later as having additional outfit/stamina/message-level behavior.[13] FE’s public OTCv8 sender evidence independently shows a feature-gated login block whose leading byte is zero and whose encryption-enabled form carries four 32-bit XTEA words before RSA wrapping; it enables XTEA only after the encrypted login send.[14] Therefore the existing plain numeric-account 740 handshake cannot be widened to protocol 800 by changing only a version number. FE now has an independently authored outbound-only opaque XTEA envelope primitive bounded to the classified encrypted 8.0 profile and a marker/four-word parser over an already decrypted fixed block; neither accepts a client frame, performs RSA decryption, parses trailing bytes or credentials, or emits key material in diagnostics. It must not infer a complete protocol-800 login, game packet, checksum, or listener contract from this evidence. Native protocol-800 enablement remains refused until parser-backed session work exists.
 
+## Vocation advancement metadata boundary
+
+The public TFS vocation registry declares `gaincap`, `gainhp`, and `gainmana` alongside regeneration amounts/ticks, skill multipliers, combat formulas, speed, soul, and other fields.[15] FE may therefore parse those three nonzero bounded per-level gain values into immutable vocation metadata. The source alone does not establish an FE starting-stat baseline, level threshold, promotion, rounding, maximum-vital, packet, or full runtime advancement contract. Parsing must not mutate player state until those dependencies have separate authoritative and profile-specific evidence.
+
 ## References
 
 [1] [TFS legacy weapon registry path](https://github.com/otland/forgottenserver/blob/master/data/weapons/weapons.xml).
@@ -72,3 +76,5 @@ The public Wireshark Tibia dissector marks client versions from 761 as using RSA
 [13] [Wireshark Tibia dissector protocol feature thresholds](https://github.com/wireshark/wireshark/blob/master/epan/dissectors/packet-tibia.c). Read-only public packet-analysis evidence; no dissector source is copied into FE.
 
 [14] [Public OTCv8 game-login sender](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/protocolgamesend.cpp). Read-only behavioral evidence; no client source is copied into FE.
+
+[15] [Public TFS vocation registry](https://raw.githubusercontent.com/otland/forgottenserver/master/data/XML/vocations.xml). Read-only XML attribute evidence; no registry data is copied into FE.
