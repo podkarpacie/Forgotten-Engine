@@ -21,6 +21,10 @@ This register records externally observable format and architecture evidence use
 
 The current FE work has added authoritative/persistent equipment foundations but has not introduced a native 740 inventory or container encoder. The local public OTClientV8 parser establishes the classic inventory dispatch IDs: `OpenContainer` (`0x6E`), `CloseContainer` (`0x6F`), container add/update/remove (`0x70`–`0x72`), set inventory (`0x78`), and remove inventory (`0x79`).[4] For the non-pagination branch applicable to the classic profile, the parser consumes an inventory slot byte followed by an item record for `0x78`, or just a slot byte for `0x79`. It consumes a container ID, container item, name, capacity, parent flag, item count, and item records for `0x6E`; pagination-only fields are gated separately. FE will now document the independently implemented item-record encoder and write parser-aligned golden fixtures before enabling this output. This avoids repeating the earlier class of client parser failures caused by guessed classic-protocol records.
 
+## Quest Log protocol boundary
+
+The public client protocol declarations identify both the classic Quest Log request and response as `0xF0`; the parser consumes a little-endian `u16` quest count before attempting to read entries.[5] FE therefore accepts only the zero-payload request and responds with an independently authored three-byte record containing `0xF0` and a zero count. This is a session-safety acknowledgement only. It does not claim quest storage, mission lines, Lua hooks, reward logic, or client confirmation beyond the automated wire contract.
+
 ## References
 
 [1] [TFS legacy weapon registry path](https://github.com/otland/forgottenserver/blob/master/data/weapons/weapons.xml).
@@ -30,3 +34,5 @@ The current FE work has added authoritative/persistent equipment foundations but
 [3] [Historical 7.4 configuration contract available in the local reference environment](file:///tmp/avesta-74/Avesta%207.4%20(OTServ_SVN%200.6.3)/config-74.lua).
 
 [4] [Local public OTClientV8 parser reference](file:///tmp/otcv8-dev-source/src/client/protocolgameparse.cpp) and [opcode definitions](file:///tmp/otcv8-dev-source/src/client/protocolcodes.h). Read-only behavioral evidence; no client source is copied into FE.
+
+[5] [Public OTClientV8 parser](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/protocolgameparse.cpp) and [opcode declarations](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/protocolcodes.h). Read-only behavioral evidence; no client source is copied into FE.

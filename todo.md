@@ -262,7 +262,8 @@
 - [ ] Persist accepted player outfit changes and hydrate the stored outfit on the next native session; current creature-outfit acknowledgement is session-only.
 - [ ] Implement or safely acknowledge profile-verified native 740 look/inspect actions for map things and creatures; current use/look handling does not provide a visible inspection result.
 - [ ] Implement a verified native 740 public-chat message layout; extended diagnostics confirm chat is currently intentionally suppressed because the profile message-mode map is incomplete.
-- [ ] Decode and safely handle the native 740 Quest Log request without ending the game session; until content exists it must return a safe empty/deferred response.
+- [x] Decode and safely handle the native 740 Quest Log request without ending the game session; until content exists it returns a parser-shaped empty/deferred response.
+- [ ] Verify the native 740 empty Quest Log response with an unmodified OTClientV8 build; do not clear the client-facing blocker until the window opens without a parser error or disconnect.
 - [x] Build, package, checksum, and publish fresh Linux and Windows artifacts from the latest verified Forgotten Engine commit for manual testing.
 - [ ] Establish and satisfy production-readiness gates for complete declared TFS feature conformance, profile-specific protocol validation, reliability, bounded memory/performance, security, and reproducible TFS-to-FE migration before describing any profile as mainstream-ready.
 - [x] Expand the completion ledger from its interim 51% target into a full evidence-based 100% production-readiness plan covering every declared FE system, compatibility profile, migration boundary, and operational gate.

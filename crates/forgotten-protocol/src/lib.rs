@@ -818,6 +818,8 @@ pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM: u8 = 0x82;
 pub const NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT: u8 = 0xd2;
 pub const NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT: u8 = 0xd3;
+pub const NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG: u8 = 0xf0;
+pub const NATIVE_OTCLIENT_GAME_QUEST_LOG: u8 = 0xf0;
 pub const NATIVE_OTCLIENT_MAX_IGNORED_INTERACTION_BYTES: usize = 512;
 pub const NATIVE_OTCLIENT_UNKNOWN_CREATURE: u16 = 0x0061;
 pub const NATIVE_OTCLIENT_MAPPED_CREATURE: u16 = 0xffff;
@@ -1096,6 +1098,7 @@ pub enum NativeOtClientGameAction {
     Talk(String),
     UseItem,
     RequestOutfit,
+    RequestQuestLog,
     ChangeOutfit(NativeOtClientClassicOutfit),
     SelectTarget(u32),
     SelectFollow(u32),
@@ -1811,6 +1814,7 @@ pub fn decode_native_otclient_game_action(
             })
         }
         NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT => NativeOtClientGameAction::RequestOutfit,
+        NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG => NativeOtClientGameAction::RequestQuestLog,
         NATIVE_OTCLIENT_CLIENT_TALK => {
             let mode = reader.byte()?;
             let message = match mode {
@@ -1891,6 +1895,20 @@ pub fn encode_native_otclient_game_ping(
         return Err(ProtocolError::UnsupportedNativeClientProfile);
     }
     Ok(Frame(vec![NATIVE_OTCLIENT_GAME_PING]))
+}
+
+/// Encodes an explicitly empty classic 7.4 Quest Log response. FE does not yet claim quest
+/// content, persistence, mission lines, scripts, or gameplay semantics.
+pub fn encode_native_otclient_empty_quest_log(
+    profile: &NativeOtClientProfile,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_QUEST_LOG);
+    writer.u16(0);
+    Ok(Frame(writer.finish()))
 }
 
 pub fn encode_native_otclient_game_cancel_walk(
@@ -3054,6 +3072,23 @@ mod tests {
             )
             .unwrap(),
             NativeOtClientGameAction::RequestOutfit
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::RequestQuestLog
+        );
+        assert!(decode_native_otclient_game_action(
+            &Frame(vec![NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG, 0]),
+            &profile,
+        )
+        .is_err());
+        assert_eq!(
+            encode_native_otclient_empty_quest_log(&profile).unwrap().0,
+            vec![NATIVE_OTCLIENT_GAME_QUEST_LOG, 0, 0]
         );
         assert_eq!(
             decode_native_otclient_game_action(

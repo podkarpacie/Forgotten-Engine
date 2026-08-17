@@ -12,7 +12,7 @@
       "id": "fe-7.4",
       "target": "Tibia 7.4",
       "nativeOtClientV8": "partial",
-      "nativeOtClientV8Detail": "experimental 740 login, character selection, map, movement, shared-player visibility, and bounded player-vitals updates. The player-stats record has parser-shaped 16-bit level and soul fields, but an unmodified-client confirmation remains required",
+      "nativeOtClientV8Detail": "experimental 740 login, character selection, map, movement, shared-player visibility, bounded player-vitals updates, and a parser-shaped empty Quest Log acknowledgement. The player-stats record has parser-shaped 16-bit level and soul fields, but unmodified-client confirmation remains required",
       "officialClientProtocolEmulation": "deferred",
       "contentAudit": "partial",
       "runtimeItemsAndInventory": "partial",
@@ -28,6 +28,8 @@
       "inventory": "partial",
       "mapItemUse": "partial",
       "mapItemUseDetail": "typed server-side validation accepts only same-tile or adjacent use of an exact top-level authoritative map item stack and returns immutable metadata without mutation; the same validation is available through synchronized host state. Action execution, doors, switches, containers, charges, Lua, persistence, and client item-use packets remain deferred",
+      "questLog": "partial",
+      "questLogDetail": "the native 740 request is decoded and receives a parser-shaped empty quest count response; quest storage, mission lines, scripting, gameplay semantics, and unmodified-client confirmation remain deferred",
       "creaturesDetail": "catalog-derived static spawn representation, native visibility, optional deterministic movement, and caller-triggered reactivation at an unoccupied spawn position with a native map refresh; timed respawns, AI, combat, loot, corpses, and scripts remain deferred",
       "scripting": "deferred",
       "socialAndEconomy": "deferred"

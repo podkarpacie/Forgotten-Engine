@@ -27,7 +27,8 @@ use forgotten_protocol::{
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
     encode_native_otclient_choose_outfit, encode_native_otclient_creature_health,
-    encode_native_otclient_creature_outfit, encode_native_otclient_game_cancel_walk_facing,
+    encode_native_otclient_creature_outfit, encode_native_otclient_empty_quest_log,
+    encode_native_otclient_game_cancel_walk_facing,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
@@ -146,6 +147,7 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         NativeOtClientGameAction::ChangeFightModes => "action=change-fight-modes".into(),
         NativeOtClientGameAction::UseItem => "action=use-item".into(),
         NativeOtClientGameAction::RequestOutfit => "action=request-outfit".into(),
+        NativeOtClientGameAction::RequestQuestLog => "action=request-quest-log".into(),
         NativeOtClientGameAction::ChangeOutfit(outfit) => format!(
             "action=change-outfit look-type={} colors={},{},{},{}",
             outfit.look_type, outfit.head, outfit.body, outfit.legs, outfit.feet
@@ -2175,6 +2177,19 @@ fn handle_native_otclient_game(
                         "outbound=choose-outfit opcode=0xc8 bytes={} look-type={}",
                         outfit_window.0.len(),
                         player_outfit.look_type
+                    ),
+                );
+            }
+            NativeOtClientGameAction::RequestQuestLog => {
+                let quest_log = encode_native_otclient_empty_quest_log(&config.client_profile)
+                    .map_err(HostError::Protocol)?;
+                write_frame(stream, &quest_log)?;
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "outbound=quest-log-empty opcode=0xf0 bytes={}",
+                        quest_log.0.len()
                     ),
                 );
             }
@@ -5405,6 +5420,18 @@ mod tests {
             .0
             .windows(expected_stats.len())
             .any(|window| window == expected_stats));
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_QUEST_LOG, 0, 0]
+        );
 
         let heartbeat = read_frame(&mut stream).unwrap();
         assert_eq!(

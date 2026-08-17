@@ -18,7 +18,7 @@ This matrix is the source-controlled statement of **current behavior**, not an a
 |---|---|---|---|
 | Profile selection/configuration | supported | supported | supported |
 | General frame/status service foundation | supported | supported | supported |
-| Native unmodified OTClientV8 game path | partial — experimental 740 login, character selection, map, movement, shared-player visibility, and bounded player-vitals updates. The 740 player-stats record has parser-shaped 16-bit level and soul fields, but an unmodified-client confirmation remains required | deferred | deferred |
+| Native unmodified OTClientV8 game path | partial — experimental 740 login, character selection, map, movement, shared-player visibility, bounded player-vitals updates, and a parser-shaped empty Quest Log acknowledgement. The 740 player-stats record has parser-shaped 16-bit level and soul fields, but unmodified-client confirmation remains required | deferred | deferred |
 | Complete official-client protocol emulation | deferred | deferred | deferred |
 | TFS-style `config.lua` discovery | partial — bounded assignment subset and safe defaults | partial — bounded assignment subset and safe defaults | partial — bounded assignment subset and safe defaults |
 | OTBM map and companion discovery | partial — map, towns, houses, spawns, and legacy item metadata import boundary | partial — content audit only until profile mapping is verified | partial — content audit only until profile mapping is verified |
@@ -36,7 +36,7 @@ This matrix is the source-controlled statement of **current behavior**, not an a
 | Monster AI, respawn, combat, loot, corpses | deferred | deferred | deferred |
 | NPC conversation, shops, travel | deferred | deferred | deferred |
 | Lua execution and event dispatch | deferred — XML/script references are validated but never executed | deferred | deferred |
-| Actions, movements, use/use-with, doors, levers | deferred — input is safely tolerated where implemented, not semantically executed | deferred | deferred |
+| Actions, movements, use/use-with, doors, levers | deferred — input is safely tolerated where implemented, not semantically executed. A native 740 Quest Log request returns an explicit empty response; client-visible look/inspect stays deferred until a verified message-mode contract exists | deferred | deferred |
 | Chat and social systems | partial — bounded shared 740 delivery with parser-safe limitations | deferred | deferred |
 | Guilds, parties, trade, mail, VIP | deferred | deferred | deferred |
 | Houses, rent, beds, bank/economy | deferred | deferred | deferred |
