@@ -241,6 +241,7 @@
 - [x] Parse and validate a bounded declarative scriptless weapon catalog for typed adjacent melee events; TFS Lua weapon scripts, legacy XML formula semantics, equipment binding, and client weapon-use packets remain deferred.
 - [x] Bind a validated declarative weapon only to the equipped main-hand item on the existing profile-approved selected-melee path; scripts, legacy formula semantics, map use, and client weapon-use packets remain deferred.
 - [x] Define typed bounded spell-cast events with authoritative mana and cooldown enforcement; profile gating, native spell packets, visual effects, Lua formulas, legacy spell semantics, and PvP policy remain deferred.
+- [x] Parse and validate a bounded scriptless FE declarative spell catalog that constructs typed spell-cast events; profile selection, client spell requests, formulas, effects, target resolution, and Lua remain deferred.
 - [x] Advance the native authoritative world tick from elapsed heartbeat time so lifecycle timestamps and future combat cooldowns share one deterministic server clock; client packet semantics remain unchanged.
 - [ ] Add profile-driven combat events for weapons, spells, damage types, cooldowns, PvP policy, and death/corpse handling after independent compatibility evidence.
 - [ ] Add authoritative item transfer, equipment/inventory synchronization, container windows, item use, actions, doors, switches, and map interactions.

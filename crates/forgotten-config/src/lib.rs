@@ -6,6 +6,7 @@
 mod items;
 mod legacy_xml;
 mod otbm;
+mod spells;
 mod stages;
 mod tfs_entities;
 mod tfs_registry;
@@ -24,6 +25,10 @@ use std::path::{Path, PathBuf};
 pub use items::{LegacyItemCatalog, LegacyItemDefinition};
 pub use legacy_xml::{
     LegacyHouse, LegacySpawnArea, LegacySpawnCreature, LegacySpawnKind, LegacyWorldCompanionData,
+};
+pub use spells::{
+    load_declarative_spell_catalog, parse_declarative_spells_xml, DeclarativeSpellCatalog,
+    DeclarativeSpellDefinition,
 };
 pub use stages::{parse_tfs_stages_xml, ExperienceStage, ExperienceStages};
 pub use tfs_entities::{
