@@ -276,3 +276,4 @@
 - [x] Define an explicit FE 8.0 native-profile foundation that reports its RSA/XTEA transport requirement and remains non-runnable until parser-backed encrypted session support exists; no listener or protocol-parity claim is enabled.
 - [x] Add bounded server-side selected melee against an active targeted static creature using percentage-point health only; deactivation may refresh native visibility, while TFS combat formulas, AI, loot, corpses, scripts, and persistent monster state remain deferred.
 - [x] Add bounded operator-configured native 7.4 outfit start/end look-type fields for the classic dialog; require an inclusive valid range around the configured current look type without validating or distributing client assets.
+- [x] Persist a concrete native classic outfit change only when its look type falls within the configured inclusive range; reject out-of-range changes without altering stored appearance or claiming asset/addon/mount support.

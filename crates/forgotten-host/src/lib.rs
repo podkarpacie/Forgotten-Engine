@@ -187,9 +187,21 @@ fn truncate_native_chat_text(message: &str) -> String {
 
 fn native_hydrated_classic_outfit(
     configured_look_type: u8,
+    outfit_first_look_type: u8,
+    outfit_last_look_type: u8,
     persisted: PlayerOutfit,
 ) -> NativeOtClientClassicOutfit {
-    if configured_look_type != 0 && persisted.look_type == configured_look_type {
+    if native_classic_outfit_is_allowed(
+        NativeOtClientClassicOutfit {
+            look_type: persisted.look_type,
+            head: persisted.head,
+            body: persisted.body,
+            legs: persisted.legs,
+            feet: persisted.feet,
+        },
+        outfit_first_look_type,
+        outfit_last_look_type,
+    ) {
         NativeOtClientClassicOutfit {
             look_type: persisted.look_type,
             head: persisted.head,
@@ -206,6 +218,17 @@ fn native_hydrated_classic_outfit(
             feet: 0,
         }
     }
+}
+
+fn native_classic_outfit_is_allowed(
+    outfit: NativeOtClientClassicOutfit,
+    outfit_first_look_type: u8,
+    outfit_last_look_type: u8,
+) -> bool {
+    outfit.look_type != 0
+        && outfit_first_look_type != 0
+        && outfit_first_look_type <= outfit_last_look_type
+        && (outfit_first_look_type..=outfit_last_look_type).contains(&outfit.look_type)
 }
 
 fn native_diagnostic_record(enabled: bool, peer: SocketAddr, event: &str) -> Option<String> {
@@ -1965,8 +1988,12 @@ fn handle_native_otclient_game(
     let static_health_frames =
         native_static_creature_health_frames(&config.client_profile, &active_static_spawns)?;
     write_frame(stream, &initialization)?;
-    let mut player_outfit =
-        native_hydrated_classic_outfit(empty_world.player_look_type, character.outfit);
+    let mut player_outfit = native_hydrated_classic_outfit(
+        empty_world.player_look_type,
+        empty_world.outfit_first_look_type,
+        empty_world.outfit_last_look_type,
+        character.outfit,
+    );
     if character.outfit.look_type == player_outfit.look_type && player_outfit.look_type != 0 {
         let hydrated_outfit = encode_native_otclient_creature_outfit(
             &config.client_profile,
@@ -2414,7 +2441,11 @@ fn handle_native_otclient_game(
                 );
             }
             NativeOtClientGameAction::ChangeOutfit(requested_outfit) => {
-                let accepted = requested_outfit.look_type == player_outfit.look_type;
+                let accepted = native_classic_outfit_is_allowed(
+                    requested_outfit,
+                    empty_world.outfit_first_look_type,
+                    empty_world.outfit_last_look_type,
+                );
                 if accepted {
                     database.update_player_outfit(
                         character.id,
@@ -5616,7 +5647,7 @@ mod tests {
     }
 
     #[test]
-    fn native_hydrated_outfit_restores_only_configured_matching_appearance() {
+    fn native_hydrated_outfit_restores_only_configured_range_appearance() {
         let persisted = PlayerOutfit {
             look_type: 128,
             head: 1,
@@ -5625,7 +5656,7 @@ mod tests {
             feet: 4,
         };
         assert_eq!(
-            native_hydrated_classic_outfit(128, persisted),
+            native_hydrated_classic_outfit(128, 128, 131, persisted),
             NativeOtClientClassicOutfit {
                 look_type: 128,
                 head: 1,
@@ -5635,7 +5666,7 @@ mod tests {
             }
         );
         assert_eq!(
-            native_hydrated_classic_outfit(128, PlayerOutfit::default()),
+            native_hydrated_classic_outfit(128, 128, 131, PlayerOutfit::default()),
             NativeOtClientClassicOutfit {
                 look_type: 128,
                 head: 0,
@@ -5647,8 +5678,28 @@ mod tests {
         assert_eq!(
             native_hydrated_classic_outfit(
                 128,
+                128,
+                131,
                 PlayerOutfit {
                     look_type: 129,
+                    ..persisted
+                },
+            ),
+            NativeOtClientClassicOutfit {
+                look_type: 129,
+                head: 1,
+                body: 2,
+                legs: 3,
+                feet: 4,
+            }
+        );
+        assert_eq!(
+            native_hydrated_classic_outfit(
+                128,
+                128,
+                131,
+                PlayerOutfit {
+                    look_type: 132,
                     ..persisted
                 },
             ),
@@ -6253,7 +6304,7 @@ mod tests {
             &mut stream,
             &Frame(vec![
                 forgotten_protocol::NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT,
-                128,
+                129,
                 1,
                 2,
                 3,
@@ -6270,7 +6321,7 @@ mod tests {
                 0,
                 0,
                 16,
-                128,
+                129,
                 1,
                 2,
                 3,
@@ -6280,7 +6331,45 @@ mod tests {
         assert_eq!(
             database.characters_for_account(account_id).unwrap()[0].outfit,
             PlayerOutfit {
-                look_type: 128,
+                look_type: 129,
+                head: 1,
+                body: 2,
+                legs: 3,
+                feet: 4,
+            }
+        );
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT,
+                132,
+                5,
+                6,
+                7,
+                8,
+            ]),
+        )
+        .unwrap();
+        let rejected_outfit = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            rejected_outfit.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT,
+                1,
+                0,
+                0,
+                16,
+                129,
+                1,
+                2,
+                3,
+                4,
+            ]
+        );
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].outfit,
+            PlayerOutfit {
+                look_type: 129,
                 head: 1,
                 body: 2,
                 legs: 3,
