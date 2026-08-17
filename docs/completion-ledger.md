@@ -49,6 +49,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 ### Milestone B — Complete authoritative items and world interaction: target 43%
 
 - [x] Establish validated runtime items, equipment, owned containers, and bounded equipment-to-container transfer.
+- [x] Synchronize catalog-mapped authoritative equipment replacements to the selected native 740 session through deterministic parser-verified set/delete inventory deltas; item movement and real-client validation remain deferred.
 - [ ] Synchronize inventory, equipment, and containers in each supported native session profile.
 - [ ] Implement authoritative item transfer, stack splitting/merging, capacity, and ownership rules across equipment, ground, containers, depot, and inbox surfaces.
 - [x] Define side-effect-free authoritative validation for same-tile or adjacent exact top-level map-item use intents.

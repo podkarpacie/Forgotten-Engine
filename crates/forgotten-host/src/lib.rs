@@ -28,8 +28,8 @@ use forgotten_protocol::{
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
     encode_native_otclient_choose_outfit, encode_native_otclient_creature_health,
-    encode_native_otclient_creature_outfit, encode_native_otclient_empty_quest_log,
-    encode_native_otclient_game_cancel_walk_facing,
+    encode_native_otclient_creature_outfit, encode_native_otclient_delete_inventory,
+    encode_native_otclient_empty_quest_log, encode_native_otclient_game_cancel_walk_facing,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
@@ -50,7 +50,7 @@ use forgotten_protocol::{
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -138,6 +138,43 @@ fn native_classic_equipment_frames(
             native_classic_item_record(catalog, item).map(|record| (slot, record))
         })
         .map(|(slot, record)| encode_native_otclient_set_inventory(profile, slot, record))
+        .collect()
+}
+
+fn native_classic_mapped_equipment(
+    catalog: Option<&NativeItemPresentationCatalog>,
+    equipment: &PlayerEquipment,
+) -> BTreeMap<EquipmentSlot, NativeOtClientClassicItemRecord> {
+    equipment
+        .iter()
+        .filter_map(|(slot, item)| {
+            native_classic_item_record(catalog, item).map(|record| (slot, record))
+        })
+        .collect()
+}
+
+/// Produces only the parser-verified equipment delta for one native session. An item without a
+/// current catalog mapping is not shown; if it replaced a previously mapped item the old visual
+/// slot is explicitly deleted so the client cannot retain stale equipment state.
+fn native_classic_equipment_delta_frames(
+    profile: &NativeOtClientProfile,
+    previous: &BTreeMap<EquipmentSlot, NativeOtClientClassicItemRecord>,
+    current: &BTreeMap<EquipmentSlot, NativeOtClientClassicItemRecord>,
+) -> Result<Vec<Frame>, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Ok(Vec::new());
+    }
+    let slots: BTreeSet<_> = previous.keys().chain(current.keys()).copied().collect();
+    slots
+        .into_iter()
+        .filter_map(|slot| match (previous.get(&slot), current.get(&slot)) {
+            (Some(previous), Some(current)) if previous == current => None,
+            (_, Some(current)) => Some(encode_native_otclient_set_inventory(
+                profile, slot, *current,
+            )),
+            (Some(_), None) => Some(encode_native_otclient_delete_inventory(profile, slot)),
+            (None, None) => None,
+        })
         .collect()
 }
 
@@ -392,6 +429,7 @@ pub struct SharedNativeWorld {
     visibility_epoch: Arc<AtomicU64>,
     vitals_epoch: Arc<AtomicU64>,
     progression_epoch: Arc<AtomicU64>,
+    equipment_epoch: Arc<AtomicU64>,
     chat_recipients: Arc<Mutex<BTreeMap<u64, mpsc::SyncSender<SharedPublicChatEvent>>>>,
 }
 
@@ -423,6 +461,7 @@ impl SharedNativeWorld {
             visibility_epoch: Arc::new(AtomicU64::new(0)),
             vitals_epoch: Arc::new(AtomicU64::new(0)),
             progression_epoch: Arc::new(AtomicU64::new(0)),
+            equipment_epoch: Arc::new(AtomicU64::new(0)),
             chat_recipients: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
@@ -463,6 +502,10 @@ impl SharedNativeWorld {
 
     pub fn progression_epoch(&self) -> u64 {
         self.progression_epoch.load(Ordering::SeqCst)
+    }
+
+    pub fn equipment_epoch(&self) -> u64 {
+        self.equipment_epoch.load(Ordering::SeqCst)
     }
 
     pub fn player_vitals(&self, player_id: u64) -> Result<PlayerVitals, HostError> {
@@ -678,9 +721,14 @@ impl SharedNativeWorld {
         player_id: u64,
         equipment: PlayerEquipment,
     ) -> Result<bool, HostError> {
-        self.lock()?
+        let changed = self
+            .lock()?
             .replace_player_equipment(player_id, equipment)
-            .map_err(HostError::Core)
+            .map_err(HostError::Core)?;
+        if changed {
+            self.equipment_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(changed)
     }
 
     pub fn player_containers(&self, player_id: u64) -> Result<PlayerContainers, HostError> {
@@ -2013,6 +2061,10 @@ fn handle_native_otclient_game(
         &bootstrap_equipment,
     )
     .map_err(HostError::Protocol)?;
+    let mut observed_mapped_equipment = native_classic_mapped_equipment(
+        config.item_presentation_catalog.as_deref(),
+        &bootstrap_equipment,
+    );
     let container_frames = native_classic_container_frames(
         &config.client_profile,
         config.item_presentation_catalog.as_deref(),
@@ -2083,6 +2135,7 @@ fn handle_native_otclient_game(
     let mut observed_visibility_epoch = shared_world.visibility_epoch();
     let mut observed_vitals_epoch = shared_world.vitals_epoch();
     let mut observed_progression_epoch = shared_world.progression_epoch();
+    let mut observed_equipment_epoch = shared_world.equipment_epoch();
     loop {
         drain_shared_public_chat(
             stream,
@@ -2304,6 +2357,33 @@ fn handle_native_otclient_game(
                             ),
                         );
                         observed_progression_epoch = progression_epoch;
+                    }
+                    let equipment_epoch = shared_world.equipment_epoch();
+                    if equipment_epoch != observed_equipment_epoch {
+                        let equipment = shared_world.player_equipment(character.id)?;
+                        let current_mapped_equipment = native_classic_mapped_equipment(
+                            config.item_presentation_catalog.as_deref(),
+                            &equipment,
+                        );
+                        let equipment_updates = native_classic_equipment_delta_frames(
+                            &config.client_profile,
+                            &observed_mapped_equipment,
+                            &current_mapped_equipment,
+                        )
+                        .map_err(HostError::Protocol)?;
+                        for frame in &equipment_updates {
+                            write_frame(stream, frame)?;
+                        }
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "outbound=equipment-refresh epoch={equipment_epoch} records={}",
+                                equipment_updates.len()
+                            ),
+                        );
+                        observed_mapped_equipment = current_mapped_equipment;
+                        observed_equipment_epoch = equipment_epoch;
                     }
                     let visibility_epoch = shared_world.visibility_epoch();
                     if visibility_epoch != observed_visibility_epoch {
@@ -3975,6 +4055,114 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn native_classic_equipment_deltas_are_mapped_ordered_and_delete_stale_slots() {
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                4526,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 102,
+                    requires_classic_740_subtype: true,
+                },
+            )
+            .unwrap();
+        catalog
+            .insert(
+                2463,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 2463,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        let mut previous_equipment = PlayerEquipment::default();
+        previous_equipment.equip(EquipmentSlot::Armor, ItemInstance::new(2463, 1).unwrap());
+        previous_equipment.equip(
+            EquipmentSlot::RightHand,
+            ItemInstance::new(4526, 25).unwrap(),
+        );
+        let previous = native_classic_mapped_equipment(Some(&catalog), &previous_equipment);
+        let config = native_otclient_config("127.0.0.1:0".parse().unwrap());
+        assert!(native_classic_equipment_delta_frames(
+            &config.client_profile,
+            &previous,
+            &previous,
+        )
+        .unwrap()
+        .is_empty());
+
+        let mut changed_equipment = previous_equipment.clone();
+        changed_equipment.unequip(EquipmentSlot::Armor);
+        changed_equipment.equip(
+            EquipmentSlot::RightHand,
+            ItemInstance::new(4526, 20).unwrap(),
+        );
+        let changed = native_classic_mapped_equipment(Some(&catalog), &changed_equipment);
+        let frames =
+            native_classic_equipment_delta_frames(&config.client_profile, &previous, &changed)
+                .unwrap();
+        assert_eq!(frames[0].0, vec![0x79, EquipmentSlot::Armor.code()]);
+        assert_eq!(
+            frames[1].0,
+            vec![0x78, EquipmentSlot::RightHand.code(), 102, 0, 20]
+        );
+
+        let mut unmapped_equipment = changed_equipment;
+        unmapped_equipment.equip(
+            EquipmentSlot::RightHand,
+            ItemInstance::new(9999, 1).unwrap(),
+        );
+        let unmapped = native_classic_mapped_equipment(Some(&catalog), &unmapped_equipment);
+        let frames =
+            native_classic_equipment_delta_frames(&config.client_profile, &changed, &unmapped)
+                .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, vec![0x79, EquipmentSlot::RightHand.code()]);
+
+        let incompatible_profile = NativeOtClientProfile {
+            protocol_version: 800,
+            ..config.client_profile
+        };
+        assert!(
+            native_classic_equipment_delta_frames(&incompatible_profile, &previous, &changed,)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn shared_native_equipment_epoch_advances_only_for_authoritative_changes() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 109,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 1,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(
+            EquipmentSlot::RightHand,
+            ItemInstance::new(4526, 20).unwrap(),
+        );
+        assert_eq!(shared.equipment_epoch(), 0);
+        assert!(shared
+            .replace_player_equipment(109, equipment.clone())
+            .unwrap());
+        assert_eq!(shared.equipment_epoch(), 1);
+        assert!(!shared.replace_player_equipment(109, equipment).unwrap());
+        assert_eq!(shared.equipment_epoch(), 1);
     }
 
     #[test]
