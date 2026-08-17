@@ -15,7 +15,7 @@ The current conservative estimate is **22% of the declared replacement scope**. 
 | Core architecture, configuration, persistence, and conversion | 18% | 13% | FE has Rust workspace foundations, SQLite migration discipline, bounded TFS-style configuration/content discovery, OTBM audit/import boundaries, and deterministic state persistence. Complete TFS configuration, database, and content-runtime behavior is not present. |
 | Native profile session and protocol compatibility | 12% | 3% | The experimental profile-driven native OTCv8 740 path covers login, character selection, map delivery, movement, visibility, bounded chat, and partial state refresh. Full protocol coverage and stable client evidence are incomplete. |
 | Player progression, lifecycle, and combat | 13% | 3% | FE has persisted vitals, regeneration, configured experience/skill foundations, bounded conditions, exact condition restart progress, server-side death state, loss/respawn foundations, and selected-player fixed melee. Formula combat and client lifecycle delivery are incomplete. |
-| Items and world interaction | 17% | 1% | Runtime item instances, equipment, owned containers, a bounded equipment-to-container transfer, persistence, and catalog validation exist. Native inventory synchronization, ground transfer, item actions, and map interactions are not complete. |
+| Items and world interaction | 17% | 1% | Runtime item instances, equipment, owned containers, bidirectional complete-item transfers between equipment and owned top-level containers, persistence, catalog validation, and mapped equipment deltas exist. Ground transfer, item actions, stacks, capacity, container deltas, and map interactions are not complete. |
 | Creatures, NPCs, spawns, loot, and corpses | 13% | 1% | FE has catalog parsing, static spawn materialization, occupancy, deterministic bounded movement, and caller-triggered reset foundations. AI, targeting, combat, timed respawns, loot, corpses, and NPC runtime are absent. |
 | Lua, social systems, economy, housing, and administration | 12% | 0% | Registry references are audited, but Lua execution and the main social, economy, housing, and moderation systems are absent. |
 | Production operations and compatibility evidence | 15% | 1% | Releases, checksums, validation scripts, and documented concurrency boundaries exist. Load, soak, security, migration, cross-platform, and independent real-client evidence are incomplete. |
@@ -48,7 +48,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 
 ### Milestone B — Complete authoritative items and world interaction: target 43%
 
-- [x] Establish validated runtime items, equipment, owned containers, and bounded equipment-to-container transfer.
+- [x] Establish validated runtime items, equipment, owned containers, and bounded complete-item transfers between equipment and owned top-level containers.
 - [x] Synchronize catalog-mapped authoritative equipment replacements to the selected native 740 session through deterministic parser-verified set/delete inventory deltas; item movement and real-client validation remain deferred.
 - [ ] Synchronize inventory, equipment, and containers in each supported native session profile.
 - [ ] Implement authoritative item transfer, stack splitting/merging, capacity, and ownership rules across equipment, ground, containers, depot, and inbox surfaces.

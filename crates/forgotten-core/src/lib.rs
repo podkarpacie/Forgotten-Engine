@@ -1223,6 +1223,18 @@ pub struct PlayerEquipmentToContainerOutcome {
     pub item: ItemInstance,
 }
 
+/// Result of moving one complete item from a bounded owned top-level container into an empty
+/// equipment slot. Stack splitting, slot compatibility, capacity, ground interaction, recursive
+/// containers, and client-driven item requests remain outside this foundation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerContainerToEquipmentOutcome {
+    pub player_id: u64,
+    pub container_id: u8,
+    pub item_index: usize,
+    pub to_slot: EquipmentSlot,
+    pub item: ItemInstance,
+}
+
 /// Presentation metadata validated from an operator-supplied item catalog. It deliberately holds
 /// only the data needed to construct a classic client item record; gameplay properties stay in
 /// the content/runtime layers.
@@ -2938,6 +2950,54 @@ impl WorldState {
         })
     }
 
+    /// Moves one complete item from an already-owned non-recursive container to an empty fixed
+    /// equipment slot. All checks occur on cloned state, so an occupied slot, missing container,
+    /// or invalid item index leaves the authoritative world unchanged.
+    pub fn move_container_item_to_equipment(
+        &mut self,
+        player_id: u64,
+        container_id: u8,
+        item_index: usize,
+        to_slot: EquipmentSlot,
+    ) -> Result<PlayerContainerToEquipmentOutcome, CoreError> {
+        let mut equipment = self.player_equipment(player_id)?.clone();
+        if equipment.item(to_slot).is_some() {
+            return Err(CoreError::OccupiedEquipmentSlot {
+                player_id,
+                slot: to_slot,
+            });
+        }
+        let mut containers = self.player_containers(player_id)?.clone();
+        let mut container =
+            containers
+                .remove(container_id)
+                .ok_or(CoreError::UnknownPlayerContainer {
+                    player_id,
+                    container_id,
+                })?;
+        let item =
+            container
+                .items
+                .remove(item_index)
+                .ok_or(CoreError::UnknownPlayerContainerItem {
+                    player_id,
+                    container_id,
+                    item_index,
+                })?;
+        equipment.equip(to_slot, item.clone());
+        containers.insert(container)?;
+        self.player_equipments.insert(player_id, equipment);
+        self.player_containers.insert(player_id, containers);
+        self.mark_changed();
+        Ok(PlayerContainerToEquipmentOutcome {
+            player_id,
+            container_id,
+            item_index,
+            to_slot,
+            item,
+        })
+    }
+
     pub fn update_player_vitals(
         &mut self,
         player_id: u64,
@@ -3729,9 +3789,18 @@ pub enum CoreError {
         player_id: u64,
         slot: EquipmentSlot,
     },
+    OccupiedEquipmentSlot {
+        player_id: u64,
+        slot: EquipmentSlot,
+    },
     UnknownPlayerContainer {
         player_id: u64,
         container_id: u8,
+    },
+    UnknownPlayerContainerItem {
+        player_id: u64,
+        container_id: u8,
+        item_index: usize,
     },
     DuplicateItemPresentation(u16),
     InvalidItemStackCount(u16),
@@ -4064,6 +4133,88 @@ mod tests {
                 .items
                 .item(0),
             Some(&sword)
+        );
+    }
+
+    #[test]
+    fn authoritative_container_to_equipment_transfer_is_atomic_and_bounded() {
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        let sword = ItemInstance::new(2376, 1).unwrap();
+        let shield = ItemInstance::new(2512, 1).unwrap();
+        let mut backpack =
+            PlayerContainer::new(0, ItemInstance::new(1988, 1).unwrap(), "Backpack", false, 2)
+                .unwrap();
+        backpack.items.insert(sword.clone()).unwrap();
+        backpack.items.insert(shield.clone()).unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(backpack).unwrap();
+        world.replace_player_containers(7, containers).unwrap();
+
+        let revision_before_transfer = world.revision();
+        let outcome = world
+            .move_container_item_to_equipment(7, 0, 0, EquipmentSlot::RightHand)
+            .unwrap();
+        assert_eq!(outcome.item, sword);
+        assert_eq!(outcome.to_slot, EquipmentSlot::RightHand);
+        assert_eq!(
+            world
+                .player_equipment(7)
+                .unwrap()
+                .item(EquipmentSlot::RightHand),
+            Some(&sword)
+        );
+        assert_eq!(
+            world
+                .player_containers(7)
+                .unwrap()
+                .container(0)
+                .unwrap()
+                .items
+                .item(0),
+            Some(&shield)
+        );
+        assert_eq!(world.revision(), revision_before_transfer + 1);
+
+        let revision_before_occupied = world.revision();
+        assert_eq!(
+            world.move_container_item_to_equipment(7, 0, 0, EquipmentSlot::RightHand),
+            Err(CoreError::OccupiedEquipmentSlot {
+                player_id: 7,
+                slot: EquipmentSlot::RightHand,
+            })
+        );
+        assert_eq!(world.revision(), revision_before_occupied);
+
+        let revision_before_missing_item = world.revision();
+        assert_eq!(
+            world.move_container_item_to_equipment(7, 0, 5, EquipmentSlot::LeftHand),
+            Err(CoreError::UnknownPlayerContainerItem {
+                player_id: 7,
+                container_id: 0,
+                item_index: 5,
+            })
+        );
+        assert_eq!(world.revision(), revision_before_missing_item);
+
+        let revision_before_missing_container = world.revision();
+        assert_eq!(
+            world.move_container_item_to_equipment(7, 1, 0, EquipmentSlot::LeftHand),
+            Err(CoreError::UnknownPlayerContainer {
+                player_id: 7,
+                container_id: 1,
+            })
+        );
+        assert_eq!(world.revision(), revision_before_missing_container);
+        assert_eq!(
+            world
+                .player_containers(7)
+                .unwrap()
+                .container(0)
+                .unwrap()
+                .items
+                .item(0),
+            Some(&shield)
         );
     }
 

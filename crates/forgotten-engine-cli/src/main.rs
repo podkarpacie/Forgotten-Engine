@@ -1096,6 +1096,60 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             );
             Ok(())
         }
+        "container-equip" => {
+            if arguments.len() != 7 {
+                return Err(
+                    "usage: player container-equip <directory> <player-id> <container-id> <item-index> <slot>"
+                        .into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let container_id = parse_u8_argument(arguments.get(4), "container ID")?;
+            let item_index = arguments
+                .get(5)
+                .ok_or("container item index is required")?
+                .parse::<usize>()
+                .map_err(|_| "container item index must be an unsigned integer")?;
+            let slot = parse_equipment_slot(arguments.get(6))?;
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            let character = database.player_by_id(player_id)?;
+            let equipment = database.player_equipment(player_id)?;
+            let containers = database.player_containers(player_id)?;
+            let mut world = WorldState::default();
+            world.add_player(Player {
+                id: character.id,
+                account_id: 0,
+                name: character.name,
+                position: character.position,
+                level: character.level,
+                experience: character.experience,
+                skill_points: character.skill_points,
+            })?;
+            world.replace_player_equipment(player_id, equipment)?;
+            world.replace_player_containers(player_id, containers)?;
+            let outcome = world.move_container_item_to_equipment(
+                player_id,
+                container_id,
+                item_index,
+                slot,
+            )?;
+            database.replace_player_inventory(
+                player_id,
+                world.player_equipment(player_id)?,
+                world.player_containers(player_id)?,
+            )?;
+            println!(
+                "moved container item to equipment player-id={player_id} container-id={} item-index={} slot={} server-item-id={} count={}",
+                outcome.container_id,
+                outcome.item_index,
+                outcome.to_slot.code(),
+                outcome.item.server_id,
+                outcome.item.count,
+            );
+            Ok(())
+        }
         "container-create" => {
             if arguments.len() < 8 {
                 return Err(
@@ -1343,6 +1397,7 @@ Commands:
   player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]
   player experience <directory> <player-id> <raw-experience>
   player container-stow-equipped <directory> <player-id> <slot> <container-id>
+  player container-equip <directory> <player-id> <container-id> <item-index> <slot>
   player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>
   player container-add <directory> <player-id> <container-id> <server-item-id> [count]
   player container-remove <directory> <player-id> <container-id> <item-index>
@@ -1438,6 +1493,7 @@ mod tests {
             "player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]",
             "player experience <directory> <player-id> <raw-experience>",
             "player container-stow-equipped <directory> <player-id> <slot> <container-id>",
+            "player container-equip <directory> <player-id> <container-id> <item-index> <slot>",
             "player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>",
             "player container-add <directory> <player-id> <container-id> <server-item-id> [count]",
             "player container-remove <directory> <player-id> <container-id> <item-index>",
