@@ -31,7 +31,8 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Award configured vocation-based fist tries from supported fixed melee events.
 - [x] Persist authoritative condition state, including exact elapsed interval remainder, across restart.
 - [x] Activate persisted server-side death state for lethal bounded condition damage at a validated assigned town temple.
-- [ ] Define typed damage classes, defensive values, attack timing, cooldown state, and bounded combat-event contracts.
+- [x] Define typed physical damage classification, bounded adjacent-melee event contracts, attack timing, and deterministic player cooldown state.
+- [ ] Define defensive values and profile-specific mitigation boundaries without silently inventing TFS formulas.
 - [ ] Add data-driven weapon use and vocation formulas without executing scripts or claiming unverified TFS behavior.
 - [ ] Add profile-gated spell definitions, cooldowns, mana use, target validation, and effects only after packet evidence.
 - [ ] Deliver verified client-visible condition health, death, temple-respawn, and approved loss state for every supported profile.
@@ -93,4 +94,4 @@ A ledger item can be marked complete only when all applicable conditions are met
 
 ## Current next slice
 
-The next implementation slice is **typed bounded combat events and attack timing**. It will extend the current fixed selected-player melee foundation through explicit data types and deterministic server-side timing. It will not claim weapon, spell, PvP, or full TFS formula parity until each has its own tested runtime and profile-specific evidence.
+The next implementation slice is **defensive values and profile-specific mitigation boundaries**. It will extend the typed physical adjacent-melee event without inventing TFS formulas, and will not claim weapon, spell, PvP, or full TFS formula parity until each has its own tested runtime and profile-specific evidence.

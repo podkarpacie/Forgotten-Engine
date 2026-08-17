@@ -236,7 +236,7 @@
 - [x] Persist and hydrate deterministic elapsed progress for bounded poison, burning, and energy schedules across restarts; client effect packets and condition-driven death behavior remain deferred.
 - [x] Persist authoritative runtime condition schedule transitions after each native heartbeat so elapsed progress and expired schedules survive restart.
 - [x] Activate and persist authoritative death state when bounded poison, burning, or energy damage reaches zero health at a validated town temple; client death screens and condition effects remain deferred.
-- [ ] Define typed bounded damage classes, validated attack timing, and deterministic player cooldown state as the next combat-event foundation; weapon, spell, PvP, and client-effect behavior remain deferred.
+- [x] Define typed bounded physical adjacent-melee events, validated attack timing, and deterministic player cooldown state as the next combat-event foundation; weapon, spell, PvP, defensive-value, and client-effect behavior remain deferred.
 - [x] Advance the native authoritative world tick from elapsed heartbeat time so lifecycle timestamps and future combat cooldowns share one deterministic server clock; client packet semantics remain unchanged.
 - [ ] Add profile-driven combat events for weapons, spells, damage types, cooldowns, PvP policy, and death/corpse handling after independent compatibility evidence.
 - [ ] Add authoritative item transfer, equipment/inventory synchronization, container windows, item use, actions, doors, switches, and map interactions.

@@ -3,8 +3,9 @@
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
 use forgotten_core::{
-    CardinalDirection, EmptyWorldManifest, ExperienceAwardPolicy, FeTfsStaticSpawnCollection,
-    ItemInstance, NativeItemPresentationCatalog, Player, PlayerCondition, PlayerConditionKind,
+    CardinalDirection, CombatAttackTiming, CombatDamageType, EmptyWorldManifest,
+    ExperienceAwardPolicy, FeTfsStaticSpawnCollection, ItemInstance, NativeItemPresentationCatalog,
+    Player, PlayerCombatEvent, PlayerCombatEventOutcome, PlayerCondition, PlayerConditionKind,
     PlayerConditionOutcome, PlayerContainers, PlayerEquipment, PlayerExperienceAwardOutcome,
     PlayerInteractionIntent, PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
     PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState, PlayerSkill,
@@ -579,13 +580,45 @@ impl SharedNativeWorld {
         ),
         HostError,
     > {
+        let event = PlayerCombatEvent::adjacent_melee(
+            attacker_id,
+            target_id,
+            CombatDamageType::Physical,
+            damage,
+            CombatAttackTiming::new(1).map_err(HostError::Core)?,
+        )
+        .map_err(HostError::Core)?;
+        let (outcome, vitals, death_state) =
+            self.apply_player_combat_event_with_death(event, world_map)?;
+        Ok((outcome.damage, vitals, death_state))
+    }
+
+    /// Applies one typed bounded event and enters the existing server-side death state only for a
+    /// validated potentially lethal target. The precheck keeps invalid temple assignment from
+    /// partially mutating combat state; client delivery remains a separate responsibility.
+    pub fn apply_player_combat_event_with_death(
+        &self,
+        event: PlayerCombatEvent,
+        world_map: &WorldMap,
+    ) -> Result<
+        (
+            PlayerCombatEventOutcome,
+            PlayerVitals,
+            Option<forgotten_core::PlayerRespawnState>,
+        ),
+        HostError,
+    > {
         let mut world = self.lock()?;
-        let vitals_before = world.player_vitals(target_id).map_err(HostError::Core)?;
-        let town_id = world.player_town(target_id).map_err(HostError::Core)?;
-        if damage > 0 && vitals_before.health <= damage {
+        let vitals_before = world
+            .player_vitals(event.target_id)
+            .map_err(HostError::Core)?;
+        let town_id = world
+            .player_town(event.target_id)
+            .map_err(HostError::Core)?;
+        if event.requested_damage > 0 && vitals_before.health <= event.requested_damage {
             if town_id == 0 {
                 return Err(HostError::Core(
-                    forgotten_core::CoreError::PlayerTownUnassigned(target_id),
+                    forgotten_core::CoreError::PlayerTownUnassigned(event.target_id),
                 ));
             }
             if world_map.temple_position_for_town(town_id).is_none() {
@@ -595,19 +628,21 @@ impl SharedNativeWorld {
             }
         }
         let outcome = world
-            .apply_player_melee_damage(attacker_id, target_id, damage)
+            .apply_player_combat_event(event)
             .map_err(HostError::Core)?;
-        let death_state = if outcome.defeated {
+        let death_state = if outcome.damage.defeated {
             Some(
                 world
-                    .apply_player_death(target_id, town_id, world_map)
+                    .apply_player_death(event.target_id, town_id, world_map)
                     .map_err(HostError::Core)?,
             )
         } else {
             None
         };
-        let vitals = world.player_vitals(target_id).map_err(HostError::Core)?;
-        if outcome.applied_damage > 0 {
+        let vitals = world
+            .player_vitals(event.target_id)
+            .map_err(HostError::Core)?;
+        if outcome.damage.applied_damage > 0 {
             self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok((outcome, vitals, death_state))
@@ -2763,6 +2798,10 @@ fn apply_native_selected_player_melee(
         Err(HostError::Core(forgotten_core::CoreError::CombatOutOfRange { .. }))
         | Err(HostError::Core(forgotten_core::CoreError::UnknownPlayer(_)))
         | Err(HostError::Core(forgotten_core::CoreError::SelfInteractionNotAllowed(_)))
+        | Err(HostError::Core(
+            forgotten_core::CoreError::CombatCooldownActive { .. }
+            | forgotten_core::CoreError::TargetAlreadyDefeated(_),
+        ))
         | Err(HostError::Core(forgotten_core::CoreError::PlayerTownUnassigned(_)))
         | Err(HostError::Core(forgotten_core::CoreError::UnknownTown(_))) => return Ok(None),
         Err(error) => return Err(error),

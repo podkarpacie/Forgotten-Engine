@@ -1423,6 +1423,94 @@ pub struct PlayerDamageOutcome {
     pub defeated: bool,
 }
 
+/// Damage families remain typed even before their profile-specific formulas, resistances, visual
+/// effects, and client delivery are implemented. The current bounded combat-event foundation
+/// admits only physical adjacent melee resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CombatDamageType {
+    Physical,
+    Fire,
+    Energy,
+    Earth,
+    Ice,
+    Holy,
+    Death,
+}
+
+/// The validated authoritative delivery rule for a bounded combat event. Future weapons, spells,
+/// and projectiles must add separate explicitly tested variants rather than overloading melee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CombatDelivery {
+    AdjacentMelee,
+}
+
+pub const MAX_COMBAT_EVENT_DAMAGE: u16 = 10_000;
+pub const MAX_COMBAT_INTERVAL_TICKS: u16 = 60;
+
+/// Server-tick spacing between two accepted events from the same attacker. It is a deterministic
+/// state model, not a claim of any profile-specific weapon or spell timing formula.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CombatAttackTiming {
+    pub interval_ticks: u16,
+}
+
+impl CombatAttackTiming {
+    pub fn new(interval_ticks: u16) -> Result<Self, CoreError> {
+        if interval_ticks == 0 || interval_ticks > MAX_COMBAT_INTERVAL_TICKS {
+            return Err(CoreError::InvalidCombatEvent);
+        }
+        Ok(Self { interval_ticks })
+    }
+}
+
+/// One fully validated server-owned combat request. It has no protocol payload, random roll,
+/// equipment lookup, spell definition, immunity, resistance, or PvP policy embedded in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerCombatEvent {
+    pub attacker_id: u64,
+    pub target_id: u64,
+    pub delivery: CombatDelivery,
+    pub damage_type: CombatDamageType,
+    pub requested_damage: u16,
+    pub timing: CombatAttackTiming,
+}
+
+impl PlayerCombatEvent {
+    pub fn adjacent_melee(
+        attacker_id: u64,
+        target_id: u64,
+        damage_type: CombatDamageType,
+        requested_damage: u16,
+        timing: CombatAttackTiming,
+    ) -> Result<Self, CoreError> {
+        if requested_damage == 0 || requested_damage > MAX_COMBAT_EVENT_DAMAGE {
+            return Err(CoreError::InvalidCombatEvent);
+        }
+        Ok(Self {
+            attacker_id,
+            target_id,
+            delivery: CombatDelivery::AdjacentMelee,
+            damage_type,
+            requested_damage,
+            timing,
+        })
+    }
+}
+
+/// Ephemeral authoritative readiness state. It is initialized for every active player and is
+/// intentionally not persisted until a future profile-specific reconnect/cooldown contract exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayerCombatCooldown {
+    pub next_attack_tick: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerCombatEventOutcome {
+    pub damage: PlayerDamageOutcome,
+    pub damage_type: CombatDamageType,
+    pub next_attack_tick: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerRenderSnapshot {
     pub id: u64,
@@ -1451,6 +1539,7 @@ pub struct WorldState {
     player_respawn_states: BTreeMap<u64, PlayerRespawnState>,
     player_equipments: BTreeMap<u64, PlayerEquipment>,
     player_containers: BTreeMap<u64, PlayerContainers>,
+    player_combat_cooldowns: BTreeMap<u64, PlayerCombatCooldown>,
     player_interactions: BTreeMap<u64, PlayerInteractionIntent>,
     static_creatures: BTreeMap<u32, StaticCreatureRuntime>,
     static_occupied_positions: BTreeSet<Position>,
@@ -1537,6 +1626,8 @@ impl WorldState {
             .insert(player.id, PlayerEquipment::default());
         self.player_containers
             .insert(player.id, PlayerContainers::default());
+        self.player_combat_cooldowns
+            .insert(player.id, PlayerCombatCooldown::default());
         self.players.insert(player.id, player);
         self.mark_changed();
         Ok(())
@@ -1556,6 +1647,7 @@ impl WorldState {
         self.player_respawn_states.remove(&id);
         self.player_equipments.remove(&id);
         self.player_containers.remove(&id);
+        self.player_combat_cooldowns.remove(&id);
         self.player_interactions.remove(&id);
         self.player_interactions.retain(|_, intent| {
             if intent.target_player_id == Some(id) {
@@ -1935,6 +2027,16 @@ impl WorldState {
 
     pub fn player_vitals(&self, player_id: u64) -> Result<PlayerVitals, CoreError> {
         self.player_vitals
+            .get(&player_id)
+            .copied()
+            .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
+    pub fn player_combat_cooldown(
+        &self,
+        player_id: u64,
+    ) -> Result<PlayerCombatCooldown, CoreError> {
+        self.player_combat_cooldowns
             .get(&player_id)
             .copied()
             .ok_or(CoreError::UnknownPlayer(player_id))
@@ -2614,15 +2716,8 @@ impl WorldState {
         if !self.players.contains_key(&target_id) {
             return Err(CoreError::UnknownPlayer(target_id));
         }
-        let (applied_damage, remaining_health) = {
-            let vitals = self
-                .player_vitals
-                .get_mut(&target_id)
-                .ok_or(CoreError::UnknownPlayer(target_id))?;
-            let applied_damage = requested_damage.min(vitals.health);
-            vitals.health = vitals.health.saturating_sub(applied_damage);
-            (applied_damage, vitals.health)
-        };
+        let (applied_damage, remaining_health) =
+            self.apply_damage_to_known_target(target_id, requested_damage)?;
         if applied_damage > 0 {
             self.mark_changed();
         }
@@ -2634,6 +2729,80 @@ impl WorldState {
             remaining_health,
             defeated: remaining_health == 0,
         })
+    }
+
+    /// Resolves one typed, bounded event using the authoritative server tick. Only explicit
+    /// adjacent melee is accepted now; formulas, weapons, spells, resistances, effects, PvP
+    /// policy, and client delivery must be added through their own tested event variants.
+    pub fn apply_player_combat_event(
+        &mut self,
+        event: PlayerCombatEvent,
+    ) -> Result<PlayerCombatEventOutcome, CoreError> {
+        if event.attacker_id == event.target_id {
+            return Err(CoreError::SelfInteractionNotAllowed(event.attacker_id));
+        }
+        if event.damage_type != CombatDamageType::Physical {
+            return Err(CoreError::InvalidCombatEvent);
+        }
+        let attacker = self
+            .player(event.attacker_id)
+            .ok_or(CoreError::UnknownPlayer(event.attacker_id))?;
+        let target = self
+            .player(event.target_id)
+            .ok_or(CoreError::UnknownPlayer(event.target_id))?;
+        if matches!(event.delivery, CombatDelivery::AdjacentMelee)
+            && !attacker.position.is_adjacent_to(target.position)
+        {
+            return Err(CoreError::CombatOutOfRange {
+                attacker_id: event.attacker_id,
+                target_id: event.target_id,
+            });
+        }
+        if self.player_vitals(event.target_id)?.health == 0 {
+            return Err(CoreError::TargetAlreadyDefeated(event.target_id));
+        }
+        let cooldown = self.player_combat_cooldown(event.attacker_id)?;
+        if self.tick < cooldown.next_attack_tick {
+            return Err(CoreError::CombatCooldownActive {
+                attacker_id: event.attacker_id,
+                current_tick: self.tick,
+                next_attack_tick: cooldown.next_attack_tick,
+            });
+        }
+        let (applied_damage, remaining_health) =
+            self.apply_damage_to_known_target(event.target_id, event.requested_damage)?;
+        let next_attack_tick = self
+            .tick
+            .saturating_add(u64::from(event.timing.interval_ticks));
+        self.player_combat_cooldowns
+            .insert(event.attacker_id, PlayerCombatCooldown { next_attack_tick });
+        self.mark_changed();
+        Ok(PlayerCombatEventOutcome {
+            damage: PlayerDamageOutcome {
+                attacker_id: event.attacker_id,
+                target_id: event.target_id,
+                requested_damage: event.requested_damage,
+                applied_damage,
+                remaining_health,
+                defeated: remaining_health == 0,
+            },
+            damage_type: event.damage_type,
+            next_attack_tick,
+        })
+    }
+
+    fn apply_damage_to_known_target(
+        &mut self,
+        target_id: u64,
+        requested_damage: u16,
+    ) -> Result<(u16, u16), CoreError> {
+        let vitals = self
+            .player_vitals
+            .get_mut(&target_id)
+            .ok_or(CoreError::UnknownPlayer(target_id))?;
+        let applied_damage = requested_damage.min(vitals.health);
+        vitals.health = vitals.health.saturating_sub(applied_damage);
+        Ok((applied_damage, vitals.health))
     }
 
     pub fn apply_player_melee_damage(
@@ -2972,6 +3141,13 @@ pub enum CoreError {
     InvalidRegenerationInterval,
     InvalidPlayerCondition,
     InvalidDeathLossPolicy,
+    InvalidCombatEvent,
+    TargetAlreadyDefeated(u64),
+    CombatCooldownActive {
+        attacker_id: u64,
+        current_tick: u64,
+        next_attack_tick: u64,
+    },
     CombatOutOfRange {
         attacker_id: u64,
         target_id: u64,
@@ -4087,6 +4263,99 @@ mod tests {
                 attacker_id: 7,
                 target_id: 9,
             })
+        );
+    }
+
+    #[test]
+    fn typed_adjacent_melee_events_enforce_deterministic_cooldowns() {
+        assert_eq!(
+            CombatAttackTiming::new(0),
+            Err(CoreError::InvalidCombatEvent)
+        );
+        assert_eq!(
+            CombatAttackTiming::new(MAX_COMBAT_INTERVAL_TICKS + 1),
+            Err(CoreError::InvalidCombatEvent)
+        );
+        let timing = CombatAttackTiming::new(2).unwrap();
+        assert_eq!(
+            PlayerCombatEvent::adjacent_melee(7, 8, CombatDamageType::Physical, 0, timing),
+            Err(CoreError::InvalidCombatEvent)
+        );
+        assert_eq!(
+            PlayerCombatEvent::adjacent_melee(
+                7,
+                8,
+                CombatDamageType::Physical,
+                MAX_COMBAT_EVENT_DAMAGE + 1,
+                timing,
+            ),
+            Err(CoreError::InvalidCombatEvent)
+        );
+
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        let mut target = player();
+        target.id = 8;
+        target.name = "Druid".into();
+        target.position.x = 101;
+        world
+            .add_player_with_vitals(
+                target,
+                PlayerVitals {
+                    health: 30,
+                    max_health: 30,
+                    ..PlayerVitals::default()
+                },
+            )
+            .unwrap();
+        let event = PlayerCombatEvent::adjacent_melee(7, 8, CombatDamageType::Physical, 10, timing)
+            .unwrap();
+        let revision = world.revision();
+        assert_eq!(
+            world.apply_player_combat_event(event).unwrap(),
+            PlayerCombatEventOutcome {
+                damage: PlayerDamageOutcome {
+                    attacker_id: 7,
+                    target_id: 8,
+                    requested_damage: 10,
+                    applied_damage: 10,
+                    remaining_health: 20,
+                    defeated: false,
+                },
+                damage_type: CombatDamageType::Physical,
+                next_attack_tick: 2,
+            }
+        );
+        assert_eq!(world.player_combat_cooldown(7).unwrap().next_attack_tick, 2);
+        assert_eq!(world.revision(), revision + 1);
+        assert_eq!(
+            world.apply_player_combat_event(event),
+            Err(CoreError::CombatCooldownActive {
+                attacker_id: 7,
+                current_tick: 0,
+                next_attack_tick: 2,
+            })
+        );
+        world.advance_ticks(2);
+        assert_eq!(
+            world
+                .apply_player_combat_event(event)
+                .unwrap()
+                .damage
+                .remaining_health,
+            10
+        );
+        assert_eq!(
+            world.apply_player_combat_event(
+                PlayerCombatEvent::adjacent_melee(7, 8, CombatDamageType::Fire, 10, timing,)
+                    .unwrap()
+            ),
+            Err(CoreError::InvalidCombatEvent)
+        );
+        world.remove_player(7).unwrap();
+        assert_eq!(
+            world.player_combat_cooldown(7),
+            Err(CoreError::UnknownPlayer(7))
         );
     }
 
