@@ -208,6 +208,23 @@ pub struct StaticCreatureTargetSelection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticCreatureTargetStepOutcome {
+    NoTarget,
+    AlreadyAdjacent {
+        target_player_id: u64,
+    },
+    Blocked {
+        target_player_id: u64,
+    },
+    Moved {
+        target_player_id: u64,
+        direction: CardinalDirection,
+        from: Position,
+        to: Position,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticCreatureMoveDecision {
     pub creature_id: u32,
     pub direction: CardinalDirection,
@@ -2239,6 +2256,86 @@ impl WorldState {
             return Err(CoreError::InactiveStaticCreature(creature_id));
         }
         Ok(runtime.target_player_id)
+    }
+
+    /// Attempts at most one deterministic distance-reducing cardinal step toward an already
+    /// selected living target. It does not acquire targets, retry later, move diagonally, route
+    /// around an obstacle, attack, or create autonomous creature behavior.
+    pub fn step_static_creature_toward_target(
+        &mut self,
+        creature_id: u32,
+        world_map: &WorldMap,
+    ) -> Result<StaticCreatureTargetStepOutcome, CoreError> {
+        let (source, target_player_id) = {
+            let runtime = self
+                .static_creatures
+                .get(&creature_id)
+                .ok_or(CoreError::UnknownStaticCreature(creature_id))?;
+            if !runtime.active {
+                return Err(CoreError::InactiveStaticCreature(creature_id));
+            }
+            (runtime.entity.position, runtime.target_player_id)
+        };
+        let Some(target_player_id) = target_player_id else {
+            return Ok(StaticCreatureTargetStepOutcome::NoTarget);
+        };
+        let target = self.players.get(&target_player_id).filter(|_| {
+            self.player_respawn_states
+                .get(&target_player_id)
+                .map_or(true, |state| !state.dead)
+        });
+        let Some(target) = target else {
+            let runtime = self
+                .static_creatures
+                .get_mut(&creature_id)
+                .ok_or(CoreError::UnknownStaticCreature(creature_id))?;
+            runtime.target_player_id = None;
+            self.mark_changed();
+            return Ok(StaticCreatureTargetStepOutcome::NoTarget);
+        };
+        if source.is_adjacent_to(target.position) {
+            return Ok(StaticCreatureTargetStepOutcome::AlreadyAdjacent { target_player_id });
+        }
+        if source.z != target.position.z {
+            return Ok(StaticCreatureTargetStepOutcome::Blocked { target_player_id });
+        }
+        let x_distance = source.x.abs_diff(target.position.x);
+        let y_distance = source.y.abs_diff(target.position.y);
+        let x_direction = match target.position.x.cmp(&source.x) {
+            std::cmp::Ordering::Less => Some(CardinalDirection::West),
+            std::cmp::Ordering::Greater => Some(CardinalDirection::East),
+            std::cmp::Ordering::Equal => None,
+        };
+        let y_direction = match target.position.y.cmp(&source.y) {
+            std::cmp::Ordering::Less => Some(CardinalDirection::North),
+            std::cmp::Ordering::Greater => Some(CardinalDirection::South),
+            std::cmp::Ordering::Equal => None,
+        };
+        let preferred = if x_distance >= y_distance {
+            [x_direction, y_direction]
+        } else {
+            [y_direction, x_direction]
+        };
+        for direction in preferred.into_iter().flatten() {
+            let destination = source.step(direction)?;
+            if !world_map.is_walkable(destination)
+                || self.is_player_occupied(destination)
+                || self.static_creatures.iter().any(|(id, runtime)| {
+                    *id != creature_id && runtime.active && runtime.entity.position == destination
+                })
+            {
+                continue;
+            }
+            let (from, to) =
+                self.move_static_creature_cardinal(creature_id, direction, world_map)?;
+            return Ok(StaticCreatureTargetStepOutcome::Moved {
+                target_player_id,
+                direction,
+                from,
+                to,
+            });
+        }
+        Ok(StaticCreatureTargetStepOutcome::Blocked { target_player_id })
     }
 
     /// Selects safe adjacent steps without mutating state. Direction preference rotates by the
@@ -5495,6 +5592,163 @@ mod tests {
         assert_eq!(
             world.static_creature_target(creature_id),
             Err(CoreError::InactiveStaticCreature(creature_id))
+        );
+    }
+
+    #[test]
+    fn static_creature_target_step_is_single_deterministic_and_map_validated() {
+        let creature_id = 0x4000_0001;
+        let creature = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut target = player();
+        target.position = Position {
+            x: 103,
+            y: 101,
+            z: 7,
+        };
+        let mut map = WorldMap::new("target-step", creature.position);
+        for position in [
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            Position {
+                x: 100,
+                y: 101,
+                z: 7,
+            },
+            Position {
+                x: 101,
+                y: 101,
+                z: 7,
+            },
+        ] {
+            map.set_tile(
+                position,
+                WorldMapTile {
+                    ground_thing_id: 102,
+                    walkable: position
+                        != Position {
+                            x: 101,
+                            y: 100,
+                            z: 7,
+                        },
+                },
+            )
+            .unwrap();
+        }
+        let mut world = WorldState::default();
+        world.add_player(target).unwrap();
+        world
+            .install_static_creatures(
+                &FeTfsStaticSpawnCollection::new(vec![creature.clone()]).unwrap(),
+            )
+            .unwrap();
+
+        let revision_before_selection = world.revision();
+        assert_eq!(
+            world.step_static_creature_toward_target(creature_id, &map),
+            Ok(StaticCreatureTargetStepOutcome::NoTarget)
+        );
+        assert_eq!(world.revision(), revision_before_selection);
+        world.select_static_creature_target(creature_id, 4).unwrap();
+        assert_eq!(
+            world.step_static_creature_toward_target(creature_id, &map),
+            Ok(StaticCreatureTargetStepOutcome::Moved {
+                target_player_id: 7,
+                direction: CardinalDirection::South,
+                from: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7
+                },
+                to: Position {
+                    x: 100,
+                    y: 101,
+                    z: 7
+                },
+            })
+        );
+        assert_eq!(
+            world.static_creature(creature_id).unwrap().position,
+            Position {
+                x: 100,
+                y: 101,
+                z: 7
+            }
+        );
+        assert_eq!(
+            world.step_static_creature_toward_target(creature_id, &map),
+            Ok(StaticCreatureTargetStepOutcome::Moved {
+                target_player_id: 7,
+                direction: CardinalDirection::East,
+                from: Position {
+                    x: 100,
+                    y: 101,
+                    z: 7
+                },
+                to: Position {
+                    x: 101,
+                    y: 101,
+                    z: 7
+                },
+            })
+        );
+
+        let mut blocked_map = WorldMap::new("blocked-target-step", creature.position);
+        blocked_map
+            .set_tile(
+                Position {
+                    x: 101,
+                    y: 101,
+                    z: 7,
+                },
+                WorldMapTile {
+                    ground_thing_id: 102,
+                    walkable: false,
+                },
+            )
+            .unwrap();
+        blocked_map
+            .set_tile(
+                Position {
+                    x: 101,
+                    y: 102,
+                    z: 7,
+                },
+                WorldMapTile {
+                    ground_thing_id: 102,
+                    walkable: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            world.step_static_creature_toward_target(creature_id, &blocked_map),
+            Ok(StaticCreatureTargetStepOutcome::Blocked {
+                target_player_id: 7
+            })
         );
     }
 
