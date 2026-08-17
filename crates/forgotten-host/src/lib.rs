@@ -471,6 +471,15 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)
     }
 
+    fn player_and_vitals(&self, player_id: u64) -> Result<(Player, PlayerVitals), HostError> {
+        let world = self.lock()?;
+        let player = world.player(player_id).cloned().ok_or(HostError::Core(
+            forgotten_core::CoreError::UnknownPlayer(player_id),
+        ))?;
+        let vitals = world.player_vitals(player_id).map_err(HostError::Core)?;
+        Ok((player, vitals))
+    }
+
     pub fn player_progression(&self, player_id: u64) -> Result<PlayerProgression, HostError> {
         self.lock()?
             .player_progression(player_id)
@@ -611,6 +620,9 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)?;
         if outcome.awarded_experience > 0 {
             self.progression_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        if outcome.gained_levels > 0 {
+            self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok(outcome)
     }
@@ -2259,15 +2271,8 @@ fn handle_native_otclient_game(
                     }
                     let vitals_epoch = shared_world.vitals_epoch();
                     if vitals_epoch != observed_vitals_epoch {
-                        let vitals = shared_world.player_vitals(character.id)?;
-                        snapshot.player_vitals = NativeOtClientPlayerVitals {
-                            health: vitals.health,
-                            max_health: vitals.max_health,
-                            mana: vitals.mana,
-                            max_mana: vitals.max_mana,
-                            capacity: vitals.capacity,
-                            magic_level: vitals.magic_level,
-                        };
+                        let (player, vitals) = shared_world.player_and_vitals(character.id)?;
+                        refresh_native_player_stats_snapshot(&mut snapshot, &player, vitals);
                         let stats_update =
                             encode_native_otclient_player_stats(&config.client_profile, &snapshot)
                                 .map_err(HostError::Protocol)?;
@@ -3334,6 +3339,26 @@ fn native_position(position: Position) -> NativeOtClientPosition {
     }
 }
 
+/// Rehydrates the authoritative fields emitted by the existing profile-gated classic player-stats
+/// record. This is deliberately pure: packet framing, client capability decisions, and all
+/// parser-layout assumptions stay in the protocol crate.
+fn refresh_native_player_stats_snapshot(
+    snapshot: &mut NativeOtClientEmptyWorldSnapshot,
+    player: &Player,
+    vitals: PlayerVitals,
+) {
+    snapshot.player_level = player.level.try_into().unwrap_or(u16::MAX);
+    snapshot.player_experience = player.experience;
+    snapshot.player_vitals = NativeOtClientPlayerVitals {
+        health: vitals.health,
+        max_health: vitals.max_health,
+        mana: vitals.mana,
+        max_mana: vitals.max_mana,
+        capacity: vitals.capacity,
+        magic_level: vitals.magic_level,
+    };
+}
+
 fn native_cardinal_direction(direction: NativeOtClientCardinalDirection) -> CardinalDirection {
     match direction {
         NativeOtClientCardinalDirection::North => CardinalDirection::North,
@@ -4259,6 +4284,83 @@ mod tests {
         let disabled_outcome = shared.award_player_experience(106, 100, &disabled).unwrap();
         assert_eq!(disabled_outcome.awarded_experience, 0);
         assert_eq!(shared.progression_epoch(), 1);
+    }
+
+    #[test]
+    fn vocation_level_up_refreshes_the_native_stats_snapshot_from_authoritative_state() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        let initial_vitals = PlayerVitals {
+            health: 50,
+            max_health: 100,
+            mana: 20,
+            max_mana: 50,
+            capacity: 500,
+            magic_level: 4,
+        };
+        shared
+            .register_player_at_available_position_with_vitals(
+                Player {
+                    id: 108,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 1,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                initial_vitals,
+                &map,
+            )
+            .unwrap();
+        let outcome = shared
+            .award_player_experience_with_vocation_gains(
+                108,
+                100,
+                &ExperienceAwardPolicy::new(10, Vec::new()).unwrap(),
+                VocationLevelUpGains::new(15, 5, 25),
+            )
+            .unwrap();
+        assert_eq!(outcome.level, 5);
+        assert_eq!(outcome.experience, 1_000);
+        assert_eq!(outcome.gained_levels, 4);
+        assert_eq!(shared.progression_epoch(), 1);
+        assert_eq!(shared.vitals_epoch(), 1);
+
+        let (player, vitals) = shared.player_and_vitals(108).unwrap();
+        let mut snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_id: native_player_id(108).unwrap(),
+            player_name: player.name.clone(),
+            player_position: native_position(player.position),
+            player_level: 1,
+            player_experience: 0,
+            player_vitals: NativeOtClientPlayerVitals::default(),
+            player_skills: forgotten_core::PlayerSkills::default(),
+            ground_thing_id: 4526,
+            player_look_type: 128,
+            player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
+            player_speed: 220,
+            server_beat: 50,
+        };
+        refresh_native_player_stats_snapshot(&mut snapshot, &player, vitals);
+        assert_eq!(snapshot.player_level, 5);
+        assert_eq!(snapshot.player_experience, 1_000);
+        assert_eq!(
+            snapshot.player_vitals,
+            NativeOtClientPlayerVitals {
+                health: 110,
+                max_health: 160,
+                mana: 40,
+                max_mana: 70,
+                capacity: 600,
+                magic_level: 4,
+            }
+        );
+        assert!(encode_native_otclient_player_stats(
+            &native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile,
+            &snapshot,
+        )
+        .is_ok());
     }
 
     #[test]

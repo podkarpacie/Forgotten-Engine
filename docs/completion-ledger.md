@@ -75,7 +75,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 
 ### Milestone E — Complete profile-driven protocol and client compatibility: target 87%
 
-- [ ] Finish profile-driven native protocol coverage for the declared FE 7.4 surface and resolve every release-blocking real-client parser or state mismatch with captured-safe evidence.
+- [ ] Finish profile-driven native protocol coverage for the declared FE 7.4 surface and resolve every release-blocking real-client parser or state mismatch with captured-safe evidence. The local 740 stats-refresh path now rehydrates a vocation-level-up from authoritative level, experience, and vitals, but still needs a native gameplay source and real-client confirmation.
 - [ ] Implement and validate FE 8.0 profile runtime and protocol behavior without hardcoding release-specific assumptions.
 - [ ] Implement and validate FE 1.2 / Tibia 10.98 profile runtime and protocol behavior without hardcoding release-specific assumptions.
 - [ ] Add repeatable lawful unmodified OTCv8 tests for login, movement, state, chat, combat, inventory, interactions, lifecycle, and world simulation in every supported profile.
