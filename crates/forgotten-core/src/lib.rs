@@ -3461,9 +3461,37 @@ impl WorldState {
     }
 }
 
+/// Returns the classic cumulative experience requirement for a one-based level. `None` means the
+/// requirement exceeds FE's `u64` experience storage and cannot be reached safely.
+pub fn classic_experience_for_level(level: u32) -> Option<u64> {
+    if level == 0 {
+        return None;
+    }
+    let level = i128::from(level);
+    let numerator = level
+        .checked_mul(level)?
+        .checked_mul(level)?
+        .checked_sub(6_i128.checked_mul(level)?.checked_mul(level)?)?
+        .checked_add(17_i128.checked_mul(level)?)?
+        .checked_sub(12)?;
+    let experience = numerator.checked_div(6)?.checked_mul(100)?;
+    u64::try_from(experience).ok()
+}
+
+/// Resolves the highest classic level whose cumulative experience requirement does not exceed the
+/// supplied total. This integer-only calculation changes level only where existing authoritative
+/// experience award and loss paths already do so; it does not mutate vocation gains or vitals.
 pub fn level_for_experience(experience: u64) -> u32 {
-    // A stable progression curve for the MVP. The exact historical formula is a future protocol test concern.
-    1 + (((experience / 100) as f64).sqrt() as u32)
+    let mut low = 1_u32;
+    let mut high = u32::MAX;
+    while low < high {
+        let midpoint = low + (high - low).div_ceil(2);
+        match classic_experience_for_level(midpoint) {
+            Some(required) if required <= experience => low = midpoint,
+            _ => high = midpoint - 1,
+        }
+    }
+    low
 }
 
 fn advance_regeneration_schedule(elapsed: &mut u16, interval: u16, delta: u16) -> u16 {
@@ -4574,7 +4602,23 @@ mod tests {
     fn experience_increases_level_deterministically() {
         let mut value = player();
         value.add_experience(900);
-        assert_eq!(value.level, 4);
+        assert_eq!(value.level, 5);
+    }
+
+    #[test]
+    fn classic_experience_thresholds_are_integer_bounded_and_monotonic() {
+        assert_eq!(classic_experience_for_level(0), None);
+        assert_eq!(classic_experience_for_level(1), Some(0));
+        assert_eq!(classic_experience_for_level(2), Some(100));
+        assert_eq!(classic_experience_for_level(5), Some(800));
+        assert_eq!(classic_experience_for_level(8), Some(4_200));
+        assert_eq!(level_for_experience(4_199), 7);
+        assert_eq!(level_for_experience(4_200), 8);
+        let maximum_representable = level_for_experience(u64::MAX);
+        assert!(classic_experience_for_level(maximum_representable).is_some());
+        if maximum_representable < u32::MAX {
+            assert!(classic_experience_for_level(maximum_representable + 1).is_none());
+        }
     }
 
     #[test]
@@ -4592,8 +4636,8 @@ mod tests {
         assert_eq!(first.raw_experience, 100);
         assert_eq!(first.awarded_experience, 1_000);
         assert_eq!(first.experience, 1_000);
-        assert_eq!(first.level, 4);
-        assert_eq!(first.gained_levels, 3);
+        assert_eq!(first.level, 5);
+        assert_eq!(first.gained_levels, 4);
         assert_eq!(world.revision(), revision_before_award + 1);
 
         let second = world.award_player_experience(7, 100, &policy).unwrap();

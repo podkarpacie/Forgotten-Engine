@@ -45,7 +45,7 @@ The public Wireshark Tibia dissector marks client versions from 761 as using RSA
 
 ## Vocation advancement metadata boundary
 
-The public TFS vocation registry declares `gaincap`, `gainhp`, and `gainmana` alongside regeneration amounts/ticks, skill multipliers, combat formulas, speed, soul, and other fields.[15] FE may therefore parse those three nonzero bounded per-level gain values into immutable vocation metadata. The source alone does not establish an FE starting-stat baseline, level threshold, promotion, rounding, maximum-vital, packet, or full runtime advancement contract. Parsing must not mutate player state until those dependencies have separate authoritative and profile-specific evidence.
+The public TFS vocation registry declares `gaincap`, `gainhp`, and `gainmana` alongside regeneration amounts/ticks, skill multipliers, combat formulas, speed, soul, and other fields.[15] The public player header exposes a pure classic experience threshold calculation, while the public progression routine compares total experience to those thresholds and applies vocation health, mana, and capacity gains when a level changes.[16] [17] FE may therefore parse those three nonzero bounded per-level gain values into immutable vocation metadata and independently test an overflow-safe threshold helper. The source alone does not establish an FE starting-stat baseline, promotion, rounding, maximum-vital, packet, or full runtime advancement transaction. Parsing and threshold calculation must not mutate player state until those dependencies have separate authoritative and profile-specific evidence.
 
 ## References
 
@@ -78,3 +78,7 @@ The public TFS vocation registry declares `gaincap`, `gainhp`, and `gainmana` al
 [14] [Public OTCv8 game-login sender](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/protocolgamesend.cpp). Read-only behavioral evidence; no client source is copied into FE.
 
 [15] [Public TFS vocation registry](https://raw.githubusercontent.com/otland/forgottenserver/master/data/XML/vocations.xml). Read-only XML attribute evidence; no registry data is copied into FE.
+
+[16] [Public TFS player progression logic](https://raw.githubusercontent.com/otland/forgottenserver/master/src/player.cpp). Read-only behavior evidence; no player source is copied into FE.
+
+[17] [Public TFS player threshold helper](https://raw.githubusercontent.com/otland/forgottenserver/master/src/player.h). Read-only formula evidence; no player source is copied into FE.

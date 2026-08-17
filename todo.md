@@ -281,3 +281,4 @@
 - [x] Add a bounded pure FE 8.0 RSA/XTEA transport-envelope primitive for future parser-backed session work; it must not decrypt client input, parse protocol-800 messages, enable a listener, or expose key material in diagnostics.
 - [x] Add a marker-and-key-only FE 8.0 bootstrap context parser over an already decrypted fixed RSA block; it must not parse credentials or other login fields, accept live input, start a listener, or expose key material in diagnostics.
 - [x] Parse and retain bounded legacy vocation `gainhp`, `gainmana`, and `gaincap` metadata as immutable configuration only; do not calculate levels, mutate player vitals/capacity, or change native HUD output.
+- [x] Replace the MVP experience-level resolver in existing authoritative experience awards and loss with a bounded overflow-safe classic threshold calculation; defer vocation gains, vitals/capacity mutation, and native HUD advancement output.
