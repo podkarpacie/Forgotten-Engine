@@ -1150,6 +1150,108 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             );
             Ok(())
         }
+        "container-stow-stack" => {
+            if arguments.len() != 7 {
+                return Err(
+                    "usage: player container-stow-stack <directory> <player-id> <slot> <container-id> <count>"
+                        .into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let slot = parse_equipment_slot(arguments.get(4))?;
+            let container_id = parse_u8_argument(arguments.get(5), "container ID")?;
+            let count = parse_u16_argument(arguments.get(6), "item count")?;
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            let character = database.player_by_id(player_id)?;
+            let equipment = database.player_equipment(player_id)?;
+            let containers = database.player_containers(player_id)?;
+            let mut world = WorldState::default();
+            world.add_player(Player {
+                id: character.id,
+                account_id: 0,
+                name: character.name,
+                position: character.position,
+                level: character.level,
+                experience: character.experience,
+                skill_points: character.skill_points,
+            })?;
+            world.replace_player_equipment(player_id, equipment)?;
+            world.replace_player_containers(player_id, containers)?;
+            let outcome =
+                world.move_equipment_stack_to_container(player_id, slot, container_id, count)?;
+            database.replace_player_inventory(
+                player_id,
+                world.player_equipment(player_id)?,
+                world.player_containers(player_id)?,
+            )?;
+            println!(
+                "moved equipped stack to container player-id={player_id} slot={} container-id={} moved-server-item-id={} moved-count={} source-remaining={:?} destination-index={} destination-count={}",
+                outcome.from_slot.code(),
+                outcome.container_id,
+                outcome.moved_item.server_id,
+                outcome.moved_item.count,
+                outcome.source_remaining_count,
+                outcome.destination_index,
+                outcome.destination_count,
+            );
+            Ok(())
+        }
+        "container-equip-stack" => {
+            if arguments.len() != 8 {
+                return Err(
+                    "usage: player container-equip-stack <directory> <player-id> <container-id> <item-index> <slot> <count>"
+                        .into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let container_id = parse_u8_argument(arguments.get(4), "container ID")?;
+            let item_index = parse_usize_argument(arguments.get(5), "container item index")?;
+            let slot = parse_equipment_slot(arguments.get(6))?;
+            let count = parse_u16_argument(arguments.get(7), "item count")?;
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            let character = database.player_by_id(player_id)?;
+            let equipment = database.player_equipment(player_id)?;
+            let containers = database.player_containers(player_id)?;
+            let mut world = WorldState::default();
+            world.add_player(Player {
+                id: character.id,
+                account_id: 0,
+                name: character.name,
+                position: character.position,
+                level: character.level,
+                experience: character.experience,
+                skill_points: character.skill_points,
+            })?;
+            world.replace_player_equipment(player_id, equipment)?;
+            world.replace_player_containers(player_id, containers)?;
+            let outcome = world.move_container_stack_to_equipment(
+                player_id,
+                container_id,
+                item_index,
+                slot,
+                count,
+            )?;
+            database.replace_player_inventory(
+                player_id,
+                world.player_equipment(player_id)?,
+                world.player_containers(player_id)?,
+            )?;
+            println!(
+                "moved container stack to equipment player-id={player_id} container-id={} item-index={} slot={} moved-server-item-id={} moved-count={} source-remaining={:?} destination-count={}",
+                outcome.container_id,
+                outcome.item_index,
+                outcome.to_slot.code(),
+                outcome.moved_item.server_id,
+                outcome.moved_item.count,
+                outcome.source_remaining_count,
+                outcome.destination_count,
+            );
+            Ok(())
+        }
         "container-create" => {
             if arguments.len() < 8 {
                 return Err(
@@ -1398,6 +1500,8 @@ Commands:
   player experience <directory> <player-id> <raw-experience>
   player container-stow-equipped <directory> <player-id> <slot> <container-id>
   player container-equip <directory> <player-id> <container-id> <item-index> <slot>
+  player container-stow-stack <directory> <player-id> <slot> <container-id> <count>
+  player container-equip-stack <directory> <player-id> <container-id> <item-index> <slot> <count>
   player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>
   player container-add <directory> <player-id> <container-id> <server-item-id> [count]
   player container-remove <directory> <player-id> <container-id> <item-index>
@@ -1494,6 +1598,8 @@ mod tests {
             "player experience <directory> <player-id> <raw-experience>",
             "player container-stow-equipped <directory> <player-id> <slot> <container-id>",
             "player container-equip <directory> <player-id> <container-id> <item-index> <slot>",
+            "player container-stow-stack <directory> <player-id> <slot> <container-id> <count>",
+            "player container-equip-stack <directory> <player-id> <container-id> <item-index> <slot> <count>",
             "player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>",
             "player container-add <directory> <player-id> <container-id> <server-item-id> [count]",
             "player container-remove <directory> <player-id> <container-id> <item-index>",
@@ -1669,6 +1775,130 @@ experienceStages = {
         assert_eq!(account.name, "test-account");
         assert_eq!(account.characters[0].name, "Knight");
         assert_eq!(account.characters[0].town_id, 42);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stable_cli_stack_transfers_persist_the_authoritative_inventory_snapshot() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("forgotten-engine-stack-cli-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        account_command(&[
+            "account".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "stack-account".into(),
+            "stack-password".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "Paladin".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "equip".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "right".into(),
+            "2148".into(),
+            "40".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "container-create".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "0".into(),
+            "1988".into(),
+            "5".into(),
+            "Backpack".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "container-add".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "0".into(),
+            "2148".into(),
+            "10".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "container-stow-stack".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "right".into(),
+            "0".into(),
+            "15".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "container-equip-stack".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "0".into(),
+            "0".into(),
+            "right".into(),
+            "20".into(),
+        ])
+        .unwrap();
+
+        let config = load(&directory).unwrap();
+        let database = EngineDatabase::open(&config.database_path).unwrap();
+        assert_eq!(
+            database
+                .player_equipment(1)
+                .unwrap()
+                .item(EquipmentSlot::RightHand)
+                .unwrap()
+                .count,
+            45
+        );
+        assert_eq!(
+            database
+                .player_containers(1)
+                .unwrap()
+                .container(0)
+                .unwrap()
+                .items
+                .item(0)
+                .unwrap()
+                .count,
+            5
+        );
+        assert!(player_command(&[
+            "player".into(),
+            "container-equip-stack".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "0".into(),
+            "0".into(),
+            "right".into(),
+            "0".into(),
+        ])
+        .is_err());
+        assert_eq!(
+            database
+                .player_equipment(1)
+                .unwrap()
+                .item(EquipmentSlot::RightHand)
+                .unwrap()
+                .count,
+            45
+        );
         let _ = fs::remove_dir_all(directory);
     }
 }
