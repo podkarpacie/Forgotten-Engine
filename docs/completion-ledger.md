@@ -48,6 +48,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Establish validated runtime items, equipment, owned containers, and bounded equipment-to-container transfer.
 - [ ] Synchronize inventory, equipment, and containers in each supported native session profile.
 - [ ] Implement authoritative item transfer, stack splitting/merging, capacity, and ownership rules across equipment, ground, containers, depot, and inbox surfaces.
+- [x] Define side-effect-free authoritative validation for same-tile or adjacent exact top-level map-item use intents.
 - [ ] Implement verified item use, use-with, move, look, doors, levers, switches, teleporters, and simple map actions.
 - [ ] Add depot, mail, and ground/container persistence with consistency and crash-recovery tests.
 - [ ] Validate legacy OTB/OTBM content mappings against active item/action runtime behavior without importing private data.

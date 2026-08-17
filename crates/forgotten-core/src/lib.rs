@@ -1599,6 +1599,52 @@ pub struct PlayerInteractionIntent {
     pub follow_player_id: Option<u64>,
 }
 
+/// A bounded request to address one top-level item in an authoritative map tile. It intentionally
+/// does not execute an action, consume charges, open containers, toggle doors or switches, run
+/// scripts, or produce a client packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerItemUseIntent {
+    pub player_id: u64,
+    pub position: Position,
+    pub stack_index: u8,
+    pub expected_server_id: u16,
+}
+
+impl PlayerItemUseIntent {
+    pub fn new(
+        player_id: u64,
+        position: Position,
+        stack_index: u8,
+        expected_server_id: u16,
+    ) -> Result<Self, CoreError> {
+        if expected_server_id == 0 {
+            return Err(CoreError::InvalidItemUseIntent);
+        }
+        Ok(Self {
+            player_id,
+            position,
+            stack_index,
+            expected_server_id,
+        })
+    }
+}
+
+/// Immutable authoritative item metadata observed by a successfully validated item-use intent.
+/// A later bounded action runtime may consume this outcome as input, but this validation step
+/// intentionally has no side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerItemUseOutcome {
+    pub player_id: u64,
+    pub position: Position,
+    pub stack_index: u8,
+    pub server_id: u16,
+    pub count: u8,
+    pub action_id: Option<u16>,
+    pub unique_id: Option<u16>,
+    pub has_text: bool,
+    pub charges: Option<u16>,
+}
+
 #[derive(Debug, Default)]
 pub struct WorldState {
     players: BTreeMap<u64, Player>,
@@ -1772,6 +1818,52 @@ impl WorldState {
             .get(&player_id)
             .copied()
             .unwrap_or_default())
+    }
+
+    /// Validates one bounded, top-level map-item use intent against server-owned world state.
+    /// Same-tile use is allowed for items under a player; otherwise the item must be adjacent.
+    /// Validation does not mutate the world or make an action-compatibility claim.
+    pub fn validate_player_item_use(
+        &self,
+        map: &WorldMap,
+        intent: PlayerItemUseIntent,
+    ) -> Result<PlayerItemUseOutcome, CoreError> {
+        if intent.expected_server_id == 0 {
+            return Err(CoreError::InvalidItemUseIntent);
+        }
+        let player = self
+            .player(intent.player_id)
+            .ok_or(CoreError::UnknownPlayer(intent.player_id))?;
+        if player.position != intent.position && !player.position.is_adjacent_to(intent.position) {
+            return Err(CoreError::ItemUseOutOfRange {
+                player_id: intent.player_id,
+                from: player.position,
+                to: intent.position,
+            });
+        }
+        if map.tile(intent.position).is_none() {
+            return Err(CoreError::MissingMapTile(intent.position));
+        }
+        let item = map
+            .tile_items(intent.position)
+            .and_then(|items| items.get(usize::from(intent.stack_index)))
+            .filter(|item| item.server_id == intent.expected_server_id)
+            .ok_or(CoreError::UnknownMapItem {
+                position: intent.position,
+                stack_index: intent.stack_index,
+                expected_server_id: intent.expected_server_id,
+            })?;
+        Ok(PlayerItemUseOutcome {
+            player_id: intent.player_id,
+            position: intent.position,
+            stack_index: intent.stack_index,
+            server_id: item.server_id,
+            count: item.count,
+            action_id: item.action_id,
+            unique_id: item.unique_id,
+            has_text: item.text.as_deref().is_some_and(|text| !text.is_empty()),
+            charges: item.charges,
+        })
     }
 
     pub fn set_player_target(
@@ -3316,6 +3408,18 @@ pub enum CoreError {
     InvalidCombatEvent,
     InvalidCombatDefense,
     InvalidSpellCastEvent,
+    InvalidItemUseIntent,
+    ItemUseOutOfRange {
+        player_id: u64,
+        from: Position,
+        to: Position,
+    },
+    MissingMapTile(Position),
+    UnknownMapItem {
+        position: Position,
+        stack_index: u8,
+        expected_server_id: u16,
+    },
     InsufficientMana {
         player_id: u64,
         required_mana: u16,
@@ -3800,6 +3904,137 @@ mod tests {
         assert_eq!(
             world.set_player_target(source.id, None),
             Ok(PlayerInteractionIntent::default())
+        );
+    }
+
+    #[test]
+    fn authoritative_map_item_use_is_bounded_side_effect_free_and_position_validated() {
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        let spawn = player().position;
+        let adjacent = Position {
+            x: spawn.x + 1,
+            y: spawn.y,
+            z: spawn.z,
+        };
+        let far = Position {
+            x: spawn.x + 2,
+            y: spawn.y,
+            z: spawn.z,
+        };
+        let mut map = WorldMap::new("item-use", spawn);
+        for position in [spawn, adjacent, far] {
+            map.set_tile(
+                position,
+                WorldMapTile {
+                    ground_thing_id: 102,
+                    walkable: true,
+                },
+            )
+            .unwrap();
+        }
+        map.set_tile_items(
+            spawn,
+            vec![WorldMapItem {
+                server_id: 1945,
+                client_thing_id: Some(1945),
+                count: 1,
+                action_id: Some(7),
+                unique_id: Some(42),
+                text: Some("Read me".into()),
+                description: None,
+                teleport_destination: None,
+                duration: None,
+                charges: Some(3),
+                children: Vec::new(),
+            }],
+        )
+        .unwrap();
+        map.set_tile_items(
+            adjacent,
+            vec![WorldMapItem {
+                server_id: 2376,
+                client_thing_id: Some(2376),
+                count: 2,
+                action_id: None,
+                unique_id: None,
+                text: None,
+                description: None,
+                teleport_destination: None,
+                duration: None,
+                charges: None,
+                children: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let revision = world.revision();
+        assert_eq!(
+            world
+                .validate_player_item_use(
+                    &map,
+                    PlayerItemUseIntent::new(7, spawn, 0, 1945).unwrap(),
+                )
+                .unwrap(),
+            PlayerItemUseOutcome {
+                player_id: 7,
+                position: spawn,
+                stack_index: 0,
+                server_id: 1945,
+                count: 1,
+                action_id: Some(7),
+                unique_id: Some(42),
+                has_text: true,
+                charges: Some(3),
+            }
+        );
+        assert_eq!(
+            world
+                .validate_player_item_use(
+                    &map,
+                    PlayerItemUseIntent::new(7, adjacent, 0, 2376).unwrap(),
+                )
+                .unwrap()
+                .count,
+            2
+        );
+        assert_eq!(world.revision(), revision);
+        assert_eq!(
+            PlayerItemUseIntent::new(7, adjacent, 0, 0),
+            Err(CoreError::InvalidItemUseIntent)
+        );
+        assert_eq!(
+            world.validate_player_item_use(
+                &map,
+                PlayerItemUseIntent::new(7, far, 0, 2376).unwrap(),
+            ),
+            Err(CoreError::ItemUseOutOfRange {
+                player_id: 7,
+                from: spawn,
+                to: far,
+            })
+        );
+        let missing = Position {
+            x: spawn.x,
+            y: spawn.y + 1,
+            z: spawn.z,
+        };
+        assert_eq!(
+            world.validate_player_item_use(
+                &map,
+                PlayerItemUseIntent::new(7, missing, 0, 2376).unwrap(),
+            ),
+            Err(CoreError::MissingMapTile(missing))
+        );
+        assert_eq!(
+            world.validate_player_item_use(
+                &map,
+                PlayerItemUseIntent::new(7, adjacent, 1, 2376).unwrap(),
+            ),
+            Err(CoreError::UnknownMapItem {
+                position: adjacent,
+                stack_index: 1,
+                expected_server_id: 2376,
+            })
         );
     }
 
