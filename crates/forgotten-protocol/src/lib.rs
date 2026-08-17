@@ -802,6 +802,10 @@ pub const NATIVE_OTCLIENT_LEAVE_GAME: u8 = 0x14;
 pub const NATIVE_OTCLIENT_CLIENT_PING: u8 = 0x1d;
 pub const NATIVE_OTCLIENT_CLIENT_PING_BACK: u8 = 0x1e;
 pub const NATIVE_OTCLIENT_CLIENT_AUTO_WALK: u8 = 0x64;
+pub const NATIVE_OTCLIENT_CLIENT_WALK_NORTH: u8 = 0x65;
+pub const NATIVE_OTCLIENT_CLIENT_WALK_EAST: u8 = 0x66;
+pub const NATIVE_OTCLIENT_CLIENT_WALK_SOUTH: u8 = 0x67;
+pub const NATIVE_OTCLIENT_CLIENT_WALK_WEST: u8 = 0x68;
 pub const NATIVE_OTCLIENT_CLIENT_STOP: u8 = 0x69;
 pub const NATIVE_OTCLIENT_CLIENT_WALK_NORTH_EAST: u8 = 0x6a;
 pub const NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_EAST: u8 = 0x6b;
@@ -996,10 +1000,10 @@ pub enum NativeOtClientCardinalDirection {
 impl NativeOtClientCardinalDirection {
     fn from_client_opcode(opcode: u8) -> Option<Self> {
         match opcode {
-            0x65 => Some(Self::North),
-            0x66 => Some(Self::East),
-            0x67 => Some(Self::South),
-            0x68 => Some(Self::West),
+            NATIVE_OTCLIENT_CLIENT_WALK_NORTH => Some(Self::North),
+            NATIVE_OTCLIENT_CLIENT_WALK_EAST => Some(Self::East),
+            NATIVE_OTCLIENT_CLIENT_WALK_SOUTH => Some(Self::South),
+            NATIVE_OTCLIENT_CLIENT_WALK_WEST => Some(Self::West),
             _ => None,
         }
     }

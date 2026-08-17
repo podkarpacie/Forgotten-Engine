@@ -5771,6 +5771,90 @@ mod tests {
     }
 
     #[test]
+    fn native_player_position_persists_across_an_orderly_relog() {
+        let database_path = database_path("native-position-relog");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+
+        let mut first = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut first,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let first_initialization = read_frame(&mut first).unwrap();
+        assert_eq!(&first_initialization.0[9..14], &[100, 0, 100, 0, 7]);
+
+        write_frame(
+            &mut first,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_EAST]),
+        )
+        .unwrap();
+        let movement = read_frame(&mut first).unwrap();
+        assert_eq!(
+            movement.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
+        );
+        let _map_step = read_frame(&mut first).unwrap();
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].position,
+            Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            }
+        );
+        write_frame(
+            &mut first,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_LEAVE_GAME]),
+        )
+        .unwrap();
+        drop(first);
+
+        let mut second = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut second,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let second_initialization = read_frame(&mut second).unwrap();
+        assert_eq!(&second_initialization.0[9..14], &[101, 0, 100, 0, 7]);
+
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn static_creature_occupancy_cancels_native_player_movement() {
         let database_path = database_path("native-static-occupancy");
         let database = EngineDatabase::open(&database_path).unwrap();

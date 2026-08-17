@@ -258,7 +258,8 @@
 - [x] Fix the native 740 player-stats (`0xA0`) record layout that the real client reports as end-of-input after the initial map payload; the parser-shaped record now has a 16-bit level and soul byte.
 - [ ] Verify the corrected native 740 player-stats record with an unmodified OTClientV8 build; do not clear the real-client release blocker until the initial payload parses without an EOF error.
 - [ ] Correct authoritative player HUD initialization and refresh so level, experience, mana, maximum mana, and magic level match persisted server state after login.
-- [ ] Persist the authoritative player position on supported movement and restore it on relog rather than returning the character to the default spawn.
+- [x] Persist the authoritative player position on supported movement and restore it on an orderly native-session relog rather than returning the character to the default spawn.
+- [ ] Verify native 740 position persistence with an unmodified OTClientV8 build: move, exit normally, relog, and confirm the real client begins at the saved tile without a parser error or disconnect.
 - [x] Persist accepted matching native 740 player outfit changes in schema-v11 and hydrate them on the next session with a configured look-type fallback.
 - [ ] Verify native 740 outfit persistence with an unmodified OTClientV8 build: change accepted colors, relog, and confirm the stored appearance is visible without a parser error or disconnect.
 - [ ] Implement or safely acknowledge profile-verified native 740 look/inspect actions for map things and creatures; current use/look handling does not provide a visible inspection result.
