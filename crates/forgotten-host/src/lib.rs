@@ -8,11 +8,11 @@ use forgotten_core::{
     ExperienceAwardPolicy, FeTfsStaticSpawnCollection, ItemInstance, NativeItemPresentationCatalog,
     Player, PlayerCombatEvent, PlayerCombatEventOutcome, PlayerCondition, PlayerConditionKind,
     PlayerConditionOutcome, PlayerContainers, PlayerEquipment, PlayerExperienceAwardOutcome,
-    PlayerInteractionIntent, PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
-    PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState, PlayerSkill,
-    PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
-    StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, StaticCreatureResetSummary,
-    VocationId, WorldMap, WorldState,
+    PlayerInteractionIntent, PlayerItemUseIntent, PlayerItemUseOutcome, PlayerProgression,
+    PlayerProgressionAttempts, PlayerProgressionRules, PlayerRegenerationOutcome,
+    PlayerRegenerationRules, PlayerRespawnState, PlayerSkill, PlayerSkillTryOutcome,
+    PlayerSpellCastOutcome, PlayerVitals, Position, StaticCreatureDecisionBatch,
+    StaticCreatureDecisionPolicy, StaticCreatureResetSummary, VocationId, WorldMap, WorldState,
 };
 use forgotten_persistence::{EngineDatabase, PlayerVitals as PersistedPlayerVitals};
 use forgotten_protocol::{
@@ -681,6 +681,19 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)?;
         self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
         Ok(outcome)
+    }
+
+    /// Validates a server-owned map-item use intent under the shared world lock. This exposes no
+    /// client route and does not execute an item action, mutate map state, persist data, or claim
+    /// doors, switches, container, script, or protocol behavior.
+    pub fn validate_player_item_use(
+        &self,
+        map: &WorldMap,
+        intent: PlayerItemUseIntent,
+    ) -> Result<PlayerItemUseOutcome, HostError> {
+        self.lock()?
+            .validate_player_item_use(map, intent)
+            .map_err(HostError::Core)
     }
 
     pub fn active_static_spawns(&self) -> Result<FeTfsStaticSpawnCollection, HostError> {
@@ -4169,6 +4182,74 @@ mod tests {
             shared.apply_declarative_spell_cast(107, 999, &catalog),
             Err(HostError::InvalidConfiguration(_))
         ));
+    }
+
+    #[test]
+    fn shared_map_item_use_validation_is_authoritative_and_side_effect_free() {
+        let spawn = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let adjacent = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let mut map = WorldMap::new("item-use-host", spawn);
+        for position in [spawn, adjacent] {
+            map.set_tile(
+                position,
+                WorldMapTile {
+                    ground_thing_id: 102,
+                    walkable: true,
+                },
+            )
+            .unwrap();
+        }
+        map.set_tile_items(
+            adjacent,
+            vec![forgotten_core::WorldMapItem {
+                server_id: 1945,
+                client_thing_id: Some(1945),
+                count: 1,
+                action_id: Some(7),
+                unique_id: None,
+                text: Some("Read me".into()),
+                description: None,
+                teleport_destination: None,
+                duration: None,
+                charges: Some(3),
+                children: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 108,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: spawn,
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                &map,
+            )
+            .unwrap();
+        assert_eq!(shared.vitals_epoch(), 0);
+        let outcome = shared
+            .validate_player_item_use(
+                &map,
+                PlayerItemUseIntent::new(108, adjacent, 0, 1945).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(outcome.action_id, Some(7));
+        assert!(outcome.has_text);
+        assert_eq!(outcome.charges, Some(3));
+        assert_eq!(shared.vitals_epoch(), 0);
     }
 
     #[test]
