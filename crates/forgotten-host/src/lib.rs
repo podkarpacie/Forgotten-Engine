@@ -10,8 +10,9 @@ use forgotten_core::{
     PlayerConditionOutcome, PlayerContainers, PlayerEquipment, PlayerExperienceAwardOutcome,
     PlayerInteractionIntent, PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
     PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState, PlayerSkill,
-    PlayerSkillTryOutcome, PlayerVitals, Position, StaticCreatureDecisionBatch,
-    StaticCreatureDecisionPolicy, StaticCreatureResetSummary, VocationId, WorldMap, WorldState,
+    PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
+    StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, StaticCreatureResetSummary,
+    VocationId, WorldMap, WorldState,
 };
 use forgotten_persistence::{EngineDatabase, PlayerVitals as PersistedPlayerVitals};
 use forgotten_protocol::{
@@ -653,6 +654,33 @@ impl SharedNativeWorld {
             self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok((outcome, vitals, death_state))
+    }
+
+    /// Resolves one scriptless declared spell into the core's resource-and-cooldown event. This
+    /// method has no protocol route and makes no target, formula, effect, persistence, or Lua
+    /// claim; it is a synchronized host boundary for later profile-approved invocation paths.
+    pub fn apply_declarative_spell_cast(
+        &self,
+        caster_id: u64,
+        spell_id: u16,
+        catalog: &DeclarativeSpellCatalog,
+    ) -> Result<PlayerSpellCastOutcome, HostError> {
+        let definition = catalog.get(spell_id).ok_or_else(|| {
+            HostError::InvalidConfiguration(
+                "declared spell ID is not present in host catalog".into(),
+            )
+        })?;
+        let event = definition.cast_event(caster_id).map_err(|_| {
+            HostError::InvalidConfiguration(
+                "validated declarative spell did not build a cast event".into(),
+            )
+        })?;
+        let outcome = self
+            .lock()?
+            .apply_player_spell_cast_event(event)
+            .map_err(HostError::Core)?;
+        self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(outcome)
     }
 
     pub fn active_static_spawns(&self) -> Result<FeTfsStaticSpawnCollection, HostError> {
@@ -3370,7 +3398,7 @@ impl std::error::Error for HostError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forgotten_config::parse_declarative_weapons_xml;
+    use forgotten_config::{parse_declarative_spells_xml, parse_declarative_weapons_xml};
     use forgotten_core::{Player, Position, WorldMapTile};
     use forgotten_protocol::FE_7_4_PROFILE;
     use std::fs;
@@ -4093,6 +4121,54 @@ mod tests {
         assert_eq!(recovered.mana_gained, 4);
         assert_eq!(shared.vitals_epoch(), 1);
         assert_eq!(shared.player_vitals(104).unwrap(), recovered.vitals);
+    }
+
+    #[test]
+    fn shared_declared_spell_cast_uses_catalog_mana_and_cooldown_only() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position_with_vitals(
+                Player {
+                    id: 107,
+                    account_id: 1,
+                    name: "Sorcerer".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                PlayerVitals {
+                    mana: 50,
+                    max_mana: 50,
+                    ..PlayerVitals::default()
+                },
+                &map,
+            )
+            .unwrap();
+        let catalog = parse_declarative_spells_xml(
+            br#"<fe-spells><fe-spell id="100" manacost="20" intervalticks="2"/></fe-spells>"#,
+        )
+        .unwrap();
+        assert_eq!(shared.vitals_epoch(), 0);
+        let outcome = shared
+            .apply_declarative_spell_cast(107, 100, &catalog)
+            .unwrap();
+        assert_eq!(outcome.mana_spent, 20);
+        assert_eq!(outcome.remaining_mana, 30);
+        assert_eq!(outcome.next_cast_tick, 2);
+        assert_eq!(shared.vitals_epoch(), 1);
+        assert_eq!(shared.player_vitals(107).unwrap().mana, 30);
+        assert!(matches!(
+            shared.apply_declarative_spell_cast(107, 100, &catalog),
+            Err(HostError::Core(
+                forgotten_core::CoreError::SpellCooldownActive { .. }
+            ))
+        ));
+        assert!(matches!(
+            shared.apply_declarative_spell_cast(107, 999, &catalog),
+            Err(HostError::InvalidConfiguration(_))
+        ));
     }
 
     #[test]

@@ -40,6 +40,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Define typed bounded spell-cast resource and cooldown accounting with no packet, target, formula, effect, or script behavior.
 - [x] Parse bounded FE-owned scriptless spell declarations that construct typed mana-and-cooldown events.
 - [x] Load the optional declarative spell catalog as immutable native-host input without enabling any client cast path.
+- [x] Resolve a declared spell through synchronized host state for bounded mana and cooldown accounting only.
 - [ ] Add profile-gated spell definitions, client request validation, target handling, formulas, effects, and safe script boundaries only after packet evidence.
 - [ ] Deliver verified client-visible condition health, death, temple-respawn, and approved loss state for every supported profile.
 - [ ] Add PvP legality, skulls, frags, death/corpse ownership rules, and explicit policy configuration.

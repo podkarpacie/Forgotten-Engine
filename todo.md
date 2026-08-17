@@ -243,6 +243,7 @@
 - [x] Define typed bounded spell-cast events with authoritative mana and cooldown enforcement; profile gating, native spell packets, visual effects, Lua formulas, legacy spell semantics, and PvP policy remain deferred.
 - [x] Parse and validate a bounded scriptless FE declarative spell catalog that constructs typed spell-cast events; profile selection, client spell requests, formulas, effects, target resolution, and Lua remain deferred.
 - [x] Load the optional declarative spell catalog as immutable native-host configuration; client invocation, profile gating, target handling, effects, and Lua remain deferred.
+- [x] Resolve a declared spell through immutable host catalog input and apply only authoritative mana/cooldown accounting; client requests, targets, formulas, effects, persistence, and Lua remain deferred.
 - [x] Define typed bounded adjacent item-use intents against authoritative map tiles; action execution, doors, switches, containers, Lua, and client item-use packets remain deferred.
 - [x] Advance the native authoritative world tick from elapsed heartbeat time so lifecycle timestamps and future combat cooldowns share one deterministic server clock; client packet semantics remain unchanged.
 - [ ] Add profile-driven combat events for weapons, spells, damage types, cooldowns, PvP policy, and death/corpse handling after independent compatibility evidence.
