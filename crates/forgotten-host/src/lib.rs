@@ -90,6 +90,19 @@ pub struct StaticTargetAcquisitionSummary {
     pub changed_static_targets: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticTargetPursuitPolicy {
+    Disabled,
+    NearestLivingPlayerOneStep { max_range: u8 },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StaticTargetPursuitSummary {
+    pub examined_static_creatures: usize,
+    pub changed_static_targets: usize,
+    pub moved_static_creatures: usize,
+}
+
 fn advance_native_shared_world_heartbeat(
     shared_world: &SharedNativeWorld,
     elapsed_seconds: u16,
@@ -1029,6 +1042,61 @@ impl SharedNativeWorld {
             if previous != selected.target_player_id {
                 summary.changed_static_targets += 1;
             }
+        }
+        Ok(summary)
+    }
+
+    /// Applies one explicit bounded pursue pass. For every active static creature, it chooses the
+    /// nearest living player within the provided range and attempts at most one existing legal
+    /// cardinal target step. It does not install a scheduler, retry blocked paths, attack, emit a
+    /// target packet, or otherwise implement general creature AI.
+    pub fn pursue_static_creature_targets_once(
+        &self,
+        world_map: &WorldMap,
+        policy: StaticTargetPursuitPolicy,
+    ) -> Result<StaticTargetPursuitSummary, HostError> {
+        let StaticTargetPursuitPolicy::NearestLivingPlayerOneStep { max_range } = policy else {
+            return Ok(StaticTargetPursuitSummary::default());
+        };
+        if !(1..=forgotten_core::MAX_STATIC_CREATURE_TARGET_RANGE).contains(&max_range) {
+            return Err(HostError::Core(
+                forgotten_core::CoreError::InvalidStaticCreatureTargetRange(max_range),
+            ));
+        }
+        let mut world = self.lock()?;
+        let creature_ids = world
+            .active_static_spawn_collection()
+            .entities
+            .into_iter()
+            .map(|entity| entity.id)
+            .collect::<Vec<_>>();
+        let mut summary = StaticTargetPursuitSummary {
+            examined_static_creatures: creature_ids.len(),
+            changed_static_targets: 0,
+            moved_static_creatures: 0,
+        };
+        for creature_id in creature_ids {
+            let previous = world
+                .static_creature_target(creature_id)
+                .map_err(HostError::Core)?;
+            let selected = world
+                .select_static_creature_target(creature_id, max_range)
+                .map_err(HostError::Core)?;
+            if previous != selected.target_player_id {
+                summary.changed_static_targets += 1;
+            }
+            if matches!(
+                world
+                    .step_static_creature_toward_target(creature_id, world_map)
+                    .map_err(HostError::Core)?,
+                StaticCreatureTargetStepOutcome::Moved { .. }
+            ) {
+                summary.moved_static_creatures += 1;
+            }
+        }
+        drop(world);
+        if summary.moved_static_creatures > 0 {
+            self.mark_visibility_changed();
         }
         Ok(summary)
     }
@@ -7587,6 +7655,100 @@ mod tests {
                 .unwrap();
         assert_eq!(unchanged.reactivated, 0);
         assert!(refresh.is_none());
+    }
+
+    #[test]
+    fn opt_in_static_target_pursuit_moves_once_and_refreshes_only_on_a_real_step() {
+        let map = native_world_map();
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let static_spawns =
+            FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
+                id: creature_id,
+                name: "Rat".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 100,
+                direction: 2,
+            }])
+            .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: Position {
+                        x: 103,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let visibility_epoch = shared.visibility_epoch();
+        assert_eq!(
+            shared
+                .pursue_static_creature_targets_once(&map, StaticTargetPursuitPolicy::Disabled)
+                .unwrap(),
+            StaticTargetPursuitSummary::default()
+        );
+        assert_eq!(shared.visibility_epoch(), visibility_epoch);
+        assert_eq!(
+            shared
+                .pursue_static_creature_targets_once(
+                    &map,
+                    StaticTargetPursuitPolicy::NearestLivingPlayerOneStep { max_range: 4 },
+                )
+                .unwrap(),
+            StaticTargetPursuitSummary {
+                examined_static_creatures: 1,
+                changed_static_targets: 1,
+                moved_static_creatures: 1,
+            }
+        );
+        assert_eq!(shared.visibility_epoch(), visibility_epoch + 1);
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .static_creature(creature_id)
+                .unwrap()
+                .position,
+            Position {
+                x: 102,
+                y: 100,
+                z: 7,
+            }
+        );
+        assert_eq!(
+            shared
+                .pursue_static_creature_targets_once(
+                    &map,
+                    StaticTargetPursuitPolicy::NearestLivingPlayerOneStep { max_range: 4 },
+                )
+                .unwrap(),
+            StaticTargetPursuitSummary {
+                examined_static_creatures: 1,
+                changed_static_targets: 0,
+                moved_static_creatures: 0,
+            }
+        );
+        assert_eq!(shared.visibility_epoch(), visibility_epoch + 1);
     }
 
     #[test]

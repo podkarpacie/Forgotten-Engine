@@ -68,6 +68,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Add a caller-triggered single deterministic cardinal target step that delegates map and occupancy validation to the authoritative movement boundary; pursuit loops, routing, AI, combat automation, and client delivery remain deferred.
 - [x] Route a real caller-triggered target step through the shared native-world visibility epoch and established full-map refresh; autonomous scheduling and real-client evidence remain deferred.
 - [x] Add an explicit opt-in shared-heartbeat nearest-player target acquisition policy with capped range, deterministic ordering, and inert default heartbeat behavior; movement, combat, packets, and client target delivery remain deferred.
+- [x] Add an explicit one-step static pursuit policy that selects a bounded nearest target then reuses authoritative map/occupancy movement once per active static creature; default scheduling, routing, combat, and client delivery remain deferred.
 - [ ] Add deterministic monster/NPC state, spawn timing, movement, target selection, pathfinding boundaries, and combat participation.
 - [ ] Add death, corpse, loot, decay, and respawn runtime behavior with owner and persistence rules.
 - [ ] Add bounded NPC dialogue, shops, travel, and typed event boundaries.
