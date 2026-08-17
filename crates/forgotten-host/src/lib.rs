@@ -13,7 +13,7 @@ use forgotten_core::{
     PlayerRegenerationRules, PlayerRespawnState, PlayerSkill, PlayerSkillTryOutcome,
     PlayerSpellCastOutcome, PlayerVitals, Position, StaticCreatureDamageOutcome,
     StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, StaticCreatureResetSummary,
-    VocationId, VocationLevelUpGains, WorldMap, WorldState,
+    StaticCreatureTargetStepOutcome, VocationId, VocationLevelUpGains, WorldMap, WorldState,
 };
 use forgotten_persistence::{EngineDatabase, PlayerOutfit, PlayerVitals as PersistedPlayerVitals};
 use forgotten_protocol::{
@@ -941,6 +941,24 @@ impl SharedNativeWorld {
             .apply_static_creature_melee_damage(attacker_id, target_id, requested_damage)
             .map_err(HostError::Core)?;
         if outcome.applied_damage > 0 {
+            self.mark_visibility_changed();
+        }
+        Ok(outcome)
+    }
+
+    /// Applies one caller-triggered bounded target step. Only a real movement increments the
+    /// shared visibility epoch; target acquisition, scheduling, AI, combat, and packets remain
+    /// outside this state transition.
+    pub fn step_static_creature_toward_target(
+        &self,
+        creature_id: u32,
+        world_map: &WorldMap,
+    ) -> Result<StaticCreatureTargetStepOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .step_static_creature_toward_target(creature_id, world_map)
+            .map_err(HostError::Core)?;
+        if matches!(outcome, StaticCreatureTargetStepOutcome::Moved { .. }) {
             self.mark_visibility_changed();
         }
         Ok(outcome)
@@ -2932,6 +2950,31 @@ pub fn apply_native_static_creature_policy_and_refresh(
     )
     .map_err(HostError::Protocol)?;
     Ok((batch, Some(frame)))
+}
+
+/// Applies one explicitly requested target-directed creature step through the shared world and
+/// refreshes the selected native session only after a real move. It creates no autonomous task,
+/// protocol-specific target state, combat action, or pathfinding behavior.
+pub fn step_shared_native_static_creature_toward_target_and_refresh(
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    shared_world: &SharedNativeWorld,
+    viewer_player_id: u64,
+    world_map: &WorldMap,
+    creature_id: u32,
+) -> Result<(StaticCreatureTargetStepOutcome, Option<Frame>), HostError> {
+    let outcome = shared_world.step_static_creature_toward_target(creature_id, world_map)?;
+    if !matches!(outcome, StaticCreatureTargetStepOutcome::Moved { .. }) {
+        return Ok((outcome, None));
+    }
+    let frame = encode_shared_native_world_viewport(
+        profile,
+        snapshot,
+        world_map,
+        shared_world,
+        viewer_player_id,
+    )?;
+    Ok((outcome, Some(frame)))
 }
 
 /// Reactivates inactive imported static entities at their validated spawn positions and emits a
@@ -6992,6 +7035,128 @@ mod tests {
 
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn shared_target_step_refreshes_native_visibility_only_after_a_real_move() {
+        let map = native_world_map();
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let creature = forgotten_core::FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let shared = SharedNativeWorld::from_static_spawns(Some(
+            &FeTfsStaticSpawnCollection::new(vec![creature]).unwrap(),
+        ))
+        .unwrap();
+        let target_position = Position {
+            x: 103,
+            y: 100,
+            z: 7,
+        };
+        assert_eq!(
+            shared
+                .register_player_at_available_position(
+                    Player {
+                        id: 101,
+                        account_id: 1,
+                        name: "Knight".into(),
+                        position: target_position,
+                        level: 8,
+                        experience: 0,
+                        skill_points: 0,
+                    },
+                    &map,
+                )
+                .unwrap(),
+            target_position
+        );
+        shared
+            .lock()
+            .unwrap()
+            .select_static_creature_target(creature_id, 4)
+            .unwrap();
+        let snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_id: native_player_id(101).unwrap(),
+            player_name: "Knight".into(),
+            player_position: native_position(target_position),
+            player_level: 8,
+            player_experience: 0,
+            player_vitals: NativeOtClientPlayerVitals::default(),
+            player_skills: forgotten_core::PlayerSkills::default(),
+            ground_thing_id: 102,
+            player_look_type: 128,
+            player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
+            player_speed: 220,
+            server_beat: 50,
+        };
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+        let epoch_before = shared.visibility_epoch();
+        let (outcome, refresh) = step_shared_native_static_creature_toward_target_and_refresh(
+            &profile,
+            &snapshot,
+            &shared,
+            101,
+            &map,
+            creature_id,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            StaticCreatureTargetStepOutcome::Moved {
+                target_player_id: 101,
+                direction: CardinalDirection::East,
+                from: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                to: Position {
+                    x: 102,
+                    y: 100,
+                    z: 7,
+                },
+            }
+        );
+        let refresh = refresh.expect("a real target step must refresh the map");
+        assert_eq!(
+            refresh.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert!(refresh.0.windows(3).any(|window| window == b"Rat"));
+        assert_eq!(shared.visibility_epoch(), epoch_before + 1);
+
+        let (adjacent, refresh) = step_shared_native_static_creature_toward_target_and_refresh(
+            &profile,
+            &snapshot,
+            &shared,
+            101,
+            &map,
+            creature_id,
+        )
+        .unwrap();
+        assert_eq!(
+            adjacent,
+            StaticCreatureTargetStepOutcome::AlreadyAdjacent {
+                target_player_id: 101
+            }
+        );
+        assert!(refresh.is_none());
+        assert_eq!(shared.visibility_epoch(), epoch_before + 1);
     }
 
     #[test]
