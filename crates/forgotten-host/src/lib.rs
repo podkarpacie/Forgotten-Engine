@@ -369,6 +369,14 @@ impl SharedNativeWorld {
         Ok(self.lock()?.advance_ticks(elapsed_seconds))
     }
 
+    pub fn reactivate_due_static_creatures(&self) -> Result<StaticCreatureResetSummary, HostError> {
+        let summary = self.lock()?.reactivate_due_static_creatures();
+        if summary.reactivated > 0 {
+            self.mark_visibility_changed();
+        }
+        Ok(summary)
+    }
+
     pub fn tick(&self) -> Result<u64, HostError> {
         Ok(self.lock()?.tick())
     }
@@ -6292,6 +6300,58 @@ mod tests {
                 .unwrap();
         assert_eq!(unchanged.reactivated, 0);
         assert!(refresh.is_none());
+    }
+
+    #[test]
+    fn shared_due_static_reactivation_refreshes_visibility_only_after_interval() {
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let collection = FeTfsStaticSpawnCollection::with_respawn_intervals(
+            vec![forgotten_core::FeTfsStaticEntity {
+                id: creature_id,
+                name: "Rat".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 100,
+                direction: 2,
+            }],
+            std::collections::BTreeMap::from([(creature_id, 2)]),
+        )
+        .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&collection)).unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .deactivate_static_creature(creature_id)
+            .unwrap();
+        let epoch_before = shared.visibility_epoch();
+        shared.advance_tick().unwrap();
+        assert_eq!(
+            shared
+                .reactivate_due_static_creatures()
+                .unwrap()
+                .reactivated,
+            0
+        );
+        assert_eq!(shared.visibility_epoch(), epoch_before);
+        shared.advance_tick().unwrap();
+        assert_eq!(
+            shared
+                .reactivate_due_static_creatures()
+                .unwrap()
+                .reactivated,
+            1
+        );
+        assert_eq!(shared.visibility_epoch(), epoch_before + 1);
     }
 
     #[test]

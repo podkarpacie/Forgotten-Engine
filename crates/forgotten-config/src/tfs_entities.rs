@@ -3,7 +3,7 @@ use crate::{ConfigError, EngineConfig};
 use forgotten_core::{FeTfsStaticEntity, FeTfsStaticSpawnCollection};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -127,6 +127,7 @@ pub fn materialize_tfs_static_spawns(
     catalog: &TfsEntityCatalog,
 ) -> Result<FeTfsStaticSpawnCollection, ConfigError> {
     let mut entities = Vec::new();
+    let mut respawn_intervals_seconds = BTreeMap::new();
     let mut next_id = STATIC_TFS_ENTITY_ID_START;
     for spawn_area in &companions.spawns {
         for creature in &spawn_area.creatures {
@@ -143,6 +144,9 @@ pub fn materialize_tfs_static_spawns(
             // A zero look type has no operator-provided client appearance and is not rendered.
             if appearance.look_type == 0 {
                 continue;
+            }
+            if creature.spawn_interval_seconds > 0 {
+                respawn_intervals_seconds.insert(next_id, creature.spawn_interval_seconds);
             }
             entities.push(FeTfsStaticEntity {
                 id: next_id,
@@ -167,7 +171,7 @@ pub fn materialize_tfs_static_spawns(
                 .ok_or_else(|| invalid("static TFS spawn identifier range is exhausted"))?;
         }
     }
-    FeTfsStaticSpawnCollection::new(entities)
+    FeTfsStaticSpawnCollection::with_respawn_intervals(entities, respawn_intervals_seconds)
         .map_err(|error| invalid(format!("invalid static TFS spawn collection: {error}")))
 }
 
@@ -821,5 +825,9 @@ mod tests {
         assert_eq!(spawns.entities[0].speed, 134);
         assert_eq!(spawns.entities[0].health_percent, 100);
         assert_eq!(spawns.entities[0].direction, 2);
+        assert_eq!(
+            spawns.respawn_interval_seconds(STATIC_TFS_ENTITY_ID_START),
+            60
+        );
     }
 }
