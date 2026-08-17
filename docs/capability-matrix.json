@@ -46,7 +46,7 @@
       "id": "fe-8.0",
       "target": "Tibia 8.0",
       "nativeOtClientV8": "partial",
-      "nativeOtClientV8Detail": "explicit profile foundation recognizes that classic 8.0 requires RSA/XTEA transport and includes a bounded outbound-only opaque XTEA envelope primitive for future parser-backed work. Native enablement remains refused: there is no client-input decryption, login/game parser, listener, packet-layout claim, or client interoperability claim",
+      "nativeOtClientV8Detail": "explicit profile foundation recognizes that classic 8.0 requires RSA/XTEA transport, includes a bounded outbound-only opaque XTEA envelope primitive, and can extract only the marker plus four XTEA words from an already decrypted fixed block for future parser-backed work. Native enablement remains refused: there is no client-input decryption, credential/login/game parser, listener, packet-layout claim, or client interoperability claim",
       "officialClientProtocolEmulation": "deferred",
       "contentAudit": "partial",
       "runtimeItemsAndInventory": "deferred",

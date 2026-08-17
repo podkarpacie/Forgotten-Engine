@@ -384,6 +384,42 @@ pub fn encode_fe_8_0_xtea_transport_envelope(
     Ok(Frame(encrypted))
 }
 
+/// The minimal encrypted-transport context that future parser-backed FE 8.0 work may consume.
+/// It contains no account, character, password, or other login field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fe80RsaXteaBootstrap {
+    pub xtea_key: XteaKey,
+}
+
+/// Extracts only the RSA-protected marker and four XTEA words from an already decrypted fixed-size
+/// block. This function does not perform RSA decryption, accept a network frame, parse credentials
+/// or login fields, or validate any protocol-800 packet layout beyond this generic bootstrap prefix.
+pub fn decode_fe_8_0_rsa_xtea_bootstrap(
+    plaintext: &[u8; LEGACY_RSA_BLOCK_SIZE],
+) -> Result<Fe80RsaXteaBootstrap, ProtocolError> {
+    let mut reader = Reader::new(plaintext);
+    if reader.byte()? != 0 {
+        return Err(ProtocolError::InvalidLoginMarker);
+    }
+    Ok(Fe80RsaXteaBootstrap {
+        xtea_key: [reader.u32()?, reader.u32()?, reader.u32()?, reader.u32()?],
+    })
+}
+
+/// Produces a fixed bootstrap-prefix block only for FE protocol regressions and local harnesses.
+/// It is not a network encoder and it does not append credentials or other login fields.
+pub fn encode_fe_8_0_rsa_xtea_bootstrap_for_harness(
+    bootstrap: Fe80RsaXteaBootstrap,
+) -> [u8; LEGACY_RSA_BLOCK_SIZE] {
+    let mut plaintext = [0; LEGACY_RSA_BLOCK_SIZE];
+    plaintext[0] = 0;
+    for (index, word) in bootstrap.xtea_key.into_iter().enumerate() {
+        let start = 1 + index * 4;
+        plaintext[start..start + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    plaintext
+}
+
 /// `0x01`, client version, then a raw 128-byte RSA block. The decrypted block has a zero marker,
 /// four XTEA words, then bounded account and password strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2496,6 +2532,20 @@ mod tests {
 
     #[test]
     fn status_contract_decodes_and_escapes_xml() {
+        let bootstrap = Fe80RsaXteaBootstrap {
+            xtea_key: [0x1122_3344, 0x5566_7788, 0x99aa_bbcc, 0xddee_ff00],
+        };
+        let mut bootstrap_plaintext = encode_fe_8_0_rsa_xtea_bootstrap_for_harness(bootstrap);
+        bootstrap_plaintext[17..22].copy_from_slice(&[9, 8, 7, 6, 5]);
+        assert_eq!(
+            decode_fe_8_0_rsa_xtea_bootstrap(&bootstrap_plaintext).unwrap(),
+            bootstrap
+        );
+        bootstrap_plaintext[0] = 1;
+        assert!(matches!(
+            decode_fe_8_0_rsa_xtea_bootstrap(&bootstrap_plaintext),
+            Err(ProtocolError::InvalidLoginMarker)
+        ));
         assert!(matches!(
             decode_status_request(&Frame(vec![1, 9, 0])),
             Ok(StatusRequest::Binary { .. })
