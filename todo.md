@@ -272,3 +272,4 @@
 - [x] Build, package, checksum, and publish fresh Linux and Windows artifacts from the latest verified Forgotten Engine commit for manual testing.
 - [ ] Establish and satisfy production-readiness gates for complete declared TFS feature conformance, profile-specific protocol validation, reliability, bounded memory/performance, security, and reproducible TFS-to-FE migration before describing any profile as mainstream-ready.
 - [x] Expand the completion ledger from its interim 51% target into a full evidence-based 100% production-readiness plan covering every declared FE system, compatibility profile, migration boundary, and operational gate.
+- [x] Define a typed audit-derived deferred script-event interface and no-op executor that never reads, loads, or runs imported Lua; real sandboxing, legacy APIs, and gameplay event execution remain deferred.

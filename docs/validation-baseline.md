@@ -45,6 +45,7 @@ Use a lawful, unmodified OTClientV8 build configured for the selected 740 profil
 | Native 740 chat boundary | Send bounded public-chat input and confirm the session remains connected without a parser error. Client-visible server chat remains intentionally deferred because unmodified OTCv8 has no message-mode map below protocol 760. | Any parser-invalid `0xAA` or generic text-message output, disconnect, or claim that visible native 740 chat is supported is a release blocker. |
 | Lifecycle foundations | Regeneration, selected melee, hydrated conditions, death-state activation with a valid town/temple, and persistence across expected supported boundaries behave exactly as documented. | Any behavior outside the documented boundary must be reported as a defect or deferred—not accepted as parity. |
 | Imported private content | `tfs-audit` and `validate` identify imported map/config/item/registry findings without executing scripts. | Audit errors, missing required files, or a false “compatible” claim is a blocker. |
+| Deferred script boundary | `tfs-audit` may report typed category/count metadata through the no-op dispatcher, but it must not read a script path or body, load Lua, execute a callback, or change world state. | Any script file access, runtime execution, private source disclosure, or gameplay side effect is a release blocker. |
 
 ## Production-release blockers
 

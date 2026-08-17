@@ -3,7 +3,7 @@ use forgotten_config::{
     load_declarative_weapon_catalog, load_legacy_item_catalog, load_tfs_content_inventory,
     load_tfs_entity_catalog, load_tfs_vocation_registry, load_world_companions, load_world_map,
     materialize_tfs_static_spawns, resolve_tfs_spawn_references, validate_content, world_map_path,
-    write_template,
+    write_template, TfsRegistryCategory,
 };
 use forgotten_core::{
     EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules, PlayerSkill,
@@ -18,6 +18,9 @@ use forgotten_persistence::{create_backup, EngineDatabase};
 use forgotten_protocol::{
     profile_by_id, CompatibilityProfile, LegacyRsaPrivateKey, OtClientEndpoint,
     COMPATIBILITY_PROFILES,
+};
+use forgotten_scripting::{
+    DeferredScriptEvent, DeferredScriptEventKind, NoopDeferredScriptExecutor, ScriptEventDispatcher,
 };
 use std::env;
 use std::fs;
@@ -171,6 +174,21 @@ fn validate(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn deferred_script_event_kind(category: TfsRegistryCategory) -> DeferredScriptEventKind {
+    match category {
+        TfsRegistryCategory::Actions => DeferredScriptEventKind::Action,
+        TfsRegistryCategory::CreatureScripts => DeferredScriptEventKind::CreatureScript,
+        TfsRegistryCategory::Events => DeferredScriptEventKind::Event,
+        TfsRegistryCategory::GlobalEvents => DeferredScriptEventKind::GlobalEvent,
+        TfsRegistryCategory::Movements => DeferredScriptEventKind::Movement,
+        TfsRegistryCategory::Spells => DeferredScriptEventKind::Spell,
+        TfsRegistryCategory::TalkActions => DeferredScriptEventKind::TalkAction,
+        TfsRegistryCategory::Weapons => DeferredScriptEventKind::Weapon,
+        TfsRegistryCategory::Monsters => DeferredScriptEventKind::Monster,
+        TfsRegistryCategory::Npcs => DeferredScriptEventKind::Npc,
+    }
+}
+
 fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!(">> Loading TFS-style configuration without executing Lua");
     let config = load(&directory)?;
@@ -235,14 +253,22 @@ fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Er
         .iter()
         .filter(|registry| registry.present)
     {
+        let dispatch = NoopDeferredScriptExecutor.dispatch(DeferredScriptEvent {
+            kind: deferred_script_event_kind(registry.category),
+            reference_count: registry.reference_count,
+            missing_reference_count: registry.missing_references.len(),
+            unsafe_reference_count: registry.unsafe_references.len(),
+        });
         println!(
-            "> registry={} entries={} references={} missing={} unsafe={} status={}",
+            "> registry={} entries={} references={} missing={} unsafe={} status={} dispatch={} execution={}",
             registry.category.label(),
             registry.entry_count,
             registry.reference_count,
             registry.missing_references.len(),
             registry.unsafe_references.len(),
             registry.category.runtime_status(),
+            dispatch.event.kind.label(),
+            dispatch.state.as_str(),
         );
         if !registry.missing_references.is_empty() {
             let paths = registry
@@ -1295,6 +1321,22 @@ mod tests {
         let profile = selected_profile(&arguments, 2).unwrap();
         assert_eq!(profile.id, "fe-7.4");
         assert_eq!(profile.tibia_protocol, "7.4");
+    }
+
+    #[test]
+    fn registry_categories_map_to_typed_deferred_script_events() {
+        assert_eq!(
+            deferred_script_event_kind(TfsRegistryCategory::Actions),
+            DeferredScriptEventKind::Action
+        );
+        assert_eq!(
+            deferred_script_event_kind(TfsRegistryCategory::TalkActions),
+            DeferredScriptEventKind::TalkAction
+        );
+        assert_eq!(
+            deferred_script_event_kind(TfsRegistryCategory::Npcs),
+            DeferredScriptEventKind::Npc
+        );
     }
 
     #[test]
