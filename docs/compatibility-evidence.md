@@ -27,9 +27,13 @@ The public client protocol declarations identify both the classic Quest Log requ
 
 ## Player-stats and inspect protocol boundaries
 
-For the selected 740 profile, the public client parser consumes a `u16` level, level percent, `u16` mana, `u16` maximum mana, magic level, magic-level percent, and a soul byte after the common health, capacity, and experience fields.[6] FE’s native `0xA0` regression contract now reflects that observed classic record boundary; it does not claim the later-protocol total-capacity, stamina, or soul gameplay systems. The public client sender describes a classic map look request as `0x8C`, position, thing ID, and stack position.[7] FE continues to tolerate that request without a visible result because a profile-specific, parser-confirmed 740 text-response mode must be established before enabling one. It must not reuse the previously invalid generic mode value.
+For the selected 740 profile, the public client parser consumes a `u16` free-capacity field, then a `u32` experience field, `u16` level, level percent, `u16` mana, `u16` maximum mana, magic level, magic-level percent, and a soul byte.[6] The public feature map enables neither double free capacity before 840 nor total capacity before 910, so no additional capacity field belongs in FE’s 740 record.[11] FE’s native `0xA0` regression therefore includes a realistic persisted `32,000` capacity with separate `42 / 50` mana bytes; it does not claim later-protocol total-capacity, stamina, or soul gameplay systems. The public client sender describes a classic map look request as `0x8C`, position, thing ID, and stack position.[7] FE continues to tolerate that request without a visible result because a profile-specific, parser-confirmed 740 text-response mode must be established before enabling one. It must not reuse the previously invalid generic mode value.
 
 The maintained OTCv8 project reports an open 7.4 defect: its message-mode map is not constructed for protocol versions below 760, causing both talk and text-message modes to resolve as invalid.[8] This independently explains the earlier `unknown message mode` client errors. FE therefore keeps native 740 visible chat and visible look output explicitly deferred. Treating a server-side mode byte as a substitute would require a client change, which conflicts with FE’s unmodified-OTClientV8 compatibility target.
+
+## Outfit-dialog protocol boundary
+
+The public client parser consumes one classic outfit record, then—when the newer outfit-list feature is unavailable—one-byte start and end look types.[12] FE’s bounded native response to request `0xD2` is therefore an independently authored `0xC8` record containing only the current classic outfit and that inclusive one-byte range. It intentionally emits no newer named-outfit list, addons, mounts, wings, auras, shaders, or client-specific extensions. The existing native session regression covers request, response, accepted colors, and persisted appearance; real-client confirmation that the dialog opens remains required.
 
 ## Physical mitigation research boundary
 
@@ -56,3 +60,7 @@ Public historical OpenTibia discussion describes shield defense and armor as sep
 [9] [OTLand discussion: Defense and armour](https://otland.net/threads/defense-and-armour.287950/). Community historical analysis; used only to identify research questions and stage ordering, not as a complete formula specification.
 
 [10] [Public TFS combat parameter declarations](https://raw.githubusercontent.com/otland/forgottenserver/master/src/combat.cpp). Read-only behavioral evidence from a later TFS codebase; no source is copied into FE.
+
+[11] [Public OTCv8 feature map](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/game.cpp). Read-only classic-profile feature evidence; no client source is copied into FE.
+
+[12] [Public OTCv8 outfit-dialog parser](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/protocolgameparse.cpp). Read-only behavioral evidence; no client source is copied into FE.
