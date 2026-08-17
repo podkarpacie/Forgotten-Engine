@@ -187,7 +187,7 @@
 - [x] Pass the validated item-presentation catalog through native host configuration without emitting inventory packets yet.
 - [x] Resolve authoritative player items through the validated native host catalog into classic record metadata without emitting packet writes yet.
 - [x] Append only catalog-validated classic-740 equipment records to native bootstrap delivery in deterministic multi-slot order, omitting unmapped items without guessed packet output.
-- [x] Add a strict classic-740 container-open encoder with golden parser-layout tests, without enabling client item-use or container-window actions yet.
+- [x] Add a strict classic-740 container-open encoder with golden parser-layout tests and profile-gated login bootstrap for top-level fully mapped persisted containers, without enabling client item-use or container-window actions yet.
 - [x] Add additive local player equipment provisioning commands that persist bounded item instances without altering existing player command syntax.
 - [x] Define authoritative player-owned named containers with bounded IDs and items as the foundation for persistence and future parser-safe window delivery.
 - [x] Add schema-v4 transactional persistence for player-owned named containers and ordered container items with safe migration and malformed-record rejection.

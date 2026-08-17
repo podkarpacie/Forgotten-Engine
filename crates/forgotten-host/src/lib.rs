@@ -35,16 +35,17 @@ use forgotten_protocol::{
     encode_native_otclient_map_step_with_static_spawns_and_players,
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
-    encode_native_otclient_move_creature_at, encode_native_otclient_player_skills,
-    encode_native_otclient_player_stats, encode_native_otclient_set_inventory,
-    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
-    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
-    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
-    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection,
-    NativeOtClientClassicItemRecord, NativeOtClientClassicOutfit, NativeOtClientEmptyWorldSnapshot,
-    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
-    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
-    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    encode_native_otclient_move_creature_at, encode_native_otclient_open_container,
+    encode_native_otclient_player_skills, encode_native_otclient_player_stats,
+    encode_native_otclient_set_inventory, encode_status_binary, encode_status_xml,
+    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
+    NativeOtClientCardinalDirection, NativeOtClientClassicItemRecord,
+    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPlayerVitals,
+    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
+    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -96,6 +97,39 @@ fn native_classic_equipment_frames(
             native_classic_item_record(catalog, item).map(|record| (slot, record))
         })
         .map(|(slot, record)| encode_native_otclient_set_inventory(profile, slot, record))
+        .collect()
+}
+
+fn native_classic_container_frames(
+    profile: &NativeOtClientProfile,
+    catalog: Option<&NativeItemPresentationCatalog>,
+    containers: &PlayerContainers,
+) -> Result<Vec<Frame>, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Ok(Vec::new());
+    }
+    containers
+        .iter()
+        .filter_map(|(_, container)| {
+            if container.has_parent {
+                return None;
+            }
+            let container_item = native_classic_item_record(catalog, &container.container_item)?;
+            let items = container
+                .items
+                .iter()
+                .map(|item| native_classic_item_record(catalog, item))
+                .collect::<Option<Vec<_>>>()?;
+            Some(NativeOtClientClassicOpenContainer {
+                container_id: container.container_id,
+                container_item,
+                name: container.name.clone(),
+                capacity: container.items.capacity() as u8,
+                has_parent: false,
+                items,
+            })
+        })
+        .map(|container| encode_native_otclient_open_container(profile, &container))
         .collect()
 }
 
@@ -1721,6 +1755,7 @@ fn handle_native_otclient_game(
         .player_conditions(character.id)
         .map_err(HostError::Persistence)?;
     let bootstrap_equipment = equipment.clone();
+    let bootstrap_containers = containers.clone();
     let initial_position = match shared_world
         .register_player_at_available_position_with_vitals_equipment_containers_progression_and_conditions(
             Player {
@@ -1814,6 +1849,12 @@ fn handle_native_otclient_game(
         &bootstrap_equipment,
     )
     .map_err(HostError::Protocol)?;
+    let container_frames = native_classic_container_frames(
+        &config.client_profile,
+        config.item_presentation_catalog.as_deref(),
+        &bootstrap_containers,
+    )
+    .map_err(HostError::Protocol)?;
     write_frame(stream, &initialization)?;
     let mut player_outfit =
         native_hydrated_classic_outfit(empty_world.player_look_type, character.outfit);
@@ -1838,15 +1879,21 @@ fn handle_native_otclient_game(
     for frame in &equipment_frames {
         write_frame(stream, frame)?;
     }
+    for frame in &container_frames {
+        write_frame(stream, frame)?;
+    }
     stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
     if config.extended_diagnostics {
         eprintln!(
-            "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} equipment-records={}/{} skipped-unmapped={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
+            "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} equipment-records={}/{} skipped-unmapped={} container-records={}/{} skipped-unmapped-or-nested={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
             character.name,
             initialization.0.len(),
             equipment_frames.len(),
             bootstrap_equipment.len(),
             bootstrap_equipment.len().saturating_sub(equipment_frames.len()),
+            container_frames.len(),
+            bootstrap_containers.len(),
+            bootstrap_containers.len().saturating_sub(container_frames.len()),
             world_map.identifier(),
             world_map.tile_count(),
             active_static_spawns.entities.len(),
@@ -3647,6 +3694,69 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn native_classic_container_bootstrap_requires_top_level_mapped_content() {
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for (server_id, client_thing_id, subtype) in [(1988, 1988, false), (4526, 102, true)] {
+            catalog
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id,
+                        requires_classic_740_subtype: subtype,
+                    },
+                )
+                .unwrap();
+        }
+        let mut top_level = forgotten_core::PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        top_level
+            .items
+            .insert(ItemInstance::new(4526, 3).unwrap())
+            .unwrap();
+        let nested = forgotten_core::PlayerContainer::new(
+            3,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Nested",
+            true,
+            20,
+        )
+        .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(top_level).unwrap();
+        containers.insert(nested).unwrap();
+
+        let config = native_otclient_config("127.0.0.1:0".parse().unwrap());
+        let frames =
+            native_classic_container_frames(&config.client_profile, Some(&catalog), &containers)
+                .unwrap();
+        assert_eq!(
+            frames,
+            vec![Frame(vec![
+                0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0, 1,
+                102, 0, 3,
+            ])]
+        );
+
+        let incompatible_profile = NativeOtClientProfile {
+            protocol_version: 800,
+            ..config.client_profile
+        };
+        assert!(native_classic_container_frames(
+            &incompatible_profile,
+            Some(&catalog),
+            &containers
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
