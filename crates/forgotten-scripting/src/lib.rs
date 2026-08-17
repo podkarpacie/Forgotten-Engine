@@ -4,7 +4,8 @@
 //! only typed aggregate inventory metadata; it cannot receive a script path or source body and
 //! always returns a deferred no-op outcome.
 
-use mlua::{HookTriggers, Lua, LuaOptions, StdLib, Value};
+use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Value};
+use std::collections::BTreeMap;
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc,
@@ -13,6 +14,8 @@ use std::sync::{
 pub const MAX_SANDBOXED_LUA_SOURCE_BYTES: usize = 4 * 1024;
 pub const MAX_SANDBOXED_LUA_MEMORY_BYTES: usize = 64 * 1024;
 pub const MAX_SANDBOXED_LUA_INSTRUCTIONS: u32 = 10_000;
+pub const MAX_SANDBOXED_LUA_CALLBACKS: usize = 64;
+pub const MAX_SANDBOXED_LUA_CALLBACK_NAME_BYTES: usize = 64;
 const INSTRUCTION_LIMIT_MARKER: &str = "forgotten-engine-sandbox-instruction-limit";
 
 /// Explicit limits for one side-effect-free Lua expression evaluation. The executor creates a
@@ -166,6 +169,189 @@ impl SandboxedLuaExecutor {
             },
             Err(_) => rejected_runtime_outcome(instruction_checks),
         }
+    }
+}
+
+/// Typed primitive arguments admitted to one explicitly registered callback. The dispatcher does
+/// not expose world state, host objects, Lua tables, paths, files, network access, modules, or
+/// mutable server APIs. The event kind is an operator-chosen label, not a claimed TFS callback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxedLuaCallbackInput {
+    pub event_kind: String,
+    pub subject_id: u64,
+    pub value: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxedLuaCallbackRegistrationError {
+    InvalidName,
+    DuplicateName(String),
+    CallbackLimit(usize),
+    SourceRejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxedLuaCallbackDispatchState {
+    Completed,
+    CallbackNotFound,
+    SourceRejected,
+    InstructionLimitReached,
+    RuntimeRejected,
+    UnsupportedValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SandboxedLuaCallbackDispatchOutcome {
+    pub state: SandboxedLuaCallbackDispatchState,
+    pub value: Option<SandboxedLuaValue>,
+    pub instruction_checks: u32,
+}
+
+/// A bounded trusted-source callback registry. Registration is explicit and in-memory: it does
+/// not discover files, load TFS registries, preserve global Lua state, or resolve modules. Every
+/// dispatch creates a new VM and expects the source to evaluate to a function accepting exactly
+/// `(event_kind, subject_id, value)` primitive arguments.
+#[derive(Debug, Clone)]
+pub struct SandboxedLuaCallbackDispatcher {
+    limits: SandboxedLuaLimits,
+    callbacks: BTreeMap<String, String>,
+}
+
+impl Default for SandboxedLuaCallbackDispatcher {
+    fn default() -> Self {
+        Self::new(SandboxedLuaLimits::default())
+    }
+}
+
+impl SandboxedLuaCallbackDispatcher {
+    pub fn new(limits: SandboxedLuaLimits) -> Self {
+        Self {
+            limits,
+            callbacks: BTreeMap::new(),
+        }
+    }
+
+    pub const fn limits(&self) -> SandboxedLuaLimits {
+        self.limits
+    }
+
+    pub fn len(&self) -> usize {
+        self.callbacks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.callbacks.is_empty()
+    }
+
+    /// Registers one operator-provided callback source. The source must be a Lua chunk that
+    /// evaluates to a function, for example: `return function(kind, id, value) return value end`.
+    /// Source execution is deferred until dispatch and takes place in a fresh restricted VM.
+    pub fn register_callback(
+        &mut self,
+        name: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Result<(), SandboxedLuaCallbackRegistrationError> {
+        let name = name.into();
+        let source = source.into();
+        if name.trim().is_empty() || name.len() > MAX_SANDBOXED_LUA_CALLBACK_NAME_BYTES {
+            return Err(SandboxedLuaCallbackRegistrationError::InvalidName);
+        }
+        if source.len() > self.limits.max_source_bytes {
+            return Err(SandboxedLuaCallbackRegistrationError::SourceRejected);
+        }
+        if self.callbacks.contains_key(&name) {
+            return Err(SandboxedLuaCallbackRegistrationError::DuplicateName(name));
+        }
+        if self.callbacks.len() >= MAX_SANDBOXED_LUA_CALLBACKS {
+            return Err(SandboxedLuaCallbackRegistrationError::CallbackLimit(
+                MAX_SANDBOXED_LUA_CALLBACKS,
+            ));
+        }
+        self.callbacks.insert(name, source);
+        Ok(())
+    }
+
+    /// Invokes one registered callback in a new no-standard-library VM. Callback state cannot
+    /// carry across invocations, and only the explicitly supplied primitive input crosses the
+    /// sandbox boundary.
+    pub fn dispatch(
+        &self,
+        callback_name: &str,
+        input: &SandboxedLuaCallbackInput,
+    ) -> SandboxedLuaCallbackDispatchOutcome {
+        let Some(source) = self.callbacks.get(callback_name) else {
+            return SandboxedLuaCallbackDispatchOutcome {
+                state: SandboxedLuaCallbackDispatchState::CallbackNotFound,
+                value: None,
+                instruction_checks: 0,
+            };
+        };
+        if source.len() > self.limits.max_source_bytes {
+            return SandboxedLuaCallbackDispatchOutcome {
+                state: SandboxedLuaCallbackDispatchState::SourceRejected,
+                value: None,
+                instruction_checks: 0,
+            };
+        }
+        let lua = match Lua::new_with(StdLib::NONE, LuaOptions::default()) {
+            Ok(lua) => lua,
+            Err(_) => return rejected_callback_outcome(0),
+        };
+        if lua.set_memory_limit(self.limits.max_memory_bytes).is_err() {
+            return rejected_callback_outcome(0);
+        }
+        let instruction_checks = Arc::new(AtomicU32::new(0));
+        let hook_checks = Arc::clone(&instruction_checks);
+        let instruction_limit = self.limits.max_instructions;
+        lua.set_hook(
+            HookTriggers {
+                every_nth_instruction: Some(1),
+                ..HookTriggers::default()
+            },
+            move |_, _| {
+                if hook_checks.fetch_add(1, Ordering::Relaxed) >= instruction_limit {
+                    Err(mlua::Error::RuntimeError(INSTRUCTION_LIMIT_MARKER.into()))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let result = lua.load(source).eval::<Function>().and_then(|callback| {
+            let subject_id = i64::try_from(input.subject_id).map_err(|_| {
+                mlua::Error::RuntimeError("subject ID exceeds signed Lua integer range".into())
+            })?;
+            callback.call::<_, Value>((input.event_kind.as_str(), subject_id, input.value))
+        });
+        let instruction_checks = instruction_checks.load(Ordering::Relaxed);
+        let instruction_limit_reached = instruction_checks > self.limits.max_instructions;
+        match result {
+            Ok(value) => match sandboxed_lua_value(value) {
+                Some(value) => SandboxedLuaCallbackDispatchOutcome {
+                    state: SandboxedLuaCallbackDispatchState::Completed,
+                    value: Some(value),
+                    instruction_checks,
+                },
+                None => SandboxedLuaCallbackDispatchOutcome {
+                    state: SandboxedLuaCallbackDispatchState::UnsupportedValue,
+                    value: None,
+                    instruction_checks,
+                },
+            },
+            Err(_) if instruction_limit_reached => SandboxedLuaCallbackDispatchOutcome {
+                state: SandboxedLuaCallbackDispatchState::InstructionLimitReached,
+                value: None,
+                instruction_checks,
+            },
+            Err(_) => rejected_callback_outcome(instruction_checks),
+        }
+    }
+}
+
+fn rejected_callback_outcome(instruction_checks: u32) -> SandboxedLuaCallbackDispatchOutcome {
+    SandboxedLuaCallbackDispatchOutcome {
+        state: SandboxedLuaCallbackDispatchState::RuntimeRejected,
+        value: None,
+        instruction_checks,
     }
 }
 
@@ -376,6 +562,100 @@ mod tests {
         assert_eq!(outcome.event.kind.label(), "talkaction");
         assert_eq!(outcome.state, DeferredScriptDispatchState::DeferredNoop);
         assert_eq!(outcome.state.as_str(), "deferred-noop");
+    }
+
+    #[test]
+    fn callback_dispatcher_runs_registered_primitive_callbacks_in_fresh_sandboxes() {
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "award",
+                "return function(kind, subject_id, value) if kind == 'award' and subject_id == 7 then return value + 1 end return false end",
+            )
+            .unwrap();
+        dispatcher
+            .register_callback(
+                "fresh-state",
+                "return function(_, _, _) counter = (counter or 0) + 1 return counter end",
+            )
+            .unwrap();
+        assert_eq!(dispatcher.len(), 2);
+        assert!(!dispatcher.is_empty());
+
+        let input = SandboxedLuaCallbackInput {
+            event_kind: "award".into(),
+            subject_id: 7,
+            value: 41,
+        };
+        let outcome = dispatcher.dispatch("award", &input);
+        assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
+        assert_eq!(outcome.value, Some(SandboxedLuaValue::Integer(42)));
+        assert!(outcome.instruction_checks > 0);
+
+        let first = dispatcher.dispatch("fresh-state", &input);
+        let second = dispatcher.dispatch("fresh-state", &input);
+        assert_eq!(first.value, Some(SandboxedLuaValue::Integer(1)));
+        assert_eq!(second.value, Some(SandboxedLuaValue::Integer(1)));
+
+        let missing = dispatcher.dispatch("missing", &input);
+        assert_eq!(
+            missing.state,
+            SandboxedLuaCallbackDispatchState::CallbackNotFound
+        );
+        assert_eq!(missing.value, None);
+        assert_eq!(missing.instruction_checks, 0);
+    }
+
+    #[test]
+    fn callback_dispatcher_enforces_registration_and_execution_boundaries() {
+        let limits = SandboxedLuaLimits::new(96, MAX_SANDBOXED_LUA_MEMORY_BYTES, 32).unwrap();
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::new(limits);
+        assert_eq!(
+            dispatcher.register_callback("", "return function() return true end"),
+            Err(SandboxedLuaCallbackRegistrationError::InvalidName)
+        );
+        assert_eq!(
+            dispatcher.register_callback("too-long", "x".repeat(97)),
+            Err(SandboxedLuaCallbackRegistrationError::SourceRejected)
+        );
+        dispatcher
+            .register_callback("typed", "return function() return {} end")
+            .unwrap();
+        assert_eq!(
+            dispatcher.register_callback("typed", "return function() return true end"),
+            Err(SandboxedLuaCallbackRegistrationError::DuplicateName(
+                "typed".into()
+            ))
+        );
+        dispatcher
+            .register_callback("limit", "return function() while true do end end")
+            .unwrap();
+        let input = SandboxedLuaCallbackInput {
+            event_kind: "test".into(),
+            subject_id: 1,
+            value: 0,
+        };
+        assert_eq!(
+            dispatcher.dispatch("typed", &input).state,
+            SandboxedLuaCallbackDispatchState::UnsupportedValue
+        );
+        assert_eq!(
+            dispatcher.dispatch("limit", &input).state,
+            SandboxedLuaCallbackDispatchState::InstructionLimitReached
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    "typed",
+                    &SandboxedLuaCallbackInput {
+                        event_kind: "test".into(),
+                        subject_id: u64::MAX,
+                        value: 0,
+                    }
+                )
+                .state,
+            SandboxedLuaCallbackDispatchState::RuntimeRejected
+        );
     }
 
     #[test]
