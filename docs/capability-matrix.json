@@ -20,7 +20,7 @@
       "playerState": "partial",
       "playerStateDetail": "persisted health, mana, capacity, and magic level feed a parser-shaped classic 740 HUD record with a 16-bit level and bounded soul byte; unmodified-client confirmation remains required",
       "playerPosition": "partial",
-      "playerPositionDetail": "authoritative native movement persists SQLite position and an orderly native-session relog regression restores the saved tile. Unmodified-client confirmation remains required",
+      "playerPositionDetail": "authoritative native movement persists SQLite position and orderly plus abrupt-disconnect native-session relog regressions restore the saved tile. Unmodified-client confirmation remains required",
       "playerOutfit": "partial",
       "playerOutfitDetail": "schema-v11 persists accepted matching classic-740 look type and color values, then hydrates them after map initialization with a configured look-type fallback for legacy or mismatched records. Look-type selection, addons, mounts, asset validation, and unmodified-client confirmation remain deferred",
       "lifecycle": "partial",
