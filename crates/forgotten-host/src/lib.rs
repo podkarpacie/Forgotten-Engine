@@ -430,6 +430,7 @@ pub struct SharedNativeWorld {
     vitals_epoch: Arc<AtomicU64>,
     progression_epoch: Arc<AtomicU64>,
     equipment_epoch: Arc<AtomicU64>,
+    containers_epoch: Arc<AtomicU64>,
     chat_recipients: Arc<Mutex<BTreeMap<u64, mpsc::SyncSender<SharedPublicChatEvent>>>>,
 }
 
@@ -462,6 +463,7 @@ impl SharedNativeWorld {
             vitals_epoch: Arc::new(AtomicU64::new(0)),
             progression_epoch: Arc::new(AtomicU64::new(0)),
             equipment_epoch: Arc::new(AtomicU64::new(0)),
+            containers_epoch: Arc::new(AtomicU64::new(0)),
             chat_recipients: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
@@ -506,6 +508,10 @@ impl SharedNativeWorld {
 
     pub fn equipment_epoch(&self) -> u64 {
         self.equipment_epoch.load(Ordering::SeqCst)
+    }
+
+    pub fn containers_epoch(&self) -> u64 {
+        self.containers_epoch.load(Ordering::SeqCst)
     }
 
     pub fn player_vitals(&self, player_id: u64) -> Result<PlayerVitals, HostError> {
@@ -743,9 +749,14 @@ impl SharedNativeWorld {
         player_id: u64,
         containers: PlayerContainers,
     ) -> Result<bool, HostError> {
-        self.lock()?
+        let changed = self
+            .lock()?
             .replace_player_containers(player_id, containers)
-            .map_err(HostError::Core)
+            .map_err(HostError::Core)?;
+        if changed {
+            self.containers_epoch.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(changed)
     }
 
     pub fn player_conditions(
@@ -2154,6 +2165,7 @@ fn handle_native_otclient_game(
     let mut observed_vitals_epoch = shared_world.vitals_epoch();
     let mut observed_progression_epoch = shared_world.progression_epoch();
     let mut observed_equipment_epoch = shared_world.equipment_epoch();
+    let mut observed_containers_epoch = shared_world.containers_epoch();
     loop {
         drain_shared_public_chat(
             stream,
@@ -2402,6 +2414,28 @@ fn handle_native_otclient_game(
                         );
                         observed_mapped_equipment = current_mapped_equipment;
                         observed_equipment_epoch = equipment_epoch;
+                    }
+                    let containers_epoch = shared_world.containers_epoch();
+                    if containers_epoch != observed_containers_epoch {
+                        let containers = shared_world.player_containers(character.id)?;
+                        let container_updates = native_classic_container_frames(
+                            &config.client_profile,
+                            config.item_presentation_catalog.as_deref(),
+                            &containers,
+                        )
+                        .map_err(HostError::Protocol)?;
+                        for frame in &container_updates {
+                            write_frame(stream, frame)?;
+                        }
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "outbound=container-refresh epoch={containers_epoch} records={}",
+                                container_updates.len()
+                            ),
+                        );
+                        observed_containers_epoch = containers_epoch;
                     }
                     let visibility_epoch = shared_world.visibility_epoch();
                     if visibility_epoch != observed_visibility_epoch {
@@ -4206,6 +4240,73 @@ mod tests {
         assert_eq!(shared.equipment_epoch(), 1);
         assert!(!shared.replace_player_equipment(109, equipment).unwrap());
         assert_eq!(shared.equipment_epoch(), 1);
+    }
+
+    #[test]
+    fn shared_native_container_epoch_refreshes_only_complete_mapped_windows() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 110,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 1,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let mut container = forgotten_core::PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        container
+            .items
+            .insert(ItemInstance::new(4526, 3).unwrap())
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(container).unwrap();
+        assert_eq!(shared.containers_epoch(), 0);
+        assert!(shared
+            .replace_player_containers(110, containers.clone())
+            .unwrap());
+        assert_eq!(shared.containers_epoch(), 1);
+        assert!(!shared.replace_player_containers(110, containers).unwrap());
+        assert_eq!(shared.containers_epoch(), 1);
+
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for (server_id, client_thing_id, subtype) in [(1988, 1988, false), (4526, 102, true)] {
+            catalog
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id,
+                        requires_classic_740_subtype: subtype,
+                    },
+                )
+                .unwrap();
+        }
+        let config = native_otclient_config("127.0.0.1:0".parse().unwrap());
+        assert_eq!(
+            native_classic_container_frames(
+                &config.client_profile,
+                Some(&catalog),
+                &shared.player_containers(110).unwrap(),
+            )
+            .unwrap(),
+            vec![Frame(vec![
+                0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0, 1,
+                102, 0, 3,
+            ])]
+        );
     }
 
     #[test]

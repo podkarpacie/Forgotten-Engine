@@ -51,6 +51,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 
 - [x] Establish validated runtime items, equipment, owned containers, and bounded complete-item transfers between equipment and owned top-level containers.
 - [x] Synchronize catalog-mapped authoritative equipment replacements to the selected native 740 session through deterministic parser-verified set/delete inventory deltas; item movement and real-client validation remain deferred.
+- [x] Synchronize changed complete catalog-mapped top-level containers to native 740 sessions by re-emitting the existing parser-verified open-container record; close and item-delta behavior remain deferred.
 - [ ] Synchronize inventory, equipment, and containers in each supported native session profile.
 - [ ] Implement authoritative item transfer, stack splitting/merging, capacity, and ownership rules across equipment, ground, containers, depot, and inbox surfaces.
 - [x] Define side-effect-free authoritative validation for same-tile or adjacent exact top-level map-item use intents.
