@@ -75,17 +75,46 @@ const NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY: Duration = Duration::from_secs(2);
 struct NativeWorldHeartbeatOutcome {
     tick: u64,
     reactivated_static_creatures: usize,
+    changed_static_targets: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticTargetAcquisitionPolicy {
+    Disabled,
+    NearestLivingPlayer { max_range: u8 },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StaticTargetAcquisitionSummary {
+    pub examined_static_creatures: usize,
+    pub changed_static_targets: usize,
 }
 
 fn advance_native_shared_world_heartbeat(
     shared_world: &SharedNativeWorld,
     elapsed_seconds: u16,
 ) -> Result<NativeWorldHeartbeatOutcome, HostError> {
+    advance_native_shared_world_heartbeat_with_target_policy(
+        shared_world,
+        elapsed_seconds,
+        StaticTargetAcquisitionPolicy::Disabled,
+    )
+}
+
+fn advance_native_shared_world_heartbeat_with_target_policy(
+    shared_world: &SharedNativeWorld,
+    elapsed_seconds: u16,
+    target_policy: StaticTargetAcquisitionPolicy,
+) -> Result<NativeWorldHeartbeatOutcome, HostError> {
     let tick = shared_world.advance_ticks(elapsed_seconds)?;
     let reactivated_static_creatures = shared_world.reactivate_due_static_creatures()?.reactivated;
+    let changed_static_targets = shared_world
+        .acquire_static_creature_targets(target_policy)?
+        .changed_static_targets;
     Ok(NativeWorldHeartbeatOutcome {
         tick,
         reactivated_static_creatures,
+        changed_static_targets,
     })
 }
 
@@ -962,6 +991,46 @@ impl SharedNativeWorld {
 
     pub fn active_static_spawns(&self) -> Result<FeTfsStaticSpawnCollection, HostError> {
         Ok(self.lock()?.active_static_spawn_collection())
+    }
+
+    /// Applies an explicitly selected, bounded target-acquisition pass to active static creatures.
+    /// It records only the core target ID. It does not schedule movement, pursue a target, attack,
+    /// send a packet, or change native visibility because target state is not yet client-rendered.
+    pub fn acquire_static_creature_targets(
+        &self,
+        policy: StaticTargetAcquisitionPolicy,
+    ) -> Result<StaticTargetAcquisitionSummary, HostError> {
+        let StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range } = policy else {
+            return Ok(StaticTargetAcquisitionSummary::default());
+        };
+        if !(1..=forgotten_core::MAX_STATIC_CREATURE_TARGET_RANGE).contains(&max_range) {
+            return Err(HostError::Core(
+                forgotten_core::CoreError::InvalidStaticCreatureTargetRange(max_range),
+            ));
+        }
+        let mut world = self.lock()?;
+        let creature_ids = world
+            .active_static_spawn_collection()
+            .entities
+            .into_iter()
+            .map(|entity| entity.id)
+            .collect::<Vec<_>>();
+        let mut summary = StaticTargetAcquisitionSummary {
+            examined_static_creatures: creature_ids.len(),
+            changed_static_targets: 0,
+        };
+        for creature_id in creature_ids {
+            let previous = world
+                .static_creature_target(creature_id)
+                .map_err(HostError::Core)?;
+            let selected = world
+                .select_static_creature_target(creature_id, max_range)
+                .map_err(HostError::Core)?;
+            if previous != selected.target_player_id {
+                summary.changed_static_targets += 1;
+            }
+        }
+        Ok(summary)
     }
 
     pub fn set_static_creature_health_percent(
@@ -7521,6 +7590,110 @@ mod tests {
     }
 
     #[test]
+    fn opt_in_shared_heartbeat_acquires_static_targets_without_visibility_or_behavior() {
+        let map = native_world_map();
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let static_spawns =
+            FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
+                id: creature_id,
+                name: "Rat".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 100,
+                direction: 2,
+            }])
+            .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: Position {
+                        x: 103,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let visibility_epoch = shared.visibility_epoch();
+        assert_eq!(
+            advance_native_shared_world_heartbeat(&shared, 1).unwrap(),
+            NativeWorldHeartbeatOutcome {
+                tick: 1,
+                reactivated_static_creatures: 0,
+                changed_static_targets: 0,
+            }
+        );
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .static_creature_target(creature_id)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            advance_native_shared_world_heartbeat_with_target_policy(
+                &shared,
+                1,
+                StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 4 },
+            )
+            .unwrap(),
+            NativeWorldHeartbeatOutcome {
+                tick: 2,
+                reactivated_static_creatures: 0,
+                changed_static_targets: 1,
+            }
+        );
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .static_creature_target(creature_id)
+                .unwrap(),
+            Some(101)
+        );
+        assert_eq!(shared.visibility_epoch(), visibility_epoch);
+        assert_eq!(
+            shared
+                .acquire_static_creature_targets(
+                    StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 4 },
+                )
+                .unwrap(),
+            StaticTargetAcquisitionSummary {
+                examined_static_creatures: 1,
+                changed_static_targets: 0,
+            }
+        );
+        assert!(matches!(
+            shared.acquire_static_creature_targets(
+                StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 0 },
+            ),
+            Err(HostError::Core(
+                forgotten_core::CoreError::InvalidStaticCreatureTargetRange(0)
+            ))
+        ));
+        assert_eq!(shared.visibility_epoch(), visibility_epoch);
+    }
+
+    #[test]
     fn native_shared_heartbeat_reactivates_static_creatures_only_after_interval() {
         let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
         let collection = FeTfsStaticSpawnCollection::with_respawn_intervals(
@@ -7557,6 +7730,7 @@ mod tests {
             NativeWorldHeartbeatOutcome {
                 tick: 1,
                 reactivated_static_creatures: 0,
+                changed_static_targets: 0,
             }
         );
         assert_eq!(shared.visibility_epoch(), epoch_before);
@@ -7565,6 +7739,7 @@ mod tests {
             NativeWorldHeartbeatOutcome {
                 tick: 2,
                 reactivated_static_creatures: 1,
+                changed_static_targets: 0,
             }
         );
         assert_eq!(shared.visibility_epoch(), epoch_before + 1);
