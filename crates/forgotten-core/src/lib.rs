@@ -1447,6 +1447,29 @@ pub enum CombatDelivery {
 pub const MAX_COMBAT_EVENT_DAMAGE: u16 = 10_000;
 pub const MAX_COMBAT_INTERVAL_TICKS: u16 = 60;
 
+/// A deliberately small, profile-neutral mitigation surface. It does not interpret TFS armor,
+/// shield, equipment, skill, vocation, or PvP formulas; those require separate compatibility
+/// evidence before they can populate this authoritative value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayerCombatDefense {
+    pub physical_flat_reduction: u16,
+}
+
+impl PlayerCombatDefense {
+    pub fn new(physical_flat_reduction: u16) -> Result<Self, CoreError> {
+        if physical_flat_reduction > MAX_COMBAT_EVENT_DAMAGE {
+            return Err(CoreError::InvalidCombatDefense);
+        }
+        Ok(Self {
+            physical_flat_reduction,
+        })
+    }
+
+    pub const fn mitigate_physical(self, requested_damage: u16) -> u16 {
+        requested_damage.saturating_sub(self.physical_flat_reduction)
+    }
+}
+
 /// Server-tick spacing between two accepted events from the same attacker. It is a deterministic
 /// state model, not a claim of any profile-specific weapon or spell timing formula.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1508,6 +1531,7 @@ pub struct PlayerCombatCooldown {
 pub struct PlayerCombatEventOutcome {
     pub damage: PlayerDamageOutcome,
     pub damage_type: CombatDamageType,
+    pub mitigated_damage: u16,
     pub next_attack_tick: u64,
 }
 
@@ -1539,6 +1563,7 @@ pub struct WorldState {
     player_respawn_states: BTreeMap<u64, PlayerRespawnState>,
     player_equipments: BTreeMap<u64, PlayerEquipment>,
     player_containers: BTreeMap<u64, PlayerContainers>,
+    player_combat_defenses: BTreeMap<u64, PlayerCombatDefense>,
     player_combat_cooldowns: BTreeMap<u64, PlayerCombatCooldown>,
     player_interactions: BTreeMap<u64, PlayerInteractionIntent>,
     static_creatures: BTreeMap<u32, StaticCreatureRuntime>,
@@ -1626,6 +1651,8 @@ impl WorldState {
             .insert(player.id, PlayerEquipment::default());
         self.player_containers
             .insert(player.id, PlayerContainers::default());
+        self.player_combat_defenses
+            .insert(player.id, PlayerCombatDefense::default());
         self.player_combat_cooldowns
             .insert(player.id, PlayerCombatCooldown::default());
         self.players.insert(player.id, player);
@@ -1647,6 +1674,7 @@ impl WorldState {
         self.player_respawn_states.remove(&id);
         self.player_equipments.remove(&id);
         self.player_containers.remove(&id);
+        self.player_combat_defenses.remove(&id);
         self.player_combat_cooldowns.remove(&id);
         self.player_interactions.remove(&id);
         self.player_interactions.retain(|_, intent| {
@@ -2040,6 +2068,35 @@ impl WorldState {
             .get(&player_id)
             .copied()
             .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
+    pub fn player_combat_defense(&self, player_id: u64) -> Result<PlayerCombatDefense, CoreError> {
+        self.player_combat_defenses
+            .get(&player_id)
+            .copied()
+            .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
+    /// Replaces one player's explicit profile-neutral defense value. It is not persisted yet
+    /// because profile-specific armor, shielding, equipment, and reconnect semantics remain
+    /// deferred; no-op replacements leave the authoritative revision unchanged.
+    pub fn replace_player_combat_defense(
+        &mut self,
+        player_id: u64,
+        defense: PlayerCombatDefense,
+    ) -> Result<bool, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        if defense.physical_flat_reduction > MAX_COMBAT_EVENT_DAMAGE {
+            return Err(CoreError::InvalidCombatDefense);
+        }
+        if self.player_combat_defense(player_id)? == defense {
+            return Ok(false);
+        }
+        self.player_combat_defenses.insert(player_id, defense);
+        self.mark_changed();
+        Ok(true)
     }
 
     pub fn player_progression(&self, player_id: u64) -> Result<PlayerProgression, CoreError> {
@@ -2769,8 +2826,10 @@ impl WorldState {
                 next_attack_tick: cooldown.next_attack_tick,
             });
         }
+        let defense = self.player_combat_defense(event.target_id)?;
+        let mitigated_damage = defense.mitigate_physical(event.requested_damage);
         let (applied_damage, remaining_health) =
-            self.apply_damage_to_known_target(event.target_id, event.requested_damage)?;
+            self.apply_damage_to_known_target(event.target_id, mitigated_damage)?;
         let next_attack_tick = self
             .tick
             .saturating_add(u64::from(event.timing.interval_ticks));
@@ -2787,6 +2846,7 @@ impl WorldState {
                 defeated: remaining_health == 0,
             },
             damage_type: event.damage_type,
+            mitigated_damage,
             next_attack_tick,
         })
     }
@@ -3142,6 +3202,7 @@ pub enum CoreError {
     InvalidPlayerCondition,
     InvalidDeathLossPolicy,
     InvalidCombatEvent,
+    InvalidCombatDefense,
     TargetAlreadyDefeated(u64),
     CombatCooldownActive {
         attacker_id: u64,
@@ -4323,6 +4384,7 @@ mod tests {
                     defeated: false,
                 },
                 damage_type: CombatDamageType::Physical,
+                mitigated_damage: 10,
                 next_attack_tick: 2,
             }
         );
@@ -4356,6 +4418,61 @@ mod tests {
         assert_eq!(
             world.player_combat_cooldown(7),
             Err(CoreError::UnknownPlayer(7))
+        );
+    }
+
+    #[test]
+    fn profile_neutral_physical_defense_mitigates_typed_events_deterministically() {
+        assert_eq!(
+            PlayerCombatDefense::new(MAX_COMBAT_EVENT_DAMAGE + 1),
+            Err(CoreError::InvalidCombatDefense)
+        );
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        let mut target = player();
+        target.id = 8;
+        target.name = "Druid".into();
+        target.position.x = 101;
+        world
+            .add_player_with_vitals(
+                target,
+                PlayerVitals {
+                    health: 25,
+                    max_health: 25,
+                    ..PlayerVitals::default()
+                },
+            )
+            .unwrap();
+        let defense = PlayerCombatDefense::new(3).unwrap();
+        assert!(world.replace_player_combat_defense(8, defense).unwrap());
+        assert!(!world.replace_player_combat_defense(8, defense).unwrap());
+        let event = PlayerCombatEvent::adjacent_melee(
+            7,
+            8,
+            CombatDamageType::Physical,
+            10,
+            CombatAttackTiming::new(1).unwrap(),
+        )
+        .unwrap();
+        let outcome = world.apply_player_combat_event(event).unwrap();
+        assert_eq!(outcome.mitigated_damage, 7);
+        assert_eq!(outcome.damage.applied_damage, 7);
+        assert_eq!(outcome.damage.remaining_health, 18);
+
+        world.advance_tick();
+        world
+            .replace_player_combat_defense(8, PlayerCombatDefense::new(10).unwrap())
+            .unwrap();
+        let absorbed = world.apply_player_combat_event(event).unwrap();
+        assert_eq!(absorbed.mitigated_damage, 0);
+        assert_eq!(absorbed.damage.applied_damage, 0);
+        assert_eq!(absorbed.damage.remaining_health, 18);
+        assert_eq!(world.player_combat_cooldown(7).unwrap().next_attack_tick, 2);
+
+        world.remove_player(8).unwrap();
+        assert_eq!(
+            world.player_combat_defense(8),
+            Err(CoreError::UnknownPlayer(8))
         );
     }
 
