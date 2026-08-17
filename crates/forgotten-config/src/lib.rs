@@ -10,6 +10,7 @@ mod stages;
 mod tfs_entities;
 mod tfs_registry;
 mod vocations;
+mod weapons;
 
 use forgotten_core::{
     OtbmMapHeader, Position, WorldMap, WorldMapItem, WorldMapSource, WorldMapTile, WorldMapTown,
@@ -33,6 +34,10 @@ pub use tfs_registry::{TfsContentInventory, TfsRegistryCategory, TfsRegistryInve
 pub use vocations::{
     load_tfs_vocation_registry, parse_tfs_vocations_xml, TfsVocationDefinition,
     TfsVocationRegistry, VocationMultiplier, VocationRegeneration,
+};
+pub use weapons::{
+    load_declarative_weapon_catalog, parse_declarative_weapons_xml, DeclarativeWeaponCatalog,
+    DeclarativeWeaponDefinition,
 };
 
 pub const CONFIG_FILE_NAME: &str = "config.lua";
