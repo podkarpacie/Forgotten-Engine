@@ -7,13 +7,14 @@ use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, EmptyWorldManifest, EquipmentSlot,
     ExperienceAwardPolicy, FeTfsStaticSpawnCollection, ItemInstance, NativeItemPresentationCatalog,
     Player, PlayerCombatEvent, PlayerCombatEventOutcome, PlayerCondition, PlayerConditionKind,
-    PlayerConditionOutcome, PlayerContainers, PlayerEquipment, PlayerExperienceAwardOutcome,
-    PlayerInteractionIntent, PlayerItemUseIntent, PlayerItemUseOutcome, PlayerProgression,
-    PlayerProgressionAttempts, PlayerProgressionRules, PlayerRegenerationOutcome,
-    PlayerRegenerationRules, PlayerRespawnState, PlayerSkill, PlayerSkillTryOutcome,
-    PlayerSpellCastOutcome, PlayerVitals, Position, StaticCreatureDamageOutcome,
-    StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, StaticCreatureResetSummary,
-    StaticCreatureTargetStepOutcome, VocationId, VocationLevelUpGains, WorldMap, WorldState,
+    PlayerConditionOutcome, PlayerContainerToEquipmentOutcome, PlayerContainers, PlayerEquipment,
+    PlayerEquipmentToContainerOutcome, PlayerExperienceAwardOutcome, PlayerInteractionIntent,
+    PlayerItemUseIntent, PlayerItemUseOutcome, PlayerProgression, PlayerProgressionAttempts,
+    PlayerProgressionRules, PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState,
+    PlayerSkill, PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
+    StaticCreatureDamageOutcome, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy,
+    StaticCreatureResetSummary, StaticCreatureTargetStepOutcome, VocationId, VocationLevelUpGains,
+    WorldMap, WorldState,
 };
 use forgotten_persistence::{EngineDatabase, PlayerOutfit, PlayerVitals as PersistedPlayerVitals};
 use forgotten_protocol::{
@@ -757,6 +758,43 @@ impl SharedNativeWorld {
             self.containers_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok(changed)
+    }
+
+    /// Applies the existing authoritative complete-item transfer under the shared world lock.
+    /// Native sessions observe the resulting equipment and container state through their separate
+    /// epochs; this method neither accepts a client request nor persists the mutation.
+    pub fn move_equipment_item_to_container(
+        &self,
+        player_id: u64,
+        from_slot: EquipmentSlot,
+        container_id: u8,
+    ) -> Result<PlayerEquipmentToContainerOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .move_equipment_item_to_container(player_id, from_slot, container_id)
+            .map_err(HostError::Core)?;
+        self.equipment_epoch.fetch_add(1, Ordering::SeqCst);
+        self.containers_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(outcome)
+    }
+
+    /// Applies the reverse existing complete-item transfer under the shared world lock. Client
+    /// requests, persistence, equipment compatibility, swaps, stack rules, ground transfer, and
+    /// recursive containers remain outside this bounded host integration.
+    pub fn move_container_item_to_equipment(
+        &self,
+        player_id: u64,
+        container_id: u8,
+        item_index: usize,
+        to_slot: EquipmentSlot,
+    ) -> Result<PlayerContainerToEquipmentOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .move_container_item_to_equipment(player_id, container_id, item_index, to_slot)
+            .map_err(HostError::Core)?;
+        self.equipment_epoch.fetch_add(1, Ordering::SeqCst);
+        self.containers_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(outcome)
     }
 
     pub fn player_conditions(
@@ -4307,6 +4345,91 @@ mod tests {
                 102, 0, 3,
             ])]
         );
+    }
+
+    #[test]
+    fn shared_complete_item_transfers_advance_both_native_refresh_epochs() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 111,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 1,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let mut equipment = PlayerEquipment::default();
+        let item = ItemInstance::new(4526, 3).unwrap();
+        equipment.equip(EquipmentSlot::RightHand, item.clone());
+        shared.replace_player_equipment(111, equipment).unwrap();
+        let container = forgotten_core::PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(container).unwrap();
+        shared.replace_player_containers(111, containers).unwrap();
+
+        let equipment_epoch = shared.equipment_epoch();
+        let containers_epoch = shared.containers_epoch();
+        let into_container = shared
+            .move_equipment_item_to_container(111, EquipmentSlot::RightHand, 2)
+            .unwrap();
+        assert_eq!(into_container.item, item);
+        assert_eq!(shared.equipment_epoch(), equipment_epoch + 1);
+        assert_eq!(shared.containers_epoch(), containers_epoch + 1);
+        assert!(shared
+            .player_equipment(111)
+            .unwrap()
+            .item(EquipmentSlot::RightHand)
+            .is_none());
+        let containers_after_move = shared.player_containers(111).unwrap();
+        let container_after_move = containers_after_move
+            .iter()
+            .find_map(|(container_id, container)| (container_id == 2).then_some(container))
+            .unwrap();
+        assert_eq!(container_after_move.items.item(0), Some(&item));
+
+        let back_to_equipment = shared
+            .move_container_item_to_equipment(111, 2, 0, EquipmentSlot::LeftHand)
+            .unwrap();
+        assert_eq!(back_to_equipment.item, item);
+        assert_eq!(shared.equipment_epoch(), equipment_epoch + 2);
+        assert_eq!(shared.containers_epoch(), containers_epoch + 2);
+        assert_eq!(
+            shared
+                .player_equipment(111)
+                .unwrap()
+                .item(EquipmentSlot::LeftHand),
+            Some(&item)
+        );
+        let containers_after_return = shared.player_containers(111).unwrap();
+        let container_after_return = &containers_after_return
+            .iter()
+            .find_map(|(container_id, container)| (container_id == 2).then_some(container))
+            .unwrap()
+            .items;
+        assert!(container_after_return.is_empty());
+
+        assert!(matches!(
+            shared.move_equipment_item_to_container(111, EquipmentSlot::RightHand, 2),
+            Err(HostError::Core(
+                forgotten_core::CoreError::EmptyEquipmentSlot { .. }
+            ))
+        ));
+        assert_eq!(shared.equipment_epoch(), equipment_epoch + 2);
+        assert_eq!(shared.containers_epoch(), containers_epoch + 2);
     }
 
     #[test]
