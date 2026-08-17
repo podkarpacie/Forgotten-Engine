@@ -39,6 +39,10 @@ The public client parser consumes one classic outfit record, then—when the new
 
 Public historical OpenTibia discussion describes shield defense and armor as separate physical-mitigation stages, with defense considered before armor and each potentially reducing the same incoming hit.[9] Current public TFS combat code also exposes independent armor and shield block switches in combat parameters.[10] The available sources span different eras and do not establish a complete profile-740 formula, blocking count, skill interaction, stance effect, or random-range contract. FE therefore retains its existing bounded profile-neutral flat mitigation foundation and does not claim TFS 7.4 armor or shielding parity from this evidence alone.
 
+## FE 8.0 encrypted transport boundary
+
+The public Wireshark Tibia dissector marks client versions from 761 as using RSA and XTEA, and marks 780 and later as having additional outfit/stamina/message-level behavior.[13] FE’s public OTCv8 sender evidence independently shows that login encryption, protocol checksums, and XTEA activation are feature-gated rather than universally interchangeable.[14] Therefore the existing plain numeric-account 740 handshake cannot be widened to protocol 800 by changing only a version number. FE now records protocol 800 as requiring a separately parser-backed RSA/XTEA login and game-session implementation, and refuses native enablement until that work exists. This is a safety classification only, not encrypted transport or client compatibility support.
+
 ## References
 
 [1] [TFS legacy weapon registry path](https://github.com/otland/forgottenserver/blob/master/data/weapons/weapons.xml).
@@ -64,3 +68,7 @@ Public historical OpenTibia discussion describes shield defense and armor as sep
 [11] [Public OTCv8 feature map](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/game.cpp). Read-only classic-profile feature evidence; no client source is copied into FE.
 
 [12] [Public OTCv8 outfit-dialog parser](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/protocolgameparse.cpp). Read-only behavioral evidence; no client source is copied into FE.
+
+[13] [Wireshark Tibia dissector protocol feature thresholds](https://github.com/wireshark/wireshark/blob/master/epan/dissectors/packet-tibia.c). Read-only public packet-analysis evidence; no dissector source is copied into FE.
+
+[14] [Public OTCv8 game-login sender](https://raw.githubusercontent.com/OTCv8/otcv8-dev/master/src/client/protocolgamesend.cpp). Read-only behavioral evidence; no client source is copied into FE.

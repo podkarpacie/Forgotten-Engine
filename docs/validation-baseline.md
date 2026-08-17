@@ -22,6 +22,7 @@ The script validates formatting, strict linting, all workspace unit and integrat
 | TFS-style configuration and SQLite | Temporary `init`, `validate`, `status`, key generation, backup, and local persistence commands | Does not validate an operator’s entire private TFS directory. |
 | Character administration | Account creation; character, vocation, town, skill, equipment, and container commands | Does not prove gameplay semantics for the stored state. |
 | Native host | Bounded process-startup check and all protocol/unit regressions in the workspace | Does not operate a real client or claim complete protocol/gameplay compatibility. |
+| FE 8.0 native profile boundary | A protocol-800 configuration is classified as requiring RSA/XTEA and refuses native enablement with an actionable diagnostic. | This proves only safe non-enablement. It does not prove encrypted login, game sessions, packet layouts, or client interoperability. |
 
 ## Required manual unmodified-OTClientV8 checks
 

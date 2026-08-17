@@ -848,14 +848,48 @@ pub struct NativeOtClientProfile {
     pub max_padding_bytes: usize,
 }
 
+/// The native transport boundary selected by a protocol profile. This is intentionally narrower
+/// than a claim of full protocol compatibility: FE currently has one runnable plain 7.4
+/// foundation and recognizes the distinct encrypted transport required by classic 8.0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeOtClientFoundation {
+    PlainClassic740,
+    Classic800RequiresRsaXtea,
+    Unsupported,
+}
+
+impl NativeOtClientFoundation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PlainClassic740 => "plain-classic-740",
+            Self::Classic800RequiresRsaXtea => "classic-800-requires-rsa-xtea",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
 impl NativeOtClientProfile {
+    pub fn foundation(&self) -> NativeOtClientFoundation {
+        if self.protocol_version == 0
+            || !self.numeric_account_ids
+            || self.max_padding_bytes > MAX_FRAME_SIZE
+        {
+            return NativeOtClientFoundation::Unsupported;
+        }
+        match self.protocol_version {
+            740 if !self.login_packet_encryption
+                && !self.protocol_checksum
+                && !self.challenge_on_login =>
+            {
+                NativeOtClientFoundation::PlainClassic740
+            }
+            800 => NativeOtClientFoundation::Classic800RequiresRsaXtea,
+            _ => NativeOtClientFoundation::Unsupported,
+        }
+    }
+
     pub fn supports_current_native_foundation(&self) -> bool {
-        self.protocol_version != 0
-            && self.numeric_account_ids
-            && !self.login_packet_encryption
-            && !self.protocol_checksum
-            && !self.challenge_on_login
-            && self.max_padding_bytes <= MAX_FRAME_SIZE
+        self.foundation() == NativeOtClientFoundation::PlainClassic740
     }
 
     /// Classic equipment records have been verified only for the selected 740 native profile.
@@ -2357,6 +2391,40 @@ mod tests {
     fn profiles_remain_explicit_and_limited() {
         assert_eq!(profile_by_id("fe-8.0"), Some(FE_8_0_PROFILE));
         assert!(!profile_by_id("fe-1.2").unwrap().complete_protocol_emulation);
+    }
+
+    #[test]
+    fn native_profile_foundations_distinguish_runnable_740_from_encrypted_800() {
+        let plain_740 = NativeOtClientProfile {
+            protocol_version: 740,
+            numeric_account_ids: true,
+            login_packet_encryption: false,
+            protocol_checksum: false,
+            challenge_on_login: false,
+            max_padding_bytes: 128,
+        };
+        assert_eq!(
+            plain_740.foundation(),
+            NativeOtClientFoundation::PlainClassic740
+        );
+        assert!(plain_740.supports_current_native_foundation());
+
+        let encrypted_800 = NativeOtClientProfile {
+            protocol_version: 800,
+            login_packet_encryption: true,
+            protocol_checksum: false,
+            challenge_on_login: false,
+            ..plain_740
+        };
+        assert_eq!(
+            encrypted_800.foundation(),
+            NativeOtClientFoundation::Classic800RequiresRsaXtea
+        );
+        assert_eq!(
+            encrypted_800.foundation().label(),
+            "classic-800-requires-rsa-xtea"
+        );
+        assert!(!encrypted_800.supports_current_native_foundation());
     }
     #[test]
     fn status_contract_decodes_and_escapes_xml() {

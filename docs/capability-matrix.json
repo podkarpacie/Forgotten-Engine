@@ -45,7 +45,8 @@
     {
       "id": "fe-8.0",
       "target": "Tibia 8.0",
-      "nativeOtClientV8": "deferred",
+      "nativeOtClientV8": "partial",
+      "nativeOtClientV8Detail": "explicit profile foundation recognizes that classic 8.0 requires RSA/XTEA transport and safely refuses native enablement until parser-backed encrypted login/game-session support exists; no listener, packet layout, or client interoperability is claimed",
       "officialClientProtocolEmulation": "deferred",
       "contentAudit": "partial",
       "runtimeItemsAndInventory": "deferred",

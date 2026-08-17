@@ -16,7 +16,9 @@ mod weapons;
 use forgotten_core::{
     OtbmMapHeader, Position, WorldMap, WorldMapItem, WorldMapSource, WorldMapTile, WorldMapTown,
 };
-use forgotten_protocol::{profile_by_id, CompatibilityProfile, NativeOtClientProfile};
+use forgotten_protocol::{
+    profile_by_id, CompatibilityProfile, NativeOtClientFoundation, NativeOtClientProfile,
+};
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
@@ -286,9 +288,21 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         max_padding_bytes: 128,
     };
     if otclient_v8_native_enabled && !native_profile.supports_current_native_foundation() {
+        let message = match native_profile.foundation() {
+            NativeOtClientFoundation::Classic800RequiresRsaXtea => {
+                "protocol 800 requires parser-backed RSA/XTEA native transport, which is not implemented"
+                    .into()
+            }
+            NativeOtClientFoundation::PlainClassic740 => {
+                "selected native profile is not runnable".into()
+            }
+            NativeOtClientFoundation::Unsupported => {
+                "requires the selected plain numeric-account native client profile".into()
+            }
+        };
         return Err(ConfigError::InvalidValue {
             key: "otclientV8NativeEnabled",
-            message: "requires a selected plain numeric-account native client profile".into(),
+            message,
         });
     }
     if otclient_v8_native_empty_world_enabled
@@ -1328,7 +1342,7 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forgotten_protocol::FE_7_4_PROFILE;
+    use forgotten_protocol::{FE_7_4_PROFILE, FE_8_0_PROFILE};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_world(name: &str) -> PathBuf {
@@ -1489,6 +1503,27 @@ experienceStages = {
                 key: "otclientV8NativeEnabled",
                 ..
             })
+        ));
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn reports_the_unimplemented_encrypted_transport_for_enabled_protocol_800() {
+        let world = temporary_world("native-800-transport-boundary");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}otclientV8NativeEnabled = true\notclientV8ProtocolVersion = 800\notclientV8LoginPacketEncryption = true\n",
+                template(FE_8_0_PROFILE)
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            load(&world),
+            Err(ConfigError::InvalidValue { key: "otclientV8NativeEnabled", message })
+                if message.contains("RSA/XTEA")
         ));
         let _ = fs::remove_dir_all(world);
     }
