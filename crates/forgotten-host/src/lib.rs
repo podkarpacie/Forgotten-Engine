@@ -10,10 +10,10 @@ use forgotten_core::{
     PlayerCondition, PlayerConditionKind, PlayerConditionOutcome,
     PlayerContainerStackToEquipmentOutcome, PlayerContainerToEquipmentOutcome, PlayerContainers,
     PlayerEquipment, PlayerEquipmentStackToContainerOutcome, PlayerEquipmentToContainerOutcome,
-    PlayerExperienceAwardOutcome, PlayerInteractionIntent, PlayerItemUseIntent,
-    PlayerItemUseOutcome, PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
-    PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState, PlayerSkill,
-    PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
+    PlayerExperienceAwardOutcome, PlayerFightMode, PlayerFightModeState, PlayerInteractionIntent,
+    PlayerItemUseIntent, PlayerItemUseOutcome, PlayerProgression, PlayerProgressionAttempts,
+    PlayerProgressionRules, PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState,
+    PlayerSkill, PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
     StaticCreatureDamageOutcome, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy,
     StaticCreatureResetSummary, StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
     StaticCreatureTargetAttackOutcome, StaticCreatureTargetStepOutcome, VocationId,
@@ -52,11 +52,11 @@ use forgotten_protocol::{
     Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
     NativeOtClientCardinalDirection, NativeOtClientClassicItemRecord,
     NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientGameAction, NativeOtClientPlayerVitals,
-    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
-    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
-    NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
-    NATIVE_OTCLIENT_PLAYER_ID_START,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientGameAction,
+    NativeOtClientPlayerVitals, NativeOtClientPosition, NativeOtClientProfile,
+    NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
+    StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES,
+    NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
@@ -451,7 +451,10 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         NativeOtClientGameAction::Talk(message) => {
             format!("action=talk text-bytes={}", message.len())
         }
-        NativeOtClientGameAction::ChangeFightModes => "action=change-fight-modes".into(),
+        NativeOtClientGameAction::ChangeFightModes(request) => format!(
+            "action=change-fight-modes mode={:?} chase={} secure={}",
+            request.mode, request.chase, request.secure
+        ),
         NativeOtClientGameAction::UseItem {
             position,
             client_thing_id,
@@ -1449,6 +1452,27 @@ impl SharedNativeWorld {
     ) -> Result<PlayerInteractionIntent, HostError> {
         self.lock()?
             .player_interaction_intent(player_id)
+            .map_err(HostError::Core)
+    }
+
+    pub fn player_fight_mode_state(
+        &self,
+        player_id: u64,
+    ) -> Result<PlayerFightModeState, HostError> {
+        self.lock()?
+            .player_fight_mode_state(player_id)
+            .map_err(HostError::Core)
+    }
+
+    /// Replaces one parsed native fight-mode request through the authoritative core boundary.
+    /// This does not change combat formulas, pursuit, persistence, or client output.
+    pub fn replace_player_fight_mode_state(
+        &self,
+        player_id: u64,
+        state: PlayerFightModeState,
+    ) -> Result<bool, HostError> {
+        self.lock()?
+            .replace_player_fight_mode_state(player_id, state)
             .map_err(HostError::Core)
     }
 
@@ -3166,9 +3190,27 @@ fn handle_native_otclient_game(
                 &encode_native_otclient_game_ping_back(&config.client_profile)
                     .map_err(HostError::Protocol)?,
             )?,
-            NativeOtClientGameAction::PingBack
-            | NativeOtClientGameAction::EnterGame
-            | NativeOtClientGameAction::ChangeFightModes => {}
+            NativeOtClientGameAction::PingBack | NativeOtClientGameAction::EnterGame => {}
+            NativeOtClientGameAction::ChangeFightModes(request) => {
+                let mode = match request.mode {
+                    NativeOtClientFightMode::Attack => PlayerFightMode::Attack,
+                    NativeOtClientFightMode::Balanced => PlayerFightMode::Balanced,
+                    NativeOtClientFightMode::Defense => PlayerFightMode::Defense,
+                };
+                let changed = shared_world.replace_player_fight_mode_state(
+                    character.id,
+                    PlayerFightModeState {
+                        mode,
+                        chase: request.chase,
+                        secure: request.secure,
+                    },
+                )?;
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!("action=change-fight-modes outcome=applied changed={changed}"),
+                );
+            }
             NativeOtClientGameAction::UseItem {
                 position,
                 client_thing_id,
@@ -6437,6 +6479,38 @@ mod tests {
             shared.player_interaction_intent(101).unwrap(),
             PlayerInteractionIntent::default()
         );
+    }
+
+    #[test]
+    fn shared_native_world_replaces_authoritative_fight_mode_state() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 101,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                &map,
+            )
+            .unwrap();
+        assert_eq!(
+            shared.player_fight_mode_state(101).unwrap(),
+            PlayerFightModeState::default()
+        );
+        let state = PlayerFightModeState {
+            mode: PlayerFightMode::Defense,
+            chase: true,
+            secure: true,
+        };
+        assert!(shared.replace_player_fight_mode_state(101, state).unwrap());
+        assert!(!shared.replace_player_fight_mode_state(101, state).unwrap());
+        assert_eq!(shared.player_fight_mode_state(101).unwrap(), state);
     }
 
     #[test]

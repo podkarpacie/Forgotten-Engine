@@ -1221,9 +1221,35 @@ pub enum NativeOtClientGameAction {
     SelectFollow(u32),
     IgnoredInteraction(u8),
     Turn(NativeOtClientCardinalDirection),
-    ChangeFightModes,
+    ChangeFightModes(NativeOtClientFightModeRequest),
     CardinalMove(NativeOtClientCardinalDirection),
     DiagonalMove(NativeOtClientAutoWalkDirection),
+}
+
+/// Parsed classic fight-mode intent. This is an inbound state request only; its use in combat and
+/// client output must be established separately by the host and profile-specific evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeOtClientFightModeRequest {
+    pub mode: NativeOtClientFightMode,
+    pub chase: bool,
+    pub secure: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeOtClientFightMode {
+    Attack,
+    Balanced,
+    Defense,
+}
+
+impl NativeOtClientFightMode {
+    const fn from_classic_value(value: u8) -> Self {
+        match value {
+            1 => Self::Attack,
+            2 => Self::Balanced,
+            _ => Self::Defense,
+        }
+    }
 }
 
 pub fn decode_native_otclient_login_request(
@@ -1981,10 +2007,11 @@ pub fn decode_native_otclient_game_action(
             NativeOtClientGameAction::Talk(message)
         }
         NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES => {
-            reader.byte()?;
-            reader.byte()?;
-            reader.byte()?;
-            NativeOtClientGameAction::ChangeFightModes
+            NativeOtClientGameAction::ChangeFightModes(NativeOtClientFightModeRequest {
+                mode: NativeOtClientFightMode::from_classic_value(reader.byte()?),
+                chase: reader.byte()? != 0,
+                secure: reader.byte()? != 0,
+            })
         }
         NATIVE_OTCLIENT_CLIENT_SELECT_TARGET => {
             NativeOtClientGameAction::SelectTarget(reader.u32()?)
@@ -3317,7 +3344,23 @@ mod tests {
                 &profile,
             )
             .unwrap(),
-            NativeOtClientGameAction::ChangeFightModes
+            NativeOtClientGameAction::ChangeFightModes(NativeOtClientFightModeRequest {
+                mode: NativeOtClientFightMode::Attack,
+                chase: false,
+                secure: true,
+            })
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES, 9, 2, 3]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::ChangeFightModes(NativeOtClientFightModeRequest {
+                mode: NativeOtClientFightMode::Defense,
+                chase: true,
+                secure: true,
+            })
         );
         assert_eq!(
             decode_native_otclient_game_action(

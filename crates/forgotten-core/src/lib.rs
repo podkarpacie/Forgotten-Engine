@@ -1742,6 +1742,25 @@ impl PlayerCombatDefense {
     }
 }
 
+/// A bounded authoritative combat-preference selection. Its effect on damage and movement remains
+/// separate until profile-specific formula and chase evidence are implemented.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlayerFightMode {
+    #[default]
+    Attack,
+    Balanced,
+    Defense,
+}
+
+/// Player-owned fight preferences. The state is intentionally non-persistent for now because
+/// reconnect semantics and client delivery require separate compatibility evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayerFightModeState {
+    pub mode: PlayerFightMode,
+    pub chase: bool,
+    pub secure: bool,
+}
+
 /// Server-tick spacing between two accepted events from the same attacker. It is a deterministic
 /// state model, not a claim of any profile-specific weapon or spell timing formula.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1930,6 +1949,7 @@ pub struct WorldState {
     player_equipments: BTreeMap<u64, PlayerEquipment>,
     player_containers: BTreeMap<u64, PlayerContainers>,
     player_combat_defenses: BTreeMap<u64, PlayerCombatDefense>,
+    player_fight_modes: BTreeMap<u64, PlayerFightModeState>,
     player_combat_cooldowns: BTreeMap<u64, PlayerCombatCooldown>,
     player_spell_cooldowns: BTreeMap<u64, PlayerSpellCooldown>,
     player_interactions: BTreeMap<u64, PlayerInteractionIntent>,
@@ -2020,6 +2040,8 @@ impl WorldState {
             .insert(player.id, PlayerContainers::default());
         self.player_combat_defenses
             .insert(player.id, PlayerCombatDefense::default());
+        self.player_fight_modes
+            .insert(player.id, PlayerFightModeState::default());
         self.player_combat_cooldowns
             .insert(player.id, PlayerCombatCooldown::default());
         self.player_spell_cooldowns
@@ -2044,6 +2066,7 @@ impl WorldState {
         self.player_equipments.remove(&id);
         self.player_containers.remove(&id);
         self.player_combat_defenses.remove(&id);
+        self.player_fight_modes.remove(&id);
         self.player_combat_cooldowns.remove(&id);
         self.player_spell_cooldowns.remove(&id);
         self.player_interactions.remove(&id);
@@ -3148,6 +3171,34 @@ impl WorldState {
             .get(&player_id)
             .copied()
             .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
+    pub fn player_fight_mode_state(
+        &self,
+        player_id: u64,
+    ) -> Result<PlayerFightModeState, CoreError> {
+        self.player_fight_modes
+            .get(&player_id)
+            .copied()
+            .ok_or(CoreError::UnknownPlayer(player_id))
+    }
+
+    /// Replaces bounded player combat preferences without implying a damage, pursuit, persistence,
+    /// or client-delivery effect. No-op replacements leave the authoritative revision unchanged.
+    pub fn replace_player_fight_mode_state(
+        &mut self,
+        player_id: u64,
+        state: PlayerFightModeState,
+    ) -> Result<bool, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        if self.player_fight_mode_state(player_id)? == state {
+            return Ok(false);
+        }
+        self.player_fight_modes.insert(player_id, state);
+        self.mark_changed();
+        Ok(true)
     }
 
     /// Replaces one player's explicit profile-neutral defense value. It is not persisted yet
@@ -7286,6 +7337,36 @@ mod tests {
         assert_eq!(
             world.player_combat_defense(8),
             Err(CoreError::UnknownPlayer(8))
+        );
+    }
+
+    #[test]
+    fn fight_mode_state_is_authoritative_idempotent_and_cleared_with_player() {
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        assert_eq!(
+            world.player_fight_mode_state(7).unwrap(),
+            PlayerFightModeState {
+                mode: PlayerFightMode::Attack,
+                chase: false,
+                secure: false,
+            }
+        );
+        let revision = world.revision();
+        let state = PlayerFightModeState {
+            mode: PlayerFightMode::Balanced,
+            chase: true,
+            secure: true,
+        };
+        assert!(world.replace_player_fight_mode_state(7, state).unwrap());
+        assert_eq!(world.revision(), revision + 1);
+        assert!(!world.replace_player_fight_mode_state(7, state).unwrap());
+        assert_eq!(world.revision(), revision + 1);
+        assert_eq!(world.player_fight_mode_state(7).unwrap(), state);
+        world.remove_player(7).unwrap();
+        assert_eq!(
+            world.player_fight_mode_state(7),
+            Err(CoreError::UnknownPlayer(7))
         );
     }
 
