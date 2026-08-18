@@ -2332,20 +2332,15 @@ fn handle_native_otclient_game(
         database.update_player_position(character.id, initial_position)?;
     }
     let player_id = native_player_id(character.id)?;
+    let (authoritative_player, authoritative_vitals) =
+        shared_world.player_and_vitals(character.id)?;
     let mut snapshot = NativeOtClientEmptyWorldSnapshot {
         player_id,
         player_name: character.name.clone(),
         player_position: native_position(initial_position),
-        player_level: character.level.try_into().unwrap_or(u16::MAX),
-        player_experience: character.experience,
-        player_vitals: NativeOtClientPlayerVitals {
-            health: character.vitals.health,
-            max_health: character.vitals.max_health,
-            mana: character.vitals.mana,
-            max_mana: character.vitals.max_mana,
-            capacity: character.vitals.capacity,
-            magic_level: character.vitals.magic_level,
-        },
+        player_level: 1,
+        player_experience: 0,
+        player_vitals: NativeOtClientPlayerVitals::default(),
         player_skills: character.progression.skills,
         ground_thing_id: empty_world.ground_thing_id,
         player_look_type: empty_world.player_look_type,
@@ -2353,6 +2348,11 @@ fn handle_native_otclient_game(
         player_speed: empty_world.player_speed,
         server_beat: empty_world.server_beat,
     };
+    refresh_native_player_stats_snapshot(
+        &mut snapshot,
+        &authoritative_player,
+        authoritative_vitals,
+    );
     let active_static_spawns = shared_world.active_static_spawns()?;
     let visible_players = shared_world.visible_players(
         character.id,
@@ -5125,11 +5125,22 @@ mod tests {
                 magic_level: 4,
             }
         );
-        assert!(encode_native_otclient_player_stats(
+        let stats = encode_native_otclient_player_stats(
             &native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile,
             &snapshot,
         )
-        .is_ok());
+        .unwrap();
+        assert_eq!(u16::from_le_bytes(stats.0[1..3].try_into().unwrap()), 110);
+        assert_eq!(u16::from_le_bytes(stats.0[3..5].try_into().unwrap()), 160);
+        assert_eq!(u16::from_le_bytes(stats.0[5..7].try_into().unwrap()), 600);
+        assert_eq!(
+            u32::from_le_bytes(stats.0[7..11].try_into().unwrap()),
+            1_000
+        );
+        assert_eq!(u16::from_le_bytes(stats.0[11..13].try_into().unwrap()), 5);
+        assert_eq!(u16::from_le_bytes(stats.0[14..16].try_into().unwrap()), 40);
+        assert_eq!(u16::from_le_bytes(stats.0[16..18].try_into().unwrap()), 70);
+        assert_eq!(stats.0[18], 4);
     }
 
     #[test]

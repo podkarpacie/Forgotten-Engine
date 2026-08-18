@@ -304,3 +304,4 @@
 - [x] Parallelize deterministic loading of independent operator-owned content catalogs while preserving a fixed validation/error order and serialized authoritative world mutation; defer parallel gameplay mutation, timing-sensitive AI, and performance parity claims.
 - [x] Persist authoritative player vitals and exact progression attempts atomically for magic-mana awards; defer live spell-client requests, Lua formulas, full rate parity, and real-client confirmation.
 - [x] Add bounded authoritative skill-try awards using configured vocation multipliers, atomic visible-progress/exact-try persistence, and additive stable CLI access; defer live combat inputs, Lua formulas, full rate parity, and real-client confirmation.
+- [x] Audit and correct native 740 player HUD initialization/refresh so level, experience, mana, maximum mana, capacity, and magic level are emitted from one persisted authoritative state; retain unmodified-client confirmation as a release blocker.
