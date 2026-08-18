@@ -14,7 +14,8 @@ mod vocations;
 mod weapons;
 
 use forgotten_core::{
-    OtbmMapHeader, Position, WorldMap, WorldMapItem, WorldMapSource, WorldMapTile, WorldMapTown,
+    CoreError, ExperienceAwardPolicy, OtbmMapHeader, Position, WorldMap, WorldMapItem,
+    WorldMapSource, WorldMapTile, WorldMapTown,
 };
 use forgotten_protocol::{
     profile_by_id, CompatibilityProfile, NativeOtClientFoundation, NativeOtClientProfile,
@@ -32,7 +33,10 @@ pub use spells::{
     load_declarative_spell_catalog, parse_declarative_spells_xml, DeclarativeSpellCatalog,
     DeclarativeSpellDefinition,
 };
-pub use stages::{parse_tfs_stages_xml, ExperienceStage, ExperienceStages};
+pub use stages::{
+    parse_tfs_config_experience_stages_table, parse_tfs_stages_xml, ExperienceStage,
+    ExperienceStages,
+};
 pub use tfs_entities::{
     materialize_tfs_static_spawns, TfsEntityAppearance, TfsEntityCatalog, TfsEntityDefinition,
     TfsEntityKind, TfsSpawnResolution,
@@ -86,6 +90,7 @@ pub struct EngineConfig {
     pub magic_rate: u32,
     pub static_creature_target_attack_damage: u16,
     pub experience_stages: Option<ExperienceStages>,
+    pub experience_stages_source: Option<ExperienceStagesSource>,
     pub death_loss_percent: i32,
     pub server_name: String,
     pub map_name: String,
@@ -120,7 +125,29 @@ pub struct EngineConfig {
     pub otclient_v8_server_beat: u16,
 }
 
+/// Declares the bounded source selected for authoritative experience stages. The legacy
+/// `config.lua` table follows documented TFS precedence and replaces `rateExp`; FE's older XML
+/// adapter keeps its existing rate-composition behavior for backwards compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExperienceStagesSource {
+    LegacyConfigLua,
+    XmlAdapter,
+}
+
 impl EngineConfig {
+    /// Converts the selected bounded configuration into the existing deterministic authoritative
+    /// award policy. It does not add gameplay event sources or execute Lua.
+    pub fn experience_award_policy(&self) -> Result<ExperienceAwardPolicy, CoreError> {
+        match (&self.experience_stages, self.experience_stages_source) {
+            (Some(stages), Some(ExperienceStagesSource::LegacyConfigLua)) => stages.award_policy(1),
+            (Some(stages), Some(ExperienceStagesSource::XmlAdapter)) => {
+                stages.award_policy(self.experience_rate)
+            }
+            (None, None) => ExperienceAwardPolicy::new(self.experience_rate, Vec::new()),
+            _ => Err(CoreError::InvalidExperienceAwardPolicy),
+        }
+    }
+
     pub fn game_socket_addr(&self) -> SocketAddr {
         SocketAddr::new(self.bind_ip, self.game_protocol_port)
     }
@@ -220,6 +247,7 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         }
     })?;
     let values = parse_assignments(&contents)?;
+    let configured_experience_stages = parse_config_experience_stages(&contents)?;
 
     let bind_ip: IpAddr = optional_string(&values, "ip", "127.0.0.1")?
         .parse()
@@ -242,7 +270,14 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         });
     }
     let content_directory = world_directory.join("data");
-    let experience_stages = load_optional_experience_stages(&content_directory)?;
+    let (experience_stages, experience_stages_source) = match configured_experience_stages {
+        Some(Some(stages)) => (Some(stages), Some(ExperienceStagesSource::LegacyConfigLua)),
+        Some(None) => (None, None),
+        None => match load_optional_experience_stages(&content_directory)? {
+            Some(stages) => (Some(stages), Some(ExperienceStagesSource::XmlAdapter)),
+            None => (None, None),
+        },
+    };
     let death_loss_percent = optional_i32(&values, "deathLosePercent", -1)?;
     if !(-1..=100).contains(&death_loss_percent) {
         return Err(ConfigError::InvalidValue {
@@ -372,6 +407,7 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         magic_rate,
         static_creature_target_attack_damage,
         experience_stages,
+        experience_stages_source,
         death_loss_percent,
         server_name: optional_string(&values, "serverName", "Forgotten Engine")?.to_owned(),
         map_name: optional_string(&values, "mapName", "forgotten")?.to_owned(),
@@ -424,6 +460,133 @@ fn load_optional_experience_stages(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(ConfigError::Io(error)),
     }
+}
+
+/// Returns `None` when the recognized TFS `experienceStages` assignment is absent, `Some(None)`
+/// for its documented `nil` setting, or parsed bounded stages for a direct literal table. This
+/// scanner does not evaluate Lua or inspect arbitrary assignments.
+fn parse_config_experience_stages(
+    contents: &str,
+) -> Result<Option<Option<ExperienceStages>>, ConfigError> {
+    let marker = "experienceStages";
+    let mut cursor = 0usize;
+    while cursor < contents.len() {
+        let remaining = &contents[cursor..];
+        let Some(relative) = remaining.find(marker) else {
+            return Ok(None);
+        };
+        let start = cursor + relative;
+        let before = contents[..start].chars().next_back();
+        let after = contents[start + marker.len()..].chars().next();
+        if before.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+            || after.is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            cursor = start + marker.len();
+            continue;
+        }
+        let line_start = contents[..start].rfind('\n').map_or(0, |index| index + 1);
+        if !strip_lua_line_comment(&contents[line_start..start])
+            .trim()
+            .is_empty()
+        {
+            cursor = start + marker.len();
+            continue;
+        }
+        let mut offset = start + marker.len();
+        while contents
+            .as_bytes()
+            .get(offset)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            offset += 1;
+        }
+        if contents.as_bytes().get(offset) != Some(&b'=') {
+            cursor = offset;
+            continue;
+        }
+        offset += 1;
+        while contents
+            .as_bytes()
+            .get(offset)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            offset += 1;
+        }
+        if contents[offset..].starts_with("nil")
+            && contents[offset + 3..]
+                .chars()
+                .next()
+                .map_or(true, |character| {
+                    character.is_ascii_whitespace() || character == '-' || character == '\n'
+                })
+        {
+            return Ok(Some(None));
+        }
+        if contents.as_bytes().get(offset) != Some(&b'{') {
+            return Err(ConfigError::InvalidValue {
+                key: "experienceStages",
+                message: "must be nil or a bounded literal table".into(),
+            });
+        }
+        let end =
+            matching_lua_table_end(contents, offset).ok_or_else(|| ConfigError::InvalidValue {
+                key: "experienceStages",
+                message: "has unbalanced braces or an unterminated quoted value".into(),
+            })?;
+        let suffix = &contents[end + 1..];
+        let line_end = suffix.find('\n').unwrap_or(suffix.len());
+        if !strip_lua_line_comment(&suffix[..line_end])
+            .trim()
+            .is_empty()
+        {
+            return Err(ConfigError::InvalidValue {
+                key: "experienceStages",
+                message: "must not have trailing executable content".into(),
+            });
+        }
+        return parse_tfs_config_experience_stages_table(&contents[offset..=end])
+            .map(|stages| Some(Some(stages)));
+    }
+    Ok(None)
+}
+
+fn matching_lua_table_end(contents: &str, opening_offset: usize) -> Option<usize> {
+    let bytes = contents.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut offset = opening_offset;
+    while offset < bytes.len() {
+        let byte = bytes[offset];
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == active_quote {
+                quote = None;
+            }
+            offset += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'\"') {
+            quote = Some(byte);
+        } else if byte == b'-' && bytes.get(offset + 1) == Some(&b'-') {
+            while offset < bytes.len() && bytes[offset] != b'\n' {
+                offset += 1;
+            }
+            continue;
+        } else if byte == b'{' {
+            depth += 1;
+        } else if byte == b'}' {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(offset);
+            }
+        }
+        offset += 1;
+    }
+    None
 }
 
 pub fn write_template(
@@ -1598,8 +1761,82 @@ experienceStages = {
         let config = load(&world).unwrap();
         let stages = config.experience_stages.as_ref().unwrap();
         assert_eq!(stages.0.len(), 2);
+        assert_eq!(
+            config.experience_stages_source,
+            Some(ExperienceStagesSource::XmlAdapter)
+        );
         let policy = stages.award_policy(config.experience_rate).unwrap();
         assert_eq!(policy.award_for(1, 10), 350);
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn loads_legacy_config_lua_experience_stages_with_documented_rate_precedence() {
+        let world = temporary_world("config-lua-experience-stages");
+        fs::create_dir_all(world.join("data/XML")).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}rateExp = 5\nexperienceStages = {{\n  {{ minlevel = 1, maxlevel = 8, multiplier = 7 }},\n  {{ minlevel = 9, multiplier = 3 }},\n}}\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            world.join("data/XML/stages.xml"),
+            r#"<stages><stage minlevel="1" multiplier="99"/></stages>"#,
+        )
+        .unwrap();
+
+        let config = load(&world).unwrap();
+        assert_eq!(
+            config.experience_stages_source,
+            Some(ExperienceStagesSource::LegacyConfigLua)
+        );
+        assert_eq!(config.experience_stages.as_ref().unwrap().0.len(), 2);
+        assert_eq!(
+            config.experience_award_policy().unwrap().award_for(1, 10),
+            70
+        );
+        assert_eq!(
+            config.experience_award_policy().unwrap().award_for(9, 10),
+            30
+        );
+
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}rateExp = 5\nexperienceStages = nil\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+        let flat_rate_config = load(&world).unwrap();
+        assert_eq!(flat_rate_config.experience_stages, None);
+        assert_eq!(flat_rate_config.experience_stages_source, None);
+        assert_eq!(
+            flat_rate_config
+                .experience_award_policy()
+                .unwrap()
+                .award_for(1, 10),
+            50
+        );
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn rejects_non_literal_legacy_config_lua_experience_stages() {
+        let world = temporary_world("unsafe-config-lua-experience-stages");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}experienceStages = {{ {{ minlevel = 1, multiplier = rateExp }} }}\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+        assert!(matches!(load(&world), Err(ConfigError::InvalidContent(_))));
         let _ = fs::remove_dir_all(world);
     }
 

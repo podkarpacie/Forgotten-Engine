@@ -200,7 +200,7 @@
 - [x] Add additive `player vocation` and `player skill` local provisioning commands without changing existing CLI grammar.
 - [x] Load and validate operator-owned TFS-style `data/XML/vocations.xml` rules, including promoted/custom vocation entries and bounded gain/multiplier settings, without activating gameplay runtime behavior.
 - [ ] Implement formula-based skill tries, magic-level advancement, level progression, and configured vocation multipliers without claiming TFS behavior before profile-specific evidence.
-- [ ] Add a bounded non-executing parser for TFS `experienceStages` table entries and flat `rateExp`, preserving ordered range precedence and rejecting malformed/overlapping stage data.
+- [x] Add a bounded non-executing parser for TFS `experienceStages` table entries and flat `rateExp`, preserving ordered range precedence and rejecting malformed/overlapping stage data.
 - [x] Add a bounded non-executing TFS-style `data/XML/stages.xml` parser with ordered range validation and malformed/overlap rejection; Lua-table syntax and live rate application remain deferred.
 - [ ] Add a validated death-loss policy for `deathLosePercent` modes and a town/temple respawn state model before exposing any client-visible death or respawn behavior.
 - [x] Add a typed validated death-loss policy model for documented `deathLosePercent` modes without yet applying loss, respawning a player, or claiming a default-formula implementation.
@@ -331,3 +331,4 @@
 - [x] Decode and honor native 740 CloseContainer as a client-session view closure, emitting the verified close record and preventing container refreshes from reopening that view; persistence, nesting, up-arrow, and item-delta controls remain deferred.
 - [x] Decode and honor native 740 UpdateContainer as a session-view refresh for one complete mapped top-level container, without changing shared or persisted state; nesting, up-arrow, and item-delta controls remain deferred.
 - [x] Deliver the existing parser-verified native 740 player-modes record immediately after an accepted authoritative fight-mode change; formula effects, persistence, and broader-profile variants remain deferred.
+- [ ] Correct local player creation so persisted starting experience is consistent with the selected initial level and later authoritative experience awards do not reduce the character level.

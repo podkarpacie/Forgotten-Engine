@@ -37,6 +37,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(test)]
+use forgotten_config::template;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("ERROR: {error}");
@@ -603,10 +606,7 @@ fn run_host(
             })
             .transpose()?
             .map(Arc::new);
-        let experience_award_policy = Arc::new(match config.experience_stages.as_ref() {
-            Some(stages) => stages.award_policy(config.experience_rate)?,
-            None => forgotten_core::ExperienceAwardPolicy::new(config.experience_rate, Vec::new())?,
-        });
+        let experience_award_policy = Arc::new(config.experience_award_policy()?);
         let death_loss_policy = DeathLossPolicy::from_config(config.death_loss_percent)?;
         let declarative_weapon_catalog = declarative_weapon_catalog.map(Arc::new);
         if let Some(catalog) = &declarative_weapon_catalog {
@@ -1380,12 +1380,7 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                 .parse::<u64>()
                 .map_err(|_| "raw experience must be an unsigned 64-bit integer")?;
             let config = load(&directory)?;
-            let policy = match config.experience_stages.as_ref() {
-                Some(stages) => stages.award_policy(config.experience_rate)?,
-                None => {
-                    forgotten_core::ExperienceAwardPolicy::new(config.experience_rate, Vec::new())?
-                }
-            };
+            let policy = config.experience_award_policy()?;
             let mut database = EngineDatabase::open(&config.database_path)?;
             let character = database.player_by_id(player_id)?;
             let gains = load_tfs_vocation_registry(&config)?
@@ -2218,6 +2213,54 @@ experienceStages = {
         assert_eq!(account.name, "test-account");
         assert_eq!(account.characters[0].name, "Knight");
         assert_eq!(account.characters[0].town_id, 42);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stable_cli_experience_award_honors_legacy_config_stage_precedence() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("forgotten-engine-stage-cli-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        fs::write(
+            directory.join("config.lua"),
+            format!(
+                "{}rateExp = 5\nexperienceStages = {{ {{ minlevel = 1, multiplier = 2 }} }}\n",
+                template(profile_by_id("fe-7.4").unwrap())
+            ),
+        )
+        .unwrap();
+        account_command(&[
+            "account".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "stage-account".into(),
+            "stage-password".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "Sorcerer".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "experience".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "10".into(),
+        ])
+        .unwrap();
+
+        let config = load(&directory).unwrap();
+        let database = EngineDatabase::open(&config.database_path).unwrap();
+        assert_eq!(database.player_by_id(1).unwrap().experience, 20);
         let _ = fs::remove_dir_all(directory);
     }
 

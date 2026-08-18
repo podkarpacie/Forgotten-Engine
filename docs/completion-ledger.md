@@ -27,7 +27,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 
 ### Milestone A — Complete bounded player lifecycle and combat foundations: target 30%
 
-- [x] Apply `rateExp` and bounded `stages.xml` ranges to authoritative experience awards.
+- [x] Apply `rateExp` plus bounded XML-stage fallback ranges to authoritative experience awards, and accept a direct validated legacy `config.lua` `experienceStages` literal table that replaces `rateExp` under the documented TFS precedence without executing Lua.
 - [x] Apply matching bounded `vocations.xml` `gainhp`, `gainmana`, and `gaincap` values to the stable CLI's atomic authoritative experience-level-up persistence transaction; native HUD delivery and full advancement parity remain deferred.
 - [x] Retain bounded nested TFS-style vocation formula defense and armor multipliers as fixed-point metadata without changing live mitigation behavior or claiming formula compatibility.
 - [x] Retain bounded TFS-style vocation attack-speed and base-speed metadata with verified defaults, without changing live movement or combat timing behavior.
