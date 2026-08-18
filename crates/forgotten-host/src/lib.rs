@@ -354,6 +354,17 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         }
         NativeOtClientGameAction::ChangeFightModes => "action=change-fight-modes".into(),
         NativeOtClientGameAction::UseItem => "action=use-item".into(),
+        NativeOtClientGameAction::LookMap {
+            position,
+            thing_id,
+            stack_position,
+        } => format!(
+            "action=look-map position={},{},{} thing-id={} stack-position={}",
+            position.x, position.y, position.z, thing_id, stack_position
+        ),
+        NativeOtClientGameAction::LookCreature { creature_id } => {
+            format!("action=look-creature creature-id={creature_id}")
+        }
         NativeOtClientGameAction::RequestOutfit => "action=request-outfit".into(),
         NativeOtClientGameAction::RequestQuestLog => "action=request-quest-log".into(),
         NativeOtClientGameAction::ChangeOutfit(outfit) => format!(
@@ -2972,6 +2983,30 @@ fn handle_native_otclient_game(
                         applied_outfit.0.len(),
                         accepted,
                         player_outfit.look_type
+                    ),
+                );
+            }
+            NativeOtClientGameAction::LookMap {
+                position,
+                thing_id,
+                stack_position,
+            } => {
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "action=look-map position={},{},{} thing-id={} stack-position={} outcome=deferred-no-safe-740-response",
+                        position.x, position.y, position.z, thing_id, stack_position
+                    ),
+                );
+            }
+            NativeOtClientGameAction::LookCreature { creature_id } => {
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "action=look-creature creature-id={} outcome=deferred-no-safe-740-response",
+                        creature_id
                     ),
                 );
             }
@@ -8654,5 +8689,17 @@ mod native_diagnostics_tests {
         assert_eq!(talk_summary, "action=talk text-bytes=28");
         assert!(!talk_summary.contains("correct"));
         assert!(!talk_summary.contains("68 6f 72"));
+        assert_eq!(
+            native_action_diagnostic_summary(&NativeOtClientGameAction::LookMap {
+                position: forgotten_protocol::NativeOtClientPosition {
+                    x: 100,
+                    y: 101,
+                    z: 7,
+                },
+                thing_id: 102,
+                stack_position: 3,
+            }),
+            "action=look-map position=100,101,7 thing-id=102 stack-position=3"
+        );
     }
 }

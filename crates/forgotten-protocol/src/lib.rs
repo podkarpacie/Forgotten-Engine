@@ -884,6 +884,8 @@ pub const NATIVE_OTCLIENT_CLIENT_SELECT_TARGET: u8 = 0xa1;
 pub const NATIVE_OTCLIENT_CLIENT_SELECT_FOLLOW: u8 = 0xa2;
 pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM: u8 = 0x82;
+pub const NATIVE_OTCLIENT_CLIENT_LOOK_MAP: u8 = 0x8c;
+pub const NATIVE_OTCLIENT_CLIENT_LOOK_CREATURE: u8 = 0x8d;
 pub const NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT: u8 = 0xd2;
 pub const NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT: u8 = 0xd3;
 pub const NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG: u8 = 0xf0;
@@ -1199,6 +1201,14 @@ pub enum NativeOtClientGameAction {
     AutoWalk(Vec<NativeOtClientAutoWalkDirection>),
     Talk(String),
     UseItem,
+    LookMap {
+        position: NativeOtClientPosition,
+        thing_id: u16,
+        stack_position: u8,
+    },
+    LookCreature {
+        creature_id: u32,
+    },
     RequestOutfit,
     RequestQuestLog,
     ChangeOutfit(NativeOtClientClassicOutfit),
@@ -1903,6 +1913,28 @@ pub fn decode_native_otclient_game_action(
             reader.take(9)?;
             NativeOtClientGameAction::UseItem
         }
+        NATIVE_OTCLIENT_CLIENT_LOOK_MAP => {
+            if reader.remaining() != 8 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            NativeOtClientGameAction::LookMap {
+                position: NativeOtClientPosition {
+                    x: reader.u16()?,
+                    y: reader.u16()?,
+                    z: reader.byte()?,
+                },
+                thing_id: reader.u16()?,
+                stack_position: reader.byte()?,
+            }
+        }
+        NATIVE_OTCLIENT_CLIENT_LOOK_CREATURE => {
+            if reader.remaining() != 4 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            NativeOtClientGameAction::LookCreature {
+                creature_id: reader.u32()?,
+            }
+        }
         NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT => {
             if reader.remaining() != 5 {
                 return Err(ProtocolError::InvalidNativeGameRequest);
@@ -1973,7 +2005,7 @@ fn is_native_otclient_compatibility_interaction(opcode: u8) -> bool {
     matches!(
         opcode,
         0x77 | 0x78
-            | 0x83..=0x8d
+            | 0x83..=0x8b
             | 0x97..=0x9f
             | 0xa3..=0xad
             | 0xbe
@@ -3306,6 +3338,47 @@ mod tests {
             .unwrap(),
             NativeOtClientGameAction::UseItem
         );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![
+                    NATIVE_OTCLIENT_CLIENT_LOOK_MAP,
+                    100,
+                    0,
+                    101,
+                    0,
+                    7,
+                    102,
+                    0,
+                    3,
+                ]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::LookMap {
+                position: NativeOtClientPosition {
+                    x: 100,
+                    y: 101,
+                    z: 7,
+                },
+                thing_id: 102,
+                stack_position: 3,
+            }
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_LOOK_CREATURE, 1, 0, 0, 16,]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::LookCreature {
+                creature_id: 0x1000_0001,
+            }
+        );
+        assert!(decode_native_otclient_game_action(
+            &Frame(vec![NATIVE_OTCLIENT_CLIENT_LOOK_MAP, 0, 0, 0, 0, 0, 0, 0]),
+            &profile,
+        )
+        .is_err());
         assert_eq!(
             decode_native_otclient_game_action(
                 &Frame(vec![0x78, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
