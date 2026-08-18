@@ -285,6 +285,18 @@ impl EngineDatabase {
         account_id: u32,
         name: &str,
     ) -> Result<LoginCharacter, PersistenceError> {
+        self.create_player_for_account_with_vocation(account_id, name, VocationId::default())
+    }
+
+    /// Creates an account-owned character with a validated typed vocation identity. The caller
+    /// chooses the existing default vocation by passing `VocationId::default()`, preserving the
+    /// stable legacy provisioning behavior.
+    pub fn create_player_for_account_with_vocation(
+        &self,
+        account_id: u32,
+        name: &str,
+        vocation: VocationId,
+    ) -> Result<LoginCharacter, PersistenceError> {
         if name.trim().is_empty() || name.len() > 32 {
             return Err(PersistenceError::InvalidPlayerName);
         }
@@ -305,8 +317,8 @@ impl EngineDatabase {
         let experience = classic_experience_for_level(DEFAULT_PROVISIONED_PLAYER_LEVEL)
             .expect("the fixed local provisioning level must have a representable threshold");
         self.connection.execute(
-            "INSERT INTO players (account_id, name, x, y, z, level, experience, skill_points)\
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO players (account_id, name, x, y, z, level, experience, skill_points, vocation)\
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 account_id as i64,
                 name.trim(),
@@ -316,6 +328,7 @@ impl EngineDatabase {
                 i64::from(DEFAULT_PROVISIONED_PLAYER_LEVEL),
                 experience as i64,
                 0_i64,
+                i64::from(vocation.value()),
             ],
         )?;
         Ok(LoginCharacter {
@@ -324,7 +337,10 @@ impl EngineDatabase {
             level: DEFAULT_PROVISIONED_PLAYER_LEVEL,
             experience,
             skill_points: 0,
-            progression: PlayerProgression::default(),
+            progression: PlayerProgression {
+                vocation,
+                ..PlayerProgression::default()
+            },
             progression_attempts: PlayerProgressionAttempts::default(),
             vitals: PlayerVitals::default(),
             position,
@@ -2814,6 +2830,26 @@ mod tests {
             .remove(0);
         assert_eq!(reloaded.level, character.level);
         assert_eq!(reloaded.experience, character.experience);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn provisions_an_explicit_typed_vocation_with_the_new_character() {
+        let path = temporary_path("provisioning-vocation");
+        let database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("admin", "hash").unwrap();
+        let character = database
+            .create_player_for_account_with_vocation(account_id as u32, "Druid", VocationId::new(4))
+            .unwrap();
+        assert_eq!(character.progression.vocation, VocationId::new(4));
+        assert_eq!(
+            database
+                .player_by_id(character.id)
+                .unwrap()
+                .progression
+                .vocation,
+            VocationId::new(4)
+        );
         let _ = fs::remove_file(path);
     }
 

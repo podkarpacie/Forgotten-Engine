@@ -1082,23 +1082,39 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                 .map(String::as_str)
                 .filter(|value| !value.trim().is_empty())
                 .ok_or("a character name is required")?;
-            if arguments.len() != 5 {
+            if !(arguments.len() == 5 || arguments.len() == 6) {
                 return Err(
-                    "usage: player create <directory> <account-id> <character-name>".into(),
+                    "usage: player create <directory> <account-id> <character-name> [vocation-id]"
+                        .into(),
                 );
             }
+            let vocation = arguments
+                .get(5)
+                .map(|value| {
+                    value
+                        .parse::<u16>()
+                        .map(VocationId::new)
+                        .map_err(|_| "vocation ID must be a u16")
+                })
+                .transpose()?
+                .unwrap_or_default();
             let config = load(&directory)?;
             let database = EngineDatabase::open(&config.database_path)?;
-            let player = database.create_player_for_account(account_id, player_name)?;
+            let player = database.create_player_for_account_with_vocation(
+                account_id,
+                player_name,
+                vocation,
+            )?;
             println!(
-                "created character name={} player-id={} account-id={} position={},{},{} level={}",
+                "created character name={} player-id={} account-id={} position={},{},{} level={} vocation-id={}",
                 player.name,
                 player.id,
                 account_id,
                 player.position.x,
                 player.position.y,
                 player.position.z,
-                player.level
+                player.level,
+                player.progression.vocation.value(),
             );
             Ok(())
         }
@@ -1876,7 +1892,7 @@ Commands:
   generate-key <directory>
   backup <directory>
   account create <directory> <account-name> <password>
-  player create <directory> <account-id> <character-name>
+  player create <directory> <account-id> <character-name> [vocation-id]
   player equip <directory> <player-id> <slot> <server-item-id> [count]
   player unequip <directory> <player-id> <slot>
   player vocation <directory> <player-id> <vocation-id>
@@ -1978,7 +1994,7 @@ mod tests {
             "generate-key <directory>",
             "backup <directory>",
             "account create <directory> <account-name> <password>",
-            "player create <directory> <account-id> <character-name>",
+            "player create <directory> <account-id> <character-name> [vocation-id]",
             "player equip <directory> <player-id> <slot> <server-item-id> [count]",
             "player unequip <directory> <player-id> <slot>",
             "player vocation <directory> <player-id> <vocation-id>",
@@ -2204,6 +2220,25 @@ experienceStages = {
         ])
         .is_err());
 
+        player_command(&[
+            "player".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "Druid".into(),
+            "4".into(),
+        ])
+        .unwrap();
+        assert!(player_command(&[
+            "player".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "Invalid".into(),
+            "not-a-vocation".into(),
+        ])
+        .is_err());
+
         let config = load(&directory).unwrap();
         let database = EngineDatabase::open(&config.database_path).unwrap();
         let account = database
@@ -2211,8 +2246,19 @@ experienceStages = {
             .unwrap()
             .unwrap();
         assert_eq!(account.name, "test-account");
-        assert_eq!(account.characters[0].name, "Knight");
-        assert_eq!(account.characters[0].town_id, 42);
+        let knight = account
+            .characters
+            .iter()
+            .find(|character| character.name == "Knight")
+            .unwrap();
+        let druid = account
+            .characters
+            .iter()
+            .find(|character| character.name == "Druid")
+            .unwrap();
+        assert_eq!(knight.town_id, 42);
+        assert_eq!(knight.progression.vocation, VocationId::default());
+        assert_eq!(druid.progression.vocation, VocationId::new(4));
         let _ = fs::remove_dir_all(directory);
     }
 
