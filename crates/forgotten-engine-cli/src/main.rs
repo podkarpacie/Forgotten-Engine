@@ -1048,6 +1048,7 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                 .parse::<u64>()
                 .map_err(|_| "awarded tries must be an unsigned 64-bit integer")?;
             let config = load(&directory)?;
+            let applied_tries = awarded_tries.saturating_mul(u64::from(config.skill_rate));
             let mut database = EngineDatabase::open(&config.database_path)?;
             let character = database.player_by_id(player_id)?;
             let registry = load_tfs_vocation_registry(&config)?
@@ -1078,16 +1079,17 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                 character.progression,
             )?;
             world.replace_player_progression_attempts(player_id, character.progression_attempts)?;
-            let outcome = world.apply_player_skill_tries(player_id, skill, awarded_tries, rules)?;
+            let outcome = world.apply_player_skill_tries(player_id, skill, applied_tries, rules)?;
             database.replace_player_progression_and_attempts(
                 player_id,
                 world.player_progression(player_id)?,
                 world.player_progression_attempts(player_id)?,
             )?;
             println!(
-                "awarded player skill-tries player-id={player_id} skill={} awarded={} level={} percent={} gained-levels={} stored-tries={}",
+                "awarded player skill-tries player-id={player_id} skill={} awarded={} applied={} level={} percent={} gained-levels={} stored-tries={}",
                 skill.code(),
                 awarded_tries,
+                applied_tries,
                 outcome.progress.level,
                 outcome.progress.percent,
                 outcome.gained_levels,
@@ -1109,6 +1111,7 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                 .parse::<u64>()
                 .map_err(|_| "awarded mana must be an unsigned 64-bit integer")?;
             let config = load(&directory)?;
+            let applied_mana = awarded_mana.saturating_mul(u64::from(config.magic_rate));
             let mut database = EngineDatabase::open(&config.database_path)?;
             let character = database.player_by_id(player_id)?;
             let registry = load_tfs_vocation_registry(&config)?
@@ -1139,7 +1142,7 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                 character.progression,
             )?;
             world.replace_player_progression_attempts(player_id, character.progression_attempts)?;
-            let outcome = world.apply_player_magic_mana(player_id, awarded_mana, rules)?;
+            let outcome = world.apply_player_magic_mana(player_id, applied_mana, rules)?;
             let vitals = world.player_vitals(player_id)?;
             database.update_player_vitals_and_progression_attempts(
                 player_id,
@@ -1154,8 +1157,9 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                 world.player_progression_attempts(player_id)?,
             )?;
             println!(
-                "awarded player magic-mana player-id={player_id} awarded={} magic-level={} gained-levels={} stored-mana={}",
+                "awarded player magic-mana player-id={player_id} awarded={} applied={} magic-level={} gained-levels={} stored-mana={}",
                 awarded_mana,
+                applied_mana,
                 outcome.magic_level,
                 outcome.gained_levels,
                 outcome.stored_mana,
@@ -2101,6 +2105,15 @@ experienceStages = {
         let directory = std::env::temp_dir().join(format!("forgotten-engine-magic-mana-{nonce}"));
         fs::create_dir_all(&directory).unwrap();
         write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        let config_path = directory.join("config.lua");
+        fs::write(
+            &config_path,
+            format!(
+                "{}\nrateMagic = 2\n",
+                fs::read_to_string(&config_path).unwrap()
+            ),
+        )
+        .unwrap();
         let vocations = directory.join("data/XML/vocations.xml");
         fs::create_dir_all(vocations.parent().unwrap()).unwrap();
         fs::write(
@@ -2142,7 +2155,7 @@ experienceStages = {
             "1".into(),
         ])
         .unwrap();
-        for awarded_mana in ["800", "800"] {
+        for awarded_mana in ["400", "400"] {
             player_command(&[
                 "player".into(),
                 "magic-mana".into(),
@@ -2179,6 +2192,15 @@ experienceStages = {
         let directory = std::env::temp_dir().join(format!("forgotten-engine-skill-tries-{nonce}"));
         fs::create_dir_all(&directory).unwrap();
         write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        let config_path = directory.join("config.lua");
+        fs::write(
+            &config_path,
+            format!(
+                "{}\nrateSkill = 2\n",
+                fs::read_to_string(&config_path).unwrap()
+            ),
+        )
+        .unwrap();
         let vocations = directory.join("data/XML/vocations.xml");
         fs::create_dir_all(vocations.parent().unwrap()).unwrap();
         fs::write(
@@ -2220,17 +2242,15 @@ experienceStages = {
             "1".into(),
         ])
         .unwrap();
-        for awarded_tries in ["25", "25"] {
-            player_command(&[
-                "player".into(),
-                "skill-tries".into(),
-                directory.display().to_string(),
-                "1".into(),
-                "sword".into(),
-                awarded_tries.into(),
-            ])
-            .unwrap();
-        }
+        player_command(&[
+            "player".into(),
+            "skill-tries".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "sword".into(),
+            "25".into(),
+        ])
+        .unwrap();
 
         let config = load(&directory).unwrap();
         let database = EngineDatabase::open(&config.database_path).unwrap();

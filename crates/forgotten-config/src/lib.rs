@@ -79,6 +79,8 @@ pub struct EngineConfig {
     pub status_protocol_port: u16,
     pub max_players: u32,
     pub experience_rate: u32,
+    pub skill_rate: u32,
+    pub magic_rate: u32,
     pub experience_stages: Option<ExperienceStages>,
     pub death_loss_percent: i32,
     pub server_name: String,
@@ -225,6 +227,8 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
     let status_protocol_port = optional_u16(&values, "statusProtocolPort", 7171)?;
     let max_players = optional_u32(&values, "maxPlayers", 0)?;
     let experience_rate = optional_u32(&values, "rateExp", 5)?;
+    let skill_rate = optional_u32(&values, "rateSkill", 1)?;
+    let magic_rate = optional_u32(&values, "rateMagic", 1)?;
     let content_directory = world_directory.join("data");
     let experience_stages = load_optional_experience_stages(&content_directory)?;
     let death_loss_percent = optional_i32(&values, "deathLosePercent", -1)?;
@@ -352,6 +356,8 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         status_protocol_port,
         max_players,
         experience_rate,
+        skill_rate,
+        magic_rate,
         experience_stages,
         death_loss_percent,
         server_name: optional_string(&values, "serverName", "Forgotten Engine")?.to_owned(),
@@ -1163,6 +1169,8 @@ fn is_recognized_config_key(key: &str) -> bool {
             | "statusProtocolPort"
             | "maxPlayers"
             | "rateExp"
+            | "rateSkill"
+            | "rateMagic"
             | "deathLosePercent"
             | "serverName"
             | "mapName"
@@ -1493,6 +1501,8 @@ gameProtocolPort = 7172
 statusProtocolPort = 7171
 maxPlayers = 0
 rateExp = 5
+rateSkill = 1
+rateMagic = 1
 deathLosePercent = -1
 serverName = "Private Forgotten"
 mapName = "myworld"
@@ -1517,6 +1527,8 @@ experienceStages = {
         assert_eq!(config.map_name, "myworld");
         assert_eq!(config.game_protocol_port, 7172);
         assert_eq!(config.experience_rate, 5);
+        assert_eq!(config.skill_rate, 1);
+        assert_eq!(config.magic_rate, 1);
         assert_eq!(config.death_loss_percent, -1);
         assert!(!config.otclient_v8_native_enabled);
         let _ = fs::remove_dir_all(world);
