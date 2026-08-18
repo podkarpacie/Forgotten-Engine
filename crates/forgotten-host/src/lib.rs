@@ -433,6 +433,10 @@ pub struct NativeOtClientHostConfig {
     /// inputs for explicit authoritative awards; weapons, spells, training, and Lua are not yet
     /// event sources.
     pub progression_rules: Option<Arc<BTreeMap<VocationId, PlayerProgressionRules>>>,
+    /// Validated TFS-style global skill rate used only by the existing fixed selected-player
+    /// melee fist-try award. Other combat, weapon, spell, training, and Lua sources remain
+    /// separate and deferred.
+    pub skill_rate: u32,
     /// Validated configured flat experience rate and optional level-stage policy. Concrete
     /// gameplay reward sources remain separate from this immutable host input.
     pub experience_award_policy: Option<Arc<ExperienceAwardPolicy>>,
@@ -2596,6 +2600,7 @@ fn handle_native_otclient_game(
                             character.id,
                             world_map,
                             config.progression_rules.as_deref(),
+                            config.skill_rate,
                             config.declarative_weapon_catalog.as_deref(),
                         )?
                     {
@@ -3645,6 +3650,7 @@ fn apply_native_selected_player_melee(
     attacker_id: u64,
     world_map: &WorldMap,
     progression_rules: Option<&BTreeMap<VocationId, PlayerProgressionRules>>,
+    skill_rate: u32,
     declarative_weapon_catalog: Option<&DeclarativeWeaponCatalog>,
 ) -> Result<
     Option<(
@@ -3713,7 +3719,13 @@ fn apply_native_selected_player_melee(
     if let Some(rules_by_vocation) = progression_rules {
         let vocation = shared_world.player_progression(attacker_id)?.vocation;
         if let Some(rules) = rules_by_vocation.get(&vocation).copied() {
-            shared_world.apply_player_skill_tries(attacker_id, PlayerSkill::Fist, 1, rules)?;
+            let awarded_tries = u64::from(skill_rate);
+            shared_world.apply_player_skill_tries(
+                attacker_id,
+                PlayerSkill::Fist,
+                awarded_tries,
+                rules,
+            )?;
             database.replace_player_progression(
                 attacker_id,
                 shared_world.player_progression(attacker_id)?,
@@ -4322,6 +4334,7 @@ mod tests {
             static_spawns: None,
             regeneration_rules: None,
             progression_rules: None,
+            skill_rate: 1,
             experience_award_policy: None,
             declarative_weapon_catalog: None,
             declarative_spell_catalog: None,
@@ -6039,7 +6052,7 @@ mod tests {
         shared.set_player_target(101, Some(102)).unwrap();
 
         let (native_target_id, vitals, outcome) =
-            apply_native_selected_player_melee(&mut database, &shared, 101, &map, None, None)
+            apply_native_selected_player_melee(&mut database, &shared, 101, &map, None, 1, None)
                 .unwrap()
                 .unwrap();
         assert_eq!(native_target_id, NATIVE_OTCLIENT_PLAYER_ID_START + 102);
@@ -6142,6 +6155,7 @@ mod tests {
             111,
             &map,
             None,
+            1,
             Some(&catalog),
         )
         .unwrap()
@@ -6159,6 +6173,7 @@ mod tests {
             111,
             &map,
             None,
+            1,
             Some(&catalog),
         )
         .unwrap()
@@ -6181,7 +6196,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_player_melee_awards_and_persists_one_configured_fist_try() {
+    fn selected_player_melee_awards_and_persists_rate_scaled_configured_fist_tries() {
         let path = database_path("selected-player-melee-skill-try");
         let mut database = EngineDatabase::open(&path).unwrap();
         let account_id = database.create_account("operator", "hash").unwrap();
@@ -6252,26 +6267,23 @@ mod tests {
             301,
             &map,
             Some(&rules_by_vocation),
+            2,
             None,
         )
         .unwrap()
         .unwrap();
 
-        assert_eq!(
-            shared
-                .player_progression_attempts(301)
-                .unwrap()
-                .skill_tries(PlayerSkill::Fist),
-            1
-        );
+        let in_memory_tries = shared
+            .player_progression_attempts(301)
+            .unwrap()
+            .skill_tries(PlayerSkill::Fist);
+        assert_eq!(in_memory_tries, 2);
         assert_eq!(shared.progression_epoch(), 1);
-        assert_eq!(
-            database
-                .player_progression_attempts(301)
-                .unwrap()
-                .skill_tries(PlayerSkill::Fist),
-            1
-        );
+        let persisted_tries = database
+            .player_progression_attempts(301)
+            .unwrap()
+            .skill_tries(PlayerSkill::Fist);
+        assert_eq!(persisted_tries, 2);
         let _ = fs::remove_file(path);
     }
 
@@ -6347,7 +6359,7 @@ mod tests {
         shared.set_player_target(201, Some(202)).unwrap();
 
         let (_native_target_id, vitals, outcome) =
-            apply_native_selected_player_melee(&mut database, &shared, 201, &map, None, None)
+            apply_native_selected_player_melee(&mut database, &shared, 201, &map, None, 1, None)
                 .unwrap()
                 .unwrap();
         assert!(outcome.defeated);

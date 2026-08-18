@@ -640,6 +640,7 @@ fn run_host(
             static_spawns: (!static_spawns.entities.is_empty()).then(|| Arc::new(static_spawns)),
             regeneration_rules,
             progression_rules,
+            skill_rate: config.skill_rate,
             experience_award_policy: Some(experience_award_policy),
             declarative_weapon_catalog,
             declarative_spell_catalog,
