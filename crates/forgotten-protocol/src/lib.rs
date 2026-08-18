@@ -846,6 +846,7 @@ pub const NATIVE_OTCLIENT_LOGIN_ERROR: u8 = 0x0a;
 pub const NATIVE_OTCLIENT_LOGIN_CHARACTER_LIST: u8 = 0x64;
 pub const NATIVE_OTCLIENT_GAME_LOGIN_ERROR: u8 = 0x14;
 pub const NATIVE_OTCLIENT_GAME_LOGIN_STATE: u8 = 0x0a;
+pub const NATIVE_OTCLIENT_GAME_DEATH: u8 = 0x28;
 pub const NATIVE_OTCLIENT_GAME_FULL_MAP: u8 = 0x64;
 pub const NATIVE_OTCLIENT_GAME_MOVE_CREATURE: u8 = 0x6d;
 pub const NATIVE_OTCLIENT_GAME_OPEN_CONTAINER: u8 = 0x6e;
@@ -1996,6 +1997,17 @@ pub fn encode_native_otclient_game_ping(
         return Err(ProtocolError::UnsupportedNativeClientProfile);
     }
     Ok(Frame(vec![NATIVE_OTCLIENT_GAME_PING]))
+}
+
+/// Encodes the classic native death notification. The supported 7.4 profile admits only the
+/// opcode: death type and penalty fields belong to later client feature sets and are not emitted.
+pub fn encode_native_otclient_game_death(
+    profile: &NativeOtClientProfile,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    Ok(Frame(vec![NATIVE_OTCLIENT_GAME_DEATH]))
 }
 
 /// Encodes an explicitly empty classic 7.4 Quest Log response. FE does not yet claim quest
@@ -3443,6 +3455,18 @@ mod tests {
             encode_native_otclient_game_ping(&profile).unwrap().0,
             vec![NATIVE_OTCLIENT_GAME_PING]
         );
+        assert_eq!(
+            encode_native_otclient_game_death(&profile).unwrap().0,
+            vec![NATIVE_OTCLIENT_GAME_DEATH]
+        );
+        let incompatible_death_profile = NativeOtClientProfile {
+            protocol_version: 800,
+            ..profile.clone()
+        };
+        assert!(matches!(
+            encode_native_otclient_game_death(&incompatible_death_profile),
+            Err(ProtocolError::UnsupportedNativeClientProfile)
+        ));
         let movement = encode_native_otclient_move_creature(
             &profile,
             snapshot.player_id,

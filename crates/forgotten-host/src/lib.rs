@@ -36,6 +36,7 @@ use forgotten_protocol::{
     encode_native_otclient_choose_outfit, encode_native_otclient_creature_health,
     encode_native_otclient_creature_outfit, encode_native_otclient_delete_inventory,
     encode_native_otclient_empty_quest_log, encode_native_otclient_game_cancel_walk_facing,
+    encode_native_otclient_game_death,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
@@ -2522,6 +2523,7 @@ fn handle_native_otclient_game(
                             character.id,
                         )?;
                         if outcome.applied_damage > 0 {
+                            let died = death_state.is_some();
                             let persisted_vitals = PersistedPlayerVitals {
                                 health: vitals.health,
                                 max_health: vitals.max_health,
@@ -2538,6 +2540,17 @@ fn handle_native_otclient_game(
                                 )?;
                             } else {
                                 database.update_player_vitals(character.id, persisted_vitals)?;
+                            }
+                            if died {
+                                let death =
+                                    encode_native_otclient_game_death(&config.client_profile)
+                                        .map_err(HostError::Protocol)?;
+                                write_frame(stream, &death)?;
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    "lifecycle=death-notification profile=740 fields=none",
+                                );
                             }
                             native_diagnostic(
                                 config.extended_diagnostics,
@@ -2612,6 +2625,16 @@ fn handle_native_otclient_game(
                         )
                         .map_err(HostError::Protocol)?;
                         write_frame(stream, &health_update)?;
+                        if outcome.defeated {
+                            let death = encode_native_otclient_game_death(&config.client_profile)
+                                .map_err(HostError::Protocol)?;
+                            write_frame(stream, &death)?;
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "lifecycle=death-notification profile=740 fields=none",
+                            );
+                        }
                         native_diagnostic(
                             config.extended_diagnostics,
                             peer,
@@ -6939,6 +6962,89 @@ mod tests {
 
         game.shutdown().unwrap();
         login.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_lethal_condition_emits_one_classic_death_record() {
+        let database_path = database_path("native-condition-death-record");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        database
+            .update_player_vitals(
+                1,
+                PersistedPlayerVitals {
+                    health: 7,
+                    max_health: 7,
+                    ..PersistedPlayerVitals::default()
+                },
+            )
+            .unwrap();
+        database.update_player_town(1, 1).unwrap();
+        let poison = PlayerCondition::new(PlayerConditionKind::Poison, 1, 7, 1).unwrap();
+        database
+            .replace_player_conditions(1, &BTreeMap::from([(PlayerConditionKind::Poison, poison)]))
+            .unwrap();
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let initialization = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            initialization.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut death_records = 0;
+        for _ in 0..3 {
+            let frame = read_frame(&mut stream).unwrap();
+            if frame.0 == vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_DEATH] {
+                death_records += 1;
+            }
+        }
+        assert_eq!(death_records, 1);
+
+        game.shutdown().unwrap();
+        let reloaded = EngineDatabase::open(&database_path).unwrap();
+        let character = reloaded
+            .characters_for_account(account_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(character.respawn_state.dead);
+        assert_eq!(character.vitals.health, 0);
         let _ = fs::remove_file(database_path);
     }
 

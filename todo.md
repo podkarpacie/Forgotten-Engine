@@ -307,3 +307,4 @@
 - [x] Audit and correct native 740 player HUD initialization/refresh so level, experience, mana, maximum mana, capacity, and magic level are emitted from one persisted authoritative state; retain unmodified-client confirmation as a release blocker.
 - [x] Parse bounded global skill and magic progression rates from TFS-style configuration and apply them to deterministic CLI award entry points; native fixed-melee routing and complete TFS formula, weapon, spell, Lua, and real-client parity remain deferred.
 - [x] Route the bounded `rateSkill` multiplier through native fixed selected-player melee fist-try awards with persistence and regressions; defer weapon timing, full formulas, spell/Lua sources, and real-client confirmation.
+- [x] Add a profile-gated native 740 zero-payload death notification from existing authoritative death transitions; defer automatic respawn scheduling, position-refresh delivery, loss formulas, and real-client confirmation.

@@ -47,6 +47,10 @@ The public Wireshark Tibia dissector marks client versions from 761 as using RSA
 
 The public TFS vocation registry declares `gaincap`, `gainhp`, and `gainmana` alongside regeneration amounts/ticks, skill multipliers, combat formulas, speed, soul, and other fields.[15] The public player header exposes a pure classic experience threshold calculation, while the public progression routine compares total experience to those thresholds and applies vocation health, mana, and capacity gains when a level changes.[16] [17] FE may therefore parse those three nonzero bounded per-level gain values into immutable vocation metadata and independently test an overflow-safe threshold helper. The source alone does not establish an FE starting-stat baseline, promotion, rounding, maximum-vital, packet, or full runtime advancement transaction. Parsing and threshold calculation must not mutate player state until those dependencies have separate authoritative and profile-specific evidence.
 
+## Classic death-notification boundary
+
+The public OTClient protocol declarations identify `GameServerDeath` as opcode `0x28`.[18] The matching parser dispatches that opcode to `parseDeath`; it consumes a death-type byte only when the later `GameDeathType` feature is enabled, and consumes a penalty byte only when the later `GamePenalityOnDeath` feature is enabled for a regular death.[19] The selected FE 740 profile enables neither later feature. FE therefore emits an independently authored one-byte `0x28` record only after an already-authoritative server-side death transition. It must not attach guessed death type, penalty, redemption, re-login, teleport, or automatic-respawn fields. Manual unmodified-OTClientV8 confirmation remains required before this record clears any release blocker.
+
 ## References
 
 [1] [TFS legacy weapon registry path](https://github.com/otland/forgottenserver/blob/master/data/weapons/weapons.xml).
@@ -82,3 +86,7 @@ The public TFS vocation registry declares `gaincap`, `gainhp`, and `gainmana` al
 [16] [Public TFS player progression logic](https://raw.githubusercontent.com/otland/forgottenserver/master/src/player.cpp). Read-only behavior evidence; no player source is copied into FE.
 
 [17] [Public TFS player threshold helper](https://raw.githubusercontent.com/otland/forgottenserver/master/src/player.h). Read-only formula evidence; no player source is copied into FE.
+
+[18] [Public OTClient game-server opcode declarations](https://github.com/edubart/otclient/blob/master/src/client/protocolcodes.h). Read-only wire-identifier evidence; no client source is copied into FE.
+
+[19] [Public OTClient death parser](https://github.com/edubart/otclient/blob/master/src/client/protocolgameparse.cpp). Read-only classic feature-gating evidence; no client source is copied into FE.
