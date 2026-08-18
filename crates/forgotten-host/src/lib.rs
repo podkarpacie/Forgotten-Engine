@@ -78,12 +78,13 @@ const NATIVE_OTCLIENT_HEARTBEAT_POLL_INTERVAL: Duration = Duration::from_millis(
 const NATIVE_OTCLIENT_DEFAULT_GROUND_SPEED: u64 = 150;
 const NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct NativeWorldHeartbeatOutcome {
     tick: u64,
     reactivated_static_creatures: usize,
     changed_static_targets: usize,
     static_target_attacks: usize,
+    static_target_attack_player_ids: BTreeSet<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,11 +118,12 @@ pub enum StaticTargetAttackPolicy {
     SelectedAdjacentFixedDamage { damage: u16 },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StaticTargetAttackSummary {
     pub examined_static_creatures: usize,
     pub applied_attacks: usize,
     pub total_applied_damage: u64,
+    pub affected_player_ids: BTreeSet<u64>,
 }
 
 #[cfg(test)]
@@ -163,26 +165,24 @@ fn advance_native_shared_world_heartbeat_with_static_target_policies(
     let changed_static_targets = shared_world
         .acquire_static_creature_targets(target_policy)?
         .changed_static_targets;
-    let static_target_attacks = match attack_policy {
-        StaticTargetAttackPolicy::Disabled => 0,
-        StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { .. } => {
-            shared_world
-                .attack_static_creature_targets_once(
-                    attack_policy,
-                    world_map.ok_or_else(|| {
-                        HostError::InvalidConfiguration(
-                            "static target attack policy requires a loaded world map".into(),
-                        )
-                    })?,
-                )?
-                .applied_attacks
-        }
+    let static_target_attack_summary = match attack_policy {
+        StaticTargetAttackPolicy::Disabled => StaticTargetAttackSummary::default(),
+        StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { .. } => shared_world
+            .attack_static_creature_targets_once(
+                attack_policy,
+                world_map.ok_or_else(|| {
+                    HostError::InvalidConfiguration(
+                        "static target attack policy requires a loaded world map".into(),
+                    )
+                })?,
+            )?,
     };
     Ok(NativeWorldHeartbeatOutcome {
         tick,
         reactivated_static_creatures,
         changed_static_targets,
-        static_target_attacks,
+        static_target_attacks: static_target_attack_summary.applied_attacks,
+        static_target_attack_player_ids: static_target_attack_summary.affected_player_ids,
     })
 }
 
@@ -191,6 +191,7 @@ fn run_native_shared_world_heartbeat(
     shutdown: Arc<AtomicBool>,
     attack_policy: StaticTargetAttackPolicy,
     world_map: Option<Arc<WorldMap>>,
+    database_path: PathBuf,
 ) -> Result<(), HostError> {
     let mut last_tick = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
@@ -210,13 +211,21 @@ fn run_native_shared_world_heartbeat(
                 StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 }
             }
         };
-        advance_native_shared_world_heartbeat_with_static_target_policies(
+        let outcome = advance_native_shared_world_heartbeat_with_static_target_policies(
             &shared_world,
             elapsed_seconds,
             target_policy,
             attack_policy,
             world_map.as_deref(),
         )?;
+        if !outcome.static_target_attack_player_ids.is_empty() {
+            let mut database = EngineDatabase::open(&database_path)?;
+            persist_static_target_attack_vitals(
+                &mut database,
+                &shared_world,
+                &outcome.static_target_attack_player_ids,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1260,10 +1269,16 @@ impl SharedNativeWorld {
             let outcome = world
                 .apply_static_creature_target_damage(creature_id, damage, world_map)
                 .map_err(HostError::Core)?;
-            if let StaticCreatureTargetAttackOutcome::Applied { applied_damage, .. } = outcome {
+            if let StaticCreatureTargetAttackOutcome::Applied {
+                target_player_id,
+                applied_damage,
+                ..
+            } = outcome
+            {
                 if applied_damage > 0 {
                     summary.applied_attacks += 1;
                     summary.total_applied_damage += u64::from(applied_damage);
+                    summary.affected_player_ids.insert(target_player_id);
                 }
             }
         }
@@ -2217,12 +2232,14 @@ fn serve_native_otclient_game(
     let heartbeat_world = shared_world.clone();
     let heartbeat_attack_policy = config.static_target_attack_policy;
     let heartbeat_map = config.world_map.clone();
+    let heartbeat_database_path = database_path.clone();
     let heartbeat = thread::spawn(move || {
         run_native_shared_world_heartbeat(
             heartbeat_world,
             heartbeat_shutdown,
             heartbeat_attack_policy,
             heartbeat_map,
+            heartbeat_database_path,
         )
     });
     let service_result = loop {
@@ -3539,6 +3556,38 @@ fn persist_runtime_player_conditions(
     database
         .replace_player_conditions(player_id, &conditions)
         .map_err(HostError::Persistence)
+}
+
+/// Persists only the authoritative players actually changed by one static-target attack pass.
+/// The caller provides a `BTreeSet`, making write order deterministic. Client combat effects,
+/// death packets, loot, corpses, formulas, scripts, and general creature AI remain separate.
+fn persist_static_target_attack_vitals(
+    database: &mut EngineDatabase,
+    shared_world: &SharedNativeWorld,
+    player_ids: &BTreeSet<u64>,
+) -> Result<(), HostError> {
+    for &player_id in player_ids {
+        let vitals = shared_world.player_vitals(player_id)?;
+        let persisted_vitals = PersistedPlayerVitals {
+            health: vitals.health,
+            max_health: vitals.max_health,
+            mana: vitals.mana,
+            max_mana: vitals.max_mana,
+            capacity: vitals.capacity,
+            magic_level: vitals.magic_level,
+        };
+        let respawn_state = shared_world.player_respawn_state(player_id)?;
+        if respawn_state.dead {
+            database
+                .update_player_vitals_and_respawn_state(player_id, persisted_vitals, respawn_state)
+                .map_err(HostError::Persistence)?;
+        } else {
+            database
+                .update_player_vitals(player_id, persisted_vitals)
+                .map_err(HostError::Persistence)?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5568,6 +5617,105 @@ mod tests {
         assert!(reloaded.respawn_state.dead);
         assert!(database.player_conditions(108).unwrap().is_empty());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn static_target_attack_heartbeat_persists_vitals_and_lethal_death_state() {
+        for (case, health, damage, expected_health, expected_dead) in [
+            ("nonlethal", 15_u16, 10_u16, 5_u16, false),
+            ("lethal", 10_u16, 10_u16, 0_u16, true),
+        ] {
+            let path = database_path(&format!("static-target-attack-{case}"));
+            let mut database = EngineDatabase::open(&path).unwrap();
+            let account_id = database.create_account("operator", "hash").unwrap();
+            let map = native_world_map();
+            let player = Player {
+                id: 101,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: map.spawn(),
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            };
+            let player_id = player.id;
+            database.save_player(&player).unwrap();
+            let static_creature = forgotten_core::FeTfsStaticEntity {
+                id: NATIVE_OTCLIENT_PLAYER_ID_END + 1,
+                name: "Rat".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 100,
+                direction: 2,
+            };
+            let shared = SharedNativeWorld::from_static_spawns(Some(
+                &FeTfsStaticSpawnCollection::new(vec![static_creature]).unwrap(),
+            ))
+            .unwrap();
+            shared
+                .register_player_at_available_position_with_vitals_equipment_containers_progression_and_conditions(
+                    player,
+                    PlayerVitals {
+                        health,
+                        max_health: health,
+                        ..PlayerVitals::default()
+                    },
+                    NativePlayerHydration {
+                        progression: PlayerProgression::default(),
+                        progression_attempts: PlayerProgressionAttempts::default(),
+                        town_id: 1,
+                        respawn_state: PlayerRespawnState::default(),
+                        equipment: PlayerEquipment::default(),
+                        containers: PlayerContainers::default(),
+                        conditions: BTreeMap::new(),
+                    },
+                    &map,
+                )
+                .unwrap();
+
+            let outcome = advance_native_shared_world_heartbeat_with_static_target_policies(
+                &shared,
+                1,
+                StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 },
+                StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage },
+                Some(&map),
+            )
+            .unwrap();
+            assert_eq!(outcome.static_target_attacks, 1);
+            assert_eq!(
+                outcome.static_target_attack_player_ids,
+                BTreeSet::from([101])
+            );
+            persist_static_target_attack_vitals(
+                &mut database,
+                &shared,
+                &outcome.static_target_attack_player_ids,
+            )
+            .unwrap();
+            drop(database);
+
+            let database = EngineDatabase::open(&path).unwrap();
+            let reloaded = database
+                .characters_for_account(account_id)
+                .unwrap()
+                .into_iter()
+                .find(|character| character.id == player_id)
+                .unwrap();
+            assert_eq!(reloaded.vitals.health, expected_health);
+            assert_eq!(reloaded.respawn_state.dead, expected_dead);
+            drop(database);
+            let _ = fs::remove_file(path);
+        }
     }
 
     #[test]
@@ -8446,6 +8594,7 @@ mod tests {
                 reactivated_static_creatures: 0,
                 changed_static_targets: 0,
                 static_target_attacks: 0,
+                static_target_attack_player_ids: BTreeSet::new(),
             }
         );
         assert_eq!(
@@ -8468,6 +8617,7 @@ mod tests {
                 reactivated_static_creatures: 0,
                 changed_static_targets: 1,
                 static_target_attacks: 0,
+                static_target_attack_player_ids: BTreeSet::new(),
             }
         );
         assert_eq!(
@@ -8561,6 +8711,7 @@ mod tests {
                 reactivated_static_creatures: 0,
                 changed_static_targets: 1,
                 static_target_attacks: 0,
+                static_target_attack_player_ids: BTreeSet::new(),
             }
         );
         assert_eq!(shared.player_vitals(101).unwrap().health, 5);
@@ -8580,6 +8731,7 @@ mod tests {
                 reactivated_static_creatures: 0,
                 changed_static_targets: 0,
                 static_target_attacks: 1,
+                static_target_attack_player_ids: BTreeSet::from([101]),
             }
         );
         assert_eq!(shared.player_vitals(101).unwrap().health, 3);
@@ -8632,6 +8784,7 @@ mod tests {
                 reactivated_static_creatures: 0,
                 changed_static_targets: 0,
                 static_target_attacks: 0,
+                static_target_attack_player_ids: BTreeSet::new(),
             }
         );
         assert_eq!(shared.visibility_epoch(), epoch_before);
@@ -8642,6 +8795,7 @@ mod tests {
                 reactivated_static_creatures: 1,
                 changed_static_targets: 0,
                 static_target_attacks: 0,
+                static_target_attack_player_ids: BTreeSet::new(),
             }
         );
         assert_eq!(shared.visibility_epoch(), epoch_before + 1);
