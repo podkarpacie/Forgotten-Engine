@@ -16,7 +16,8 @@ use forgotten_core::{
     PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
     StaticCreatureDamageOutcome, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy,
     StaticCreatureResetSummary, StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
-    StaticCreatureTargetStepOutcome, VocationId, VocationLevelUpGains, WorldMap, WorldState,
+    StaticCreatureTargetAttackOutcome, StaticCreatureTargetStepOutcome, VocationId,
+    VocationLevelUpGains, WorldMap, WorldState,
 };
 use forgotten_persistence::{
     EngineDatabase, PlayerOutfit, PlayerVitals as PersistedPlayerVitals,
@@ -1198,6 +1199,32 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)?;
         if outcome.applied_damage > 0 {
             self.mark_visibility_changed();
+        }
+        Ok(outcome)
+    }
+
+    /// Exposes one explicit core-only static target attack under the shared world lock. A real
+    /// player-vitals mutation advances the existing refresh epoch, but scheduling, persistence,
+    /// native delivery, formulas, loot, corpses, scripts, and creature AI remain caller-owned
+    /// deferred concerns.
+    pub fn apply_static_creature_target_damage(
+        &self,
+        creature_id: u32,
+        requested_damage: u16,
+        world_map: &WorldMap,
+    ) -> Result<StaticCreatureTargetAttackOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .apply_static_creature_target_damage(creature_id, requested_damage, world_map)
+            .map_err(HostError::Core)?;
+        if matches!(
+            outcome,
+            StaticCreatureTargetAttackOutcome::Applied {
+                applied_damage: 1..,
+                ..
+            }
+        ) {
+            self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok(outcome)
     }
@@ -6002,6 +6029,101 @@ mod tests {
             shared.player_interaction_intent(101).unwrap(),
             PlayerInteractionIntent::default()
         );
+    }
+
+    #[test]
+    fn shared_static_target_attack_updates_vitals_epoch_only_after_real_damage() {
+        let map = native_world_map();
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let creature = forgotten_core::FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let shared = SharedNativeWorld::from_static_spawns(Some(
+            &FeTfsStaticSpawnCollection::new(vec![creature]).unwrap(),
+        ))
+        .unwrap();
+        shared
+            .register_player_at_available_position_with_vitals(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                PlayerVitals {
+                    health: 5,
+                    max_health: 5,
+                    ..PlayerVitals::default()
+                },
+                &map,
+            )
+            .unwrap();
+        assert_eq!(
+            shared
+                .apply_static_creature_target_damage(creature_id, 2, &map)
+                .unwrap(),
+            StaticCreatureTargetAttackOutcome::NoTarget
+        );
+        assert_eq!(shared.vitals_epoch(), 0);
+
+        shared
+            .lock()
+            .unwrap()
+            .select_static_creature_target(creature_id, 1)
+            .unwrap();
+        assert!(matches!(
+            shared
+                .apply_static_creature_target_damage(creature_id, 2, &map)
+                .unwrap(),
+            StaticCreatureTargetAttackOutcome::Applied {
+                applied_damage: 2,
+                remaining_health: 3,
+                death_state: None,
+                ..
+            }
+        ));
+        assert_eq!(shared.vitals_epoch(), 1);
+
+        shared
+            .lock()
+            .unwrap()
+            .move_player(
+                101,
+                Position {
+                    x: 99,
+                    y: 100,
+                    z: 7,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            shared
+                .apply_static_creature_target_damage(creature_id, 3, &map)
+                .unwrap(),
+            StaticCreatureTargetAttackOutcome::TargetNotAdjacent {
+                creature_id,
+                target_player_id: 101,
+            }
+        );
+        assert_eq!(shared.vitals_epoch(), 1);
     }
 
     #[test]
