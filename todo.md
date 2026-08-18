@@ -327,6 +327,7 @@
 - [x] Parse and validate bounded TFS vocation nested-formula defense and armor multipliers for future profile-specific mitigation without changing live combat behavior or claiming formula compatibility.
 - [x] Decode and retain bounded native fight-mode, chase-mode, and secure-mode state with the verified TFS defaults, without connecting it to unverified combat formulas or client output.
 - [x] Parse and validate bounded TFS vocation attack-speed and base-speed metadata for future timing compatibility without changing movement, cooldown, or combat execution.
-- [x] Encode and deliver the verified three-byte native 740 player-modes record from authoritative fight-mode state, while leaving later PvP-mode variants and formula effects deferred.
+- [x] Encode and deliver the verified three-byte native 740 player-modes record from authoritative fight-mode state at initialization and after a changed accepted mode request, while leaving persistence, later PvP-mode variants, and formula effects deferred.
 - [x] Decode and honor native 740 CloseContainer as a client-session view closure, emitting the verified close record and preventing container refreshes from reopening that view; persistence, nesting, up-arrow, and item-delta controls remain deferred.
 - [x] Decode and honor native 740 UpdateContainer as a session-view refresh for one complete mapped top-level container, without changing shared or persisted state; nesting, up-arrow, and item-delta controls remain deferred.
+- [x] Deliver the existing parser-verified native 740 player-modes record immediately after an accepted authoritative fight-mode change; formula effects, persistence, and broader-profile variants remain deferred.

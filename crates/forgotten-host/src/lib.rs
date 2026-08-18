@@ -3251,10 +3251,19 @@ fn handle_native_otclient_game(
                         secure: request.secure,
                     },
                 )?;
+                if changed {
+                    let player_modes =
+                        encode_native_otclient_player_modes(&config.client_profile, request)
+                            .map_err(HostError::Protocol)?;
+                    write_frame(stream, &player_modes)?;
+                }
                 native_diagnostic(
                     config.extended_diagnostics,
                     peer,
-                    &format!("action=change-fight-modes outcome=applied changed={changed}"),
+                    &format!(
+                        "action=change-fight-modes outcome=applied changed={changed} delivery={}",
+                        if changed { "player-modes" } else { "unchanged" }
+                    ),
                 );
             }
             NativeOtClientGameAction::CloseContainer(container_id) => {
@@ -8365,6 +8374,36 @@ mod tests {
         write_frame(
             &mut stream,
             &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES,
+                3,
+                1,
+                1,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_MODES,
+                3,
+                1,
+                1,
+            ]
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES,
+                3,
+                1,
+                1,
+            ]),
+        )
+        .unwrap();
+        write_frame(
+            &mut stream,
+            &Frame(vec![
                 forgotten_protocol::NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG,
             ]),
         )
@@ -8409,6 +8448,15 @@ mod tests {
         .unwrap();
         write_frame(&mut stream, &Frame(vec![0xa0, 1, 0, 1])).unwrap();
         write_frame(&mut stream, &Frame(vec![0x1d])).unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_MODES,
+                1,
+                0,
+                1,
+            ]
+        );
         let ping_back = read_frame(&mut stream).unwrap();
         assert_eq!(ping_back.0, vec![0x1d]);
 
