@@ -2163,6 +2163,9 @@ impl WorldState {
         if !self.players.contains_key(&player_id) {
             return Err(CoreError::UnknownPlayer(player_id));
         }
+        if target_static_creature_id.is_some() && self.player_respawn_state(player_id)?.dead {
+            return Err(CoreError::PlayerIsDead(player_id));
+        }
         if let Some(target_static_creature_id) = target_static_creature_id {
             let target = self
                 .static_creatures
@@ -4264,6 +4267,9 @@ impl WorldState {
         } else {
             follow_player_id
         };
+        if selected_player_id.is_some() && self.player_respawn_state(player_id)?.dead {
+            return Err(CoreError::PlayerIsDead(player_id));
+        }
         if let Some(selected_player_id) = selected_player_id {
             if selected_player_id == player_id {
                 return Err(CoreError::SelfInteractionNotAllowed(player_id));
@@ -5331,6 +5337,33 @@ mod tests {
             world.set_player_follow(source.id, Some(9)),
             Err(CoreError::UnknownPlayer(9))
         );
+
+        world
+            .hydrate_player_respawn_state(
+                source.id,
+                PlayerRespawnState {
+                    dead: true,
+                    respawn_at: Some(Position {
+                        x: 110,
+                        y: 120,
+                        z: 7,
+                    }),
+                    death_time: Some(0),
+                    loss_applied: false,
+                },
+            )
+            .unwrap();
+        let dead_revision = world.revision();
+        assert_eq!(
+            world.set_player_target(source.id, Some(selected.id)),
+            Err(CoreError::PlayerIsDead(source.id))
+        );
+        assert_eq!(
+            world.set_player_follow(source.id, Some(selected.id)),
+            Err(CoreError::PlayerIsDead(source.id))
+        );
+        assert_eq!(world.revision(), dead_revision);
+        assert!(world.set_player_target(source.id, None).is_ok());
 
         world.remove_player(selected.id).unwrap();
         assert_eq!(
