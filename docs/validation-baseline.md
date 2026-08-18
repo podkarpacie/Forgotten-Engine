@@ -24,6 +24,17 @@ The script validates formatting, strict linting, all workspace unit and integrat
 | Native host | Bounded process-startup check and all protocol/unit regressions in the workspace | Does not operate a real client or claim complete protocol/gameplay compatibility. |
 | FE 8.0 native profile boundary | A protocol-800 configuration is classified as requiring RSA/XTEA and refuses native enablement with an actionable diagnostic. The protocol unit suite may encode a non-empty bounded outbound XTEA envelope and extract only a marker/four-word key prefix from an already decrypted fixed test block. | This proves only safe non-enablement and isolated transport/bootstrap primitives. It does not prove client-input or RSA decryption, credentials, encrypted login, game sessions, packet layouts, listener operation, or client interoperability. |
 
+## Local artifact verification
+
+The following **unpublished local candidate** was built from commit `7348d4d` using the repository packaging scripts. The Linux executable reported `Forgotten Engine build 7.4.44`; the Windows binary was verified as a 64-bit PE executable. Both ZIP archives passed `unzip -t`, and each manifest passed `sha256sum --check`. The artifacts are ignored by Git and have not been attached to a GitHub release.
+
+| Artifact | SHA-256 | Evidence and boundary |
+|---|---|---|
+| `forgotten-engine-fe-v7.4.44-linux-x86_64.zip` | `3294c80d6c186a21251cfe69bd8fb778ea73871a70dce52db53c29136b4e0aac` | Optimized native Linux build; archive contains `forgotten-engine` and `INSTALL.txt`. |
+| `forgotten-engine-fe-v7.4.44-windows-x86_64.zip` | `d1c4afa7f8a0137aff421cf4e3aad6246dac5b5587e80dff057fff6d6e8c94f5` | Optimized GNU cross-build; archive contains `forgotten-engine.exe` and `INSTALL.txt`. It has not received a Windows runtime smoke test. |
+
+> Archive generation and checksum verification do **not** constitute a published release or production approval. GitHub authentication must be restored before these files can be uploaded, and platform/client validation blockers below remain in force.
+
 ## Required manual unmodified-OTClientV8 checks
 
 Use a lawful, unmodified OTClientV8 build configured for the selected 740 profile and your own matching data. Record the engine commit, client revision, profile configuration, map/item-data fingerprint, OS, and outcome for every run. Never include credentials or raw packet bodies in the report.

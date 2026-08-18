@@ -270,6 +270,7 @@
 - [x] Decode and safely handle the native 740 Quest Log request without ending the game session; until content exists it returns a parser-shaped empty/deferred response.
 - [ ] Verify the native 740 empty Quest Log response with an unmodified OTClientV8 build; do not clear the client-facing blocker until the window opens without a parser error or disconnect.
 - [x] Build, package, checksum, and publish fresh Linux and Windows artifacts from the latest verified Forgotten Engine commit for manual testing.
+- [x] Build and verify unpublished local FE 7.4.44 Linux and Windows release-candidate archives from commit `7348d4d`, including SHA-256 manifests and ZIP integrity; Windows runtime smoke testing and GitHub publication remain blocked or deferred.
 - [ ] Establish and satisfy production-readiness gates for complete declared TFS feature conformance, profile-specific protocol validation, reliability, bounded memory/performance, security, and reproducible TFS-to-FE migration before describing any profile as mainstream-ready.
 - [x] Expand the completion ledger from its interim 51% target into a full evidence-based 100% production-readiness plan covering every declared FE system, compatibility profile, migration boundary, and operational gate.
 - [x] Define a typed audit-derived deferred script-event interface and no-op executor that never reads, loads, or runs imported Lua; real sandboxing, legacy APIs, and gameplay event execution remain deferred.
