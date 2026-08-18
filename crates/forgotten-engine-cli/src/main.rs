@@ -1033,6 +1033,68 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             );
             Ok(())
         }
+        "skill-tries" => {
+            if arguments.len() != 6 {
+                return Err(
+                    "usage: player skill-tries <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <awarded-tries>".into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let skill = parse_player_skill(arguments.get(4))?;
+            let awarded_tries = arguments
+                .get(5)
+                .ok_or("awarded tries are required")?
+                .parse::<u64>()
+                .map_err(|_| "awarded tries must be an unsigned 64-bit integer")?;
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            let character = database.player_by_id(player_id)?;
+            let registry = load_tfs_vocation_registry(&config)?
+                .ok_or("player skill-tries requires data/XML/vocations.xml")?;
+            let rules = registry
+                .get(character.progression.vocation)
+                .ok_or("player vocation has no configured progression rules")?
+                .progression_rules()?;
+            let mut world = WorldState::default();
+            world.add_player_with_vitals_and_progression(
+                Player {
+                    id: character.id,
+                    account_id: 0,
+                    name: character.name,
+                    position: character.position,
+                    level: character.level,
+                    experience: character.experience,
+                    skill_points: character.skill_points,
+                },
+                PlayerVitals {
+                    health: character.vitals.health,
+                    max_health: character.vitals.max_health,
+                    mana: character.vitals.mana,
+                    max_mana: character.vitals.max_mana,
+                    capacity: character.vitals.capacity,
+                    magic_level: character.vitals.magic_level,
+                },
+                character.progression,
+            )?;
+            world.replace_player_progression_attempts(player_id, character.progression_attempts)?;
+            let outcome = world.apply_player_skill_tries(player_id, skill, awarded_tries, rules)?;
+            database.replace_player_progression_and_attempts(
+                player_id,
+                world.player_progression(player_id)?,
+                world.player_progression_attempts(player_id)?,
+            )?;
+            println!(
+                "awarded player skill-tries player-id={player_id} skill={} awarded={} level={} percent={} gained-levels={} stored-tries={}",
+                skill.code(),
+                awarded_tries,
+                outcome.progress.level,
+                outcome.progress.percent,
+                outcome.gained_levels,
+                outcome.stored_tries,
+            );
+            Ok(())
+        }
         "magic-mana" => {
             if arguments.len() != 5 {
                 return Err(
@@ -1621,6 +1683,7 @@ Commands:
   player vocation <directory> <player-id> <vocation-id>
   player town <directory> <player-id> <town-id>
   player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]
+  player skill-tries <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <awarded-tries>
   player magic-mana <directory> <player-id> <awarded-mana>
   player experience <directory> <player-id> <raw-experience>
   player container-stow-equipped <directory> <player-id> <slot> <container-id>
@@ -1720,6 +1783,7 @@ mod tests {
             "player vocation <directory> <player-id> <vocation-id>",
             "player town <directory> <player-id> <town-id>",
             "player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]",
+            "player skill-tries <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <awarded-tries>",
             "player magic-mana <directory> <player-id> <awarded-mana>",
             "player experience <directory> <player-id> <raw-experience>",
             "player container-stow-equipped <directory> <player-id> <slot> <container-id>",
@@ -2103,6 +2167,102 @@ experienceStages = {
         ])
         .is_err());
         assert_eq!(database.player_by_id(1).unwrap().vitals.magic_level, 1);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stable_cli_skill_tries_awards_persist_configured_vocation_progress() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("forgotten-engine-skill-tries-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        let vocations = directory.join("data/XML/vocations.xml");
+        fs::create_dir_all(vocations.parent().unwrap()).unwrap();
+        fs::write(
+            &vocations,
+            r#"<vocations>
+  <vocation id="1" name="Knight" manamultiplier="1.000" gainhpticks="1" gainhpamount="0" gainmanaticks="1" gainmanaamount="0" gainsoulticks="1">
+    <skill id="0" multiplier="1.000"/>
+    <skill id="1" multiplier="1.000"/>
+    <skill id="2" multiplier="1.000"/>
+    <skill id="3" multiplier="1.000"/>
+    <skill id="4" multiplier="1.000"/>
+    <skill id="5" multiplier="1.000"/>
+    <skill id="6" multiplier="1.000"/>
+  </vocation>
+</vocations>"#,
+        )
+        .unwrap();
+        account_command(&[
+            "account".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "skill-account".into(),
+            "skill-password".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "Knight".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "vocation".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "1".into(),
+        ])
+        .unwrap();
+        for awarded_tries in ["25", "25"] {
+            player_command(&[
+                "player".into(),
+                "skill-tries".into(),
+                directory.display().to_string(),
+                "1".into(),
+                "sword".into(),
+                awarded_tries.into(),
+            ])
+            .unwrap();
+        }
+
+        let config = load(&directory).unwrap();
+        let database = EngineDatabase::open(&config.database_path).unwrap();
+        let character = database.player_by_id(1).unwrap();
+        assert_eq!(
+            character.progression.skills.skill(PlayerSkill::Sword),
+            SkillProgress::new(11, 0).unwrap()
+        );
+        assert_eq!(
+            character
+                .progression_attempts
+                .skill_tries(PlayerSkill::Sword),
+            0
+        );
+        assert!(player_command(&[
+            "player".into(),
+            "skill-tries".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "sword".into(),
+            "invalid".into(),
+        ])
+        .is_err());
+        assert_eq!(
+            database
+                .player_by_id(1)
+                .unwrap()
+                .progression
+                .skills
+                .skill(PlayerSkill::Sword),
+            SkillProgress::new(11, 0).unwrap()
+        );
         let _ = fs::remove_dir_all(directory);
     }
 

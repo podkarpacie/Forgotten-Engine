@@ -741,6 +741,53 @@ impl EngineDatabase {
         Ok(())
     }
 
+    /// Replaces visible progression and exact counters in one transaction. This prevents a
+    /// restart from observing an advanced skill percentage without its matching remaining tries.
+    pub fn replace_player_progression_and_attempts(
+        &mut self,
+        player_id: u64,
+        progression: PlayerProgression,
+        attempts: PlayerProgressionAttempts,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let progress_values = progression
+            .skills
+            .iter()
+            .flat_map(|(_, progress)| [i64::from(progress.level), i64::from(progress.percent)])
+            .collect::<Vec<_>>();
+        let attempt_values = attempts
+            .all_skill_tries()
+            .into_iter()
+            .map(sqlite_progression_attempt)
+            .collect::<Result<Vec<_>, _>>()?;
+        let magic_mana = sqlite_progression_attempt(attempts.magic_mana())?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE players SET vocation = ?1 WHERE id = ?2",
+            params![i64::from(progression.vocation.value()), player_id as i64],
+        )?;
+        transaction.execute(
+            "INSERT INTO player_skills (player_id, fist_level, fist_percent, club_level, club_percent, sword_level, sword_percent, axe_level, axe_percent, distance_level, distance_percent, shielding_level, shielding_percent, fishing_level, fishing_percent) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) ON CONFLICT(player_id) DO UPDATE SET fist_level=excluded.fist_level, fist_percent=excluded.fist_percent, club_level=excluded.club_level, club_percent=excluded.club_percent, sword_level=excluded.sword_level, sword_percent=excluded.sword_percent, axe_level=excluded.axe_level, axe_percent=excluded.axe_percent, distance_level=excluded.distance_level, distance_percent=excluded.distance_percent, shielding_level=excluded.shielding_level, shielding_percent=excluded.shielding_percent, fishing_level=excluded.fishing_level, fishing_percent=excluded.fishing_percent",
+            params![
+                player_id as i64,
+                progress_values[0], progress_values[1], progress_values[2], progress_values[3],
+                progress_values[4], progress_values[5], progress_values[6], progress_values[7],
+                progress_values[8], progress_values[9], progress_values[10], progress_values[11],
+                progress_values[12], progress_values[13],
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO player_progression_attempts (player_id, fist_tries, club_tries, sword_tries, axe_tries, distance_tries, shielding_tries, fishing_tries, magic_mana) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(player_id) DO UPDATE SET fist_tries=excluded.fist_tries, club_tries=excluded.club_tries, sword_tries=excluded.sword_tries, axe_tries=excluded.axe_tries, distance_tries=excluded.distance_tries, shielding_tries=excluded.shielding_tries, fishing_tries=excluded.fishing_tries, magic_mana=excluded.magic_mana",
+            params![
+                player_id as i64,
+                attempt_values[0], attempt_values[1], attempt_values[2], attempt_values[3],
+                attempt_values[4], attempt_values[5], attempt_values[6], magic_mana,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Loads a player's progression through validated fixed-width database fields. Worlds that
     /// predate schema-v5 have no skill row after migration and are represented by safe defaults.
     pub fn player_progression(
@@ -2140,6 +2187,57 @@ mod tests {
         ));
         let loaded = database.player_by_id(7).unwrap();
         assert_eq!(loaded.vitals, vitals);
+        assert_eq!(loaded.progression_attempts, attempts);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn atomically_persists_player_progression_and_attempts() {
+        let path = temporary_path("progression-attempts-transaction");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("admin", "hash").unwrap();
+        database
+            .save_player(&Player {
+                id: 7,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let mut progression = PlayerProgression::default();
+        progression
+            .skills
+            .set(PlayerSkill::Sword, SkillProgress::new(11, 0).unwrap());
+        let attempts = PlayerProgressionAttempts::new([10, 20, 0, 40, 50, 60, 70], 800);
+        database
+            .replace_player_progression_and_attempts(7, progression, attempts)
+            .unwrap();
+        let loaded = database.player_by_id(7).unwrap();
+        assert_eq!(loaded.progression, progression);
+        assert_eq!(loaded.progression_attempts, attempts);
+
+        let mut rejected_progression = progression;
+        rejected_progression
+            .skills
+            .set(PlayerSkill::Sword, SkillProgress::new(12, 0).unwrap());
+        assert!(matches!(
+            database.replace_player_progression_and_attempts(
+                7,
+                rejected_progression,
+                PlayerProgressionAttempts::new([u64::MAX; 7], 0),
+            ),
+            Err(PersistenceError::InvalidProgressionAttemptRecord(_))
+        ));
+        let loaded = database.player_by_id(7).unwrap();
+        assert_eq!(loaded.progression, progression);
         assert_eq!(loaded.progression_attempts, attempts);
         let _ = fs::remove_file(path);
     }
