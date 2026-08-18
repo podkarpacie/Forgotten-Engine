@@ -14,6 +14,8 @@
       "nativeOtClientV8": "partial",
       "nativeOtClientV8Detail": "experimental 740 login, character selection, map, movement, shared-player visibility, bounded player-vitals updates, typed no-output map/creature look request handling, and a parser-shaped empty Quest Log acknowledgement. The player-stats record has parser-shaped 16-bit level and soul fields, but unmodified-client confirmation remains required",
       "officialClientProtocolEmulation": "deferred",
+      "localCharacterProvisioning": "supported",
+      "localCharacterProvisioningDetail": "local SQLite/Argon2 account provisioning and additive character creation persist the exact classic cumulative experience threshold for the returned level-eight default, so later authoritative experience awards cannot reduce a newly created character's level. Existing externally created or legacy inconsistent character records are not rewritten automatically",
       "contentAudit": "partial",
       "legacyItemMetadata": "partial",
       "legacyItemMetadataDetail": "bounded operator-supplied items.xml armor, defense, extra-defense, attack-speed, and verified weapon-type labels are retained only for known OTB items. The parsed fields do not alter FE combat, equipment behavior, packets, or compatibility claims. Formula use remains deferred until profile-specific slot, vocation, fight-mode, active-block, and controlled-randomness evidence is implemented",

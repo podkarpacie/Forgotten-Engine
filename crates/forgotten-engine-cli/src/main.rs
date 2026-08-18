@@ -2260,7 +2260,9 @@ experienceStages = {
 
         let config = load(&directory).unwrap();
         let database = EngineDatabase::open(&config.database_path).unwrap();
-        assert_eq!(database.player_by_id(1).unwrap().experience, 20);
+        let character = database.player_by_id(1).unwrap();
+        assert_eq!(character.experience, 4_220);
+        assert_eq!(character.level, 8);
         let _ = fs::remove_dir_all(directory);
     }
 

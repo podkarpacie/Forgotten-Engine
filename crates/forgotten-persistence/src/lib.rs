@@ -5,9 +5,10 @@ use argon2::{
     Argon2,
 };
 use forgotten_core::{
-    EquipmentSlot, ItemInstance, Player, PlayerCondition, PlayerConditionKind, PlayerContainer,
-    PlayerContainers, PlayerEquipment, PlayerProgression, PlayerProgressionAttempts,
-    PlayerRespawnState, PlayerSkill, PlayerSkills, Position, SkillProgress, VocationId,
+    classic_experience_for_level, EquipmentSlot, ItemInstance, Player, PlayerCondition,
+    PlayerConditionKind, PlayerContainer, PlayerContainers, PlayerEquipment, PlayerProgression,
+    PlayerProgressionAttempts, PlayerRespawnState, PlayerSkill, PlayerSkills, Position,
+    SkillProgress, VocationId,
 };
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -29,6 +30,7 @@ const SCHEMA_VERSION_STATIC_CREATURE_RUNTIME: i64 = 12;
 const SCHEMA_VERSION_STATIC_CREATURE_REACTIVATION: i64 = 13;
 pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_STATIC_CREATURE_REACTIVATION;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 
 pub struct EngineDatabase {
     connection: Connection,
@@ -300,6 +302,8 @@ impl EngineDatabase {
             y: 100,
             z: 7,
         };
+        let experience = classic_experience_for_level(DEFAULT_PROVISIONED_PLAYER_LEVEL)
+            .expect("the fixed local provisioning level must have a representable threshold");
         self.connection.execute(
             "INSERT INTO players (account_id, name, x, y, z, level, experience, skill_points)\
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -309,16 +313,16 @@ impl EngineDatabase {
                 position.x as i64,
                 position.y as i64,
                 position.z as i64,
-                8_i64,
-                0_i64,
+                i64::from(DEFAULT_PROVISIONED_PLAYER_LEVEL),
+                experience as i64,
                 0_i64,
             ],
         )?;
         Ok(LoginCharacter {
             id: self.connection.last_insert_rowid() as u64,
             name: name.trim().to_owned(),
-            level: 8,
-            experience: 0,
+            level: DEFAULT_PROVISIONED_PLAYER_LEVEL,
+            experience,
             skill_points: 0,
             progression: PlayerProgression::default(),
             progression_attempts: PlayerProgressionAttempts::default(),
@@ -2784,7 +2788,11 @@ mod tests {
             .create_player_for_account(account_id.try_into().unwrap(), "Knight")
             .unwrap();
         assert_eq!(character.name, "Knight");
-        assert_eq!(character.level, 8);
+        assert_eq!(character.level, DEFAULT_PROVISIONED_PLAYER_LEVEL);
+        assert_eq!(
+            character.experience,
+            classic_experience_for_level(DEFAULT_PROVISIONED_PLAYER_LEVEL).unwrap()
+        );
         assert_eq!(
             character.position,
             Position {
@@ -2800,6 +2808,12 @@ mod tests {
             .characters
             .iter()
             .any(|entry| entry.name == "Knight"));
+        let reloaded = database
+            .characters_for_account(account_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(reloaded.level, character.level);
+        assert_eq!(reloaded.experience, character.experience);
         let _ = fs::remove_file(path);
     }
 
