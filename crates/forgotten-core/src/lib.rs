@@ -243,6 +243,26 @@ pub enum StaticCreatureTargetStepOutcome {
     },
 }
 
+/// Result of one explicit static-creature attack against its already selected player target.
+/// This is a core-only transition: callers remain responsible for scheduling, persistence, and
+/// client delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticCreatureTargetAttackOutcome {
+    NoTarget,
+    TargetNotAdjacent {
+        creature_id: u32,
+        target_player_id: u64,
+    },
+    Applied {
+        creature_id: u32,
+        target_player_id: u64,
+        requested_damage: u16,
+        applied_damage: u16,
+        remaining_health: u16,
+        death_state: Option<PlayerRespawnState>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticCreatureMoveDecision {
     pub creature_id: u32,
@@ -2507,6 +2527,91 @@ impl WorldState {
             return Err(CoreError::InactiveStaticCreature(creature_id));
         }
         Ok(runtime.target_player_id)
+    }
+
+    fn clear_static_creature_target(&mut self, creature_id: u32) -> Result<(), CoreError> {
+        let runtime = self
+            .static_creatures
+            .get_mut(&creature_id)
+            .ok_or(CoreError::UnknownStaticCreature(creature_id))?;
+        if runtime.target_player_id.take().is_some() {
+            self.mark_changed();
+        }
+        Ok(())
+    }
+
+    /// Applies one bounded fixed damage event from an active static creature to its already
+    /// selected living player target. The target must remain adjacent. A potentially lethal hit
+    /// validates the assigned town temple before health changes, then reuses the established
+    /// authoritative death state. This does not schedule attacks or imply creature-AI parity.
+    pub fn apply_static_creature_target_damage(
+        &mut self,
+        creature_id: u32,
+        requested_damage: u16,
+        world_map: &WorldMap,
+    ) -> Result<StaticCreatureTargetAttackOutcome, CoreError> {
+        let (source, target_player_id) = {
+            let runtime = self
+                .static_creatures
+                .get(&creature_id)
+                .ok_or(CoreError::UnknownStaticCreature(creature_id))?;
+            if !runtime.active {
+                return Err(CoreError::InactiveStaticCreature(creature_id));
+            }
+            (runtime.entity.position, runtime.target_player_id)
+        };
+        let Some(target_player_id) = target_player_id else {
+            return Ok(StaticCreatureTargetAttackOutcome::NoTarget);
+        };
+        let Some(target) = self.players.get(&target_player_id).cloned() else {
+            self.clear_static_creature_target(creature_id)?;
+            return Ok(StaticCreatureTargetAttackOutcome::NoTarget);
+        };
+        if self
+            .player_respawn_states
+            .get(&target_player_id)
+            .is_some_and(|state| state.dead)
+        {
+            self.clear_static_creature_target(creature_id)?;
+            return Ok(StaticCreatureTargetAttackOutcome::NoTarget);
+        }
+        if !source.is_adjacent_to(target.position) {
+            return Ok(StaticCreatureTargetAttackOutcome::TargetNotAdjacent {
+                creature_id,
+                target_player_id,
+            });
+        }
+        let current_health = self.player_vitals(target_player_id)?.health;
+        let potentially_lethal = current_health > 0 && requested_damage >= current_health;
+        let town_id = if potentially_lethal {
+            let town_id = self.player_town(target_player_id)?;
+            world_map
+                .temple_position_for_town(town_id)
+                .ok_or(CoreError::UnknownTown(town_id))?;
+            Some(town_id)
+        } else {
+            None
+        };
+        let (applied_damage, remaining_health) =
+            self.apply_damage_to_known_target(target_player_id, requested_damage)?;
+        let death_state = town_id
+            .filter(|_| remaining_health == 0 && applied_damage > 0)
+            .map(|town_id| self.apply_player_death(target_player_id, town_id, world_map))
+            .transpose()?;
+        if death_state.is_some() {
+            self.clear_static_creature_target(creature_id)?;
+        }
+        if applied_damage > 0 {
+            self.mark_changed();
+        }
+        Ok(StaticCreatureTargetAttackOutcome::Applied {
+            creature_id,
+            target_player_id,
+            requested_damage,
+            applied_damage,
+            remaining_health,
+            death_state,
+        })
     }
 
     /// Attempts at most one deterministic distance-reducing cardinal step toward an already
@@ -6221,6 +6326,138 @@ mod tests {
         assert!(world.deactivate_static_creature(creature_id).unwrap());
         assert_eq!(
             world.static_creature_target(creature_id),
+            Err(CoreError::InactiveStaticCreature(creature_id))
+        );
+    }
+
+    #[test]
+    fn static_creature_target_damage_requires_a_live_adjacent_target_and_reuses_death_state() {
+        let creature_id = 0x4000_0001;
+        let creature_position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let target_position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let temple_position = Position {
+            x: 102,
+            y: 100,
+            z: 7,
+        };
+        let creature = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: creature_position,
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut target = player();
+        target.position = target_position;
+        let mut map = WorldMap::new("static-target-attack", creature_position);
+        map.set_town(WorldMapTown {
+            id: 1,
+            name: "Temple".into(),
+            temple_position,
+        })
+        .unwrap();
+        let mut world = WorldState::default();
+        world.add_player(target).unwrap();
+        world
+            .update_player_vitals(
+                7,
+                PlayerVitals {
+                    health: 5,
+                    max_health: 5,
+                    ..PlayerVitals::default()
+                },
+            )
+            .unwrap();
+        world
+            .install_static_creatures(&FeTfsStaticSpawnCollection::new(vec![creature]).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            world.apply_static_creature_target_damage(creature_id, 1, &map),
+            Ok(StaticCreatureTargetAttackOutcome::NoTarget)
+        );
+        world.select_static_creature_target(creature_id, 1).unwrap();
+        assert_eq!(
+            world.apply_static_creature_target_damage(creature_id, 5, &map),
+            Err(CoreError::UnknownTown(0))
+        );
+        assert_eq!(world.player_vitals(7).unwrap().health, 5);
+        assert_eq!(world.static_creature_target(creature_id), Ok(Some(7)));
+        world.replace_player_town(7, 1).unwrap();
+        assert_eq!(
+            world.apply_static_creature_target_damage(creature_id, 2, &map),
+            Ok(StaticCreatureTargetAttackOutcome::Applied {
+                creature_id,
+                target_player_id: 7,
+                requested_damage: 2,
+                applied_damage: 2,
+                remaining_health: 3,
+                death_state: None,
+            })
+        );
+        assert_eq!(world.player_vitals(7).unwrap().health, 3);
+        assert_eq!(world.static_creature_target(creature_id), Ok(Some(7)));
+
+        let distant_position = Position {
+            x: 103,
+            y: 100,
+            z: 7,
+        };
+        world.move_player(7, temple_position).unwrap();
+        world.move_player(7, distant_position).unwrap();
+        assert_eq!(
+            world.apply_static_creature_target_damage(creature_id, 3, &map),
+            Ok(StaticCreatureTargetAttackOutcome::TargetNotAdjacent {
+                creature_id,
+                target_player_id: 7,
+            })
+        );
+        assert_eq!(world.player_vitals(7).unwrap().health, 3);
+
+        world.move_player(7, temple_position).unwrap();
+        world.move_player(7, target_position).unwrap();
+        assert_eq!(
+            world.apply_static_creature_target_damage(creature_id, 3, &map),
+            Ok(StaticCreatureTargetAttackOutcome::Applied {
+                creature_id,
+                target_player_id: 7,
+                requested_damage: 3,
+                applied_damage: 3,
+                remaining_health: 0,
+                death_state: Some(PlayerRespawnState {
+                    dead: true,
+                    respawn_at: Some(temple_position),
+                    death_time: Some(0),
+                    loss_applied: false,
+                }),
+            })
+        );
+        assert_eq!(world.player_vitals(7).unwrap().health, 0);
+        assert!(world.player_respawn_state(7).unwrap().dead);
+        assert_eq!(world.static_creature_target(creature_id), Ok(None));
+        assert_eq!(
+            world.apply_static_creature_target_damage(creature_id, 1, &map),
+            Ok(StaticCreatureTargetAttackOutcome::NoTarget)
+        );
+
+        world.deactivate_static_creature(creature_id).unwrap();
+        assert_eq!(
+            world.apply_static_creature_target_damage(creature_id, 1, &map),
             Err(CoreError::InactiveStaticCreature(creature_id))
         );
     }
