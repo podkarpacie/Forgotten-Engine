@@ -3697,6 +3697,14 @@ impl WorldState {
         elapsed_seconds: u16,
     ) -> Result<PlayerRegenerationOutcome, CoreError> {
         let current_vitals = self.player_vitals(player_id)?;
+        if self.player_respawn_state(player_id)?.dead {
+            return Ok(PlayerRegenerationOutcome {
+                player_id,
+                health_gained: 0,
+                mana_gained: 0,
+                vitals: current_vitals,
+            });
+        }
         if elapsed_seconds == 0 {
             return Ok(PlayerRegenerationOutcome {
                 player_id,
@@ -7487,6 +7495,38 @@ mod tests {
             .unwrap();
         assert_eq!(capped.vitals.health, 150);
         assert_eq!(capped.vitals.mana, 50);
+        world
+            .update_player_vitals(
+                7,
+                PlayerVitals {
+                    health: 0,
+                    ..capped.vitals
+                },
+            )
+            .unwrap();
+        world
+            .hydrate_player_respawn_state(
+                7,
+                PlayerRespawnState {
+                    dead: true,
+                    respawn_at: Some(Position {
+                        x: 110,
+                        y: 120,
+                        z: 7,
+                    }),
+                    death_time: Some(0),
+                    loss_applied: false,
+                },
+            )
+            .unwrap();
+        let dead_revision = world.revision();
+        let dead = world
+            .apply_player_regeneration(7, rules, MAX_REGENERATION_ELAPSED_SECONDS)
+            .unwrap();
+        assert_eq!(dead.health_gained, 0);
+        assert_eq!(dead.mana_gained, 0);
+        assert_eq!(dead.vitals.health, 0);
+        assert_eq!(world.revision(), dead_revision);
         world.remove_player(7).unwrap();
         assert_eq!(
             world.apply_player_regeneration(7, rules, 1),
