@@ -8,9 +8,9 @@ use forgotten_config::{
     TfsEntityCatalog, TfsRegistryCategory, TfsVocationRegistry,
 };
 use forgotten_core::{
-    EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules, PlayerSkill,
-    PlayerVitals, RegenerationRule, SkillProgress, VocationId, WorldMap, WorldMapSource,
-    WorldState,
+    EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
+    PlayerRespawnState, PlayerSkill, PlayerVitals, RegenerationRule, SkillProgress, VocationId,
+    WorldMap, WorldMapSource, WorldState,
 };
 use forgotten_host::{
     start, start_game_session, start_native_otclient_game, start_native_otclient_login,
@@ -1005,6 +1005,63 @@ fn account_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error
     }
 }
 
+/// Runs the existing authoritative temple-respawn transition against one persisted player, then
+/// commits position, vitals, and cleared lifecycle state together. It is intentionally
+/// operator-controlled and has no native session, teleport packet, timer, loss, or effect path.
+fn respawn_persisted_player(
+    database: &mut EngineDatabase,
+    player_id: u64,
+    world_map: &WorldMap,
+) -> Result<(forgotten_core::Position, PlayerVitals), Box<dyn std::error::Error>> {
+    let character = database.player_by_id(player_id)?;
+    let mut world = WorldState::default();
+    world.add_player_with_vitals_and_progression(
+        Player {
+            id: character.id,
+            account_id: 0,
+            name: character.name,
+            position: character.position,
+            level: character.level,
+            experience: character.experience,
+            skill_points: character.skill_points,
+        },
+        PlayerVitals {
+            health: character.vitals.health,
+            max_health: character.vitals.max_health,
+            mana: character.vitals.mana,
+            max_mana: character.vitals.max_mana,
+            capacity: character.vitals.capacity,
+            magic_level: character.vitals.magic_level,
+        },
+        character.progression,
+    )?;
+    world.replace_player_town(player_id, character.town_id)?;
+    world.hydrate_player_respawn_state(player_id, character.respawn_state)?;
+    let outcome = world.respawn_player(player_id)?;
+    if !world_map
+        .tile(outcome.position)
+        .is_some_and(|tile| tile.walkable)
+    {
+        return Err(
+            "player respawn destination is missing or not walkable in the loaded map".into(),
+        );
+    }
+    database.update_player_position_vitals_and_respawn_state(
+        player_id,
+        outcome.position,
+        forgotten_persistence::PlayerVitals {
+            health: outcome.vitals.health,
+            max_health: outcome.vitals.max_health,
+            mana: outcome.vitals.mana,
+            max_mana: outcome.vitals.max_mana,
+            capacity: outcome.vitals.capacity,
+            magic_level: outcome.vitals.magic_level,
+        },
+        PlayerRespawnState::default(),
+    )?;
+    Ok((outcome.position, outcome.vitals))
+}
+
 fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let action = arguments
         .get(1)
@@ -1120,6 +1177,29 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             let database = EngineDatabase::open(&config.database_path)?;
             database.update_player_town(player_id, town_id)?;
             println!("updated player town player-id={player_id} town-id={town_id}");
+            Ok(())
+        }
+        "respawn" => {
+            if arguments.len() != 4 {
+                return Err("usage: player respawn <directory> <player-id>".into());
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let config = load(&directory)?;
+            let world_map = load_world_map(&config)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            let (position, vitals) =
+                respawn_persisted_player(&mut database, player_id, &world_map)?;
+            println!(
+                "respawned player-id={player_id} position={},{},{} health={}/{} mana={}/{}",
+                position.x,
+                position.y,
+                position.z,
+                vitals.health,
+                vitals.max_health,
+                vitals.mana,
+                vitals.max_mana,
+            );
             Ok(())
         }
         "skill" => {
@@ -1804,6 +1884,7 @@ Commands:
   player unequip <directory> <player-id> <slot>
   player vocation <directory> <player-id> <vocation-id>
   player town <directory> <player-id> <town-id>
+  player respawn <directory> <player-id>
   player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]
   player skill-tries <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <awarded-tries>
   player magic-mana <directory> <player-id> <awarded-mana>
@@ -1905,6 +1986,7 @@ mod tests {
             "player unequip <directory> <player-id> <slot>",
             "player vocation <directory> <player-id> <vocation-id>",
             "player town <directory> <player-id> <town-id>",
+            "player respawn <directory> <player-id>",
             "player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]",
             "player skill-tries <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <awarded-tries>",
             "player magic-mana <directory> <player-id> <awarded-mana>",

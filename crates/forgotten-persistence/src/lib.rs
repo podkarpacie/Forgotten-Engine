@@ -428,6 +428,68 @@ impl EngineDatabase {
         Ok(())
     }
 
+    /// Commits a completed authoritative respawn as one transaction. Position, vitals, and the
+    /// cleared lifecycle record must become visible together so a restart cannot observe a
+    /// temple position with a stale dead state or defeated vitals.
+    pub fn update_player_position_vitals_and_respawn_state(
+        &mut self,
+        player_id: u64,
+        position: Position,
+        vitals: PlayerVitals,
+        state: PlayerRespawnState,
+    ) -> Result<(), PersistenceError> {
+        if !vitals.is_valid() {
+            return Err(PersistenceError::InvalidPlayerVitals);
+        }
+        self.ensure_player_exists(player_id)?;
+        let lifecycle = if state == PlayerRespawnState::default() {
+            None
+        } else {
+            Some(lifecycle_state_fields(player_id, state)?)
+        };
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE players SET x = ?1, y = ?2, z = ?3, health = ?4, max_health = ?5, mana = ?6, max_mana = ?7, capacity = ?8, magic_level = ?9 WHERE id = ?10",
+            params![
+                i64::from(position.x),
+                i64::from(position.y),
+                i64::from(position.z),
+                i64::from(vitals.health),
+                i64::from(vitals.max_health),
+                i64::from(vitals.mana),
+                i64::from(vitals.max_mana),
+                i64::from(vitals.capacity),
+                i64::from(vitals.magic_level),
+                player_id as i64,
+            ],
+        )?;
+        if let Some((respawn_position, death_time)) = lifecycle {
+            let death_time = i64::try_from(death_time).map_err(|_| {
+                PersistenceError::InvalidLifecycleRecord(
+                    "death time does not fit SQLite integer".into(),
+                )
+            })?;
+            transaction.execute(
+                "INSERT INTO player_lifecycle (player_id, dead, respawn_x, respawn_y, respawn_z, death_time, loss_applied) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(player_id) DO UPDATE SET dead=excluded.dead, respawn_x=excluded.respawn_x, respawn_y=excluded.respawn_y, respawn_z=excluded.respawn_z, death_time=excluded.death_time, loss_applied=excluded.loss_applied",
+                params![
+                    player_id as i64,
+                    i64::from(respawn_position.x),
+                    i64::from(respawn_position.y),
+                    i64::from(respawn_position.z),
+                    death_time,
+                    i64::from(u8::from(state.loss_applied)),
+                ],
+            )?;
+        } else {
+            transaction.execute(
+                "DELETE FROM player_lifecycle WHERE player_id = ?1",
+                params![player_id as i64],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Commits authoritative vitals and exact progression counters together. This prevents a
     /// restart from observing an updated magic level without the matching remaining spent mana.
     pub fn update_player_vitals_and_progression_attempts(
@@ -2053,6 +2115,35 @@ mod tests {
             .remove(0);
         assert_eq!(loaded.vitals, defeated_vitals);
         assert_eq!(loaded.respawn_state, state);
+
+        let restored_position = Position {
+            x: 110,
+            y: 120,
+            z: 7,
+        };
+        let restored_vitals = PlayerVitals {
+            health: 150,
+            max_health: 150,
+            mana: 50,
+            max_mana: 50,
+            capacity: 40_000,
+            magic_level: 0,
+        };
+        database
+            .update_player_position_vitals_and_respawn_state(
+                character.id,
+                restored_position,
+                restored_vitals,
+                PlayerRespawnState::default(),
+            )
+            .unwrap();
+        let restored = database
+            .characters_for_account(account_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(restored.position, restored_position);
+        assert_eq!(restored.vitals, restored_vitals);
+        assert_eq!(restored.respawn_state, PlayerRespawnState::default());
 
         database
             .replace_player_respawn_state(character.id, PlayerRespawnState::default())
