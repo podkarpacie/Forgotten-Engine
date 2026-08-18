@@ -3811,6 +3811,14 @@ impl WorldState {
         elapsed_seconds: u16,
     ) -> Result<PlayerConditionOutcome, CoreError> {
         let current_vitals = self.player_vitals(player_id)?;
+        if self.player_respawn_state(player_id)?.dead {
+            return Ok(PlayerConditionOutcome {
+                player_id,
+                applied_damage: 0,
+                remaining_health: current_vitals.health,
+                expired_conditions: 0,
+            });
+        }
         let elapsed_seconds = elapsed_seconds.min(MAX_REGENERATION_ELAPSED_SECONDS);
         let requested_damage = self.pending_player_condition_damage(player_id, elapsed_seconds)?;
         let conditions = self
@@ -3872,9 +3880,20 @@ impl WorldState {
         world_map: &WorldMap,
         elapsed_seconds: u16,
     ) -> Result<(PlayerConditionOutcome, Option<PlayerRespawnState>), CoreError> {
+        let vitals = self.player_vitals(player_id)?;
+        if self.player_respawn_state(player_id)?.dead {
+            return Ok((
+                PlayerConditionOutcome {
+                    player_id,
+                    applied_damage: 0,
+                    remaining_health: vitals.health,
+                    expired_conditions: 0,
+                },
+                None,
+            ));
+        }
         let elapsed_seconds = elapsed_seconds.min(MAX_REGENERATION_ELAPSED_SECONDS);
         let pending_damage = self.pending_player_condition_damage(player_id, elapsed_seconds)?;
-        let vitals = self.player_vitals(player_id)?;
         if pending_damage > 0 && pending_damage >= vitals.health {
             if town_id == 0 {
                 return Err(CoreError::PlayerTownUnassigned(player_id));
@@ -7778,6 +7797,22 @@ mod tests {
         );
         assert_eq!(world.player_vitals(7).unwrap().health, 0);
         assert!(world.player_conditions(7).unwrap().is_empty());
+        let dead_revision = world.revision();
+        assert_eq!(
+            world
+                .apply_player_conditions_with_death(7, 42, &map, 1)
+                .unwrap(),
+            (
+                PlayerConditionOutcome {
+                    player_id: 7,
+                    applied_damage: 0,
+                    remaining_health: 0,
+                    expired_conditions: 0,
+                },
+                None,
+            )
+        );
+        assert_eq!(world.revision(), dead_revision);
     }
 
     #[test]
