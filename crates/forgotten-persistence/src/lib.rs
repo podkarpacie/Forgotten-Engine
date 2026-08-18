@@ -26,7 +26,8 @@ const SCHEMA_VERSION_LIFECYCLE: i64 = 9;
 const SCHEMA_VERSION_CONDITION_ELAPSED: i64 = 10;
 const SCHEMA_VERSION_OUTFIT: i64 = 11;
 const SCHEMA_VERSION_STATIC_CREATURE_RUNTIME: i64 = 12;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_STATIC_CREATURE_RUNTIME;
+const SCHEMA_VERSION_STATIC_CREATURE_REACTIVATION: i64 = 13;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_STATIC_CREATURE_REACTIVATION;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct EngineDatabase {
@@ -34,14 +35,16 @@ pub struct EngineDatabase {
     path: PathBuf,
 }
 
-/// The durable subset of known static-creature runtime state. Spawn definitions, appearance,
-/// targets, scheduling, combat, loot, and scripts remain content/runtime concerns.
+/// The durable subset of known static-creature runtime state. The optional delay is a bounded,
+/// restart-relative reactivation value, not an autonomous scheduler. Spawn definitions,
+/// appearance, targets, AI cadence, combat, loot, and scripts remain content/runtime concerns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticCreatureRuntimeRecord {
     pub creature_id: u32,
     pub position: Position,
     pub active: bool,
     pub health_percent: u8,
+    pub reactivation_remaining_seconds: Option<u32>,
 }
 
 impl EngineDatabase {
@@ -1108,6 +1111,11 @@ impl EngineDatabase {
                     "health percent must be at most 100".into(),
                 ));
             }
+            if record.active && record.reactivation_remaining_seconds.is_some() {
+                return Err(PersistenceError::InvalidStaticCreatureRuntimeRecord(
+                    "active creatures cannot carry a reactivation delay".into(),
+                ));
+            }
             if seen.insert(record.creature_id, ()).is_some() {
                 return Err(PersistenceError::InvalidStaticCreatureRuntimeRecord(
                     "duplicate static creature ID".into(),
@@ -1118,7 +1126,7 @@ impl EngineDatabase {
         transaction.execute("DELETE FROM static_creature_runtime", [])?;
         for record in records {
             transaction.execute(
-                "INSERT INTO static_creature_runtime (creature_id, x, y, z, active, health_percent) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO static_creature_runtime (creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     i64::from(record.creature_id),
                     i64::from(record.position.x),
@@ -1126,6 +1134,7 @@ impl EngineDatabase {
                     i64::from(record.position.z),
                     i64::from(u8::from(record.active)),
                     i64::from(record.health_percent),
+                    record.reactivation_remaining_seconds.map(i64::from),
                 ],
             )?;
         }
@@ -1139,7 +1148,7 @@ impl EngineDatabase {
         &self,
     ) -> Result<Vec<StaticCreatureRuntimeRecord>, PersistenceError> {
         let mut statement = self.connection.prepare(
-            "SELECT creature_id, x, y, z, active, health_percent FROM static_creature_runtime ORDER BY creature_id",
+            "SELECT creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds FROM static_creature_runtime ORDER BY creature_id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -1149,11 +1158,13 @@ impl EngineDatabase {
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, Option<i64>>(6)?,
             ))
         })?;
         let mut records = Vec::new();
         for row in rows {
-            let (creature_id, x, y, z, active, health_percent) = row?;
+            let (creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds) =
+                row?;
             let creature_id = u32::try_from(creature_id).map_err(|_| {
                 PersistenceError::InvalidStaticCreatureRuntimeRecord(
                     "creature ID does not fit u32".into(),
@@ -1193,11 +1204,26 @@ impl EngineDatabase {
                     "health percent must be at most 100".into(),
                 ));
             }
+            let reactivation_remaining_seconds = reactivation_remaining_seconds
+                .map(|remaining_seconds| {
+                    u32::try_from(remaining_seconds).map_err(|_| {
+                        PersistenceError::InvalidStaticCreatureRuntimeRecord(
+                            "reactivation delay does not fit u32".into(),
+                        )
+                    })
+                })
+                .transpose()?;
+            if active && reactivation_remaining_seconds.is_some() {
+                return Err(PersistenceError::InvalidStaticCreatureRuntimeRecord(
+                    "active creatures cannot carry a reactivation delay".into(),
+                ));
+            }
             records.push(StaticCreatureRuntimeRecord {
                 creature_id,
                 position,
                 active,
                 health_percent,
+                reactivation_remaining_seconds,
             });
         }
         Ok(records)
@@ -1342,6 +1368,15 @@ impl EngineDatabase {
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![SCHEMA_VERSION_STATIC_CREATURE_RUNTIME, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < SCHEMA_VERSION_STATIC_CREATURE_REACTIVATION {
+            self.connection.execute_batch(
+                "ALTER TABLE static_creature_runtime ADD COLUMN reactivation_remaining_seconds INTEGER NULL;",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_STATIC_CREATURE_REACTIVATION, unix_seconds()],
             )?;
         }
         Ok(())
@@ -1763,6 +1798,7 @@ mod tests {
                 },
                 active: true,
                 health_percent: 100,
+                reactivation_remaining_seconds: None,
             },
             StaticCreatureRuntimeRecord {
                 creature_id: 0x1000_0002,
@@ -1773,9 +1809,20 @@ mod tests {
                 },
                 active: false,
                 health_percent: 0,
+                reactivation_remaining_seconds: Some(42),
             },
         ];
         database.replace_static_creature_runtime(&records).unwrap();
+        assert_eq!(database.static_creature_runtime().unwrap(), records);
+
+        let invalid_active_delay = [StaticCreatureRuntimeRecord {
+            reactivation_remaining_seconds: Some(1),
+            ..records[0]
+        }];
+        assert!(matches!(
+            database.replace_static_creature_runtime(&invalid_active_delay),
+            Err(PersistenceError::InvalidStaticCreatureRuntimeRecord(_))
+        ));
         assert_eq!(database.static_creature_runtime().unwrap(), records);
 
         let invalid_health = [StaticCreatureRuntimeRecord {
@@ -1802,8 +1849,8 @@ mod tests {
         database
             .connection
             .execute(
-                "INSERT INTO static_creature_runtime (creature_id, x, y, z, active, health_percent) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![0x1000_0001_i64, 101_i64, 102_i64, 7_i64, 2_i64, 100_i64],
+                "INSERT INTO static_creature_runtime (creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![0x1000_0001_i64, 101_i64, 102_i64, 7_i64, 1_i64, 100_i64, 3_i64],
             )
             .unwrap();
         assert!(matches!(

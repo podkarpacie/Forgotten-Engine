@@ -180,17 +180,20 @@ pub struct StaticCreatureLifecycle {
     pub health_percent: u8,
     pub activated_at_tick: u64,
     pub inactive_since_tick: Option<u64>,
+    pub reactivation_due_tick: Option<u64>,
     pub respawn_interval_seconds: u32,
 }
 
-/// The compact restart snapshot for an installed static creature. This deliberately excludes
-/// spawn identity, appearance, targets, scheduling timestamps, combat, loot, and scripts.
+/// The compact restart snapshot for an installed static creature. It retains only the remaining
+/// delay for the current bounded reactivation schedule; it deliberately excludes spawn identity,
+/// appearance, targets, autonomous AI cadence, combat, loot, and scripts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticCreatureRuntimeSnapshot {
     pub id: u32,
     pub position: Position,
     pub active: bool,
     pub health_percent: u8,
+    pub reactivation_remaining_seconds: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -260,6 +263,7 @@ struct StaticCreatureRuntime {
     health_percent: u8,
     activated_at_tick: u64,
     inactive_since_tick: Option<u64>,
+    reactivation_due_tick: Option<u64>,
     respawn_interval_seconds: u32,
     target_player_id: Option<u64>,
 }
@@ -2184,6 +2188,7 @@ impl WorldState {
                         health_percent: entity.health_percent,
                         activated_at_tick: self.tick,
                         inactive_since_tick: None,
+                        reactivation_due_tick: None,
                         respawn_interval_seconds: collection.respawn_interval_seconds(entity.id),
                         target_player_id: None,
                     },
@@ -2229,6 +2234,7 @@ impl WorldState {
                 health_percent: runtime.health_percent,
                 activated_at_tick: runtime.activated_at_tick,
                 inactive_since_tick: runtime.inactive_since_tick,
+                reactivation_due_tick: runtime.reactivation_due_tick,
                 respawn_interval_seconds: runtime.respawn_interval_seconds,
             })
     }
@@ -2242,6 +2248,9 @@ impl WorldState {
                 position: runtime.entity.position,
                 active: runtime.active,
                 health_percent: runtime.health_percent,
+                reactivation_remaining_seconds: runtime.reactivation_due_tick.map(|due_tick| {
+                    u32::try_from(due_tick.saturating_sub(self.tick)).unwrap_or(u32::MAX)
+                }),
             })
             .collect()
     }
@@ -2266,7 +2275,25 @@ impl WorldState {
                     record.health_percent,
                 ));
             }
-            if self.static_creatures.contains_key(&record.id) {
+            if let Some(runtime) = self.static_creatures.get(&record.id) {
+                if record.active && record.reactivation_remaining_seconds.is_some() {
+                    return Err(CoreError::InvalidStaticCreatureReactivationDelay {
+                        id: record.id,
+                        remaining_seconds: record.reactivation_remaining_seconds.unwrap_or(0),
+                        interval_seconds: runtime.respawn_interval_seconds,
+                    });
+                }
+                if let Some(remaining_seconds) = record.reactivation_remaining_seconds {
+                    if runtime.respawn_interval_seconds == 0
+                        || remaining_seconds > runtime.respawn_interval_seconds
+                    {
+                        return Err(CoreError::InvalidStaticCreatureReactivationDelay {
+                            id: record.id,
+                            remaining_seconds,
+                            interval_seconds: runtime.respawn_interval_seconds,
+                        });
+                    }
+                }
                 known_records.push(*record);
             } else {
                 ignored_unknown += 1;
@@ -2307,6 +2334,10 @@ impl WorldState {
                 || runtime.active != record.active
                 || runtime.health_percent != record.health_percent
                 || runtime.target_player_id.is_some()
+                || runtime.reactivation_due_tick
+                    != record
+                        .reactivation_remaining_seconds
+                        .map(|remaining| self.tick.saturating_add(u64::from(remaining)))
             {
                 changed = true;
             }
@@ -2317,8 +2348,12 @@ impl WorldState {
             if record.active {
                 runtime.activated_at_tick = self.tick;
                 runtime.inactive_since_tick = None;
+                runtime.reactivation_due_tick = None;
             } else {
                 runtime.inactive_since_tick = Some(self.tick);
+                runtime.reactivation_due_tick = record
+                    .reactivation_remaining_seconds
+                    .map(|remaining| self.tick.saturating_add(u64::from(remaining)));
             }
         }
         if changed {
@@ -2640,6 +2675,8 @@ impl WorldState {
             runtime.target_player_id = None;
             if changed {
                 runtime.inactive_since_tick = Some(tick);
+                runtime.reactivation_due_tick = (runtime.respawn_interval_seconds > 0)
+                    .then(|| tick.saturating_add(u64::from(runtime.respawn_interval_seconds)));
             }
             changed
         };
@@ -2769,6 +2806,7 @@ impl WorldState {
             runtime.active = true;
             runtime.activated_at_tick = self.tick;
             runtime.inactive_since_tick = None;
+            runtime.reactivation_due_tick = None;
             active_positions.insert(runtime.entity.position);
             summary.reactivated += 1;
         }
@@ -2798,11 +2836,10 @@ impl WorldState {
             if runtime.active {
                 continue;
             }
-            let Some(inactive_since_tick) = runtime.inactive_since_tick else {
+            let Some(reactivation_due_tick) = runtime.reactivation_due_tick else {
                 continue;
             };
-            let interval = u64::from(runtime.respawn_interval_seconds);
-            if interval == 0 || self.tick.saturating_sub(inactive_since_tick) < interval {
+            if self.tick < reactivation_due_tick {
                 continue;
             }
             if player_positions.contains(&runtime.spawn_position) {
@@ -2818,6 +2855,7 @@ impl WorldState {
             runtime.active = true;
             runtime.activated_at_tick = self.tick;
             runtime.inactive_since_tick = None;
+            runtime.reactivation_due_tick = None;
             active_positions.insert(runtime.entity.position);
             summary.reactivated += 1;
         }
@@ -4342,6 +4380,11 @@ pub enum CoreError {
     DuplicateStaticSpawnId(u32),
     EmptyStaticSpawnName,
     InvalidStaticCreatureHealthPercent(u8),
+    InvalidStaticCreatureReactivationDelay {
+        id: u32,
+        remaining_seconds: u32,
+        interval_seconds: u32,
+    },
     UnknownStaticCreatureSchedule,
     StaticCreatureOccupiesPosition(Position),
     PlayerOccupiesStaticCreaturePosition(Position),
@@ -5859,6 +5902,7 @@ mod tests {
                 health_percent: 100,
                 activated_at_tick: 0,
                 inactive_since_tick: None,
+                reactivation_due_tick: None,
                 respawn_interval_seconds: 3,
             })
         );
@@ -5998,6 +6042,94 @@ mod tests {
                 deferred_by_static_creature_occupancy: 0,
             }
         );
+    }
+
+    #[test]
+    fn static_creature_runtime_restores_only_the_remaining_reactivation_delay() {
+        let creature_id = 0x4000_0001;
+        let position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let collection = FeTfsStaticSpawnCollection::with_respawn_intervals(
+            vec![FeTfsStaticEntity {
+                id: creature_id,
+                name: "Rat".into(),
+                position,
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 100,
+                direction: 2,
+            }],
+            BTreeMap::from([(creature_id, 5)]),
+        )
+        .unwrap();
+        let mut world = WorldState::default();
+        world.install_static_creatures(&collection).unwrap();
+        world.deactivate_static_creature(creature_id).unwrap();
+        world.advance_ticks(2);
+        let snapshot = world.static_creature_runtime_snapshot();
+        assert_eq!(
+            snapshot,
+            vec![StaticCreatureRuntimeSnapshot {
+                id: creature_id,
+                position,
+                active: false,
+                health_percent: 100,
+                reactivation_remaining_seconds: Some(3),
+            }]
+        );
+
+        let mut fresh = WorldState::default();
+        fresh.install_static_creatures(&collection).unwrap();
+        assert_eq!(
+            fresh.restore_static_creature_runtime(&snapshot),
+            Ok(StaticCreatureRuntimeRestoreSummary {
+                restored: 1,
+                ignored_unknown: 0,
+            })
+        );
+        fresh.advance_ticks(2);
+        assert_eq!(
+            fresh.reactivate_due_static_creatures(),
+            StaticCreatureResetSummary {
+                reactivated: 0,
+                deferred_by_player_occupancy: 0,
+                deferred_by_static_creature_occupancy: 0,
+            }
+        );
+        fresh.advance_tick();
+        assert_eq!(
+            fresh.reactivate_due_static_creatures(),
+            StaticCreatureResetSummary {
+                reactivated: 1,
+                deferred_by_player_occupancy: 0,
+                deferred_by_static_creature_occupancy: 0,
+            }
+        );
+
+        let before_invalid = fresh.static_creature_runtime_snapshot();
+        assert_eq!(
+            fresh.restore_static_creature_runtime(&[StaticCreatureRuntimeSnapshot {
+                id: creature_id,
+                position,
+                active: false,
+                health_percent: 100,
+                reactivation_remaining_seconds: Some(6),
+            }]),
+            Err(CoreError::InvalidStaticCreatureReactivationDelay {
+                id: creature_id,
+                remaining_seconds: 6,
+                interval_seconds: 5,
+            })
+        );
+        assert_eq!(fresh.static_creature_runtime_snapshot(), before_invalid);
     }
 
     #[test]
@@ -6382,12 +6514,14 @@ mod tests {
                 position: restored_position,
                 active: false,
                 health_percent: 70,
+                reactivation_remaining_seconds: None,
             },
             StaticCreatureRuntimeSnapshot {
                 id: 0x4000_9999,
                 position: initial_position,
                 active: true,
                 health_percent: 100,
+                reactivation_remaining_seconds: None,
             },
         ];
         assert_eq!(
@@ -6404,6 +6538,7 @@ mod tests {
                 position: restored_position,
                 active: false,
                 health_percent: 70,
+                reactivation_remaining_seconds: None,
             }]
         );
         assert_eq!(
@@ -6424,6 +6559,7 @@ mod tests {
                 position: source.position,
                 active: true,
                 health_percent: 100,
+                reactivation_remaining_seconds: None,
             }]),
             Err(CoreError::PlayerOccupiesStaticCreaturePosition(
                 source.position

@@ -2131,6 +2131,7 @@ fn restore_static_creature_runtime_from_database(
             position: record.position,
             active: record.active,
             health_percent: record.health_percent,
+            reactivation_remaining_seconds: record.reactivation_remaining_seconds,
         })
         .collect::<Vec<_>>();
     shared_world.restore_static_creature_runtime(&snapshots)
@@ -2148,6 +2149,7 @@ fn persist_static_creature_runtime_to_database(
             position: snapshot.position,
             active: snapshot.active,
             health_percent: snapshot.health_percent,
+            reactivation_remaining_seconds: snapshot.reactivation_remaining_seconds,
         })
         .collect::<Vec<_>>();
     let mut database = EngineDatabase::open(database_path).map_err(HostError::Persistence)?;
@@ -5820,8 +5822,8 @@ mod tests {
     fn static_creature_runtime_snapshot_persists_across_fresh_shared_worlds() {
         let path = database_path("static-creature-runtime-persistence");
         let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
-        let static_spawns =
-            FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
+        let static_spawns = FeTfsStaticSpawnCollection::with_respawn_intervals(
+            vec![forgotten_core::FeTfsStaticEntity {
                 id: creature_id,
                 name: "Rat".into(),
                 position: Position {
@@ -5838,8 +5840,10 @@ mod tests {
                 speed: 134,
                 health_percent: 75,
                 direction: 2,
-            }])
-            .unwrap();
+            }],
+            BTreeMap::from([(creature_id, 8)]),
+        )
+        .unwrap();
         let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
         shared
             .set_static_creature_health_percent(creature_id, 42)
@@ -5870,6 +5874,7 @@ mod tests {
                 },
                 active: false,
                 health_percent: 42,
+                reactivation_remaining_seconds: Some(8),
             }]
         );
         let _ = fs::remove_file(path);
