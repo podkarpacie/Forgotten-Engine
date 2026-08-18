@@ -15,6 +15,10 @@ const MAX_VOCATION_NAME_BYTES: usize = 128;
 const MAX_REGENERATION_SECONDS: u16 = 60 * 60;
 const MAX_REGENERATION_AMOUNT: u16 = 65_535;
 const MAX_MULTIPLIER_MILLI: u32 = 100_000;
+const DEFAULT_VOCATION_ATTACK_SPEED_MILLIS: u32 = 1_500;
+const DEFAULT_VOCATION_BASE_SPEED: u32 = 220;
+const MAX_VOCATION_ATTACK_SPEED_MILLIS: u32 = 60_000;
+const MAX_VOCATION_BASE_SPEED: u32 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VocationRegeneration {
@@ -48,6 +52,10 @@ pub struct TfsVocationDefinition {
     pub soul_regeneration: VocationRegeneration,
     pub magic_level_multiplier: VocationMultiplier,
     pub skill_multipliers: [VocationMultiplier; 7],
+    /// Metadata-only legacy timing values. They do not affect FE movement, cooldowns, or combat
+    /// execution until profile-specific timing behavior is independently verified.
+    pub attack_speed_millis: u32,
+    pub base_speed: u32,
     /// Metadata for a future profile-specific mitigation adapter. Parsing these values does not
     /// change current FE combat damage, equipment behavior, or client protocol delivery.
     pub defense_multiplier: VocationMultiplier,
@@ -254,6 +262,17 @@ fn parse_vocation(event: &BytesStart<'_>) -> Result<PendingVocation, ConfigError
             soul_regeneration,
             magic_level_multiplier: parse_multiplier(&attribute_string(event, b"manamultiplier")?)?,
             skill_multipliers: [VocationMultiplier { milli: 1_000 }; 7],
+            attack_speed_millis: bounded_u32(
+                optional_attribute_u32(event, b"attackspeed")?
+                    .unwrap_or(DEFAULT_VOCATION_ATTACK_SPEED_MILLIS),
+                "vocation attack speed",
+                MAX_VOCATION_ATTACK_SPEED_MILLIS,
+            )?,
+            base_speed: bounded_u32(
+                optional_attribute_u32(event, b"basespeed")?.unwrap_or(DEFAULT_VOCATION_BASE_SPEED),
+                "vocation base speed",
+                MAX_VOCATION_BASE_SPEED,
+            )?,
             defense_multiplier: VocationMultiplier { milli: 1_000 },
             armor_multiplier: VocationMultiplier { milli: 1_000 },
         },
@@ -348,6 +367,13 @@ fn bounded_u16(value: u16, label: &str, minimum: u16, maximum: u16) -> Result<u1
     Ok(value)
 }
 
+fn bounded_u32(value: u32, label: &str, maximum: u32) -> Result<u32, ConfigError> {
+    if value > maximum {
+        return Err(invalid(format!("{label} is outside the configured range")));
+    }
+    Ok(value)
+}
+
 fn attribute_string(event: &BytesStart<'_>, name: &[u8]) -> Result<String, ConfigError> {
     event
         .try_get_attribute(name)
@@ -410,6 +436,19 @@ fn optional_attribute_u16(event: &BytesStart<'_>, name: &[u8]) -> Result<Option<
         .transpose()
 }
 
+fn optional_attribute_u32(event: &BytesStart<'_>, name: &[u8]) -> Result<Option<u32>, ConfigError> {
+    optional_attribute_string(event, name)?
+        .map(|value| {
+            value.parse::<u32>().map_err(|_| {
+                invalid(format!(
+                    "vocations.xml attribute `{}` must be u32",
+                    String::from_utf8_lossy(name)
+                ))
+            })
+        })
+        .transpose()
+}
+
 fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::InvalidContent(message.into())
 }
@@ -423,7 +462,7 @@ mod tests {
     use super::*;
 
     const VOCATIONS: &[u8] = br#"<?xml version="1.0"?><vocations>
-      <vocation id="4" clientid="1" name="Knight" description="a knight" gaincap="25" gainhp="15" gainmana="5" gainhpticks="3" gainhpamount="5" gainmanaticks="6" gainmanaamount="5" manamultiplier="3.0" gainsoulticks="120" fromvoc="4">
+      <vocation id="4" clientid="1" name="Knight" description="a knight" gaincap="25" gainhp="15" gainmana="5" gainhpticks="3" gainhpamount="5" gainmanaticks="6" gainmanaamount="5" manamultiplier="3.0" gainsoulticks="120" attackspeed="1800" basespeed="230" fromvoc="4">
         <skill id="0" multiplier="1.1"/><skill id="1" multiplier="1.1"/><skill id="2" multiplier="1.1"/><skill id="3" multiplier="1.1"/><skill id="4" multiplier="1.4"/><skill id="5" multiplier="1.1"/><skill id="6" multiplier="1.1"/>
         <formula defense="0.8" armor="1.2"/>
       </vocation>
@@ -461,6 +500,8 @@ mod tests {
         );
         assert_eq!(knight.defense_multiplier.milli(), 800);
         assert_eq!(knight.armor_multiplier.milli(), 1_200);
+        assert_eq!(knight.attack_speed_millis, 1_800);
+        assert_eq!(knight.base_speed, 230);
         let rules = knight.progression_rules().unwrap();
         assert_eq!(rules.magic_level_multiplier.milli(), 3_000);
         assert_eq!(
@@ -490,6 +531,30 @@ mod tests {
                 &format!("<formula defense=\"{invalid}\" armor=\"1.2\"/>"),
             );
             assert!(parse_tfs_vocations_xml(invalid_formula.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn vocation_timing_metadata_uses_verified_defaults_and_rejects_out_of_range_values() {
+        let source = std::str::from_utf8(VOCATIONS).unwrap();
+        let defaults = source.replace(" attackspeed=\"1800\" basespeed=\"230\"", "");
+        let knight = parse_tfs_vocations_xml(defaults.as_bytes())
+            .unwrap()
+            .get(VocationId::new(4))
+            .unwrap()
+            .clone();
+        assert_eq!(
+            knight.attack_speed_millis,
+            DEFAULT_VOCATION_ATTACK_SPEED_MILLIS
+        );
+        assert_eq!(knight.base_speed, DEFAULT_VOCATION_BASE_SPEED);
+
+        for invalid in [
+            source.replace("attackspeed=\"1800\"", "attackspeed=\"60001\""),
+            source.replace("basespeed=\"230\"", "basespeed=\"10001\""),
+            source.replace("attackspeed=\"1800\"", "attackspeed=\"invalid\""),
+        ] {
+            assert!(parse_tfs_vocations_xml(invalid.as_bytes()).is_err());
         }
     }
 }

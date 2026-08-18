@@ -326,3 +326,4 @@
 - [x] Parse and validate bounded legacy item armor, defense, extra-defense, attack-speed, and weapon-type metadata for future profile-specific mitigation without changing live combat behavior or claiming formula compatibility.
 - [x] Parse and validate bounded TFS vocation nested-formula defense and armor multipliers for future profile-specific mitigation without changing live combat behavior or claiming formula compatibility.
 - [x] Decode and retain bounded native fight-mode, chase-mode, and secure-mode state with the verified TFS defaults, without connecting it to unverified combat formulas or client output.
+- [x] Parse and validate bounded TFS vocation attack-speed and base-speed metadata for future timing compatibility without changing movement, cooldown, or combat execution.

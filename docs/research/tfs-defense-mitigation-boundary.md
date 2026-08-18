@@ -34,3 +34,5 @@ No formula implementation is authorized from this audit alone. The next safe ind
 ## Metadata progress
 
 FE now retains bounded legacy item armor, defense, extra-defense, attack-speed, and verified weapon-type fields for known OTB items. It also retains optional fixed-point `defense` and `armor` values from nested TFS-style `<formula>` vocation elements, defaulting each to `1.000` when absent. These values remain parser metadata only. They do not alter FE damage, equipment behavior, packets, or compatibility claims.
+
+FE also retains bounded TFS-style vocation `attackspeed` and `basespeed` attributes. Absent values use the verified public defaults of 1500 milliseconds and 220 respectively. These values remain metadata only and do not alter FE attack cooldowns, movement, packets, or compatibility claims.

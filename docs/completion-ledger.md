@@ -30,6 +30,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Apply `rateExp` and bounded `stages.xml` ranges to authoritative experience awards.
 - [x] Apply matching bounded `vocations.xml` `gainhp`, `gainmana`, and `gaincap` values to the stable CLI's atomic authoritative experience-level-up persistence transaction; native HUD delivery and full advancement parity remain deferred.
 - [x] Retain bounded nested TFS-style vocation formula defense and armor multipliers as fixed-point metadata without changing live mitigation behavior or claiming formula compatibility.
+- [x] Retain bounded TFS-style vocation attack-speed and base-speed metadata with verified defaults, without changing live movement or combat timing behavior.
 - [x] Award configured vocation-based fist tries from supported fixed melee events.
 - [x] Persist authoritative condition state, including exact elapsed interval remainder, across restart.
 - [x] Activate persisted server-side death state for lethal bounded condition damage at a validated assigned town temple.
