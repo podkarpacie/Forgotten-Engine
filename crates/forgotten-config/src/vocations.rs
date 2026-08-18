@@ -48,6 +48,10 @@ pub struct TfsVocationDefinition {
     pub soul_regeneration: VocationRegeneration,
     pub magic_level_multiplier: VocationMultiplier,
     pub skill_multipliers: [VocationMultiplier; 7],
+    /// Metadata for a future profile-specific mitigation adapter. Parsing these values does not
+    /// change current FE combat damage, equipment behavior, or client protocol delivery.
+    pub defense_multiplier: VocationMultiplier,
+    pub armor_multiplier: VocationMultiplier,
 }
 
 impl TfsVocationDefinition {
@@ -145,6 +149,7 @@ pub fn parse_tfs_vocations_xml(bytes: &[u8]) -> Result<TfsVocationRegistry, Conf
                         current = Some(parse_vocation(&event)?);
                     }
                     b"skill" if depth == 3 => add_skill_multiplier(&mut current, &event)?,
+                    b"formula" if depth == 3 => add_formula_multipliers(&mut current, &event)?,
                     _ => {}
                 }
             }
@@ -154,6 +159,7 @@ pub fn parse_tfs_vocations_xml(bytes: &[u8]) -> Result<TfsVocationRegistry, Conf
                     registry.insert(definition)?;
                 }
                 b"skill" if depth == 2 => add_skill_multiplier(&mut current, &event)?,
+                b"formula" if depth == 2 => add_formula_multipliers(&mut current, &event)?,
                 _ => {}
             },
             Event::End(event) => {
@@ -248,6 +254,8 @@ fn parse_vocation(event: &BytesStart<'_>) -> Result<PendingVocation, ConfigError
             soul_regeneration,
             magic_level_multiplier: parse_multiplier(&attribute_string(event, b"manamultiplier")?)?,
             skill_multipliers: [VocationMultiplier { milli: 1_000 }; 7],
+            defense_multiplier: VocationMultiplier { milli: 1_000 },
+            armor_multiplier: VocationMultiplier { milli: 1_000 },
         },
         seen_skills: [false; 7],
     })
@@ -270,6 +278,22 @@ fn add_skill_multiplier(
     current.definition.skill_multipliers[index] =
         parse_multiplier(&attribute_string(event, b"multiplier")?)?;
     current.seen_skills[index] = true;
+    Ok(())
+}
+
+fn add_formula_multipliers(
+    current: &mut Option<PendingVocation>,
+    event: &BytesStart<'_>,
+) -> Result<(), ConfigError> {
+    let current = current
+        .as_mut()
+        .ok_or_else(|| invalid("formula is outside a vocation"))?;
+    if let Some(value) = optional_attribute_string(event, b"defense")? {
+        current.definition.defense_multiplier = parse_multiplier(&value)?;
+    }
+    if let Some(value) = optional_attribute_string(event, b"armor")? {
+        current.definition.armor_multiplier = parse_multiplier(&value)?;
+    }
     Ok(())
 }
 
@@ -401,6 +425,7 @@ mod tests {
     const VOCATIONS: &[u8] = br#"<?xml version="1.0"?><vocations>
       <vocation id="4" clientid="1" name="Knight" description="a knight" gaincap="25" gainhp="15" gainmana="5" gainhpticks="3" gainhpamount="5" gainmanaticks="6" gainmanaamount="5" manamultiplier="3.0" gainsoulticks="120" fromvoc="4">
         <skill id="0" multiplier="1.1"/><skill id="1" multiplier="1.1"/><skill id="2" multiplier="1.1"/><skill id="3" multiplier="1.1"/><skill id="4" multiplier="1.4"/><skill id="5" multiplier="1.1"/><skill id="6" multiplier="1.1"/>
+        <formula defense="0.8" armor="1.2"/>
       </vocation>
     </vocations>"#;
 
@@ -434,6 +459,8 @@ mod tests {
             knight.skill_multipliers[PlayerSkill::Distance.code() as usize].milli(),
             1_400
         );
+        assert_eq!(knight.defense_multiplier.milli(), 800);
+        assert_eq!(knight.armor_multiplier.milli(), 1_200);
         let rules = knight.progression_rules().unwrap();
         assert_eq!(rules.magic_level_multiplier.milli(), 3_000);
         assert_eq!(
@@ -452,5 +479,17 @@ mod tests {
             "<skill id=\"6\" multiplier=\"1.1\"/><skill id=\"6\" multiplier=\"1.1\"/>",
         );
         assert!(parse_tfs_vocations_xml(duplicate.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_nested_formula_combat_multipliers() {
+        let source = std::str::from_utf8(VOCATIONS).unwrap();
+        for invalid in ["0", "100.001", "not-a-number"] {
+            let invalid_formula = source.replace(
+                "<formula defense=\"0.8\" armor=\"1.2\"/>",
+                &format!("<formula defense=\"{invalid}\" armor=\"1.2\"/>"),
+            );
+            assert!(parse_tfs_vocations_xml(invalid_formula.as_bytes()).is_err());
+        }
     }
 }

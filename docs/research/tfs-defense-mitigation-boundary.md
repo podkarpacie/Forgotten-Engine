@@ -30,3 +30,7 @@ The existing FE legacy item catalog validates server/client IDs, groups, subtype
 ## Decision
 
 No formula implementation is authorized from this audit alone. The next safe independent slice is **catalog-only ingestion and validation of the required item and vocation combat metadata**, with no change to live damage, combat packets, or compatibility claim. Any later mitigation algorithm must be profile-gated, deterministic, independently tested, and accompanied by exact source/evidence notes.
+
+## Metadata progress
+
+FE now retains bounded legacy item armor, defense, extra-defense, attack-speed, and verified weapon-type fields for known OTB items. It also retains optional fixed-point `defense` and `armor` values from nested TFS-style `<formula>` vocation elements, defaulting each to `1.000` when absent. These values remain parser metadata only. They do not alter FE damage, equipment behavior, packets, or compatibility claims.
