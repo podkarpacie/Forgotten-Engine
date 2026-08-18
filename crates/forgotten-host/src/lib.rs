@@ -83,6 +83,7 @@ struct NativeWorldHeartbeatOutcome {
     tick: u64,
     reactivated_static_creatures: usize,
     changed_static_targets: usize,
+    static_target_attacks: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +111,20 @@ pub struct StaticTargetPursuitSummary {
     pub moved_static_creatures: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticTargetAttackPolicy {
+    Disabled,
+    SelectedAdjacentFixedDamage { damage: u16 },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StaticTargetAttackSummary {
+    pub examined_static_creatures: usize,
+    pub applied_attacks: usize,
+    pub total_applied_damage: u64,
+}
+
+#[cfg(test)]
 fn advance_native_shared_world_heartbeat(
     shared_world: &SharedNativeWorld,
     elapsed_seconds: u16,
@@ -121,26 +136,61 @@ fn advance_native_shared_world_heartbeat(
     )
 }
 
+#[cfg(test)]
 fn advance_native_shared_world_heartbeat_with_target_policy(
     shared_world: &SharedNativeWorld,
     elapsed_seconds: u16,
     target_policy: StaticTargetAcquisitionPolicy,
+) -> Result<NativeWorldHeartbeatOutcome, HostError> {
+    advance_native_shared_world_heartbeat_with_static_target_policies(
+        shared_world,
+        elapsed_seconds,
+        target_policy,
+        StaticTargetAttackPolicy::Disabled,
+        None,
+    )
+}
+
+fn advance_native_shared_world_heartbeat_with_static_target_policies(
+    shared_world: &SharedNativeWorld,
+    elapsed_seconds: u16,
+    target_policy: StaticTargetAcquisitionPolicy,
+    attack_policy: StaticTargetAttackPolicy,
+    world_map: Option<&WorldMap>,
 ) -> Result<NativeWorldHeartbeatOutcome, HostError> {
     let tick = shared_world.advance_ticks(elapsed_seconds)?;
     let reactivated_static_creatures = shared_world.reactivate_due_static_creatures()?.reactivated;
     let changed_static_targets = shared_world
         .acquire_static_creature_targets(target_policy)?
         .changed_static_targets;
+    let static_target_attacks = match attack_policy {
+        StaticTargetAttackPolicy::Disabled => 0,
+        StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { .. } => {
+            shared_world
+                .attack_static_creature_targets_once(
+                    attack_policy,
+                    world_map.ok_or_else(|| {
+                        HostError::InvalidConfiguration(
+                            "static target attack policy requires a loaded world map".into(),
+                        )
+                    })?,
+                )?
+                .applied_attacks
+        }
+    };
     Ok(NativeWorldHeartbeatOutcome {
         tick,
         reactivated_static_creatures,
         changed_static_targets,
+        static_target_attacks,
     })
 }
 
 fn run_native_shared_world_heartbeat(
     shared_world: SharedNativeWorld,
     shutdown: Arc<AtomicBool>,
+    attack_policy: StaticTargetAttackPolicy,
+    world_map: Option<Arc<WorldMap>>,
 ) -> Result<(), HostError> {
     let mut last_tick = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
@@ -154,7 +204,19 @@ fn run_native_shared_world_heartbeat(
             continue;
         }
         last_tick += Duration::from_secs(u64::from(elapsed_seconds));
-        advance_native_shared_world_heartbeat(&shared_world, elapsed_seconds)?;
+        let target_policy = match attack_policy {
+            StaticTargetAttackPolicy::Disabled => StaticTargetAcquisitionPolicy::Disabled,
+            StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { .. } => {
+                StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 }
+            }
+        };
+        advance_native_shared_world_heartbeat_with_static_target_policies(
+            &shared_world,
+            elapsed_seconds,
+            target_policy,
+            attack_policy,
+            world_map.as_deref(),
+        )?;
     }
     Ok(())
 }
@@ -438,6 +500,10 @@ pub struct NativeOtClientHostConfig {
     /// Immutable display-only TFS spawn entities. No AI, combat, movement, or Lua behavior is
     /// attached at this host boundary.
     pub static_spawns: Option<Arc<FeTfsStaticSpawnCollection>>,
+    /// Disabled by default. When enabled, one heartbeat pass may apply bounded fixed damage from
+    /// each active static creature to its already selected adjacent target. Formula, persistence,
+    /// packet, loot, corpse, script, and general AI behavior remain separate and deferred.
+    pub static_target_attack_policy: StaticTargetAttackPolicy,
     /// Optional validated vocation recovery rules. Without this catalog automatic recovery is
     /// disabled; soul, condition client effects, death activation from conditions, and scripted
     /// lifecycle hooks remain deferred.
@@ -1159,6 +1225,51 @@ impl SharedNativeWorld {
         drop(world);
         if summary.moved_static_creatures > 0 {
             self.mark_visibility_changed();
+        }
+        Ok(summary)
+    }
+
+    /// Applies one explicit bounded static target-attack pass under the shared-world lock. It
+    /// does not select targets, install timing beyond the caller, persist state, emit packets, or
+    /// claim formulas, loot, corpses, scripts, or general creature AI.
+    pub fn attack_static_creature_targets_once(
+        &self,
+        policy: StaticTargetAttackPolicy,
+        world_map: &WorldMap,
+    ) -> Result<StaticTargetAttackSummary, HostError> {
+        let StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage } = policy else {
+            return Ok(StaticTargetAttackSummary::default());
+        };
+        if !(1..=100).contains(&damage) {
+            return Err(HostError::InvalidConfiguration(
+                "static target attack damage must be between 1 and 100".into(),
+            ));
+        }
+        let mut world = self.lock()?;
+        let creature_ids = world
+            .active_static_spawn_collection()
+            .entities
+            .into_iter()
+            .map(|entity| entity.id)
+            .collect::<Vec<_>>();
+        let mut summary = StaticTargetAttackSummary {
+            examined_static_creatures: creature_ids.len(),
+            ..StaticTargetAttackSummary::default()
+        };
+        for creature_id in creature_ids {
+            let outcome = world
+                .apply_static_creature_target_damage(creature_id, damage, world_map)
+                .map_err(HostError::Core)?;
+            if let StaticCreatureTargetAttackOutcome::Applied { applied_damage, .. } = outcome {
+                if applied_damage > 0 {
+                    summary.applied_attacks += 1;
+                    summary.total_applied_damage += u64::from(applied_damage);
+                }
+            }
+        }
+        drop(world);
+        if summary.applied_attacks > 0 {
+            self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok(summary)
     }
@@ -2104,8 +2215,15 @@ fn serve_native_otclient_game(
     );
     let heartbeat_shutdown = Arc::clone(&shutdown);
     let heartbeat_world = shared_world.clone();
+    let heartbeat_attack_policy = config.static_target_attack_policy;
+    let heartbeat_map = config.world_map.clone();
     let heartbeat = thread::spawn(move || {
-        run_native_shared_world_heartbeat(heartbeat_world, heartbeat_shutdown)
+        run_native_shared_world_heartbeat(
+            heartbeat_world,
+            heartbeat_shutdown,
+            heartbeat_attack_policy,
+            heartbeat_map,
+        )
     });
     let service_result = loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -4417,6 +4535,7 @@ mod tests {
             world_map: None,
             item_presentation_catalog: None,
             static_spawns: None,
+            static_target_attack_policy: StaticTargetAttackPolicy::Disabled,
             regeneration_rules: None,
             progression_rules: None,
             skill_rate: 1,
@@ -8326,6 +8445,7 @@ mod tests {
                 tick: 1,
                 reactivated_static_creatures: 0,
                 changed_static_targets: 0,
+                static_target_attacks: 0,
             }
         );
         assert_eq!(
@@ -8347,6 +8467,7 @@ mod tests {
                 tick: 2,
                 reactivated_static_creatures: 0,
                 changed_static_targets: 1,
+                static_target_attacks: 0,
             }
         );
         assert_eq!(
@@ -8378,6 +8499,98 @@ mod tests {
             ))
         ));
         assert_eq!(shared.visibility_epoch(), visibility_epoch);
+    }
+
+    #[test]
+    fn opt_in_shared_heartbeat_applies_static_target_damage_only_when_enabled() {
+        let map = native_world_map();
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let creature = forgotten_core::FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let shared = SharedNativeWorld::from_static_spawns(Some(
+            &FeTfsStaticSpawnCollection::new(vec![creature]).unwrap(),
+        ))
+        .unwrap();
+        shared
+            .register_player_at_available_position_with_vitals(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                PlayerVitals {
+                    health: 5,
+                    max_health: 5,
+                    ..PlayerVitals::default()
+                },
+                &map,
+            )
+            .unwrap();
+
+        assert_eq!(
+            advance_native_shared_world_heartbeat_with_static_target_policies(
+                &shared,
+                1,
+                StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 },
+                StaticTargetAttackPolicy::Disabled,
+                Some(&map),
+            )
+            .unwrap(),
+            NativeWorldHeartbeatOutcome {
+                tick: 1,
+                reactivated_static_creatures: 0,
+                changed_static_targets: 1,
+                static_target_attacks: 0,
+            }
+        );
+        assert_eq!(shared.player_vitals(101).unwrap().health, 5);
+        assert_eq!(shared.vitals_epoch(), 0);
+
+        assert_eq!(
+            advance_native_shared_world_heartbeat_with_static_target_policies(
+                &shared,
+                1,
+                StaticTargetAcquisitionPolicy::Disabled,
+                StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage: 2 },
+                Some(&map),
+            )
+            .unwrap(),
+            NativeWorldHeartbeatOutcome {
+                tick: 2,
+                reactivated_static_creatures: 0,
+                changed_static_targets: 0,
+                static_target_attacks: 1,
+            }
+        );
+        assert_eq!(shared.player_vitals(101).unwrap().health, 3);
+        assert_eq!(shared.vitals_epoch(), 1);
+        assert!(matches!(
+            shared.attack_static_creature_targets_once(
+                StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage: 0 },
+                &map,
+            ),
+            Err(HostError::InvalidConfiguration(_))
+        ));
     }
 
     #[test]
@@ -8418,6 +8631,7 @@ mod tests {
                 tick: 1,
                 reactivated_static_creatures: 0,
                 changed_static_targets: 0,
+                static_target_attacks: 0,
             }
         );
         assert_eq!(shared.visibility_epoch(), epoch_before);
@@ -8427,6 +8641,7 @@ mod tests {
                 tick: 2,
                 reactivated_static_creatures: 1,
                 changed_static_targets: 0,
+                static_target_attacks: 0,
             }
         );
         assert_eq!(shared.visibility_epoch(), epoch_before + 1);

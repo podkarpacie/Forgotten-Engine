@@ -312,3 +312,4 @@
 - [x] Add a bounded core-only static-creature adjacent attack transition against its selected living target; automatic scheduling, persistence, native delivery, formulas, loot, corpses, scripts, and full AI parity remain deferred.
 - [x] Expose the bounded static-creature target attack through the shared-world lock and advance vitals refresh only after real damage; scheduling, persistence, native delivery, formulas, loot, corpses, scripts, and full AI parity remain deferred.
 - [x] Decode bounded native 740 map and creature look requests into typed actions without emitting an unverified client-visible response; text-message delivery remains blocked by the unmodified OTCv8 740 message-mode gap.
+- [x] Add an opt-in disabled-by-default native static-creature target-attack policy that reuses the bounded shared-world attack transition; formulas, persistence, packets, loot, corpses, scripts, and full monster AI parity remain deferred.

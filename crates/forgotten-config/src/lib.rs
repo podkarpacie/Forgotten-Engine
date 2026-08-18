@@ -81,6 +81,7 @@ pub struct EngineConfig {
     pub experience_rate: u32,
     pub skill_rate: u32,
     pub magic_rate: u32,
+    pub static_creature_target_attack_damage: u16,
     pub experience_stages: Option<ExperienceStages>,
     pub death_loss_percent: i32,
     pub server_name: String,
@@ -229,6 +230,14 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
     let experience_rate = optional_u32(&values, "rateExp", 5)?;
     let skill_rate = optional_u32(&values, "rateSkill", 1)?;
     let magic_rate = optional_u32(&values, "rateMagic", 1)?;
+    let static_creature_target_attack_damage =
+        optional_u16(&values, "staticCreatureTargetAttackDamage", 0)?;
+    if static_creature_target_attack_damage > 100 {
+        return Err(ConfigError::InvalidValue {
+            key: "staticCreatureTargetAttackDamage",
+            message: "must be between 0 and 100".into(),
+        });
+    }
     let content_directory = world_directory.join("data");
     let experience_stages = load_optional_experience_stages(&content_directory)?;
     let death_loss_percent = optional_i32(&values, "deathLosePercent", -1)?;
@@ -358,6 +367,7 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         experience_rate,
         skill_rate,
         magic_rate,
+        static_creature_target_attack_damage,
         experience_stages,
         death_loss_percent,
         server_name: optional_string(&values, "serverName", "Forgotten Engine")?.to_owned(),
@@ -1171,6 +1181,7 @@ fn is_recognized_config_key(key: &str) -> bool {
             | "rateExp"
             | "rateSkill"
             | "rateMagic"
+            | "staticCreatureTargetAttackDamage"
             | "deathLosePercent"
             | "serverName"
             | "mapName"
@@ -1529,8 +1540,44 @@ experienceStages = {
         assert_eq!(config.experience_rate, 5);
         assert_eq!(config.skill_rate, 1);
         assert_eq!(config.magic_rate, 1);
+        assert_eq!(config.static_creature_target_attack_damage, 0);
         assert_eq!(config.death_loss_percent, -1);
         assert!(!config.otclient_v8_native_enabled);
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn loads_a_bounded_opt_in_static_target_attack_damage() {
+        let world = temporary_world("static-target-attack-damage");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}staticCreatureTargetAttackDamage = 2\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            load(&world).unwrap().static_creature_target_attack_damage,
+            2
+        );
+
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}staticCreatureTargetAttackDamage = 101\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            load(&world),
+            Err(ConfigError::InvalidValue {
+                key: "staticCreatureTargetAttackDamage",
+                ..
+            })
+        ));
         let _ = fs::remove_dir_all(world);
     }
 

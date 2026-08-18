@@ -14,7 +14,8 @@ use forgotten_core::{
 use forgotten_host::{
     start, start_game_session, start_native_otclient_game, start_native_otclient_login,
     start_status, GameSessionHostConfig, HostConfig, LegacyLoginConfig,
-    NativeOtClientEmptyWorldConfig, NativeOtClientHostConfig, StatusHostConfig,
+    NativeOtClientEmptyWorldConfig, NativeOtClientHostConfig, StaticTargetAttackPolicy,
+    StatusHostConfig,
 };
 use forgotten_persistence::{create_backup, EngineDatabase};
 use forgotten_protocol::{
@@ -638,6 +639,10 @@ fn run_host(
             world_map: Some(Arc::clone(&world_map)),
             item_presentation_catalog: item_presentation_catalog.map(Arc::new),
             static_spawns: (!static_spawns.entities.is_empty()).then(|| Arc::new(static_spawns)),
+            static_target_attack_policy: match config.static_creature_target_attack_damage {
+                0 => StaticTargetAttackPolicy::Disabled,
+                damage => StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage },
+            },
             regeneration_rules,
             progression_rules,
             skill_rate: config.skill_rate,
