@@ -302,3 +302,4 @@
 - [x] Persist and restore bounded static-creature reactivation scheduling for known static IDs; defer target state, autonomous AI cadence, combat formulas, loot, dynamic spawns, and real-client confirmation.
 - [x] Add bounded authoritative magic-mana progression awards using configured vocation multipliers, exact threshold accounting, persistence, and additive stable CLI access; defer spell-client requests, Lua formulas, full TFS rate parity, and real-client confirmation.
 - [x] Parallelize deterministic loading of independent operator-owned content catalogs while preserving a fixed validation/error order and serialized authoritative world mutation; defer parallel gameplay mutation, timing-sensitive AI, and performance parity claims.
+- [x] Persist authoritative player vitals and exact progression attempts atomically for magic-mana awards; defer live spell-client requests, Lua formulas, full rate parity, and real-client confirmation.

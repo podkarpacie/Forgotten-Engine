@@ -428,6 +428,49 @@ impl EngineDatabase {
         Ok(())
     }
 
+    /// Commits authoritative vitals and exact progression counters together. This prevents a
+    /// restart from observing an updated magic level without the matching remaining spent mana.
+    pub fn update_player_vitals_and_progression_attempts(
+        &mut self,
+        player_id: u64,
+        vitals: PlayerVitals,
+        attempts: PlayerProgressionAttempts,
+    ) -> Result<(), PersistenceError> {
+        if !vitals.is_valid() {
+            return Err(PersistenceError::InvalidPlayerVitals);
+        }
+        self.ensure_player_exists(player_id)?;
+        let values = attempts
+            .all_skill_tries()
+            .into_iter()
+            .map(sqlite_progression_attempt)
+            .collect::<Result<Vec<_>, _>>()?;
+        let magic_mana = sqlite_progression_attempt(attempts.magic_mana())?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE players SET health = ?1, max_health = ?2, mana = ?3, max_mana = ?4, capacity = ?5, magic_level = ?6 WHERE id = ?7",
+            params![
+                i64::from(vitals.health),
+                i64::from(vitals.max_health),
+                i64::from(vitals.mana),
+                i64::from(vitals.max_mana),
+                i64::from(vitals.capacity),
+                i64::from(vitals.magic_level),
+                player_id as i64,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO player_progression_attempts (player_id, fist_tries, club_tries, sword_tries, axe_tries, distance_tries, shielding_tries, fishing_tries, magic_mana) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(player_id) DO UPDATE SET fist_tries=excluded.fist_tries, club_tries=excluded.club_tries, sword_tries=excluded.sword_tries, axe_tries=excluded.axe_tries, distance_tries=excluded.distance_tries, shielding_tries=excluded.shielding_tries, fishing_tries=excluded.fishing_tries, magic_mana=excluded.magic_mana",
+            params![
+                player_id as i64,
+                values[0], values[1], values[2], values[3], values[4], values[5], values[6],
+                magic_mana,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Persists the authoritative player level and experience without replacing unrelated player
     /// state such as vitals, position, equipment, conditions, or progression attempts.
     pub fn update_player_experience(
@@ -2043,6 +2086,61 @@ mod tests {
             database.player_progression_attempts(999),
             Err(PersistenceError::UnknownPlayer(999))
         ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn atomically_persists_player_vitals_and_progression_attempts() {
+        let path = temporary_path("vitals-progression-attempts");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("admin", "hash").unwrap();
+        database
+            .save_player(&Player {
+                id: 7,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let vitals = PlayerVitals {
+            health: 175,
+            max_health: 200,
+            mana: 80,
+            max_mana: 120,
+            capacity: 45_000,
+            magic_level: 3,
+        };
+        let attempts = PlayerProgressionAttempts::new([10, 20, 30, 40, 50, 60, 70], 800);
+        database
+            .update_player_vitals_and_progression_attempts(7, vitals, attempts)
+            .unwrap();
+        let loaded = database.player_by_id(7).unwrap();
+        assert_eq!(loaded.vitals, vitals);
+        assert_eq!(loaded.progression_attempts, attempts);
+
+        let rejected_vitals = PlayerVitals {
+            magic_level: 4,
+            ..vitals
+        };
+        assert!(matches!(
+            database.update_player_vitals_and_progression_attempts(
+                7,
+                rejected_vitals,
+                PlayerProgressionAttempts::new([u64::MAX; 7], 0),
+            ),
+            Err(PersistenceError::InvalidProgressionAttemptRecord(_))
+        ));
+        let loaded = database.player_by_id(7).unwrap();
+        assert_eq!(loaded.vitals, vitals);
+        assert_eq!(loaded.progression_attempts, attempts);
         let _ = fs::remove_file(path);
     }
 

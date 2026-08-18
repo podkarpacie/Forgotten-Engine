@@ -1079,7 +1079,7 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             world.replace_player_progression_attempts(player_id, character.progression_attempts)?;
             let outcome = world.apply_player_magic_mana(player_id, awarded_mana, rules)?;
             let vitals = world.player_vitals(player_id)?;
-            database.update_player_vitals(
+            database.update_player_vitals_and_progression_attempts(
                 player_id,
                 forgotten_persistence::PlayerVitals {
                     health: vitals.health,
@@ -1089,9 +1089,6 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                     capacity: vitals.capacity,
                     magic_level: vitals.magic_level,
                 },
-            )?;
-            database.replace_player_progression_attempts(
-                player_id,
                 world.player_progression_attempts(player_id)?,
             )?;
             println!(
