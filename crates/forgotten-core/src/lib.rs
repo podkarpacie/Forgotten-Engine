@@ -4165,6 +4165,9 @@ impl WorldState {
     }
 
     pub fn move_player(&mut self, id: u64, destination: Position) -> Result<(), CoreError> {
+        if self.player_respawn_state(id)?.dead {
+            return Err(CoreError::PlayerIsDead(id));
+        }
         if self.is_static_creature_occupied(destination) {
             return Err(CoreError::StaticCreatureOccupiesPosition(destination));
         }
@@ -4520,6 +4523,7 @@ pub enum CoreError {
     UnknownTown(u32),
     PlayerTownUnassigned(u64),
     InvalidPlayerRespawnState(u64),
+    PlayerIsDead(u64),
     PlayerIsNotDead(u64),
     MissingRespawnPosition(u64),
     DeathLossAlreadyApplied(u64),
@@ -7593,6 +7597,19 @@ mod tests {
         assert_eq!(world.player(7).unwrap().position, position_before_death);
         assert_eq!(world.revision(), revision + 1);
         assert_eq!(world.apply_player_death(7, 42, &map).unwrap(), state);
+        assert_eq!(world.revision(), revision + 1);
+        assert_eq!(
+            world.move_player(
+                7,
+                Position {
+                    x: position_before_death.x + 1,
+                    y: position_before_death.y,
+                    z: position_before_death.z,
+                },
+            ),
+            Err(CoreError::PlayerIsDead(7))
+        );
+        assert_eq!(world.player(7).unwrap().position, position_before_death);
         assert_eq!(world.revision(), revision + 1);
 
         assert_eq!(
