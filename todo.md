@@ -334,3 +334,5 @@
 - [x] Correct local player creation so persisted starting experience is consistent with the selected initial level and later authoritative experience awards do not reduce the character level.
 - [x] Extend stable `player create` with an optional validated numeric vocation ID, preserving the existing account/name invocation and default vocation when absent.
 - [x] Deliver bounded native selected-static-creature melee health updates and persist changed static runtime state, while leaving loot, corpses, formulas, AI, and real-client confirmation deferred.
+- [x] Parse bounded monster experience metadata from TFS entity definitions without executing XML or activating reward gameplay; malformed or overflowing values are rejected and NPC metadata remains zero.
+- [ ] Route parsed monster experience through a deterministic authoritative selected-static defeat reward with existing rate/stage, vocation-gain, persistence, and native progression-refresh rules; loot, corpses, formulas, AI, scripts, and real-client confirmation remain deferred.

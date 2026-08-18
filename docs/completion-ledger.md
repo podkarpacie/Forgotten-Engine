@@ -74,6 +74,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 ### Milestone C — Complete creature, NPC, spawn, loot, and corpse runtime: target 58%
 
 - [x] Establish bounded static spawn materialization, occupancy, safe deterministic movement, and reset foundations.
+- [x] Retain bounded non-executing monster-root `experience` metadata with strict unsigned parsing; absent values and NPCs remain zero, while malformed or overflowing data is rejected. Reward routing remains deferred.
 - [x] Add bounded deterministic static target selection that records the nearest living same-floor player under an explicit capped range, with stable tie-breaking and lifecycle cleanup; pursuit, combat, and client delivery remain deferred.
 - [x] Add a caller-triggered single deterministic cardinal target step that delegates map and occupancy validation to the authoritative movement boundary; pursuit loops, routing, AI, combat automation, and client delivery remain deferred.
 - [x] Route a real caller-triggered target step through the shared native-world visibility epoch and established full-map refresh; autonomous scheduling and real-client evidence remain deferred.

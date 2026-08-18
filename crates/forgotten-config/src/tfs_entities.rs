@@ -33,6 +33,9 @@ impl TfsEntityKind {
 pub struct TfsEntityDefinition {
     pub kind: TfsEntityKind,
     pub name: String,
+    /// Non-executing monster metadata retained for explicit future reward policies. NPCs and
+    /// monster definitions without a root `experience` attribute retain zero.
+    pub experience: u64,
     pub definition_path: PathBuf,
     pub script_path: Option<PathBuf>,
     pub script_present: bool,
@@ -457,6 +460,11 @@ fn entity_from_root_event(
     Ok(TfsEntityDefinition {
         kind,
         name,
+        experience: if matches!(kind, TfsEntityKind::Monster) {
+            optional_attribute_u64(event, b"experience")?.unwrap_or_default()
+        } else {
+            0
+        },
         definition_path: definition_path.to_path_buf(),
         script_path,
         script_present,
@@ -607,6 +615,19 @@ fn optional_attribute_u16(event: &BytesStart<'_>, name: &[u8]) -> Result<Option<
         .transpose()
 }
 
+fn optional_attribute_u64(event: &BytesStart<'_>, name: &[u8]) -> Result<Option<u64>, ConfigError> {
+    optional_attribute_string(event, name)?
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                invalid(format!(
+                    "TFS entity XML has invalid {} value",
+                    String::from_utf8_lossy(name)
+                ))
+            })
+        })
+        .transpose()
+}
+
 fn xml_error(error: impl std::fmt::Display) -> ConfigError {
     invalid(format!("TFS entity XML parse error: {error}"))
 }
@@ -642,7 +663,7 @@ mod tests {
         .unwrap();
         fs::write(
             data.join("monster/monsters/rat.xml"),
-            r#"<monster name="Rat" speed="134"><health now="20" max="20"/><look type="21"/></monster>"#,
+            r#"<monster name="Rat" speed="134" experience="25"><health now="20" max="20"/><look type="21"/></monster>"#,
         )
         .unwrap();
         fs::write(
@@ -655,6 +676,8 @@ mod tests {
         let catalog = load_tfs_entity_catalog_from_data(&data).unwrap();
         assert!(catalog.contains(TfsEntityKind::Monster, "rat"));
         assert!(catalog.contains(TfsEntityKind::Npc, "ALICE"));
+        assert_eq!(catalog.monsters[0].experience, 25);
+        assert_eq!(catalog.npcs[0].experience, 0);
         assert_eq!(
             catalog.monsters[0].appearance,
             Some(TfsEntityAppearance {
@@ -690,11 +713,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_monster_experience_metadata() {
+        let data = temporary_data_directory("tfs-entity-experience-invalid");
+        fs::create_dir_all(data.join("monster/monsters")).unwrap();
+        fs::write(
+            data.join("monster/monsters.xml"),
+            r#"<monsters><monster name="Rat" file="monsters/rat.xml"/></monsters>"#,
+        )
+        .unwrap();
+        fs::write(
+            data.join("monster/monsters/rat.xml"),
+            r#"<monster name="Rat" experience="not-a-number"/>"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            load_tfs_entity_catalog_from_data(&data),
+            Err(ConfigError::InvalidContent(message)) if message.contains("experience")
+        ));
+        let _ = fs::remove_dir_all(data.parent().unwrap());
+    }
+
+    #[test]
     fn resolves_spawn_entities_case_insensitively_and_reports_missing_names() {
         let catalog = TfsEntityCatalog {
             monsters: vec![TfsEntityDefinition {
                 kind: TfsEntityKind::Monster,
                 name: "Rat".into(),
+                experience: 0,
                 definition_path: PathBuf::from("rat.xml"),
                 script_path: None,
                 script_present: true,
@@ -703,6 +748,7 @@ mod tests {
             npcs: vec![TfsEntityDefinition {
                 kind: TfsEntityKind::Npc,
                 name: "Alice".into(),
+                experience: 0,
                 definition_path: PathBuf::from("Alice.xml"),
                 script_path: None,
                 script_present: true,
@@ -770,6 +816,7 @@ mod tests {
             monsters: vec![TfsEntityDefinition {
                 kind: TfsEntityKind::Monster,
                 name: "Rat".into(),
+                experience: 0,
                 definition_path: PathBuf::from("rat.xml"),
                 script_path: None,
                 script_present: true,
