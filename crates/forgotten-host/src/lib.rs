@@ -245,6 +245,30 @@ fn native_classic_item_record(
     })
 }
 
+/// Converts a fully decoded native map-item request into the core's server-ID intent only when
+/// the operator-supplied presentation catalog has an unambiguous reverse mapping. The returned
+/// intent is still validation-only; it does not execute an action or produce a packet.
+fn native_map_item_use_intent(
+    catalog: Option<&NativeItemPresentationCatalog>,
+    player_id: u64,
+    position: NativeOtClientPosition,
+    client_thing_id: u16,
+    stack_position: u8,
+) -> Option<PlayerItemUseIntent> {
+    let server_id = catalog?.unique_server_id_for_client_thing_id(client_thing_id)?;
+    PlayerItemUseIntent::new(
+        player_id,
+        Position {
+            x: position.x,
+            y: position.y,
+            z: position.z,
+        },
+        stack_position,
+        server_id,
+    )
+    .ok()
+}
+
 fn native_classic_equipment_frames(
     profile: &NativeOtClientProfile,
     catalog: Option<&NativeItemPresentationCatalog>,
@@ -424,7 +448,15 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
             format!("action=talk text-bytes={}", message.len())
         }
         NativeOtClientGameAction::ChangeFightModes => "action=change-fight-modes".into(),
-        NativeOtClientGameAction::UseItem => "action=use-item".into(),
+        NativeOtClientGameAction::UseItem {
+            position,
+            client_thing_id,
+            stack_position,
+            index,
+        } => format!(
+            "action=use-item position={},{},{} client-thing-id={} stack-position={} index={}",
+            position.x, position.y, position.z, client_thing_id, stack_position, index
+        ),
         NativeOtClientGameAction::LookMap {
             position,
             thing_id,
@@ -3077,8 +3109,59 @@ fn handle_native_otclient_game(
             )?,
             NativeOtClientGameAction::PingBack
             | NativeOtClientGameAction::EnterGame
-            | NativeOtClientGameAction::ChangeFightModes
-            | NativeOtClientGameAction::UseItem => {}
+            | NativeOtClientGameAction::ChangeFightModes => {}
+            NativeOtClientGameAction::UseItem {
+                position,
+                client_thing_id,
+                stack_position,
+                index,
+            } => {
+                let Some(world_map) = config.world_map.as_deref() else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=use-item outcome=deferred-no-world-map",
+                    );
+                    continue;
+                };
+                let Some(intent) = native_map_item_use_intent(
+                    config.item_presentation_catalog.as_deref(),
+                    character.id,
+                    position,
+                    client_thing_id,
+                    stack_position,
+                ) else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        &format!(
+                            "action=use-item outcome=deferred-unmapped-or-ambiguous-client-thing-id client-thing-id={client_thing_id}"
+                        ),
+                    );
+                    continue;
+                };
+                match shared_world.validate_player_item_use(world_map, intent) {
+                    Ok(outcome) => native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        &format!(
+                            "action=use-item outcome=validated server-id={} count={} action-id={:?} unique-id={:?} text={} charges={:?} index={index}",
+                            outcome.server_id,
+                            outcome.count,
+                            outcome.action_id,
+                            outcome.unique_id,
+                            outcome.has_text,
+                            outcome.charges,
+                        ),
+                    ),
+                    Err(HostError::Core(_)) => native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=use-item outcome=deferred-invalid-server-owned-map-item",
+                    ),
+                    Err(error) => return Err(error),
+                }
+            }
             NativeOtClientGameAction::RequestOutfit => {
                 let outfit_window = encode_native_otclient_choose_outfit(
                     &config.client_profile,
@@ -6053,6 +6136,58 @@ mod tests {
         assert!(outcome.has_text);
         assert_eq!(outcome.charges, Some(3));
         assert_eq!(shared.vitals_epoch(), 0);
+    }
+
+    #[test]
+    fn native_map_item_use_intent_requires_one_catalog_server_id() {
+        let position = NativeOtClientPosition {
+            x: 100,
+            y: 101,
+            z: 7,
+        };
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                1945,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 102,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            native_map_item_use_intent(Some(&catalog), 101, position, 102, 3),
+            Some(
+                PlayerItemUseIntent::new(
+                    101,
+                    Position {
+                        x: 100,
+                        y: 101,
+                        z: 7,
+                    },
+                    3,
+                    1945,
+                )
+                .unwrap()
+            ),
+        );
+        assert_eq!(
+            native_map_item_use_intent(Some(&catalog), 101, position, 103, 3),
+            None
+        );
+        catalog
+            .insert(
+                1946,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 102,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            native_map_item_use_intent(Some(&catalog), 101, position, 102, 3),
+            None
+        );
     }
 
     #[test]

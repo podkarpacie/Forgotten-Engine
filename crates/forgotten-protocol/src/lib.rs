@@ -1200,7 +1200,12 @@ pub enum NativeOtClientGameAction {
     Stop,
     AutoWalk(Vec<NativeOtClientAutoWalkDirection>),
     Talk(String),
-    UseItem,
+    UseItem {
+        position: NativeOtClientPosition,
+        client_thing_id: u16,
+        stack_position: u8,
+        index: u8,
+    },
     LookMap {
         position: NativeOtClientPosition,
         thing_id: u16,
@@ -1910,8 +1915,19 @@ pub fn decode_native_otclient_game_action(
             NativeOtClientGameAction::AutoWalk(path)
         }
         NATIVE_OTCLIENT_CLIENT_USE_ITEM => {
-            reader.take(9)?;
-            NativeOtClientGameAction::UseItem
+            if reader.remaining() != 9 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            NativeOtClientGameAction::UseItem {
+                position: NativeOtClientPosition {
+                    x: reader.u16()?,
+                    y: reader.u16()?,
+                    z: reader.byte()?,
+                },
+                client_thing_id: reader.u16()?,
+                stack_position: reader.byte()?,
+                index: reader.byte()?,
+            }
         }
         NATIVE_OTCLIENT_CLIENT_LOOK_MAP => {
             if reader.remaining() != 8 {
@@ -3323,21 +3339,35 @@ mod tests {
             decode_native_otclient_game_action(
                 &Frame(vec![
                     NATIVE_OTCLIENT_CLIENT_USE_ITEM,
+                    100,
                     0,
+                    101,
                     0,
+                    7,
+                    102,
                     0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0
+                    3,
+                    1,
                 ]),
                 &profile,
             )
             .unwrap(),
-            NativeOtClientGameAction::UseItem
+            NativeOtClientGameAction::UseItem {
+                position: NativeOtClientPosition {
+                    x: 100,
+                    y: 101,
+                    z: 7,
+                },
+                client_thing_id: 102,
+                stack_position: 3,
+                index: 1,
+            }
         );
+        assert!(decode_native_otclient_game_action(
+            &Frame(vec![NATIVE_OTCLIENT_CLIENT_USE_ITEM, 0]),
+            &profile,
+        )
+        .is_err());
         assert_eq!(
             decode_native_otclient_game_action(
                 &Frame(vec![

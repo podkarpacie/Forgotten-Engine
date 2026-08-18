@@ -57,6 +57,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [ ] Implement authoritative item transfer, stack splitting/merging, capacity, and ownership rules across equipment, ground, containers, depot, and inbox surfaces.
 - [x] Define side-effect-free authoritative validation for same-tile or adjacent exact top-level map-item use intents.
 - [x] Expose the side-effect-free map-item validation contract through synchronized host state.
+- [x] Decode bounded native 740 UseItem input and route it into synchronized no-mutation map validation only after a unique validated client-to-server item mapping; missing or ambiguous mappings remain rejected and action behavior stays deferred.
 - [ ] Implement verified item use, use-with, move, look, doors, levers, switches, teleporters, and simple map actions.
 - [ ] Add depot, mail, and ground/container persistence with consistency and crash-recovery tests.
 - [ ] Validate legacy OTB/OTBM content mappings against active item/action runtime behavior without importing private data.

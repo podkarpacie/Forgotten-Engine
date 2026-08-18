@@ -1409,6 +1409,20 @@ impl NativeItemPresentationCatalog {
         self.entries.get(&server_id).copied()
     }
 
+    /// Returns a server item ID only when this catalog has exactly one presentation with the
+    /// requested client thing ID. Client IDs can legitimately be reused by distinct server items,
+    /// so ambiguous or unknown reverse lookups are rejected instead of being guessed.
+    pub fn unique_server_id_for_client_thing_id(&self, client_thing_id: u16) -> Option<u16> {
+        let mut matching = self
+            .entries
+            .iter()
+            .filter_map(|(&server_id, presentation)| {
+                (presentation.client_thing_id == client_thing_id).then_some(server_id)
+            });
+        let server_id = matching.next()?;
+        matching.next().is_none().then_some(server_id)
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -4654,7 +4668,22 @@ mod tests {
         let mut catalog = NativeItemPresentationCatalog::default();
         catalog.insert(4526, presentation).unwrap();
         assert_eq!(catalog.presentation(4526), Some(presentation));
+        assert_eq!(
+            catalog.unique_server_id_for_client_thing_id(102),
+            Some(4526)
+        );
+        assert_eq!(catalog.unique_server_id_for_client_thing_id(103), None);
         assert_eq!(catalog.len(), 1);
+        catalog
+            .insert(
+                4527,
+                NativeItemPresentation {
+                    client_thing_id: 102,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(catalog.unique_server_id_for_client_thing_id(102), None);
         assert!(matches!(
             catalog.insert(
                 1,
