@@ -58,6 +58,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Establish validated runtime items, equipment, owned containers, and bounded complete-item transfers between equipment and owned top-level containers.
 - [x] Synchronize catalog-mapped authoritative equipment replacements to the selected native 740 session through deterministic parser-verified set/delete inventory deltas; item movement and real-client validation remain deferred.
 - [x] Synchronize changed complete catalog-mapped top-level containers to native 740 sessions by re-emitting the existing parser-verified open-container record; close and item-delta behavior remain deferred.
+- [x] Decode native 740 CloseContainer and return the parser-verified close record while filtering that top-level client view from later session refreshes without mutating shared or persisted container state; nesting, up-arrow, update, and item-delta controls remain deferred.
 - [x] Expose existing complete-item equipment/container transactions through the shared world and advance both native refresh epochs only after core success; persistence and client routing remain deferred.
 - [x] Retain bounded legacy `items.xml` armor, defense, extra-defense, attack-speed, and verified weapon-type metadata for known OTB items without changing live combat behavior or claiming formula compatibility.
 - [ ] Synchronize inventory, equipment, and containers in each supported native session profile.

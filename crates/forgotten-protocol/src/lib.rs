@@ -858,6 +858,7 @@ pub const NATIVE_OTCLIENT_GAME_PLAYER_STATS: u8 = 0xa0;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_SKILLS: u8 = 0xa1;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATE: u8 = 0xa2;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_MODES: u8 = 0xa7;
+pub const NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER: u8 = 0x6f;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_HEALTH: u8 = 0x8c;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT: u8 = 0x8e;
 pub const NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT: u8 = 0xc8;
@@ -885,6 +886,7 @@ pub const NATIVE_OTCLIENT_CLIENT_SELECT_TARGET: u8 = 0xa1;
 pub const NATIVE_OTCLIENT_CLIENT_SELECT_FOLLOW: u8 = 0xa2;
 pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM: u8 = 0x82;
+pub const NATIVE_OTCLIENT_CLIENT_CLOSE_CONTAINER: u8 = 0x87;
 pub const NATIVE_OTCLIENT_CLIENT_LOOK_MAP: u8 = 0x8c;
 pub const NATIVE_OTCLIENT_CLIENT_LOOK_CREATURE: u8 = 0x8d;
 pub const NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT: u8 = 0xd2;
@@ -1218,6 +1220,7 @@ pub enum NativeOtClientGameAction {
     RequestOutfit,
     RequestQuestLog,
     ChangeOutfit(NativeOtClientClassicOutfit),
+    CloseContainer(u8),
     SelectTarget(u32),
     SelectFollow(u32),
     IgnoredInteraction(u8),
@@ -1990,6 +1993,9 @@ pub fn decode_native_otclient_game_action(
                 feet: reader.byte()?,
             })
         }
+        NATIVE_OTCLIENT_CLIENT_CLOSE_CONTAINER => {
+            NativeOtClientGameAction::CloseContainer(reader.byte()?)
+        }
         NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT => NativeOtClientGameAction::RequestOutfit,
         NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG => NativeOtClientGameAction::RequestQuestLog,
         NATIVE_OTCLIENT_CLIENT_TALK => {
@@ -2094,6 +2100,21 @@ pub fn encode_native_otclient_player_modes(
         mode,
         u8::from(modes.chase),
         u8::from(modes.secure),
+    ]))
+}
+
+/// Encodes classic `CloseContainer` (`0x6F`) for the supported native 740 profile. This closes
+/// only the client view; authoritative container ownership and persistence are separate.
+pub fn encode_native_otclient_close_container(
+    profile: &NativeOtClientProfile,
+    container_id: u8,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    Ok(Frame(vec![
+        NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER,
+        container_id,
     ]))
 }
 
@@ -3397,6 +3418,20 @@ mod tests {
             .unwrap()
             .0,
             vec![NATIVE_OTCLIENT_GAME_PLAYER_MODES, 3, 1, 0]
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_CLOSE_CONTAINER, 2]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::CloseContainer(2)
+        );
+        assert_eq!(
+            encode_native_otclient_close_container(&profile, 2)
+                .unwrap()
+                .0,
+            vec![NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER, 2]
         );
         assert_eq!(
             decode_native_otclient_game_action(

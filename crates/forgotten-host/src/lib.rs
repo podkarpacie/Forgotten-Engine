@@ -34,10 +34,10 @@ use forgotten_protocol::{
     encode_fe_otclient_world_tick, encode_legacy_74_character_list,
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
-    encode_native_otclient_choose_outfit, encode_native_otclient_creature_health,
-    encode_native_otclient_creature_outfit, encode_native_otclient_delete_inventory,
-    encode_native_otclient_empty_quest_log, encode_native_otclient_game_cancel_walk_facing,
-    encode_native_otclient_game_death,
+    encode_native_otclient_choose_outfit, encode_native_otclient_close_container,
+    encode_native_otclient_creature_health, encode_native_otclient_creature_outfit,
+    encode_native_otclient_delete_inventory, encode_native_otclient_empty_quest_log,
+    encode_native_otclient_game_cancel_walk_facing, encode_native_otclient_game_death,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
@@ -332,6 +332,7 @@ fn native_classic_container_frames(
     profile: &NativeOtClientProfile,
     catalog: Option<&NativeItemPresentationCatalog>,
     containers: &PlayerContainers,
+    closed_container_ids: &BTreeSet<u8>,
 ) -> Result<Vec<Frame>, ProtocolError> {
     if !profile.supports_classic_740_inventory_records() {
         return Ok(Vec::new());
@@ -339,7 +340,7 @@ fn native_classic_container_frames(
     containers
         .iter()
         .filter_map(|(_, container)| {
-            if container.has_parent {
+            if container.has_parent || closed_container_ids.contains(&container.container_id) {
                 return None;
             }
             let container_item = native_classic_item_record(catalog, &container.container_item)?;
@@ -456,6 +457,9 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
             "action=change-fight-modes mode={:?} chase={} secure={}",
             request.mode, request.chase, request.secure
         ),
+        NativeOtClientGameAction::CloseContainer(container_id) => {
+            format!("action=close-container container-id={container_id}")
+        }
         NativeOtClientGameAction::UseItem {
             position,
             client_thing_id,
@@ -2688,6 +2692,7 @@ fn handle_native_otclient_game(
         &config.client_profile,
         config.item_presentation_catalog.as_deref(),
         &bootstrap_containers,
+        &BTreeSet::new(),
     )
     .map_err(HostError::Protocol)?;
     let static_health_frames =
@@ -2756,6 +2761,7 @@ fn handle_native_otclient_game(
     let mut observed_progression_epoch = shared_world.progression_epoch();
     let mut observed_equipment_epoch = shared_world.equipment_epoch();
     let mut observed_containers_epoch = shared_world.containers_epoch();
+    let mut closed_container_ids = BTreeSet::new();
     let mut observed_dead = shared_world.player_respawn_state(character.id)?.dead;
     loop {
         drain_shared_public_chat(
@@ -3068,6 +3074,7 @@ fn handle_native_otclient_game(
                             &config.client_profile,
                             config.item_presentation_catalog.as_deref(),
                             &containers,
+                            &closed_container_ids,
                         )
                         .map_err(HostError::Protocol)?;
                         for frame in &container_updates {
@@ -3228,6 +3235,20 @@ fn handle_native_otclient_game(
                     config.extended_diagnostics,
                     peer,
                     &format!("action=change-fight-modes outcome=applied changed={changed}"),
+                );
+            }
+            NativeOtClientGameAction::CloseContainer(container_id) => {
+                closed_container_ids.insert(container_id);
+                let close =
+                    encode_native_otclient_close_container(&config.client_profile, container_id)
+                        .map_err(HostError::Protocol)?;
+                write_frame(stream, &close)?;
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "action=close-container outcome=session-view-closed container-id={container_id}"
+                    ),
                 );
             }
             NativeOtClientGameAction::UseItem {
@@ -5196,6 +5217,7 @@ mod tests {
                 &config.client_profile,
                 Some(&catalog),
                 &shared.player_containers(110).unwrap(),
+                &BTreeSet::new(),
             )
             .unwrap(),
             vec![Frame(vec![
@@ -5203,6 +5225,15 @@ mod tests {
                 102, 0, 3,
             ])]
         );
+        let closed_container_ids = BTreeSet::from([2]);
+        assert!(native_classic_container_frames(
+            &config.client_profile,
+            Some(&catalog),
+            &shared.player_containers(110).unwrap(),
+            &closed_container_ids,
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
@@ -5397,9 +5428,13 @@ mod tests {
         containers.insert(nested).unwrap();
 
         let config = native_otclient_config("127.0.0.1:0".parse().unwrap());
-        let frames =
-            native_classic_container_frames(&config.client_profile, Some(&catalog), &containers)
-                .unwrap();
+        let frames = native_classic_container_frames(
+            &config.client_profile,
+            Some(&catalog),
+            &containers,
+            &BTreeSet::new(),
+        )
+        .unwrap();
         assert_eq!(
             frames,
             vec![Frame(vec![
@@ -5415,7 +5450,8 @@ mod tests {
         assert!(native_classic_container_frames(
             &incompatible_profile,
             Some(&catalog),
-            &containers
+            &containers,
+            &BTreeSet::new(),
         )
         .unwrap()
         .is_empty());
@@ -8239,6 +8275,19 @@ mod tests {
         assert_eq!(
             read_frame(&mut stream).unwrap().0,
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_QUEST_LOG, 0, 0]
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_CLOSE_CONTAINER,
+                2,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER, 2]
         );
 
         let heartbeat = read_frame(&mut stream).unwrap();
