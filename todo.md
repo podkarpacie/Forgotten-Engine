@@ -333,3 +333,4 @@
 - [x] Deliver the existing parser-verified native 740 player-modes record immediately after an accepted authoritative fight-mode change; formula effects, persistence, and broader-profile variants remain deferred.
 - [x] Correct local player creation so persisted starting experience is consistent with the selected initial level and later authoritative experience awards do not reduce the character level.
 - [x] Extend stable `player create` with an optional validated numeric vocation ID, preserving the existing account/name invocation and default vocation when absent.
+- [x] Deliver bounded native selected-static-creature melee health updates and persist changed static runtime state, while leaving loot, corpses, formulas, AI, and real-client confirmation deferred.

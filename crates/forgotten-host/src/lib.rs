@@ -2453,6 +2453,14 @@ fn persist_static_creature_runtime_to_database(
     shared_world: &SharedNativeWorld,
     database_path: &Path,
 ) -> Result<(), HostError> {
+    let mut database = EngineDatabase::open(database_path).map_err(HostError::Persistence)?;
+    persist_static_creature_runtime_to_open_database(shared_world, &mut database)
+}
+
+fn persist_static_creature_runtime_to_open_database(
+    shared_world: &SharedNativeWorld,
+    database: &mut EngineDatabase,
+) -> Result<(), HostError> {
     let snapshots = shared_world.static_creature_runtime_snapshot()?;
     let records = snapshots
         .into_iter()
@@ -2464,7 +2472,6 @@ fn persist_static_creature_runtime_to_database(
             reactivation_remaining_seconds: snapshot.reactivation_remaining_seconds,
         })
         .collect::<Vec<_>>();
-    let mut database = EngineDatabase::open(database_path).map_err(HostError::Persistence)?;
     database
         .replace_static_creature_runtime(&records)
         .map_err(HostError::Persistence)
@@ -3012,11 +3019,23 @@ fn handle_native_otclient_game(
                         character.id,
                         world_map,
                     )? {
+                        persist_static_creature_runtime_to_open_database(
+                            shared_world,
+                            &mut database,
+                        )?;
+                        let health_update = encode_native_otclient_creature_health(
+                            &config.client_profile,
+                            outcome.target_id,
+                            u16::from(outcome.remaining_health_percent),
+                            100,
+                        )
+                        .map_err(HostError::Protocol)?;
+                        write_frame(stream, &health_update)?;
                         native_diagnostic(
                             config.extended_diagnostics,
                             peer,
                             &format!(
-                                "combat=selected-static-melee target={} damage={} health-percent={} deactivated={}",
+                                "combat=selected-static-melee target={} damage={} health-percent={} deactivated={} delivery=creature-health persistence=static-runtime",
                                 outcome.target_id,
                                 outcome.applied_damage,
                                 outcome.remaining_health_percent,
@@ -6946,6 +6965,37 @@ mod tests {
             shared.active_static_spawns().unwrap().entities[0].health_percent,
             5
         );
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+        assert_eq!(
+            encode_native_otclient_creature_health(&profile, creature_id, 5, 100)
+                .unwrap()
+                .0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH,
+                1,
+                0,
+                0,
+                64,
+                5,
+            ]
+        );
+        let path = database_path("selected-static-melee-runtime");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        persist_static_creature_runtime_to_open_database(&shared, &mut database).unwrap();
+        assert_eq!(
+            database.static_creature_runtime().unwrap(),
+            vec![StaticCreatureRuntimeRecord {
+                creature_id,
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                active: true,
+                health_percent: 5,
+                reactivation_remaining_seconds: None,
+            }]
+        );
         assert_eq!(
             apply_native_selected_static_creature_melee(&shared, 101, &map).unwrap(),
             None
@@ -6964,10 +7014,26 @@ mod tests {
         assert!(final_hit.deactivated);
         assert_eq!(shared.visibility_epoch(), 3);
         assert!(shared.active_static_spawns().unwrap().entities.is_empty());
+        persist_static_creature_runtime_to_open_database(&shared, &mut database).unwrap();
+        assert_eq!(
+            database.static_creature_runtime().unwrap()[0],
+            StaticCreatureRuntimeRecord {
+                creature_id,
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                active: false,
+                health_percent: 0,
+                reactivation_remaining_seconds: None,
+            }
+        );
         assert_eq!(
             shared.player_interaction_intent(101).unwrap(),
             PlayerInteractionIntent::default()
         );
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -8496,6 +8562,45 @@ mod tests {
         assert_ne!(
             manual_edge.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_SELECT_TARGET,
+                1,
+                0,
+                0,
+                64,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH,
+                1,
+                0,
+                0,
+                64,
+                90,
+            ]
+        );
+        let static_visibility_refresh = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            static_visibility_refresh.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH,
+                1,
+                0,
+                0,
+                64,
+                90,
+            ]
         );
 
         write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
