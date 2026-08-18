@@ -976,6 +976,76 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             );
             Ok(())
         }
+        "magic-mana" => {
+            if arguments.len() != 5 {
+                return Err(
+                    "usage: player magic-mana <directory> <player-id> <awarded-mana>".into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let awarded_mana = arguments
+                .get(4)
+                .ok_or("awarded mana is required")?
+                .parse::<u64>()
+                .map_err(|_| "awarded mana must be an unsigned 64-bit integer")?;
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            let character = database.player_by_id(player_id)?;
+            let registry = load_tfs_vocation_registry(&config)?
+                .ok_or("player magic-mana requires data/XML/vocations.xml")?;
+            let rules = registry
+                .get(character.progression.vocation)
+                .ok_or("player vocation has no configured progression rules")?
+                .progression_rules()?;
+            let mut world = WorldState::default();
+            world.add_player_with_vitals_and_progression(
+                Player {
+                    id: character.id,
+                    account_id: 0,
+                    name: character.name,
+                    position: character.position,
+                    level: character.level,
+                    experience: character.experience,
+                    skill_points: character.skill_points,
+                },
+                PlayerVitals {
+                    health: character.vitals.health,
+                    max_health: character.vitals.max_health,
+                    mana: character.vitals.mana,
+                    max_mana: character.vitals.max_mana,
+                    capacity: character.vitals.capacity,
+                    magic_level: character.vitals.magic_level,
+                },
+                character.progression,
+            )?;
+            world.replace_player_progression_attempts(player_id, character.progression_attempts)?;
+            let outcome = world.apply_player_magic_mana(player_id, awarded_mana, rules)?;
+            let vitals = world.player_vitals(player_id)?;
+            database.update_player_vitals(
+                player_id,
+                forgotten_persistence::PlayerVitals {
+                    health: vitals.health,
+                    max_health: vitals.max_health,
+                    mana: vitals.mana,
+                    max_mana: vitals.max_mana,
+                    capacity: vitals.capacity,
+                    magic_level: vitals.magic_level,
+                },
+            )?;
+            database.replace_player_progression_attempts(
+                player_id,
+                world.player_progression_attempts(player_id)?,
+            )?;
+            println!(
+                "awarded player magic-mana player-id={player_id} awarded={} magic-level={} gained-levels={} stored-mana={}",
+                awarded_mana,
+                outcome.magic_level,
+                outcome.gained_levels,
+                outcome.stored_mana,
+            );
+            Ok(())
+        }
         "experience" => {
             if arguments.len() != 5 {
                 return Err(
@@ -1497,6 +1567,7 @@ Commands:
   player vocation <directory> <player-id> <vocation-id>
   player town <directory> <player-id> <town-id>
   player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]
+  player magic-mana <directory> <player-id> <awarded-mana>
   player experience <directory> <player-id> <raw-experience>
   player container-stow-equipped <directory> <player-id> <slot> <container-id>
   player container-equip <directory> <player-id> <container-id> <item-index> <slot>
@@ -1595,6 +1666,7 @@ mod tests {
             "player vocation <directory> <player-id> <vocation-id>",
             "player town <directory> <player-id> <town-id>",
             "player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]",
+            "player magic-mana <directory> <player-id> <awarded-mana>",
             "player experience <directory> <player-id> <raw-experience>",
             "player container-stow-equipped <directory> <player-id> <slot> <container-id>",
             "player container-equip <directory> <player-id> <container-id> <item-index> <slot>",
@@ -1899,6 +1971,84 @@ experienceStages = {
                 .count,
             45
         );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stable_cli_magic_mana_awards_persist_configured_vocation_progress() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("forgotten-engine-magic-mana-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        let vocations = directory.join("data/XML/vocations.xml");
+        fs::create_dir_all(vocations.parent().unwrap()).unwrap();
+        fs::write(
+            &vocations,
+            r#"<vocations>
+  <vocation id="1" name="Sorcerer" manamultiplier="1.000" gainhpticks="1" gainhpamount="0" gainmanaticks="1" gainmanaamount="0" gainsoulticks="1">
+    <skill id="0" multiplier="1.000"/>
+    <skill id="1" multiplier="1.000"/>
+    <skill id="2" multiplier="1.000"/>
+    <skill id="3" multiplier="1.000"/>
+    <skill id="4" multiplier="1.000"/>
+    <skill id="5" multiplier="1.000"/>
+    <skill id="6" multiplier="1.000"/>
+  </vocation>
+</vocations>"#,
+        )
+        .unwrap();
+        account_command(&[
+            "account".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "magic-account".into(),
+            "magic-password".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "Sorcerer".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "vocation".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "1".into(),
+        ])
+        .unwrap();
+        for awarded_mana in ["800", "800"] {
+            player_command(&[
+                "player".into(),
+                "magic-mana".into(),
+                directory.display().to_string(),
+                "1".into(),
+                awarded_mana.into(),
+            ])
+            .unwrap();
+        }
+
+        let config = load(&directory).unwrap();
+        let database = EngineDatabase::open(&config.database_path).unwrap();
+        let character = database.player_by_id(1).unwrap();
+        assert_eq!(character.vitals.magic_level, 1);
+        assert_eq!(character.progression_attempts.magic_mana(), 0);
+        assert!(player_command(&[
+            "player".into(),
+            "magic-mana".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "invalid".into(),
+        ])
+        .is_err());
+        assert_eq!(database.player_by_id(1).unwrap().vitals.magic_level, 1);
         let _ = fs::remove_dir_all(directory);
     }
 }
