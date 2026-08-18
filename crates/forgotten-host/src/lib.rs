@@ -2211,6 +2211,21 @@ fn serve_native_otclient_login(
     Ok(())
 }
 
+/// Tracks one native session's authoritative lifecycle state. A session that joins while already
+/// dead does not synthesize a historical death packet; a future authoritative respawn resets the
+/// observation so a subsequent real death can be delivered once. Respawn timing, teleportation,
+/// loss, and client-side recovery records remain separate deferred work.
+fn observe_native_death_transition(
+    shared_world: &SharedNativeWorld,
+    player_id: u64,
+    observed_dead: &mut bool,
+) -> Result<bool, HostError> {
+    let dead = shared_world.player_respawn_state(player_id)?.dead;
+    let should_notify = dead && !*observed_dead;
+    *observed_dead = dead;
+    Ok(should_notify)
+}
+
 fn serve_native_otclient_game(
     listener: TcpListener,
     config: NativeOtClientHostConfig,
@@ -2628,6 +2643,7 @@ fn handle_native_otclient_game(
     let mut observed_progression_epoch = shared_world.progression_epoch();
     let mut observed_equipment_epoch = shared_world.equipment_epoch();
     let mut observed_containers_epoch = shared_world.containers_epoch();
+    let mut observed_dead = shared_world.player_respawn_state(character.id)?.dead;
     loop {
         drain_shared_public_chat(
             stream,
@@ -2636,6 +2652,16 @@ fn handle_native_otclient_game(
             config.extended_diagnostics,
             peer,
         )?;
+        if observe_native_death_transition(shared_world, character.id, &mut observed_dead)? {
+            let death = encode_native_otclient_game_death(&config.client_profile)
+                .map_err(HostError::Protocol)?;
+            write_frame(stream, &death)?;
+            native_diagnostic(
+                config.extended_diagnostics,
+                peer,
+                "lifecycle=death-notification profile=740 fields=none source=shared-world-transition",
+            );
+        }
         let read_timeout = active_click_walk
             .as_ref()
             .map(|task| {
@@ -2724,6 +2750,7 @@ fn handle_native_otclient_game(
                                     peer,
                                     "lifecycle=death-notification profile=740 fields=none",
                                 );
+                                observed_dead = true;
                             }
                             native_diagnostic(
                                 config.extended_diagnostics,
@@ -5716,6 +5743,85 @@ mod tests {
             drop(database);
             let _ = fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn static_target_death_transition_is_observed_once_by_a_native_session() {
+        let map = native_world_map();
+        let shared = SharedNativeWorld::from_static_spawns(Some(
+            &FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
+                id: NATIVE_OTCLIENT_PLAYER_ID_END + 1,
+                name: "Rat".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 100,
+                direction: 2,
+            }])
+            .unwrap(),
+        ))
+        .unwrap();
+        shared
+            .register_player_at_available_position_with_vitals_equipment_containers_progression_and_conditions(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                PlayerVitals {
+                    health: 10,
+                    max_health: 10,
+                    ..PlayerVitals::default()
+                },
+                NativePlayerHydration {
+                    progression: PlayerProgression::default(),
+                    progression_attempts: PlayerProgressionAttempts::default(),
+                    town_id: 1,
+                    respawn_state: PlayerRespawnState::default(),
+                    equipment: PlayerEquipment::default(),
+                    containers: PlayerContainers::default(),
+                    conditions: BTreeMap::new(),
+                },
+                &map,
+            )
+            .unwrap();
+        let mut observed_dead = false;
+        assert!(!observe_native_death_transition(&shared, 101, &mut observed_dead).unwrap());
+
+        let heartbeat = advance_native_shared_world_heartbeat_with_static_target_policies(
+            &shared,
+            1,
+            StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 },
+            StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage: 10 },
+            Some(&map),
+        )
+        .unwrap();
+        assert_eq!(
+            heartbeat.static_target_attack_player_ids,
+            BTreeSet::from([101])
+        );
+        assert!(shared.player_respawn_state(101).unwrap().dead);
+        assert!(observe_native_death_transition(&shared, 101, &mut observed_dead).unwrap());
+        assert!(!observe_native_death_transition(&shared, 101, &mut observed_dead).unwrap());
+
+        shared
+            .hydrate_player_respawn_state(101, PlayerRespawnState::default())
+            .unwrap();
+        assert!(!observe_native_death_transition(&shared, 101, &mut observed_dead).unwrap());
+        assert!(!observed_dead);
     }
 
     #[test]
