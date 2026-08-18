@@ -7,7 +7,7 @@ use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
     EquipmentSlot, ExperienceAwardPolicy, FeTfsStaticSpawnCollection, ItemInstance,
     NativeItemPresentationCatalog, Player, PlayerCombatEvent, PlayerCombatEventOutcome,
-    PlayerCondition, PlayerConditionKind, PlayerConditionOutcome,
+    PlayerCondition, PlayerConditionKind, PlayerConditionOutcome, PlayerContainer,
     PlayerContainerStackToEquipmentOutcome, PlayerContainerToEquipmentOutcome, PlayerContainers,
     PlayerEquipment, PlayerEquipmentStackToContainerOutcome, PlayerEquipmentToContainerOutcome,
     PlayerExperienceAwardOutcome, PlayerFightMode, PlayerFightModeState, PlayerInteractionIntent,
@@ -328,6 +328,40 @@ fn native_classic_equipment_delta_frames(
         .collect()
 }
 
+fn native_classic_container_frame(
+    profile: &NativeOtClientProfile,
+    catalog: Option<&NativeItemPresentationCatalog>,
+    container: &PlayerContainer,
+) -> Result<Option<Frame>, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() || container.has_parent {
+        return Ok(None);
+    }
+    let Some(container_item) = native_classic_item_record(catalog, &container.container_item)
+    else {
+        return Ok(None);
+    };
+    let Some(items) = container
+        .items
+        .iter()
+        .map(|item| native_classic_item_record(catalog, item))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let frame = encode_native_otclient_open_container(
+        profile,
+        &NativeOtClientClassicOpenContainer {
+            container_id: container.container_id,
+            container_item,
+            name: container.name.clone(),
+            capacity: container.items.capacity() as u8,
+            has_parent: false,
+            items,
+        },
+    )?;
+    Ok(Some(frame))
+}
+
 fn native_classic_container_frames(
     profile: &NativeOtClientProfile,
     catalog: Option<&NativeItemPresentationCatalog>,
@@ -339,27 +373,10 @@ fn native_classic_container_frames(
     }
     containers
         .iter()
-        .filter_map(|(_, container)| {
-            if container.has_parent || closed_container_ids.contains(&container.container_id) {
-                return None;
-            }
-            let container_item = native_classic_item_record(catalog, &container.container_item)?;
-            let items = container
-                .items
-                .iter()
-                .map(|item| native_classic_item_record(catalog, item))
-                .collect::<Option<Vec<_>>>()?;
-            Some(NativeOtClientClassicOpenContainer {
-                container_id: container.container_id,
-                container_item,
-                name: container.name.clone(),
-                capacity: container.items.capacity() as u8,
-                has_parent: false,
-                items,
-            })
-        })
-        .map(|container| encode_native_otclient_open_container(profile, &container))
-        .collect()
+        .filter(|(_, container)| !closed_container_ids.contains(&container.container_id))
+        .map(|(_, container)| native_classic_container_frame(profile, catalog, container))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|frames| frames.into_iter().flatten().collect::<Vec<_>>())
 }
 
 fn truncate_native_chat_text(message: &str) -> String {
@@ -459,6 +476,9 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         ),
         NativeOtClientGameAction::CloseContainer(container_id) => {
             format!("action=close-container container-id={container_id}")
+        }
+        NativeOtClientGameAction::UpdateContainer(container_id) => {
+            format!("action=update-container container-id={container_id}")
         }
         NativeOtClientGameAction::UseItem {
             position,
@@ -3248,6 +3268,38 @@ fn handle_native_otclient_game(
                     peer,
                     &format!(
                         "action=close-container outcome=session-view-closed container-id={container_id}"
+                    ),
+                );
+            }
+            NativeOtClientGameAction::UpdateContainer(container_id) => {
+                let containers = shared_world.player_containers(character.id)?;
+                let frame = containers
+                    .container(container_id)
+                    .map(|container| {
+                        native_classic_container_frame(
+                            &config.client_profile,
+                            config.item_presentation_catalog.as_deref(),
+                            container,
+                        )
+                    })
+                    .transpose()
+                    .map_err(HostError::Protocol)?
+                    .flatten();
+                let refreshed = frame.is_some();
+                if let Some(frame) = frame {
+                    closed_container_ids.remove(&container_id);
+                    write_frame(stream, &frame)?;
+                }
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "action=update-container outcome={} container-id={container_id}",
+                        if refreshed {
+                            "session-view-refreshed"
+                        } else {
+                            "deferred-unavailable-or-unmapped"
+                        }
                     ),
                 );
             }
@@ -8100,7 +8152,7 @@ mod tests {
     #[test]
     fn serves_a_native_empty_world_and_normal_cardinal_movement() {
         let database_path = database_path("native-empty-world");
-        let database = EngineDatabase::open(&database_path).unwrap();
+        let mut database = EngineDatabase::open(&database_path).unwrap();
         let account_id = database
             .create_account_with_password("operator", "correct horse battery staple")
             .unwrap();
@@ -8132,7 +8184,32 @@ mod tests {
                 },
             )
             .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers
+            .insert(
+                PlayerContainer::new(
+                    2,
+                    ItemInstance::new(1988, 1).unwrap(),
+                    "Backpack",
+                    false,
+                    20,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        database.replace_player_containers(1, &containers).unwrap();
         let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                1988,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 1988,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        native_config.item_presentation_catalog = Some(Arc::new(catalog));
         let empty_world = native_config.empty_world.as_mut().unwrap();
         empty_world.outfit_first_look_type = 128;
         empty_world.outfit_last_look_type = 131;
@@ -8253,6 +8330,26 @@ mod tests {
             .0
             .windows(expected_stats.len())
             .any(|window| window == expected_stats));
+        let expected_backpack = vec![
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER,
+            2,
+            196,
+            7,
+            8,
+            0,
+            b'B',
+            b'a',
+            b'c',
+            b'k',
+            b'p',
+            b'a',
+            b'c',
+            b'k',
+            20,
+            0,
+            0,
+        ];
+        assert_eq!(read_frame(&mut stream).unwrap().0, expected_backpack);
         assert_eq!(
             read_frame(&mut stream).unwrap().0,
             vec![
@@ -8289,6 +8386,16 @@ mod tests {
             read_frame(&mut stream).unwrap().0,
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER, 2]
         );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_UPDATE_CONTAINER,
+                2,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(read_frame(&mut stream).unwrap().0, expected_backpack);
 
         let heartbeat = read_frame(&mut stream).unwrap();
         assert_eq!(

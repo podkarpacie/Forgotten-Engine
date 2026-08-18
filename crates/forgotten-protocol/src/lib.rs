@@ -887,6 +887,7 @@ pub const NATIVE_OTCLIENT_CLIENT_SELECT_FOLLOW: u8 = 0xa2;
 pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM: u8 = 0x82;
 pub const NATIVE_OTCLIENT_CLIENT_CLOSE_CONTAINER: u8 = 0x87;
+pub const NATIVE_OTCLIENT_CLIENT_UPDATE_CONTAINER: u8 = 0xca;
 pub const NATIVE_OTCLIENT_CLIENT_LOOK_MAP: u8 = 0x8c;
 pub const NATIVE_OTCLIENT_CLIENT_LOOK_CREATURE: u8 = 0x8d;
 pub const NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT: u8 = 0xd2;
@@ -1221,6 +1222,7 @@ pub enum NativeOtClientGameAction {
     RequestQuestLog,
     ChangeOutfit(NativeOtClientClassicOutfit),
     CloseContainer(u8),
+    UpdateContainer(u8),
     SelectTarget(u32),
     SelectFollow(u32),
     IgnoredInteraction(u8),
@@ -1995,6 +1997,9 @@ pub fn decode_native_otclient_game_action(
         }
         NATIVE_OTCLIENT_CLIENT_CLOSE_CONTAINER => {
             NativeOtClientGameAction::CloseContainer(reader.byte()?)
+        }
+        NATIVE_OTCLIENT_CLIENT_UPDATE_CONTAINER => {
+            NativeOtClientGameAction::UpdateContainer(reader.byte()?)
         }
         NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT => NativeOtClientGameAction::RequestOutfit,
         NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG => NativeOtClientGameAction::RequestQuestLog,
@@ -3432,6 +3437,14 @@ mod tests {
                 .unwrap()
                 .0,
             vec![NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER, 2]
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_UPDATE_CONTAINER, 2]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::UpdateContainer(2)
         );
         assert_eq!(
             decode_native_otclient_game_action(

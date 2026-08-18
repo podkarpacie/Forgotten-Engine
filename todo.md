@@ -329,3 +329,4 @@
 - [x] Parse and validate bounded TFS vocation attack-speed and base-speed metadata for future timing compatibility without changing movement, cooldown, or combat execution.
 - [x] Encode and deliver the verified three-byte native 740 player-modes record from authoritative fight-mode state, while leaving later PvP-mode variants and formula effects deferred.
 - [x] Decode and honor native 740 CloseContainer as a client-session view closure, emitting the verified close record and preventing container refreshes from reopening that view; persistence, nesting, up-arrow, and item-delta controls remain deferred.
+- [x] Decode and honor native 740 UpdateContainer as a session-view refresh for one complete mapped top-level container, without changing shared or persisted state; nesting, up-arrow, and item-delta controls remain deferred.
