@@ -21,6 +21,8 @@ const MAX_OTB_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OTB_NODES: usize = 300_000;
 const MAX_OTB_NODE_DEPTH: usize = 64;
 const MAX_ITEM_RANGE: usize = 16_384;
+const MAX_ITEM_COMBAT_VALUE: u16 = 10_000;
+const MAX_ITEM_ATTACK_SPEED_MILLIS: u32 = 60_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyItemCatalog {
@@ -38,6 +40,45 @@ pub struct LegacyItemDefinition {
     pub flags: u32,
     pub xml_blocks_solid: Option<bool>,
     pub xml_blocks_pathfind: Option<bool>,
+    /// Operator-supplied legacy XML metadata retained for a future profile-specific combat
+    /// adapter. It never changes current FE combat behavior by itself.
+    pub xml_armor: Option<u16>,
+    pub xml_defense: Option<u16>,
+    pub xml_extra_defense: Option<u16>,
+    pub xml_attack_speed_millis: Option<u32>,
+    pub xml_weapon_type: Option<LegacyWeaponType>,
+}
+
+/// The verified legacy XML weapon-type labels needed by a future item-combat adapter. This is
+/// metadata only: parsing one of these values does not activate weapon formulas or client use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyWeaponType {
+    Sword,
+    Club,
+    Axe,
+    Shield,
+    Distance,
+    Wand,
+    Ammunition,
+    Quiver,
+}
+
+impl LegacyWeaponType {
+    fn parse(value: &str) -> Result<Self, ConfigError> {
+        match value {
+            "sword" => Ok(Self::Sword),
+            "club" => Ok(Self::Club),
+            "axe" => Ok(Self::Axe),
+            "shield" => Ok(Self::Shield),
+            "distance" => Ok(Self::Distance),
+            "wand" => Ok(Self::Wand),
+            "ammunition" => Ok(Self::Ammunition),
+            "quiver" => Ok(Self::Quiver),
+            _ => Err(invalid(
+                "items.xml weaponType must be sword, club, axe, shield, distance, wand, ammunition, or quiver",
+            )),
+        }
+    }
 }
 
 impl LegacyItemDefinition {
@@ -332,6 +373,11 @@ fn parse_item_node(group: u8, props: &[u8]) -> Result<Option<LegacyItemDefinitio
                 flags,
                 xml_blocks_solid: None,
                 xml_blocks_pathfind: None,
+                xml_armor: None,
+                xml_defense: None,
+                xml_extra_defense: None,
+                xml_attack_speed_millis: None,
+                xml_weapon_type: None,
             }))
         }
         (None, None) => Ok(None),
@@ -354,6 +400,20 @@ fn apply_inline_item_attributes(
             optional_attribute_string(event, key)?.or(optional_attribute_string(event, value)?)
         {
             set_block_attribute(catalog, ids, key, parse_bool(&value, key)?)?;
+        }
+    }
+    for key in [
+        b"armor".as_slice(),
+        b"defense".as_slice(),
+        b"extraDef".as_slice(),
+        b"extradef".as_slice(),
+        b"attackSpeed".as_slice(),
+        b"attackspeed".as_slice(),
+        b"weaponType".as_slice(),
+        b"weapontype".as_slice(),
+    ] {
+        if let Some(value) = optional_attribute_string(event, key)? {
+            set_combat_attribute(catalog, ids, key, &value)?;
         }
     }
     Ok(())
@@ -382,6 +442,8 @@ fn apply_xml_attribute(
             b"blockPathFind",
             parse_bool(&value, b"blockPathFind")?,
         ),
+        "armor" | "defense" | "extraDef" | "extradef" | "attackSpeed" | "attackspeed"
+        | "weaponType" | "weapontype" => set_combat_attribute(catalog, ids, key.as_bytes(), &value),
         _ => Ok(()),
     }
 }
@@ -402,6 +464,66 @@ fn set_block_attribute(
         }
     }
     Ok(())
+}
+
+fn set_combat_attribute(
+    catalog: &mut LegacyItemCatalog,
+    ids: &[u16],
+    key: &[u8],
+    value: &str,
+) -> Result<(), ConfigError> {
+    let normalized_key = match key {
+        b"extraDef" => b"extradef".as_slice(),
+        b"attackSpeed" => b"attackspeed".as_slice(),
+        b"weaponType" => b"weapontype".as_slice(),
+        _ => key,
+    };
+    for id in ids {
+        let Some(definition) = catalog.definitions.get_mut(id) else {
+            continue;
+        };
+        match normalized_key {
+            b"armor" => definition.xml_armor = Some(parse_item_combat_u16(value, b"armor")?),
+            b"defense" => definition.xml_defense = Some(parse_item_combat_u16(value, b"defense")?),
+            b"extradef" => {
+                definition.xml_extra_defense = Some(parse_item_combat_u16(value, b"extradef")?)
+            }
+            b"attackspeed" => {
+                definition.xml_attack_speed_millis = Some(parse_item_attack_speed(value)?)
+            }
+            b"weapontype" => definition.xml_weapon_type = Some(LegacyWeaponType::parse(value)?),
+            _ => unreachable!("combat attribute dispatch accepts only normalized known keys"),
+        }
+    }
+    Ok(())
+}
+
+fn parse_item_combat_u16(value: &str, key: &[u8]) -> Result<u16, ConfigError> {
+    let value = value.parse::<u16>().map_err(|_| {
+        invalid(format!(
+            "items.xml attribute `{}` must be an unsigned integer",
+            String::from_utf8_lossy(key)
+        ))
+    })?;
+    if value > MAX_ITEM_COMBAT_VALUE {
+        return Err(invalid(format!(
+            "items.xml attribute `{}` exceeds the supported combat metadata bound",
+            String::from_utf8_lossy(key)
+        )));
+    }
+    Ok(value)
+}
+
+fn parse_item_attack_speed(value: &str) -> Result<u32, ConfigError> {
+    let value = value
+        .parse::<u32>()
+        .map_err(|_| invalid("items.xml attribute `attackspeed` must be an unsigned integer"))?;
+    if value > MAX_ITEM_ATTACK_SPEED_MILLIS {
+        return Err(invalid(
+            "items.xml attribute `attackspeed` exceeds the supported metadata bound",
+        ));
+    }
+    Ok(value)
 }
 
 fn item_ids(event: &BytesStart<'_>) -> Result<Vec<u16>, ConfigError> {
@@ -590,6 +712,11 @@ mod tests {
             flags: 0,
             xml_blocks_solid: None,
             xml_blocks_pathfind: None,
+            xml_armor: None,
+            xml_defense: None,
+            xml_extra_defense: None,
+            xml_attack_speed_millis: None,
+            xml_weapon_type: None,
         };
         let fluid = LegacyItemDefinition {
             group: OTB_ITEM_GROUP_FLUID,
@@ -620,6 +747,71 @@ mod tests {
                 requires_classic_740_subtype: false,
             })
         );
+    }
+
+    fn combat_metadata_catalog() -> LegacyItemCatalog {
+        LegacyItemCatalog {
+            otb_major_version: 3,
+            client_version: 57,
+            build_number: 1,
+            definitions: BTreeMap::from([(
+                100,
+                LegacyItemDefinition {
+                    server_id: 100,
+                    client_id: 200,
+                    group: 1,
+                    flags: 0,
+                    xml_blocks_solid: None,
+                    xml_blocks_pathfind: None,
+                    xml_armor: None,
+                    xml_defense: None,
+                    xml_extra_defense: None,
+                    xml_attack_speed_millis: None,
+                    xml_weapon_type: None,
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn parses_bounded_legacy_item_combat_metadata_without_enabling_runtime_behavior() {
+        let mut catalog = combat_metadata_catalog();
+        apply_items_xml(
+            &mut catalog,
+            br#"<items><item id="100"><attribute key="armor" value="12"/><attribute key="defense" value="24"/><attribute key="extradef" value="3"/><attribute key="attackspeed" value="1800"/><attribute key="weapontype" value="shield"/></item></items>"#,
+        )
+        .unwrap();
+        let definition = catalog.definition(100).unwrap();
+        assert_eq!(definition.xml_armor, Some(12));
+        assert_eq!(definition.xml_defense, Some(24));
+        assert_eq!(definition.xml_extra_defense, Some(3));
+        assert_eq!(definition.xml_attack_speed_millis, Some(1_800));
+        assert_eq!(definition.xml_weapon_type, Some(LegacyWeaponType::Shield));
+
+        apply_items_xml(
+            &mut catalog,
+            br#"<items><item id="100" armor="13" defense="25" extraDef="4" attackSpeed="1600" weaponType="sword"/><item id="101" armor="99"/></items>"#,
+        )
+        .unwrap();
+        let definition = catalog.definition(100).unwrap();
+        assert_eq!(definition.xml_armor, Some(13));
+        assert_eq!(definition.xml_defense, Some(25));
+        assert_eq!(definition.xml_extra_defense, Some(4));
+        assert_eq!(definition.xml_attack_speed_millis, Some(1_600));
+        assert_eq!(definition.xml_weapon_type, Some(LegacyWeaponType::Sword));
+        assert_eq!(catalog.definition(101), None);
+    }
+
+    #[test]
+    fn rejects_invalid_or_unbounded_legacy_item_combat_metadata() {
+        for source in [
+            br#"<items><item id="100" armor="10001"/></items>"#.as_slice(),
+            br#"<items><item id="100"><attribute key="defense" value="nope"/></item></items>"#,
+            br#"<items><item id="100" weaponType="laser"/></items>"#,
+            br#"<items><item id="100" attackSpeed="60001"/></items>"#,
+        ] {
+            assert!(apply_items_xml(&mut combat_metadata_catalog(), source).is_err());
+        }
     }
 
     #[test]
