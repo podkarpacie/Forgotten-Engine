@@ -37,7 +37,10 @@ pub use tfs_entities::{
     materialize_tfs_static_spawns, TfsEntityAppearance, TfsEntityCatalog, TfsEntityDefinition,
     TfsEntityKind, TfsSpawnResolution,
 };
-pub use tfs_registry::{TfsContentInventory, TfsRegistryCategory, TfsRegistryInventory};
+pub use tfs_registry::{
+    resolve_tfs_registry_script_reference, TfsContentInventory, TfsRegistryCategory,
+    TfsRegistryInventory, TfsRegistryScriptReference,
+};
 pub use vocations::{
     load_tfs_vocation_registry, parse_tfs_vocations_xml, TfsVocationDefinition,
     TfsVocationRegistry, VocationMultiplier, VocationRegeneration,

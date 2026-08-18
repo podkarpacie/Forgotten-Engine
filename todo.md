@@ -314,3 +314,4 @@
 - [x] Decode bounded native 740 map and creature look requests into typed actions without emitting an unverified client-visible response; text-message delivery remains blocked by the unmodified OTCv8 740 message-mode gap.
 - [x] Add an opt-in disabled-by-default native static-creature target-attack policy that reuses the bounded shared-world attack transition; formulas, persistence, packets, loot, corpses, scripts, and full monster AI parity remain deferred.
 - [x] Persist authoritative player-vitals changes caused by the opt-in native static-creature target-attack policy; client combat effects, loot, corpses, formulas, scripts, and full monster AI parity remain deferred.
+- [x] Add an explicit bounded `script dispatch` bridge that resolves one declared safe TFS XML `script` path into the existing callback sandbox; automatic discovery, ordinary registry execution, TFS APIs, module loading, gameplay mutation, and full Lua compatibility remain deferred.

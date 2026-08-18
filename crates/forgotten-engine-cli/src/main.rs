@@ -2,9 +2,10 @@ use forgotten_config::{
     apply_legacy_item_metadata, ensure_content_skeleton, load, load_declarative_spell_catalog,
     load_declarative_weapon_catalog, load_legacy_item_catalog, load_tfs_content_inventory,
     load_tfs_entity_catalog, load_tfs_vocation_registry, load_world_companions, load_world_map,
-    materialize_tfs_static_spawns, resolve_tfs_spawn_references, validate_content, world_map_path,
-    write_template, DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig,
-    LegacyWorldCompanionData, TfsEntityCatalog, TfsRegistryCategory, TfsVocationRegistry,
+    materialize_tfs_static_spawns, resolve_tfs_registry_script_reference,
+    resolve_tfs_spawn_references, validate_content, world_map_path, write_template,
+    DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig, LegacyWorldCompanionData,
+    TfsEntityCatalog, TfsRegistryCategory, TfsVocationRegistry,
 };
 use forgotten_core::{
     EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules, PlayerSkill,
@@ -23,12 +24,14 @@ use forgotten_protocol::{
     COMPATIBILITY_PROFILES,
 };
 use forgotten_scripting::{
-    DeferredScriptEvent, DeferredScriptEventKind, NoopDeferredScriptExecutor, ScriptEventDispatcher,
+    DeferredScriptEvent, DeferredScriptEventKind, NoopDeferredScriptExecutor,
+    SandboxedLuaCallbackDispatcher, SandboxedLuaCallbackInput, ScriptEventDispatcher,
+    MAX_SANDBOXED_LUA_CALLBACK_NAME_BYTES,
 };
 use std::env;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
@@ -59,6 +62,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "generate-key" => generate_key(required_path(&arguments, 1)?),
         "backup" => backup(required_path(&arguments, 1)?),
         "command" => command_line(&arguments),
+        "script" => script_command(&arguments),
         "account" => account_command(&arguments),
         "player" => player_command(&arguments),
         "compatibility" => compatibility(&arguments),
@@ -856,6 +860,114 @@ fn command_line(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         }
         unsupported => Err(format!("unsupported command action `{unsupported}`").into()),
     }
+}
+
+/// Executes one operator-requested callback only when the exact relative file path is already
+/// declared by the selected TFS XML registry. This bridge is intentionally side-effect-free: the
+/// sandbox receives primitive values only and exposes no TFS Lua API, world mutation, modules, or
+/// filesystem access from Lua.
+fn script_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let action = arguments
+        .get(1)
+        .map(String::as_str)
+        .ok_or("a script action is required")?;
+    match action {
+        "dispatch" => {
+            if arguments.len() != 9 {
+                return Err("usage: script dispatch <directory> <actions|creaturescripts|events|globalevents|movements|spells|talkactions|weapons> <declared-relative-script> <callback-name> <event-kind> <subject-id> <value>".into());
+            }
+            let directory = required_path(arguments, 2)?;
+            let category = parse_tfs_script_registry_category(arguments.get(3))?;
+            let relative_path = Path::new(
+                arguments
+                    .get(4)
+                    .ok_or("a declared relative script path is required")?,
+            );
+            let callback_name = arguments
+                .get(5)
+                .map(String::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("a callback name is required")?;
+            let event_kind = parse_script_event_kind(arguments.get(6))?;
+            let subject_id = arguments
+                .get(7)
+                .ok_or("a script subject ID is required")?
+                .parse::<u64>()
+                .map_err(|_| "script subject ID must be an unsigned 64-bit integer")?;
+            let value = arguments
+                .get(8)
+                .ok_or("a script value is required")?
+                .parse::<i64>()
+                .map_err(|_| "script value must be a signed 64-bit integer")?;
+            let config = load(&directory)?;
+            let reference =
+                resolve_tfs_registry_script_reference(&config, category, relative_path)?;
+            let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+            dispatcher
+                .register_callback_file(
+                    callback_name,
+                    &reference.script_root,
+                    &reference.relative_path,
+                )
+                .map_err(|error| format!("script callback registration rejected: {error:?}"))?;
+            let outcome = dispatcher.dispatch(
+                callback_name,
+                &SandboxedLuaCallbackInput {
+                    event_kind,
+                    subject_id,
+                    value,
+                },
+            );
+            println!(
+                "script-dispatch category={} registry={} script={} callback={} state={:?} instruction-checks={} value={:?}",
+                reference.category.label(),
+                reference.registry_path.display(),
+                reference.relative_path.display(),
+                callback_name,
+                outcome.state,
+                outcome.instruction_checks,
+                outcome.value,
+            );
+            Ok(())
+        }
+        unsupported => Err(format!("unsupported script action `{unsupported}`").into()),
+    }
+}
+
+fn parse_tfs_script_registry_category(
+    value: Option<&String>,
+) -> Result<TfsRegistryCategory, Box<dyn std::error::Error>> {
+    match value.map(String::as_str) {
+        Some("actions") => Ok(TfsRegistryCategory::Actions),
+        Some("creaturescripts") => Ok(TfsRegistryCategory::CreatureScripts),
+        Some("events") => Ok(TfsRegistryCategory::Events),
+        Some("globalevents") => Ok(TfsRegistryCategory::GlobalEvents),
+        Some("movements") => Ok(TfsRegistryCategory::Movements),
+        Some("spells") => Ok(TfsRegistryCategory::Spells),
+        Some("talkactions") => Ok(TfsRegistryCategory::TalkActions),
+        Some("weapons") => Ok(TfsRegistryCategory::Weapons),
+        Some("monsters" | "npcs") => Err(
+            "monster and NPC registries use entity file references, not Lua script references"
+                .into(),
+        ),
+        Some(other) => Err(format!("unsupported TFS script registry category `{other}`").into()),
+        None => Err("a TFS script registry category is required".into()),
+    }
+}
+
+fn parse_script_event_kind(value: Option<&String>) -> Result<String, Box<dyn std::error::Error>> {
+    let value = value
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("a script event kind is required")?;
+    if value.len() > MAX_SANDBOXED_LUA_CALLBACK_NAME_BYTES {
+        return Err(format!(
+            "script event kind exceeds the {}-byte limit",
+            MAX_SANDBOXED_LUA_CALLBACK_NAME_BYTES
+        )
+        .into());
+    }
+    Ok(value.to_owned())
 }
 
 fn account_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -1704,6 +1816,7 @@ Commands:
   player container-add <directory> <player-id> <container-id> <server-item-id> [count]
   player container-remove <directory> <player-id> <container-id> <item-index>
   command <directory> broadcast <message>
+  script dispatch <directory> <actions|creaturescripts|events|globalevents|movements|spells|talkactions|weapons> <declared-relative-script> <callback-name> <event-kind> <subject-id> <value>
   compatibility [--json]
   version"#
 }
@@ -1804,6 +1917,7 @@ mod tests {
             "player container-add <directory> <player-id> <container-id> <server-item-id> [count]",
             "player container-remove <directory> <player-id> <container-id> <item-index>",
             "command <directory> broadcast <message>",
+            "script dispatch <directory>",
             "compatibility",
             "version",
         ] {
@@ -1812,6 +1926,51 @@ mod tests {
                 "missing stable CLI command: {command}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_tfs_registry_callback_command_dispatches_only_a_declared_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("forgotten-engine-registry-callback-{nonce}"));
+        fs::create_dir_all(directory.join("data/actions/scripts")).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        fs::write(
+            directory.join("data/actions/actions.xml"),
+            r#"<actions><action itemid="100" script="scripts/safe.lua"/></actions>"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.join("data/actions/scripts/safe.lua"),
+            "return function(_, _, value) return value + 1 end",
+        )
+        .unwrap();
+
+        let dispatched = vec![
+            "script".into(),
+            "dispatch".into(),
+            directory.display().to_string(),
+            "actions".into(),
+            "scripts/safe.lua".into(),
+            "safe-callback".into(),
+            "operator-test".into(),
+            "42".into(),
+            "7".into(),
+        ];
+        assert!(script_command(&dispatched).is_ok());
+
+        let mut undeclared = dispatched;
+        undeclared[4] = "scripts/other.lua".into();
+        assert!(script_command(&undeclared).is_err());
+        assert!(parse_tfs_script_registry_category(Some(&"monsters".into())).is_err());
+        assert!(parse_script_event_kind(Some(
+            &"x".repeat(MAX_SANDBOXED_LUA_CALLBACK_NAME_BYTES + 1,)
+        ))
+        .is_err());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
