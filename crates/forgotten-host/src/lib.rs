@@ -4,12 +4,12 @@
 
 use forgotten_config::{DeclarativeSpellCatalog, DeclarativeWeaponCatalog};
 use forgotten_core::{
-    CardinalDirection, CombatAttackTiming, CombatDamageType, EmptyWorldManifest, EquipmentSlot,
-    ExperienceAwardPolicy, FeTfsStaticSpawnCollection, ItemInstance, NativeItemPresentationCatalog,
-    Player, PlayerCombatEvent, PlayerCombatEventOutcome, PlayerCondition, PlayerConditionKind,
-    PlayerConditionOutcome, PlayerContainerStackToEquipmentOutcome,
-    PlayerContainerToEquipmentOutcome, PlayerContainers, PlayerEquipment,
-    PlayerEquipmentStackToContainerOutcome, PlayerEquipmentToContainerOutcome,
+    CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
+    EquipmentSlot, ExperienceAwardPolicy, FeTfsStaticSpawnCollection, ItemInstance,
+    NativeItemPresentationCatalog, Player, PlayerCombatEvent, PlayerCombatEventOutcome,
+    PlayerCondition, PlayerConditionKind, PlayerConditionOutcome,
+    PlayerContainerStackToEquipmentOutcome, PlayerContainerToEquipmentOutcome, PlayerContainers,
+    PlayerEquipment, PlayerEquipmentStackToContainerOutcome, PlayerEquipmentToContainerOutcome,
     PlayerExperienceAwardOutcome, PlayerInteractionIntent, PlayerItemUseIntent,
     PlayerItemUseOutcome, PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
     PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState, PlayerSkill,
@@ -20,8 +20,8 @@ use forgotten_core::{
     VocationLevelUpGains, WorldMap, WorldState,
 };
 use forgotten_persistence::{
-    EngineDatabase, PlayerOutfit, PlayerVitals as PersistedPlayerVitals,
-    StaticCreatureRuntimeRecord,
+    EngineDatabase, PlayerFixedDeathLossSnapshot, PlayerOutfit,
+    PlayerVitals as PersistedPlayerVitals, StaticCreatureRuntimeRecord,
 };
 use forgotten_protocol::{
     decode, decode_fe_otclient_capability_ack, decode_fe_otclient_move_request,
@@ -192,6 +192,8 @@ fn run_native_shared_world_heartbeat(
     attack_policy: StaticTargetAttackPolicy,
     world_map: Option<Arc<WorldMap>>,
     database_path: PathBuf,
+    death_loss_policy: DeathLossPolicy,
+    progression_rules: Option<Arc<BTreeMap<VocationId, PlayerProgressionRules>>>,
 ) -> Result<(), HostError> {
     let mut last_tick = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
@@ -224,6 +226,8 @@ fn run_native_shared_world_heartbeat(
                 &mut database,
                 &shared_world,
                 &outcome.static_target_attack_player_ids,
+                death_loss_policy,
+                progression_rules.as_deref(),
             )?;
         }
     }
@@ -560,6 +564,10 @@ pub struct NativeOtClientHostConfig {
     /// Validated configured flat experience rate and optional level-stage policy. Concrete
     /// gameplay reward sources remain separate from this immutable host input.
     pub experience_award_policy: Option<Arc<ExperienceAwardPolicy>>,
+    /// Validated `deathLosePercent` mode. The host applies only the bounded explicit fixed-percent
+    /// mode when an accepted native death transition has matching vocation progression rules.
+    /// Default-formula, promotion, blessing, and client lifecycle semantics remain deferred.
+    pub death_loss_policy: DeathLossPolicy,
     /// Optional operator-owned scriptless weapon catalog. It is only eligible for the existing
     /// server-selected adjacent-melee action when a matching main-hand item is equipped.
     pub declarative_weapon_catalog: Option<Arc<DeclarativeWeaponCatalog>>,
@@ -1043,6 +1051,25 @@ impl SharedNativeWorld {
             self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok((outcome, vitals))
+    }
+
+    /// Applies one already-validated fixed loss percentage to a player with an accepted death
+    /// state. The caller owns policy selection and persistence; this synchronized boundary keeps
+    /// the core transition authoritative and refreshes only the state epochs affected by its
+    /// level, skill, magic-level, and vitality changes.
+    pub fn apply_fixed_percent_death_loss(
+        &self,
+        player_id: u64,
+        percent: u8,
+        rules: PlayerProgressionRules,
+    ) -> Result<forgotten_core::PlayerDeathLossOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .apply_fixed_percent_death_loss(player_id, percent, rules)
+            .map_err(HostError::Core)?;
+        self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+        self.progression_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(outcome)
     }
 
     /// Applies one bounded player melee hit and, only when it would defeat a target with a
@@ -1834,6 +1861,13 @@ impl NativeOtClientHostConfig {
                 "session_timeout must be greater than zero".into(),
             ));
         }
+        if matches!(self.death_loss_policy, DeathLossPolicy::FixedPercent(_))
+            && self.progression_rules.is_none()
+        {
+            return Err(HostError::InvalidConfiguration(
+                "fixed deathLosePercent requires validated vocation progression rules".into(),
+            ));
+        }
         if let Some(empty_world) = &self.empty_world {
             if empty_world.player_speed == 0 || empty_world.server_beat == 0 {
                 return Err(HostError::InvalidConfiguration(
@@ -2280,6 +2314,8 @@ fn serve_native_otclient_game(
     let heartbeat_attack_policy = config.static_target_attack_policy;
     let heartbeat_map = config.world_map.clone();
     let heartbeat_database_path = database_path.clone();
+    let heartbeat_death_loss_policy = config.death_loss_policy;
+    let heartbeat_progression_rules = config.progression_rules.clone();
     let heartbeat = thread::spawn(move || {
         run_native_shared_world_heartbeat(
             heartbeat_world,
@@ -2287,6 +2323,8 @@ fn serve_native_otclient_game(
             heartbeat_attack_policy,
             heartbeat_map,
             heartbeat_database_path,
+            heartbeat_death_loss_policy,
+            heartbeat_progression_rules,
         )
     });
     let service_result = loop {
@@ -2728,7 +2766,7 @@ fn handle_native_otclient_game(
                     if condition_elapsed_seconds > 0 {
                         last_condition_tick +=
                             Duration::from_secs(u64::from(condition_elapsed_seconds));
-                        let (outcome, vitals, death_state) = match shared_world
+                        let (outcome, mut vitals, death_state) = match shared_world
                             .apply_player_conditions_with_death(
                                 character.id,
                                 world_map,
@@ -2755,6 +2793,20 @@ fn handle_native_otclient_game(
                         )?;
                         if outcome.applied_damage > 0 {
                             let died = death_state.is_some();
+                            let loss_persisted = if died {
+                                apply_configured_native_death_loss(
+                                    &mut database,
+                                    shared_world,
+                                    character.id,
+                                    config.death_loss_policy,
+                                    config.progression_rules.as_deref(),
+                                )?
+                            } else {
+                                false
+                            };
+                            if loss_persisted {
+                                vitals = shared_world.player_vitals(character.id)?;
+                            }
                             let persisted_vitals = PersistedPlayerVitals {
                                 health: vitals.health,
                                 max_health: vitals.max_health,
@@ -2763,7 +2815,9 @@ fn handle_native_otclient_game(
                                 capacity: vitals.capacity,
                                 magic_level: vitals.magic_level,
                             };
-                            if let Some(death_state) = death_state {
+                            if loss_persisted {
+                                // The complete post-loss snapshot was already committed atomically.
+                            } else if let Some(death_state) = death_state {
                                 database.update_player_vitals_and_respawn_state(
                                     character.id,
                                     persisted_vitals,
@@ -2844,9 +2898,14 @@ fn handle_native_otclient_game(
                             shared_world,
                             character.id,
                             world_map,
-                            config.progression_rules.as_deref(),
-                            config.skill_rate,
-                            config.declarative_weapon_catalog.as_deref(),
+                            NativeSelectedPlayerMeleePolicy {
+                                progression_rules: config.progression_rules.as_deref(),
+                                skill_rate: config.skill_rate,
+                                death_loss_policy: config.death_loss_policy,
+                                declarative_weapon_catalog: config
+                                    .declarative_weapon_catalog
+                                    .as_deref(),
+                            },
                         )?
                     {
                         let health_update = encode_native_otclient_creature_health(
@@ -3675,8 +3734,24 @@ fn persist_static_target_attack_vitals(
     database: &mut EngineDatabase,
     shared_world: &SharedNativeWorld,
     player_ids: &BTreeSet<u64>,
+    death_loss_policy: DeathLossPolicy,
+    progression_rules: Option<&BTreeMap<VocationId, PlayerProgressionRules>>,
 ) -> Result<(), HostError> {
     for &player_id in player_ids {
+        let loss_persisted = if shared_world.player_respawn_state(player_id)?.dead {
+            apply_configured_native_death_loss(
+                database,
+                shared_world,
+                player_id,
+                death_loss_policy,
+                progression_rules,
+            )?
+        } else {
+            false
+        };
+        if loss_persisted {
+            continue;
+        }
         let vitals = shared_world.player_vitals(player_id)?;
         let persisted_vitals = PersistedPlayerVitals {
             health: vitals.health,
@@ -4006,14 +4081,19 @@ fn apply_native_player_interaction(
     }
 }
 
+struct NativeSelectedPlayerMeleePolicy<'a> {
+    progression_rules: Option<&'a BTreeMap<VocationId, PlayerProgressionRules>>,
+    skill_rate: u32,
+    death_loss_policy: DeathLossPolicy,
+    declarative_weapon_catalog: Option<&'a DeclarativeWeaponCatalog>,
+}
+
 fn apply_native_selected_player_melee(
     database: &mut EngineDatabase,
     shared_world: &SharedNativeWorld,
     attacker_id: u64,
     world_map: &WorldMap,
-    progression_rules: Option<&BTreeMap<VocationId, PlayerProgressionRules>>,
-    skill_rate: u32,
-    declarative_weapon_catalog: Option<&DeclarativeWeaponCatalog>,
+    policy: NativeSelectedPlayerMeleePolicy<'_>,
 ) -> Result<
     Option<(
         u32,
@@ -4028,7 +4108,7 @@ fn apply_native_selected_player_melee(
     else {
         return Ok(None);
     };
-    let combat_result = if let Some(catalog) = declarative_weapon_catalog {
+    let combat_result = if let Some(catalog) = policy.declarative_weapon_catalog {
         let Some(event) =
             shared_world.equipped_declarative_melee_event(attacker_id, target_id, catalog)?
         else {
@@ -4045,7 +4125,7 @@ fn apply_native_selected_player_melee(
             world_map,
         )
     };
-    let (outcome, vitals, death_state) = match combat_result {
+    let (outcome, mut vitals, mut death_state) = match combat_result {
         Ok(result) => result,
         Err(HostError::Core(forgotten_core::CoreError::CombatOutOfRange { .. }))
         | Err(HostError::Core(forgotten_core::CoreError::UnknownPlayer(_)))
@@ -4061,6 +4141,37 @@ fn apply_native_selected_player_melee(
     if outcome.applied_damage == 0 {
         return Ok(None);
     }
+    let fixed_death_loss_persisted = if death_state.is_some()
+        && matches!(policy.death_loss_policy, DeathLossPolicy::FixedPercent(_))
+    {
+        let Some(rules_by_vocation) = policy.progression_rules else {
+            return Err(HostError::InvalidConfiguration(
+                "fixed deathLosePercent requires validated vocation progression rules".into(),
+            ));
+        };
+        let vocation = shared_world.player_progression(target_id)?.vocation;
+        let rules = rules_by_vocation.get(&vocation).copied().ok_or_else(|| {
+            HostError::InvalidConfiguration(format!(
+                "fixed deathLosePercent has no validated progression rules for vocation {}",
+                vocation.value()
+            ))
+        })?;
+        let DeathLossPolicy::FixedPercent(percent) = policy.death_loss_policy else {
+            unreachable!("fixed death-loss branch requires a fixed policy");
+        };
+        apply_and_persist_native_fixed_death_loss(
+            database,
+            shared_world,
+            target_id,
+            percent,
+            rules,
+        )?;
+        vitals = shared_world.player_vitals(target_id)?;
+        death_state = Some(shared_world.player_respawn_state(target_id)?);
+        true
+    } else {
+        false
+    };
     let persisted_vitals = forgotten_persistence::PlayerVitals {
         health: vitals.health,
         max_health: vitals.max_health,
@@ -4069,7 +4180,9 @@ fn apply_native_selected_player_melee(
         capacity: vitals.capacity,
         magic_level: vitals.magic_level,
     };
-    if let Some(death_state) = death_state {
+    if fixed_death_loss_persisted {
+        // The complete post-loss snapshot and marked lifecycle state were committed together.
+    } else if let Some(death_state) = death_state {
         database.update_player_vitals_and_respawn_state(
             target_id,
             persisted_vitals,
@@ -4078,10 +4191,10 @@ fn apply_native_selected_player_melee(
     } else {
         database.update_player_vitals(target_id, persisted_vitals)?;
     }
-    if let Some(rules_by_vocation) = progression_rules {
+    if let Some(rules_by_vocation) = policy.progression_rules {
         let vocation = shared_world.player_progression(attacker_id)?.vocation;
         if let Some(rules) = rules_by_vocation.get(&vocation).copied() {
-            let awarded_tries = u64::from(skill_rate);
+            let awarded_tries = u64::from(policy.skill_rate);
             shared_world.apply_player_skill_tries(
                 attacker_id,
                 PlayerSkill::Fist,
@@ -4110,6 +4223,67 @@ fn apply_native_selected_player_melee(
         },
         outcome,
     )))
+}
+
+/// Applies one accepted explicit fixed-percent loss and commits its complete authoritative result.
+/// The caller invokes this only after the existing combat path has entered a validated death state.
+/// Default formulas, promotions, blessings, and client-facing lifecycle presentation remain out of
+/// scope because the current FE data model does not yet represent their compatibility inputs.
+fn apply_configured_native_death_loss(
+    database: &mut EngineDatabase,
+    shared_world: &SharedNativeWorld,
+    player_id: u64,
+    policy: DeathLossPolicy,
+    progression_rules: Option<&BTreeMap<VocationId, PlayerProgressionRules>>,
+) -> Result<bool, HostError> {
+    let DeathLossPolicy::FixedPercent(percent) = policy else {
+        return Ok(false);
+    };
+    let rules_by_vocation = progression_rules.ok_or_else(|| {
+        HostError::InvalidConfiguration(
+            "fixed deathLosePercent requires validated vocation progression rules".into(),
+        )
+    })?;
+    let vocation = shared_world.player_progression(player_id)?.vocation;
+    let rules = rules_by_vocation.get(&vocation).copied().ok_or_else(|| {
+        HostError::InvalidConfiguration(format!(
+            "fixed deathLosePercent has no validated progression rules for vocation {}",
+            vocation.value()
+        ))
+    })?;
+    apply_and_persist_native_fixed_death_loss(database, shared_world, player_id, percent, rules)?;
+    Ok(true)
+}
+
+fn apply_and_persist_native_fixed_death_loss(
+    database: &mut EngineDatabase,
+    shared_world: &SharedNativeWorld,
+    player_id: u64,
+    percent: u8,
+    rules: PlayerProgressionRules,
+) -> Result<(), HostError> {
+    shared_world.apply_fixed_percent_death_loss(player_id, percent, rules)?;
+    let (player, vitals) = shared_world.player_and_vitals(player_id)?;
+    let progression = shared_world.player_progression(player_id)?;
+    let attempts = shared_world.player_progression_attempts(player_id)?;
+    let state = shared_world.player_respawn_state(player_id)?;
+    database.update_player_fixed_death_loss(PlayerFixedDeathLossSnapshot {
+        player_id,
+        level: player.level,
+        experience: player.experience,
+        vitals: PersistedPlayerVitals {
+            health: vitals.health,
+            max_health: vitals.max_health,
+            mana: vitals.mana,
+            max_mana: vitals.max_mana,
+            capacity: vitals.capacity,
+            magic_level: vitals.magic_level,
+        },
+        progression,
+        attempts,
+        state,
+    })?;
+    Ok(())
 }
 
 fn apply_native_selected_static_creature_melee(
@@ -4699,6 +4873,7 @@ mod tests {
             progression_rules: None,
             skill_rate: 1,
             experience_award_policy: None,
+            death_loss_policy: DeathLossPolicy::DefaultFormula,
             declarative_weapon_catalog: None,
             declarative_spell_catalog: None,
         }
@@ -5651,7 +5826,7 @@ mod tests {
     }
 
     #[test]
-    fn native_condition_damage_persists_authoritative_death_state() {
+    fn native_condition_damage_applies_and_persists_configured_death_loss() {
         let path = database_path("native-condition-death-persistence");
         let mut database = EngineDatabase::open(&path).unwrap();
         let account_id = database.create_account("operator", "hash").unwrap();
@@ -5702,20 +5877,20 @@ mod tests {
         let death_state = death_state.unwrap();
         assert!(death_state.dead);
         persist_runtime_player_conditions(&mut database, &shared, 108).unwrap();
-        database
-            .update_player_vitals_and_respawn_state(
-                108,
-                PersistedPlayerVitals {
-                    health: vitals.health,
-                    max_health: vitals.max_health,
-                    mana: vitals.mana,
-                    max_mana: vitals.max_mana,
-                    capacity: vitals.capacity,
-                    magic_level: vitals.magic_level,
-                },
-                death_state,
-            )
-            .unwrap();
+        let multiplier = forgotten_core::ProgressionMultiplier::new(1_000).unwrap();
+        let rules = PlayerProgressionRules {
+            magic_level_multiplier: multiplier,
+            skill_multipliers: [multiplier; 7],
+        };
+        let rules_by_vocation = BTreeMap::from([(VocationId::new(0), rules)]);
+        assert!(apply_configured_native_death_loss(
+            &mut database,
+            &shared,
+            108,
+            DeathLossPolicy::FixedPercent(10),
+            Some(&rules_by_vocation),
+        )
+        .unwrap());
 
         let reloaded = database
             .characters_for_account(account_id)
@@ -5724,16 +5899,34 @@ mod tests {
             .find(|character| character.id == 108)
             .unwrap();
         assert_eq!(reloaded.vitals.health, 0);
+        assert_eq!(reloaded.experience, 4_410);
         assert!(reloaded.respawn_state.dead);
+        assert!(reloaded.respawn_state.loss_applied);
         assert!(database.player_conditions(108).unwrap().is_empty());
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn static_target_attack_heartbeat_persists_vitals_and_lethal_death_state() {
-        for (case, health, damage, expected_health, expected_dead) in [
-            ("nonlethal", 15_u16, 10_u16, 5_u16, false),
-            ("lethal", 10_u16, 10_u16, 0_u16, true),
+    fn static_target_attack_heartbeat_persists_vitals_and_configured_death_loss() {
+        for (case, health, damage, policy, expected_health, expected_dead, expected_experience) in [
+            (
+                "nonlethal",
+                15_u16,
+                10_u16,
+                DeathLossPolicy::DefaultFormula,
+                5_u16,
+                false,
+                4_900_u64,
+            ),
+            (
+                "lethal-fixed-loss",
+                10_u16,
+                10_u16,
+                DeathLossPolicy::FixedPercent(10),
+                0_u16,
+                true,
+                4_410_u64,
+            ),
         ] {
             let path = database_path(&format!("static-target-attack-{case}"));
             let mut database = EngineDatabase::open(&path).unwrap();
@@ -5806,10 +5999,18 @@ mod tests {
                 outcome.static_target_attack_player_ids,
                 BTreeSet::from([101])
             );
+            let multiplier = forgotten_core::ProgressionMultiplier::new(1_000).unwrap();
+            let rules = PlayerProgressionRules {
+                magic_level_multiplier: multiplier,
+                skill_multipliers: [multiplier; 7],
+            };
+            let rules_by_vocation = BTreeMap::from([(VocationId::new(0), rules)]);
             persist_static_target_attack_vitals(
                 &mut database,
                 &shared,
                 &outcome.static_target_attack_player_ids,
+                policy,
+                Some(&rules_by_vocation),
             )
             .unwrap();
             drop(database);
@@ -5823,6 +6024,11 @@ mod tests {
                 .unwrap();
             assert_eq!(reloaded.vitals.health, expected_health);
             assert_eq!(reloaded.respawn_state.dead, expected_dead);
+            assert_eq!(reloaded.experience, expected_experience);
+            assert_eq!(
+                reloaded.respawn_state.loss_applied,
+                matches!(policy, DeathLossPolicy::FixedPercent(_))
+            );
             drop(database);
             let _ = fs::remove_file(path);
         }
@@ -6739,10 +6945,20 @@ mod tests {
             .unwrap();
         shared.set_player_target(101, Some(102)).unwrap();
 
-        let (native_target_id, vitals, outcome) =
-            apply_native_selected_player_melee(&mut database, &shared, 101, &map, None, 1, None)
-                .unwrap()
-                .unwrap();
+        let (native_target_id, vitals, outcome) = apply_native_selected_player_melee(
+            &mut database,
+            &shared,
+            101,
+            &map,
+            NativeSelectedPlayerMeleePolicy {
+                progression_rules: None,
+                skill_rate: 1,
+                death_loss_policy: DeathLossPolicy::DefaultFormula,
+                declarative_weapon_catalog: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(native_target_id, NATIVE_OTCLIENT_PLAYER_ID_START + 102);
         assert_eq!(
             outcome.applied_damage,
@@ -6842,9 +7058,12 @@ mod tests {
             &shared,
             111,
             &map,
-            None,
-            1,
-            Some(&catalog),
+            NativeSelectedPlayerMeleePolicy {
+                progression_rules: None,
+                skill_rate: 1,
+                death_loss_policy: DeathLossPolicy::DefaultFormula,
+                declarative_weapon_catalog: Some(&catalog),
+            },
         )
         .unwrap()
         .is_none());
@@ -6860,9 +7079,12 @@ mod tests {
             &shared,
             111,
             &map,
-            None,
-            1,
-            Some(&catalog),
+            NativeSelectedPlayerMeleePolicy {
+                progression_rules: None,
+                skill_rate: 1,
+                death_loss_policy: DeathLossPolicy::DefaultFormula,
+                declarative_weapon_catalog: Some(&catalog),
+            },
         )
         .unwrap()
         .unwrap();
@@ -6954,9 +7176,12 @@ mod tests {
             &shared,
             301,
             &map,
-            Some(&rules_by_vocation),
-            2,
-            None,
+            NativeSelectedPlayerMeleePolicy {
+                progression_rules: Some(&rules_by_vocation),
+                skill_rate: 2,
+                death_loss_policy: DeathLossPolicy::DefaultFormula,
+                declarative_weapon_catalog: None,
+            },
         )
         .unwrap()
         .unwrap();
@@ -6976,7 +7201,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_player_melee_enters_server_side_death_state_for_hydrated_town() {
+    fn selected_player_melee_applies_and_persists_fixed_configured_death_loss() {
         let path = database_path("selected-player-melee-death");
         let mut database = EngineDatabase::open(&path).unwrap();
         let account_id = database.create_account("operator", "hash").unwrap();
@@ -7045,29 +7270,48 @@ mod tests {
             .unwrap();
         shared.replace_player_town(202, 1).unwrap();
         shared.set_player_target(201, Some(202)).unwrap();
+        let multiplier = forgotten_core::ProgressionMultiplier::new(1_000).unwrap();
+        let rules = PlayerProgressionRules {
+            magic_level_multiplier: multiplier,
+            skill_multipliers: [multiplier; 7],
+        };
+        let rules_by_vocation = BTreeMap::from([(VocationId::new(0), rules)]);
 
-        let (_native_target_id, vitals, outcome) =
-            apply_native_selected_player_melee(&mut database, &shared, 201, &map, None, 1, None)
-                .unwrap()
-                .unwrap();
+        let (_native_target_id, vitals, outcome) = apply_native_selected_player_melee(
+            &mut database,
+            &shared,
+            201,
+            &map,
+            NativeSelectedPlayerMeleePolicy {
+                progression_rules: Some(&rules_by_vocation),
+                skill_rate: 1,
+                death_loss_policy: DeathLossPolicy::FixedPercent(10),
+                declarative_weapon_catalog: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
         assert!(outcome.defeated);
         assert_eq!(vitals.health, 0);
         assert_eq!(
-            shared.player_respawn_state(202).unwrap().respawn_at,
-            Some(map.spawn())
+            shared.player_respawn_state(202).unwrap(),
+            PlayerRespawnState {
+                dead: true,
+                respawn_at: Some(map.spawn()),
+                death_time: Some(0),
+                loss_applied: true,
+            }
         );
-        assert!(shared.player_respawn_state(202).unwrap().dead);
-        assert_eq!(
-            database
-                .characters_for_account(account_id)
-                .unwrap()
-                .into_iter()
-                .find(|character| character.id == 202)
-                .unwrap()
-                .vitals
-                .health,
-            0
-        );
+        assert_eq!(shared.player_and_vitals(202).unwrap().0.experience, 4_410);
+        let persisted = database
+            .characters_for_account(account_id)
+            .unwrap()
+            .into_iter()
+            .find(|character| character.id == 202)
+            .unwrap();
+        assert_eq!(persisted.vitals.health, 0);
+        assert_eq!(persisted.experience, 4_410);
+        assert!(persisted.respawn_state.loss_applied);
         let _ = fs::remove_file(path);
     }
 
@@ -7455,6 +7699,17 @@ mod tests {
         assert!(matches!(
             start(config, database_path("limit")),
             Err(HostError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn fixed_configured_death_loss_requires_vocation_progression_rules() {
+        let mut config = native_otclient_config("127.0.0.1:0".parse().unwrap());
+        config.death_loss_policy = DeathLossPolicy::FixedPercent(10);
+        assert!(matches!(
+            config.validate(),
+            Err(HostError::InvalidConfiguration(message))
+                if message == "fixed deathLosePercent requires validated vocation progression rules"
         ));
     }
 

@@ -8,7 +8,7 @@ use forgotten_config::{
     TfsEntityCatalog, TfsRegistryCategory, TfsVocationRegistry,
 };
 use forgotten_core::{
-    EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
+    DeathLossPolicy, EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
     PlayerRespawnState, PlayerSkill, PlayerVitals, RegenerationRule, SkillProgress, VocationId,
     WorldMap, WorldMapSource, WorldState,
 };
@@ -607,6 +607,7 @@ fn run_host(
             Some(stages) => stages.award_policy(config.experience_rate)?,
             None => forgotten_core::ExperienceAwardPolicy::new(config.experience_rate, Vec::new())?,
         });
+        let death_loss_policy = DeathLossPolicy::from_config(config.death_loss_percent)?;
         let declarative_weapon_catalog = declarative_weapon_catalog.map(Arc::new);
         if let Some(catalog) = &declarative_weapon_catalog {
             println!(
@@ -651,6 +652,7 @@ fn run_host(
             progression_rules,
             skill_rate: config.skill_rate,
             experience_award_policy: Some(experience_award_policy),
+            death_loss_policy,
             declarative_weapon_catalog,
             declarative_spell_catalog,
         })

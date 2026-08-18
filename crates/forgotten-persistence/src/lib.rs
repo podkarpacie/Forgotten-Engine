@@ -47,6 +47,19 @@ pub struct StaticCreatureRuntimeRecord {
     pub reactivation_remaining_seconds: Option<u32>,
 }
 
+/// The complete accepted authoritative state that must be persisted together after a bounded
+/// explicit fixed-percent death-loss transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerFixedDeathLossSnapshot {
+    pub player_id: u64,
+    pub level: u32,
+    pub experience: u64,
+    pub vitals: PlayerVitals,
+    pub progression: PlayerProgression,
+    pub attempts: PlayerProgressionAttempts,
+    pub state: PlayerRespawnState,
+}
+
 impl EngineDatabase {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, PersistenceError> {
         let path = path.as_ref().to_path_buf();
@@ -578,6 +591,98 @@ impl EngineDatabase {
                 i64::from(vitals.capacity),
                 i64::from(vitals.magic_level),
                 player_id as i64,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Commits the bounded fixed-percent death-loss result as one transaction. The authoritative
+    /// core has already recalculated level, visible skills, exact progression attempts, and magic
+    /// level. This method only persists that complete accepted snapshot with its matching marked
+    /// dead lifecycle state; default loss formulas and client lifecycle delivery remain outside
+    /// this database boundary.
+    pub fn update_player_fixed_death_loss(
+        &mut self,
+        snapshot: PlayerFixedDeathLossSnapshot,
+    ) -> Result<(), PersistenceError> {
+        let PlayerFixedDeathLossSnapshot {
+            player_id,
+            level,
+            experience,
+            vitals,
+            progression,
+            attempts,
+            state,
+        } = snapshot;
+        if !vitals.is_valid() {
+            return Err(PersistenceError::InvalidPlayerVitals);
+        }
+        if !state.dead || !state.loss_applied {
+            return Err(PersistenceError::InvalidLifecycleRecord(
+                "fixed death loss requires a marked dead lifecycle state".into(),
+            ));
+        }
+        self.ensure_player_exists(player_id)?;
+        let (respawn_position, death_time) = lifecycle_state_fields(player_id, state)?;
+        let death_time = i64::try_from(death_time).map_err(|_| {
+            PersistenceError::InvalidLifecycleRecord(
+                "death time does not fit SQLite integer".into(),
+            )
+        })?;
+        let progress_values = progression
+            .skills
+            .iter()
+            .flat_map(|(_, progress)| [i64::from(progress.level), i64::from(progress.percent)])
+            .collect::<Vec<_>>();
+        let attempt_values = attempts
+            .all_skill_tries()
+            .into_iter()
+            .map(sqlite_progression_attempt)
+            .collect::<Result<Vec<_>, _>>()?;
+        let magic_mana = sqlite_progression_attempt(attempts.magic_mana())?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE players SET level = ?1, experience = ?2, health = ?3, max_health = ?4, mana = ?5, max_mana = ?6, capacity = ?7, magic_level = ?8, vocation = ?9 WHERE id = ?10",
+            params![
+                i64::from(level),
+                experience as i64,
+                i64::from(vitals.health),
+                i64::from(vitals.max_health),
+                i64::from(vitals.mana),
+                i64::from(vitals.max_mana),
+                i64::from(vitals.capacity),
+                i64::from(vitals.magic_level),
+                i64::from(progression.vocation.value()),
+                player_id as i64,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO player_skills (player_id, fist_level, fist_percent, club_level, club_percent, sword_level, sword_percent, axe_level, axe_percent, distance_level, distance_percent, shielding_level, shielding_percent, fishing_level, fishing_percent) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) ON CONFLICT(player_id) DO UPDATE SET fist_level=excluded.fist_level, fist_percent=excluded.fist_percent, club_level=excluded.club_level, club_percent=excluded.club_percent, sword_level=excluded.sword_level, sword_percent=excluded.sword_percent, axe_level=excluded.axe_level, axe_percent=excluded.axe_percent, distance_level=excluded.distance_level, distance_percent=excluded.distance_percent, shielding_level=excluded.shielding_level, shielding_percent=excluded.shielding_percent, fishing_level=excluded.fishing_level, fishing_percent=excluded.fishing_percent",
+            params![
+                player_id as i64,
+                progress_values[0], progress_values[1], progress_values[2], progress_values[3],
+                progress_values[4], progress_values[5], progress_values[6], progress_values[7],
+                progress_values[8], progress_values[9], progress_values[10], progress_values[11],
+                progress_values[12], progress_values[13],
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO player_progression_attempts (player_id, fist_tries, club_tries, sword_tries, axe_tries, distance_tries, shielding_tries, fishing_tries, magic_mana) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(player_id) DO UPDATE SET fist_tries=excluded.fist_tries, club_tries=excluded.club_tries, sword_tries=excluded.sword_tries, axe_tries=excluded.axe_tries, distance_tries=excluded.distance_tries, shielding_tries=excluded.shielding_tries, fishing_tries=excluded.fishing_tries, magic_mana=excluded.magic_mana",
+            params![
+                player_id as i64,
+                attempt_values[0], attempt_values[1], attempt_values[2], attempt_values[3],
+                attempt_values[4], attempt_values[5], attempt_values[6], magic_mana,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO player_lifecycle (player_id, dead, respawn_x, respawn_y, respawn_z, death_time, loss_applied) VALUES (?1, 1, ?2, ?3, ?4, ?5, 1) ON CONFLICT(player_id) DO UPDATE SET dead=excluded.dead, respawn_x=excluded.respawn_x, respawn_y=excluded.respawn_y, respawn_z=excluded.respawn_z, death_time=excluded.death_time, loss_applied=excluded.loss_applied",
+            params![
+                player_id as i64,
+                i64::from(respawn_position.x),
+                i64::from(respawn_position.y),
+                i64::from(respawn_position.z),
+                death_time,
             ],
         )?;
         transaction.commit()?;

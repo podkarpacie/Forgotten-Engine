@@ -33,6 +33,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Persist authoritative condition state, including exact elapsed interval remainder, across restart.
 - [x] Activate persisted server-side death state for lethal bounded condition damage at a validated assigned town temple.
 - [x] Add an operator-controlled temple respawn that delegates to the authoritative dead-state transition and atomically persists validated position, vitals, and cleared lifecycle state; automatic client delivery remains deferred.
+- [x] Apply explicit configured `deathLosePercent` values from `1` through `100` after supported native player-melee, condition, and static-creature heartbeat deaths, atomically persisting level, experience, vitals, visible skills, exact attempts, and marked lifecycle state; default formula, promotion, blessing, and client loss delivery remain deferred.
 - [x] Define typed physical damage classification, bounded adjacent-melee event contracts, attack timing, and deterministic player cooldown state.
 - [x] Define bounded profile-neutral flat physical mitigation without silently inventing TFS formulas.
 - [ ] Map verified profile-specific armor, shielding, equipment, weapon, and resistance formulas into the typed mitigation contract.
