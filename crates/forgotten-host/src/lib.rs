@@ -45,18 +45,19 @@ use forgotten_protocol::{
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
     encode_native_otclient_move_creature_at, encode_native_otclient_open_container,
-    encode_native_otclient_player_skills, encode_native_otclient_player_stats,
-    encode_native_otclient_set_inventory, encode_status_binary, encode_status_xml,
-    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
-    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
-    NativeOtClientCardinalDirection, NativeOtClientClassicItemRecord,
-    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientGameAction,
-    NativeOtClientPlayerVitals, NativeOtClientPosition, NativeOtClientProfile,
-    NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
-    StatusSnapshot, MAX_FRAME_SIZE, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES,
-    NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
+    encode_native_otclient_player_modes, encode_native_otclient_player_skills,
+    encode_native_otclient_player_stats, encode_native_otclient_set_inventory,
+    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
+    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
+    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection,
+    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
+    NativeOtClientClassicOutfit, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
+    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerVitals,
+    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
+    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
+    NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
@@ -2646,7 +2647,7 @@ fn handle_native_otclient_game(
         empty_world.player_look_type,
         empty_world.player_speed,
     )?;
-    let initialization =
+    let mut initialization =
         encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players(
             &config.client_profile,
             &snapshot,
@@ -2655,6 +2656,24 @@ fn handle_native_otclient_game(
             Some(&visible_players),
         )
         .map_err(HostError::Protocol)?;
+    let fight_mode_state = shared_world.player_fight_mode_state(character.id)?;
+    let mode = match fight_mode_state.mode {
+        PlayerFightMode::Attack => NativeOtClientFightMode::Attack,
+        PlayerFightMode::Balanced => NativeOtClientFightMode::Balanced,
+        PlayerFightMode::Defense => NativeOtClientFightMode::Defense,
+    };
+    initialization.0.extend_from_slice(
+        &encode_native_otclient_player_modes(
+            &config.client_profile,
+            NativeOtClientFightModeRequest {
+                mode,
+                chase: fight_mode_state.chase,
+                secure: fight_mode_state.secure,
+            },
+        )
+        .map_err(HostError::Protocol)?
+        .0,
+    );
     let equipment_frames = native_classic_equipment_frames(
         &config.client_profile,
         config.item_presentation_catalog.as_deref(),
@@ -8162,6 +8181,15 @@ mod tests {
         assert!(initialization
             .0
             .contains(&forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_SKILLS));
+        assert!(initialization.0.windows(4).any(|window| {
+            window
+                == [
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_MODES,
+                    1,
+                    0,
+                    0,
+                ]
+        }));
         let expected_stats = [
             forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_STATS,
             95,

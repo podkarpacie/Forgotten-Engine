@@ -857,6 +857,7 @@ pub const NATIVE_OTCLIENT_GAME_PING: u8 = 0x1e;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATS: u8 = 0xa0;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_SKILLS: u8 = 0xa1;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATE: u8 = 0xa2;
+pub const NATIVE_OTCLIENT_GAME_PLAYER_MODES: u8 = 0xa7;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_HEALTH: u8 = 0x8c;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT: u8 = 0x8e;
 pub const NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT: u8 = 0xc8;
@@ -2072,6 +2073,28 @@ pub fn encode_native_otclient_game_ping(
         return Err(ProtocolError::UnsupportedNativeClientProfile);
     }
     Ok(Frame(vec![NATIVE_OTCLIENT_GAME_PING]))
+}
+
+/// Encodes the classic three-byte `PlayerModes` (`0xA7`) record for the supported native 740
+/// profile. Later protocol variants may append a PvP-mode byte and are intentionally excluded.
+pub fn encode_native_otclient_player_modes(
+    profile: &NativeOtClientProfile,
+    modes: NativeOtClientFightModeRequest,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mode = match modes.mode {
+        NativeOtClientFightMode::Attack => 1,
+        NativeOtClientFightMode::Balanced => 2,
+        NativeOtClientFightMode::Defense => 3,
+    };
+    Ok(Frame(vec![
+        NATIVE_OTCLIENT_GAME_PLAYER_MODES,
+        mode,
+        u8::from(modes.chase),
+        u8::from(modes.secure),
+    ]))
 }
 
 /// Encodes the classic native death notification. The supported 7.4 profile admits only the
@@ -3361,6 +3384,19 @@ mod tests {
                 chase: true,
                 secure: true,
             })
+        );
+        assert_eq!(
+            encode_native_otclient_player_modes(
+                &profile,
+                NativeOtClientFightModeRequest {
+                    mode: NativeOtClientFightMode::Defense,
+                    chase: true,
+                    secure: false,
+                },
+            )
+            .unwrap()
+            .0,
+            vec![NATIVE_OTCLIENT_GAME_PLAYER_MODES, 3, 1, 0]
         );
         assert_eq!(
             decode_native_otclient_game_action(
