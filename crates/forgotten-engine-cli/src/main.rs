@@ -3,11 +3,13 @@ use forgotten_config::{
     load_declarative_weapon_catalog, load_legacy_item_catalog, load_tfs_content_inventory,
     load_tfs_entity_catalog, load_tfs_vocation_registry, load_world_companions, load_world_map,
     materialize_tfs_static_spawns, resolve_tfs_spawn_references, validate_content, world_map_path,
-    write_template, TfsRegistryCategory,
+    write_template, DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig,
+    LegacyWorldCompanionData, TfsEntityCatalog, TfsRegistryCategory, TfsVocationRegistry,
 };
 use forgotten_core::{
     EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules, PlayerSkill,
-    PlayerVitals, RegenerationRule, SkillProgress, VocationId, WorldMapSource, WorldState,
+    PlayerVitals, RegenerationRule, SkillProgress, VocationId, WorldMap, WorldMapSource,
+    WorldState,
 };
 use forgotten_host::{
     start, start_game_session, start_native_otclient_game, start_native_otclient_login,
@@ -66,6 +68,58 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         unknown => Err(format!("unknown command `{unknown}`; run `forgotten-engine help`").into()),
     }
+}
+
+#[derive(Debug)]
+struct IndependentNativeStartupContent {
+    companions: LegacyWorldCompanionData,
+    entity_catalog: TfsEntityCatalog,
+    vocation_registry: Option<TfsVocationRegistry>,
+    declarative_weapon_catalog: Option<DeclarativeWeaponCatalog>,
+    declarative_spell_catalog: Option<DeclarativeSpellCatalog>,
+}
+
+/// Loads only configuration-independent native content in scoped worker threads. Results are
+/// joined in a fixed historical validation order, so startup remains reproducible even when I/O
+/// completes in a different order. Map/item normalization and all authoritative world mutation
+/// deliberately remain serialized outside this helper.
+fn load_independent_native_startup_content(
+    config: &EngineConfig,
+    world_map: &WorldMap,
+) -> Result<IndependentNativeStartupContent, Box<dyn std::error::Error>> {
+    thread::scope(
+        |scope| -> Result<IndependentNativeStartupContent, Box<dyn std::error::Error>> {
+            let companions = scope.spawn(|| load_world_companions(config, world_map));
+            let entity_catalog = scope.spawn(|| load_tfs_entity_catalog(config));
+            let vocation_registry = scope.spawn(|| load_tfs_vocation_registry(config));
+            let declarative_weapon_catalog =
+                scope.spawn(|| load_declarative_weapon_catalog(config));
+            let declarative_spell_catalog = scope.spawn(|| load_declarative_spell_catalog(config));
+
+            let companions = companions
+                .join()
+                .map_err(|_| "world companion loader worker panicked")??;
+            let entity_catalog = entity_catalog
+                .join()
+                .map_err(|_| "entity catalog loader worker panicked")??;
+            let vocation_registry = vocation_registry
+                .join()
+                .map_err(|_| "vocation registry loader worker panicked")??;
+            let declarative_weapon_catalog = declarative_weapon_catalog
+                .join()
+                .map_err(|_| "weapon catalog loader worker panicked")??;
+            let declarative_spell_catalog = declarative_spell_catalog
+                .join()
+                .map_err(|_| "spell catalog loader worker panicked")??;
+            Ok(IndependentNativeStartupContent {
+                companions,
+                entity_catalog,
+                vocation_registry,
+                declarative_weapon_catalog,
+                declarative_spell_catalog,
+            })
+        },
+    )
 }
 
 fn required_path(
@@ -502,9 +556,12 @@ fn run_host(
         } else {
             None
         };
-        let companions = load_world_companions(&config, &world_map)?;
-        let entity_catalog = load_tfs_entity_catalog(&config)?;
-        let vocation_registry = load_tfs_vocation_registry(&config)?;
+        let startup_content = load_independent_native_startup_content(&config, &world_map)?;
+        let companions = startup_content.companions;
+        let entity_catalog = startup_content.entity_catalog;
+        let vocation_registry = startup_content.vocation_registry;
+        let declarative_weapon_catalog = startup_content.declarative_weapon_catalog;
+        let declarative_spell_catalog = startup_content.declarative_spell_catalog;
         let regeneration_rules = vocation_registry
             .as_ref()
             .map(|registry| {
@@ -545,14 +602,14 @@ fn run_host(
             Some(stages) => stages.award_policy(config.experience_rate)?,
             None => forgotten_core::ExperienceAwardPolicy::new(config.experience_rate, Vec::new())?,
         });
-        let declarative_weapon_catalog = load_declarative_weapon_catalog(&config)?.map(Arc::new);
+        let declarative_weapon_catalog = declarative_weapon_catalog.map(Arc::new);
         if let Some(catalog) = &declarative_weapon_catalog {
             println!(
                 "> Loaded {} scriptless declarative weapon definitions; equipped-item binding remains limited to the native selected-melee foundation.",
                 catalog.len()
             );
         }
-        let declarative_spell_catalog = load_declarative_spell_catalog(&config)?.map(Arc::new);
+        let declarative_spell_catalog = declarative_spell_catalog.map(Arc::new);
         if let Some(catalog) = &declarative_spell_catalog {
             println!(
                 "> Loaded {} scriptless declarative spell definitions; client invocation, effects, and Lua remain deferred.",
@@ -2049,6 +2106,57 @@ experienceStages = {
         ])
         .is_err());
         assert_eq!(database.player_by_id(1).unwrap().vitals.magic_level, 1);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn parallel_native_startup_content_load_is_reproducible_and_ordered() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("forgotten-engine-parallel-load-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        fs::create_dir_all(directory.join("data/world")).unwrap();
+        fs::write(
+            directory.join("data/world/forgotten.femap"),
+            "format=fe-map-v1\nspawn=100,100,7\nfill=99,99,101,101,7,0,true\n",
+        )
+        .unwrap();
+        let config = load(&directory).unwrap();
+        let world_map = load_world_map(&config).unwrap();
+        let first = load_independent_native_startup_content(&config, &world_map).unwrap();
+        let second = load_independent_native_startup_content(&config, &world_map).unwrap();
+        assert_eq!(first.companions, second.companions);
+        assert_eq!(first.entity_catalog, second.entity_catalog);
+        assert_eq!(first.vocation_registry, second.vocation_registry);
+        assert_eq!(
+            first.declarative_weapon_catalog,
+            second.declarative_weapon_catalog
+        );
+        assert_eq!(
+            first.declarative_spell_catalog,
+            second.declarative_spell_catalog
+        );
+
+        fs::create_dir_all(directory.join("data/XML")).unwrap();
+        fs::create_dir_all(directory.join("data/weapons")).unwrap();
+        fs::write(
+            directory.join("data/XML/vocations.xml"),
+            "<vocations><vocation",
+        )
+        .unwrap();
+        fs::write(
+            directory.join("data/weapons/forgotten-engine-weapons.xml"),
+            "<weapons><weapon",
+        )
+        .unwrap();
+        let error = load_independent_native_startup_content(&config, &world_map)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("vocations.xml"), "unexpected error: {error}");
         let _ = fs::remove_dir_all(directory);
     }
 }
