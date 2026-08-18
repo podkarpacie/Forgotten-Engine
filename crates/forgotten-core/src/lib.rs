@@ -3992,8 +3992,8 @@ impl WorldState {
         if attacker_id == target_id {
             return Err(CoreError::SelfInteractionNotAllowed(attacker_id));
         }
-        if !self.players.contains_key(&attacker_id) {
-            return Err(CoreError::UnknownPlayer(attacker_id));
+        if self.player_respawn_state(attacker_id)?.dead {
+            return Err(CoreError::PlayerIsDead(attacker_id));
         }
         if !self.players.contains_key(&target_id) {
             return Err(CoreError::UnknownPlayer(target_id));
@@ -4025,6 +4025,9 @@ impl WorldState {
         }
         if event.damage_type != CombatDamageType::Physical {
             return Err(CoreError::InvalidCombatEvent);
+        }
+        if self.player_respawn_state(event.attacker_id)?.dead {
+            return Err(CoreError::PlayerIsDead(event.attacker_id));
         }
         let attacker = self
             .player(event.attacker_id)
@@ -4090,6 +4093,9 @@ impl WorldState {
             || event.timing.interval_ticks > MAX_COMBAT_INTERVAL_TICKS
         {
             return Err(CoreError::InvalidSpellCastEvent);
+        }
+        if self.player_respawn_state(event.caster_id)?.dead {
+            return Err(CoreError::PlayerIsDead(event.caster_id));
         }
         let cooldown = self.player_spell_cooldown(event.caster_id)?;
         if self.tick < cooldown.next_cast_tick {
@@ -7653,6 +7659,12 @@ mod tests {
             })
             .unwrap();
         let blocked_revision = world.revision();
+        assert_eq!(
+            world.apply_player_damage(7, 8, 1),
+            Err(CoreError::PlayerIsDead(7))
+        );
+        assert!(world.player_respawn_state(7).unwrap().dead);
+        assert_eq!(world.revision(), blocked_revision);
         assert_eq!(
             world.respawn_player(7),
             Err(CoreError::PlayerOccupiesPosition(temple))
