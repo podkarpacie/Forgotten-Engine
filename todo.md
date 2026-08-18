@@ -308,3 +308,4 @@
 - [x] Parse bounded global skill and magic progression rates from TFS-style configuration and apply them to deterministic CLI award entry points; native fixed-melee routing and complete TFS formula, weapon, spell, Lua, and real-client parity remain deferred.
 - [x] Route the bounded `rateSkill` multiplier through native fixed selected-player melee fist-try awards with persistence and regressions; defer weapon timing, full formulas, spell/Lua sources, and real-client confirmation.
 - [x] Add a profile-gated native 740 zero-payload death notification from existing authoritative death transitions; defer automatic respawn scheduling, position-refresh delivery, loss formulas, and real-client confirmation.
+- [x] Add bounded path-safe loading of explicit callback-function Lua files into the existing sandbox dispatcher; ordinary TFS scripts, module loading, legacy APIs, and world mutation remain deferred.

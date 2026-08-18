@@ -51,6 +51,10 @@ The public TFS vocation registry declares `gaincap`, `gainhp`, and `gainmana` al
 
 The public OTClient protocol declarations identify `GameServerDeath` as opcode `0x28`.[18] The matching parser dispatches that opcode to `parseDeath`; it consumes a death-type byte only when the later `GameDeathType` feature is enabled, and consumes a penalty byte only when the later `GamePenalityOnDeath` feature is enabled for a regular death.[19] The selected FE 740 profile enables neither later feature. FE therefore emits an independently authored one-byte `0x28` record only after an already-authoritative server-side death transition. It must not attach guessed death type, penalty, redemption, re-login, teleport, or automatic-respawn fields. Manual unmodified-OTClientV8 confirmation remains required before this record clears any release blocker.
 
+## Script-file loading boundary
+
+The public TFS registry examples use XML `script` attributes relative to a subsystem directory, while its newer Revscriptsys model discovers scripts beneath `data/scripts/` and expects TFS metatables and registration methods.[20] [21] These sources establish that script location is a separate concern from the Lua API contract. FE therefore permits an operator to load only an explicit callback-function chunk from a caller-selected canonical root, using normal relative path components only and rejecting traversal or canonical symlink escape. The loaded source still executes only in FE’s fresh no-standard-library sandbox with existing source, memory, instruction, primitive-value, and callback-count limits. It does not load XML registries, resolve modules, expose TFS metatables, provide `Player`, `Game`, `Action`, `CreatureEvent`, or filesystem/network APIs, or mutate authoritative world state. Ordinary TFS Lua compatibility remains deferred.
+
 ## References
 
 [1] [TFS legacy weapon registry path](https://github.com/otland/forgottenserver/blob/master/data/weapons/weapons.xml).
@@ -90,3 +94,7 @@ The public OTClient protocol declarations identify `GameServerDeath` as opcode `
 [18] [Public OTClient game-server opcode declarations](https://github.com/edubart/otclient/blob/master/src/client/protocolcodes.h). Read-only wire-identifier evidence; no client source is copied into FE.
 
 [19] [Public OTClient death parser](https://github.com/edubart/otclient/blob/master/src/client/protocolgameparse.cpp). Read-only classic feature-gating evidence; no client source is copied into FE.
+
+[20] [Public TFS talkactions XML registry](https://github.com/otland/forgottenserver/blob/master/data/talkactions/talkactions.xml) and [creaturescripts XML registry](https://github.com/otland/forgottenserver/blob/master/data/creaturescripts/creaturescripts.xml). Read-only script-reference evidence; no script source is copied into FE.
+
+[21] [Public TFS Revscriptsys documentation](https://github.com/otland/forgottenserver/wiki/Revscriptsys). Read-only discovery and API-surface evidence; no script source is copied into FE.

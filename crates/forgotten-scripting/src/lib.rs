@@ -6,6 +6,8 @@
 
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Value};
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc,
@@ -190,6 +192,18 @@ pub enum SandboxedLuaCallbackRegistrationError {
     SourceRejected,
 }
 
+/// Bounded file-loading failures for explicit callback-function chunks. This loader is not a TFS
+/// script runtime: it rejects traversal, resolves both root and candidate canonically, and then
+/// delegates only the source bytes to the existing callback registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxedLuaCallbackFileRegistrationError {
+    InvalidRelativePath,
+    SourceReadFailed,
+    SourceOutsideRoot,
+    SourceNotRegularFile,
+    Registration(SandboxedLuaCallbackRegistrationError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxedLuaCallbackDispatchState {
     Completed,
@@ -269,6 +283,41 @@ impl SandboxedLuaCallbackDispatcher {
         }
         self.callbacks.insert(name, source);
         Ok(())
+    }
+
+    /// Loads one explicit callback-function chunk from a canonical operator-owned script root.
+    /// The path must contain only normal relative components and resolve to a regular UTF-8 file
+    /// inside that root. Ordinary TFS script registries, module imports, filesystem access from
+    /// Lua, and legacy callback APIs are intentionally not enabled by this loader.
+    pub fn register_callback_file(
+        &mut self,
+        name: impl Into<String>,
+        script_root: &Path,
+        relative_path: &Path,
+    ) -> Result<(), SandboxedLuaCallbackFileRegistrationError> {
+        if !relative_path.is_relative()
+            || !relative_path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(SandboxedLuaCallbackFileRegistrationError::InvalidRelativePath);
+        }
+        let canonical_root = fs::canonicalize(script_root)
+            .map_err(|_| SandboxedLuaCallbackFileRegistrationError::SourceReadFailed)?;
+        let canonical_source = fs::canonicalize(script_root.join(relative_path))
+            .map_err(|_| SandboxedLuaCallbackFileRegistrationError::SourceReadFailed)?;
+        if !canonical_source.starts_with(&canonical_root) {
+            return Err(SandboxedLuaCallbackFileRegistrationError::SourceOutsideRoot);
+        }
+        let metadata = fs::metadata(&canonical_source)
+            .map_err(|_| SandboxedLuaCallbackFileRegistrationError::SourceReadFailed)?;
+        if !metadata.is_file() {
+            return Err(SandboxedLuaCallbackFileRegistrationError::SourceNotRegularFile);
+        }
+        let source = fs::read_to_string(canonical_source)
+            .map_err(|_| SandboxedLuaCallbackFileRegistrationError::SourceReadFailed)?;
+        self.register_callback(name, source)
+            .map_err(SandboxedLuaCallbackFileRegistrationError::Registration)
     }
 
     /// Invokes one registered callback in a new no-standard-library VM. Callback state cannot
@@ -656,6 +705,66 @@ mod tests {
                 .state,
             SandboxedLuaCallbackDispatchState::RuntimeRejected
         );
+    }
+
+    #[test]
+    fn callback_dispatcher_loads_only_bounded_callback_files_under_its_root() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("forgotten-engine-script-root-{nonce}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("award.lua"),
+            "return function(kind, _, value) if kind == 'award' then return value + 1 end return false end",
+        )
+        .unwrap();
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback_file("award", &root, Path::new("award.lua"))
+            .unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    "award",
+                    &SandboxedLuaCallbackInput {
+                        event_kind: "award".into(),
+                        subject_id: 7,
+                        value: 41,
+                    },
+                )
+                .value,
+            Some(SandboxedLuaValue::Integer(42))
+        );
+        assert_eq!(
+            dispatcher.register_callback_file("outside", &root, Path::new("../outside.lua")),
+            Err(SandboxedLuaCallbackFileRegistrationError::InvalidRelativePath)
+        );
+        let escaped_source = root.with_extension("escaped.lua");
+        fs::write(
+            &escaped_source,
+            "return function(_, _, value) return value end",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&escaped_source, root.join("escape.lua")).unwrap();
+        assert_eq!(
+            dispatcher.register_callback_file("escape", &root, Path::new("escape.lua")),
+            Err(SandboxedLuaCallbackFileRegistrationError::SourceOutsideRoot)
+        );
+
+        let constrained_limits =
+            SandboxedLuaLimits::new(64, MAX_SANDBOXED_LUA_MEMORY_BYTES, 32).unwrap();
+        fs::write(root.join("oversized.lua"), "x".repeat(65)).unwrap();
+        let mut constrained = SandboxedLuaCallbackDispatcher::new(constrained_limits);
+        assert_eq!(
+            constrained.register_callback_file("oversized", &root, Path::new("oversized.lua")),
+            Err(SandboxedLuaCallbackFileRegistrationError::Registration(
+                SandboxedLuaCallbackRegistrationError::SourceRejected
+            ))
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(escaped_source).unwrap();
     }
 
     #[test]
