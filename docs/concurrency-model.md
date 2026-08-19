@@ -31,6 +31,24 @@ snapshots and returns a bounded result to the authoritative boundary:
 | Conversion audit and content inventory | Stable sorted report generated from immutable input. |
 | Per-session network waiting and frame writes | Session-local I/O result only. |
 
+## Implemented immutable render-preparation worker
+
+`forgotten-host` now provides a bounded `NativeRenderPreparationWorker` foundation. The worker
+receives an owned native render snapshot, immutable `Arc<WorldMap>`, profile, and session snapshot
+through a fixed 32-request queue. It returns one encoded viewport frame through a one-shot bounded
+response channel. The worker receives no `SharedNativeWorld`, database connection, socket, or
+world-mutation capability.
+
+| Guarantee | Implemented boundary | Still deferred |
+| --- | --- | --- |
+| Immutable input | The request owns a captured render snapshot and shares only an immutable map. | Snapshot publication across every native refresh path. |
+| Bounded work | The request queue holds at most 32 pending preparations and each response has a caller-selected timeout. | Production admission, overload telemetry, and retry policy. |
+| Reproducible packet result | A regression compares the worker frame byte-for-byte with direct encoding from the same snapshot. | Full ordered multi-session packet pipeline. |
+| Mutation isolation | Removing a player after capture cannot alter the queued snapshot frame. | Live listener integration and worker-pool fanout. |
+
+> This worker is a tested preparation primitive. It is not yet attached to the production listener,
+> does not execute gameplay, and carries **no performance or scalability claim**.
+
 ## Required deterministic simulation design
 
 Before parallel worker pools execute gameplay simulation, FE will introduce a command queue with an

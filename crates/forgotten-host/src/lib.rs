@@ -800,6 +800,77 @@ struct NativeWorldRenderSnapshot {
     visible_players: Vec<NativeOtClientVisiblePlayer>,
 }
 
+// Staged foundation: production listener integration is deferred until lifecycle and benchmark gates pass.
+#[allow(dead_code)]
+const NATIVE_RENDER_PREPARATION_QUEUE_CAPACITY: usize = 32;
+
+#[allow(dead_code)]
+struct NativeRenderPreparationRequest {
+    profile: NativeOtClientProfile,
+    snapshot: NativeOtClientEmptyWorldSnapshot,
+    world_map: Arc<WorldMap>,
+    render_snapshot: NativeWorldRenderSnapshot,
+    response: mpsc::SyncSender<Result<Frame, ProtocolError>>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct NativeRenderPreparationWorker {
+    requests: mpsc::SyncSender<NativeRenderPreparationRequest>,
+    response_timeout: Duration,
+}
+
+#[allow(dead_code)]
+impl NativeRenderPreparationWorker {
+    fn start(response_timeout: Duration) -> (Self, JoinHandle<()>) {
+        let (requests, receiver) = mpsc::sync_channel::<NativeRenderPreparationRequest>(
+            NATIVE_RENDER_PREPARATION_QUEUE_CAPACITY,
+        );
+        let thread = thread::spawn(move || {
+            while let Ok(request) = receiver.recv() {
+                let frame = encode_native_otclient_map_viewport_with_static_spawns_and_players(
+                    &request.profile,
+                    &request.snapshot,
+                    request.world_map.as_ref(),
+                    Some(&request.render_snapshot.static_spawns),
+                    Some(&request.render_snapshot.visible_players),
+                );
+                let _ = request.response.send(frame);
+            }
+        });
+        (
+            Self {
+                requests,
+                response_timeout,
+            },
+            thread,
+        )
+    }
+
+    fn prepare(
+        &self,
+        profile: NativeOtClientProfile,
+        snapshot: NativeOtClientEmptyWorldSnapshot,
+        world_map: Arc<WorldMap>,
+        render_snapshot: NativeWorldRenderSnapshot,
+    ) -> Result<Frame, HostError> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.requests
+            .try_send(NativeRenderPreparationRequest {
+                profile,
+                snapshot,
+                world_map,
+                render_snapshot,
+                response,
+            })
+            .map_err(|_| HostError::RenderPreparationUnavailable)?;
+        receiver
+            .recv_timeout(self.response_timeout)
+            .map_err(|_| HostError::RenderPreparationUnavailable)?
+            .map_err(HostError::Protocol)
+    }
+}
+
 impl SharedNativeWorld {
     pub fn from_static_spawns(
         static_spawns: Option<&FeTfsStaticSpawnCollection>,
@@ -6191,6 +6262,7 @@ pub enum HostError {
     InvalidConfiguration(String),
     InvalidProbe(&'static str),
     SharedWorldUnavailable,
+    RenderPreparationUnavailable,
     LegacyLoginUnavailable,
     HostThreadPanicked,
 }
@@ -6205,6 +6277,7 @@ impl HostError {
             Self::Io(_) => b"io-error",
             Self::InvalidConfiguration(_) => b"invalid-config",
             Self::SharedWorldUnavailable => b"shared-world-unavailable",
+            Self::RenderPreparationUnavailable => b"render-preparation-unavailable",
             Self::LegacyLoginUnavailable => b"legacy-login-unavailable",
             Self::HostThreadPanicked => b"host-panic",
         }
@@ -10725,12 +10798,39 @@ mod tests {
                 &map,
             )
             .unwrap();
-        let render_snapshot = shared.native_render_snapshot(101, 0, 220).unwrap();
-        let preparation = thread::spawn(move || render_snapshot.visible_players);
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+        let snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_id: native_player_id(101).unwrap(),
+            player_name: "Knight".into(),
+            player_position: native_position(map.spawn()),
+            player_level: 8,
+            player_experience: 0,
+            player_vitals: NativeOtClientPlayerVitals::default(),
+            player_skills: forgotten_core::PlayerSkills::default(),
+            ground_thing_id: 102,
+            player_look_type: 128,
+            player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
+            player_speed: 220,
+            server_beat: 50,
+        };
+        let render_snapshot = shared.native_render_snapshot(101, 128, 220).unwrap();
+        let expected = encode_native_otclient_map_viewport_with_static_spawns_and_players(
+            &profile,
+            &snapshot,
+            &map,
+            Some(&render_snapshot.static_spawns),
+            Some(&render_snapshot.visible_players),
+        )
+        .unwrap();
+        let (worker, worker_thread) = NativeRenderPreparationWorker::start(Duration::from_secs(1));
+        let prepared = worker
+            .prepare(profile, snapshot, Arc::clone(&map), render_snapshot)
+            .unwrap();
         shared.remove_player(102).unwrap();
-        let visible_players = preparation.join().unwrap();
-        assert_eq!(visible_players.len(), 1);
-        assert_eq!(visible_players[0].player_id, native_player_id(102).unwrap());
+        drop(worker);
+        worker_thread.join().unwrap();
+        assert_eq!(prepared, expected);
+        assert!(prepared.0.windows(5).any(|window| window == b"Druid"));
         assert!(shared.visible_players(101, 0, 220).unwrap().is_empty());
     }
 
