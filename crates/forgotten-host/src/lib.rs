@@ -743,6 +743,7 @@ pub struct NativePlayerHydration {
 #[derive(Debug, Clone)]
 pub struct SharedNativeWorld {
     world: Arc<Mutex<WorldState>>,
+    player_look_types: Arc<Mutex<BTreeMap<u64, u8>>>,
     visibility_epoch: Arc<AtomicU64>,
     vitals_epoch: Arc<AtomicU64>,
     progression_epoch: Arc<AtomicU64>,
@@ -776,6 +777,7 @@ impl SharedNativeWorld {
         }
         Ok(Self {
             world: Arc::new(Mutex::new(world)),
+            player_look_types: Arc::new(Mutex::new(BTreeMap::new())),
             visibility_epoch: Arc::new(AtomicU64::new(0)),
             vitals_epoch: Arc::new(AtomicU64::new(0)),
             progression_epoch: Arc::new(AtomicU64::new(0)),
@@ -1708,8 +1710,12 @@ impl SharedNativeWorld {
         look_type: u8,
         speed: u16,
     ) -> Result<Vec<NativeOtClientVisiblePlayer>, HostError> {
-        self.lock()?
-            .player_render_snapshots()
+        let player_snapshots = self.lock()?.player_render_snapshots();
+        let player_look_types = self
+            .player_look_types
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        player_snapshots
             .into_iter()
             .filter(|player| player.id != observer_id)
             .map(|player| {
@@ -1717,7 +1723,10 @@ impl SharedNativeWorld {
                     player_id: native_player_id(player.id)?,
                     name: player.name,
                     position: native_position(player.position),
-                    look_type,
+                    look_type: player_look_types
+                        .get(&player.id)
+                        .copied()
+                        .unwrap_or(look_type),
                     speed,
                 })
             })
@@ -1740,6 +1749,10 @@ impl SharedNativeWorld {
                 world.player_render_snapshots(),
             )
         };
+        let player_look_types = self
+            .player_look_types
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
         let visible_players = player_snapshots
             .into_iter()
             .filter(|player| player.id != observer_id)
@@ -1748,7 +1761,10 @@ impl SharedNativeWorld {
                     player_id: native_player_id(player.id)?,
                     name: player.name,
                     position: native_position(player.position),
-                    look_type,
+                    look_type: player_look_types
+                        .get(&player.id)
+                        .copied()
+                        .unwrap_or(look_type),
                     speed,
                 })
             })
@@ -1954,6 +1970,19 @@ impl SharedNativeWorld {
 
     pub fn remove_player(&self, id: u64) -> Result<(), HostError> {
         self.lock()?.remove_player(id).map_err(HostError::Core)?;
+        self.player_look_types
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?
+            .remove(&id);
+        self.mark_visibility_changed();
+        Ok(())
+    }
+    pub fn update_player_look_type(&self, player_id: u64, look_type: u8) -> Result<(), HostError> {
+        self.player_and_vitals(player_id)?;
+        self.player_look_types
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?
+            .insert(player_id, look_type);
         self.mark_visibility_changed();
         Ok(())
     }
@@ -2790,6 +2819,13 @@ fn handle_native_otclient_game(
     if initial_position != character.position {
         database.update_player_position(character.id, initial_position)?;
     }
+    let mut player_outfit = native_hydrated_classic_outfit(
+        empty_world.player_look_type,
+        empty_world.outfit_first_look_type,
+        empty_world.outfit_last_look_type,
+        character.outfit,
+    );
+    shared_world.update_player_look_type(character.id, player_outfit.look_type)?;
     let player_id = native_player_id(character.id)?;
     let (authoritative_player, authoritative_vitals) =
         shared_world.player_and_vitals(character.id)?;
@@ -2802,7 +2838,7 @@ fn handle_native_otclient_game(
         player_vitals: NativeOtClientPlayerVitals::default(),
         player_skills: character.progression.skills,
         ground_thing_id: empty_world.ground_thing_id,
-        player_look_type: empty_world.player_look_type,
+        player_look_type: player_outfit.look_type,
         player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
         player_speed: empty_world.player_speed,
         server_beat: empty_world.server_beat,
@@ -2865,12 +2901,6 @@ fn handle_native_otclient_game(
     let static_health_frames =
         native_static_creature_health_frames(&config.client_profile, &active_static_spawns)?;
     write_frame(stream, &initialization)?;
-    let mut player_outfit = native_hydrated_classic_outfit(
-        empty_world.player_look_type,
-        empty_world.outfit_first_look_type,
-        empty_world.outfit_last_look_type,
-        character.outfit,
-    );
     if character.outfit.look_type == player_outfit.look_type && player_outfit.look_type != 0 {
         let hydrated_outfit = encode_native_otclient_creature_outfit(
             &config.client_profile,
@@ -3797,6 +3827,8 @@ fn handle_native_otclient_game(
                         },
                     )?;
                     player_outfit = requested_outfit;
+                    shared_world.update_player_look_type(character.id, player_outfit.look_type)?;
+                    observed_visibility_epoch = shared_world.visibility_epoch();
                 }
                 let applied_outfit = encode_native_otclient_creature_outfit(
                     &config.client_profile,
@@ -8502,6 +8534,200 @@ mod tests {
             encode_shared_native_world_viewport(&profile, &snapshot, &map, &shared, 101).unwrap();
         assert!(!left.0.windows(5).any(|window| window == b"Druid"));
         shared.remove_player(101).unwrap();
+    }
+
+    #[test]
+    fn shared_player_visibility_uses_authoritative_updated_look_type() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 102,
+                    account_id: 2,
+                    name: "Druid".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        assert_eq!(shared.visibility_epoch(), 2);
+        assert_eq!(
+            shared.visible_players(101, 128, 220).unwrap()[0].look_type,
+            128
+        );
+
+        shared.update_player_look_type(102, 129).unwrap();
+
+        assert_eq!(shared.visibility_epoch(), 3);
+        let visible = shared.visible_players(101, 128, 220).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].player_id, native_player_id(102).unwrap());
+        assert_eq!(
+            visible[0].position,
+            native_position(Position {
+                x: 101,
+                y: 100,
+                z: 7
+            })
+        );
+        assert_eq!(visible[0].look_type, 129);
+        shared.remove_player(102).unwrap();
+        shared.remove_player(101).unwrap();
+    }
+
+    #[test]
+    fn native_outfit_change_refreshes_visible_peer_with_authoritative_look_type() {
+        let database_path = database_path("native-peer-outfit-refresh");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        for (id, name, position) in [
+            (
+                1,
+                "Knight",
+                Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+            (
+                2,
+                "Druid",
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+        ] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: account_id as u64,
+                    name: name.into(),
+                    position,
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let mut config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        config.empty_world.as_mut().unwrap().outfit_last_look_type = 129;
+        let game = start_native_otclient_game(config, &database_path).unwrap();
+
+        let mut knight = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut knight,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut knight).unwrap().0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+
+        let mut druid = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut druid,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Druid",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let initial_druid_view = read_frame(&mut druid).unwrap();
+        let knight_name = [6, 0, b'K', b'n', b'i', b'g', b'h', b't'];
+        let initial_knight_name_index = initial_druid_view
+            .0
+            .windows(knight_name.len())
+            .position(|window| window == knight_name)
+            .unwrap();
+        assert_eq!(
+            initial_druid_view.0[initial_knight_name_index + knight_name.len() + 2],
+            128
+        );
+
+        write_frame(
+            &mut knight,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT,
+                129,
+                1,
+                2,
+                3,
+                4,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut knight).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT,
+                1,
+                0,
+                0,
+                16,
+                129,
+                1,
+                2,
+                3,
+                4,
+            ]
+        );
+
+        druid
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let refreshed_druid_view = (0..3)
+            .map(|_| read_frame(&mut druid).unwrap())
+            .find(|frame| {
+                frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP)
+            })
+            .expect("peer session did not receive a viewport refresh after outfit change");
+        let refreshed_knight_name_index = refreshed_druid_view
+            .0
+            .windows(knight_name.len())
+            .position(|window| window == knight_name)
+            .unwrap();
+        assert_eq!(
+            refreshed_druid_view.0[refreshed_knight_name_index + knight_name.len() + 2],
+            129
+        );
+
+        drop(knight);
+        drop(druid);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
     }
 
     #[test]
