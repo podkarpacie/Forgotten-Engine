@@ -3756,6 +3756,35 @@ fn handle_native_otclient_game(
                         );
                         continue;
                     }
+                    if equipment
+                        .item(target_slot)
+                        .is_some_and(|destination| destination.server_id == item.server_id)
+                    {
+                        shared_world.move_container_stack_to_equipment(
+                            character.id,
+                            container_id,
+                            item_index,
+                            target_slot,
+                            requested_count,
+                        )?;
+                        let next_equipment = shared_world.player_equipment(character.id)?;
+                        let next_containers = shared_world.player_containers(character.id)?;
+                        database.replace_player_equipment(character.id, &next_equipment)?;
+                        database.replace_player_containers(character.id, &next_containers)?;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "action=throw-item outcome=top-level-container-stack-to-equipment-merge container-id={} item-index={} target-slot={} client-thing-id={} count={}",
+                                container_id,
+                                item_index,
+                                target_slot.code(),
+                                source_client_thing_id,
+                                count
+                            ),
+                        );
+                        continue;
+                    }
                     if equipment.item(target_slot).is_some() {
                         native_diagnostic(
                             config.extended_diagnostics,
@@ -10347,6 +10376,74 @@ mod tests {
                 == &vec![
                     0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0,
                     1, 102, 0, 30,
+                ]
+        }));
+
+        write_frame(
+            &mut client,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                255,
+                255,
+                0x40 | 2,
+                0,
+                0,
+                102,
+                0,
+                0,
+                255,
+                255,
+                EquipmentSlot::RightHand.code(),
+                0,
+                0,
+                30,
+            ]),
+        )
+        .unwrap();
+        for _ in 0..20 {
+            if database
+                .player_containers(1)
+                .unwrap()
+                .container(2)
+                .unwrap()
+                .items
+                .is_empty()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            database
+                .player_equipment(1)
+                .unwrap()
+                .item(EquipmentSlot::RightHand),
+            Some(&ItemInstance::new(4526, 60).unwrap())
+        );
+        assert!(database
+            .player_containers(1)
+            .unwrap()
+            .container(2)
+            .unwrap()
+            .items
+            .is_empty());
+        let full_merge_updates = (0..12)
+            .map(|_| read_frame(&mut client).unwrap().0)
+            .collect::<Vec<_>>();
+        assert!(full_merge_updates.iter().any(|frame| {
+            frame
+                == &vec![
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_SET_INVENTORY,
+                    EquipmentSlot::RightHand.code(),
+                    102,
+                    0,
+                    60,
+                ]
+        }));
+        assert!(full_merge_updates.iter().any(|frame| {
+            frame
+                == &vec![
+                    0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0, 0,
                 ]
         }));
         drop(client);
