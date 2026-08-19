@@ -743,7 +743,7 @@ pub struct NativePlayerHydration {
 #[derive(Debug, Clone)]
 pub struct SharedNativeWorld {
     world: Arc<Mutex<WorldState>>,
-    player_look_types: Arc<Mutex<BTreeMap<u64, u8>>>,
+    player_outfits: Arc<Mutex<BTreeMap<u64, NativeOtClientClassicOutfit>>>,
     visibility_epoch: Arc<AtomicU64>,
     vitals_epoch: Arc<AtomicU64>,
     progression_epoch: Arc<AtomicU64>,
@@ -777,7 +777,7 @@ impl SharedNativeWorld {
         }
         Ok(Self {
             world: Arc::new(Mutex::new(world)),
-            player_look_types: Arc::new(Mutex::new(BTreeMap::new())),
+            player_outfits: Arc::new(Mutex::new(BTreeMap::new())),
             visibility_epoch: Arc::new(AtomicU64::new(0)),
             vitals_epoch: Arc::new(AtomicU64::new(0)),
             progression_epoch: Arc::new(AtomicU64::new(0)),
@@ -1711,8 +1711,8 @@ impl SharedNativeWorld {
         speed: u16,
     ) -> Result<Vec<NativeOtClientVisiblePlayer>, HostError> {
         let player_snapshots = self.lock()?.player_render_snapshots();
-        let player_look_types = self
-            .player_look_types
+        let player_outfits = self
+            .player_outfits
             .lock()
             .map_err(|_| HostError::SharedWorldUnavailable)?;
         player_snapshots
@@ -1723,10 +1723,15 @@ impl SharedNativeWorld {
                     player_id: native_player_id(player.id)?,
                     name: player.name,
                     position: native_position(player.position),
-                    look_type: player_look_types
-                        .get(&player.id)
-                        .copied()
-                        .unwrap_or(look_type),
+                    outfit: player_outfits.get(&player.id).copied().unwrap_or(
+                        NativeOtClientClassicOutfit {
+                            look_type,
+                            head: 0,
+                            body: 0,
+                            legs: 0,
+                            feet: 0,
+                        },
+                    ),
                     speed,
                 })
             })
@@ -1749,8 +1754,8 @@ impl SharedNativeWorld {
                 world.player_render_snapshots(),
             )
         };
-        let player_look_types = self
-            .player_look_types
+        let player_outfits = self
+            .player_outfits
             .lock()
             .map_err(|_| HostError::SharedWorldUnavailable)?;
         let visible_players = player_snapshots
@@ -1761,10 +1766,15 @@ impl SharedNativeWorld {
                     player_id: native_player_id(player.id)?,
                     name: player.name,
                     position: native_position(player.position),
-                    look_type: player_look_types
-                        .get(&player.id)
-                        .copied()
-                        .unwrap_or(look_type),
+                    outfit: player_outfits.get(&player.id).copied().unwrap_or(
+                        NativeOtClientClassicOutfit {
+                            look_type,
+                            head: 0,
+                            body: 0,
+                            legs: 0,
+                            feet: 0,
+                        },
+                    ),
                     speed,
                 })
             })
@@ -1970,19 +1980,23 @@ impl SharedNativeWorld {
 
     pub fn remove_player(&self, id: u64) -> Result<(), HostError> {
         self.lock()?.remove_player(id).map_err(HostError::Core)?;
-        self.player_look_types
+        self.player_outfits
             .lock()
             .map_err(|_| HostError::SharedWorldUnavailable)?
             .remove(&id);
         self.mark_visibility_changed();
         Ok(())
     }
-    pub fn update_player_look_type(&self, player_id: u64, look_type: u8) -> Result<(), HostError> {
+    pub fn update_player_outfit(
+        &self,
+        player_id: u64,
+        outfit: NativeOtClientClassicOutfit,
+    ) -> Result<(), HostError> {
         self.player_and_vitals(player_id)?;
-        self.player_look_types
+        self.player_outfits
             .lock()
             .map_err(|_| HostError::SharedWorldUnavailable)?
-            .insert(player_id, look_type);
+            .insert(player_id, outfit);
         self.mark_visibility_changed();
         Ok(())
     }
@@ -2825,7 +2839,7 @@ fn handle_native_otclient_game(
         empty_world.outfit_last_look_type,
         character.outfit,
     );
-    shared_world.update_player_look_type(character.id, player_outfit.look_type)?;
+    shared_world.update_player_outfit(character.id, player_outfit)?;
     let player_id = native_player_id(character.id)?;
     let (authoritative_player, authoritative_vitals) =
         shared_world.player_and_vitals(character.id)?;
@@ -3827,7 +3841,7 @@ fn handle_native_otclient_game(
                         },
                     )?;
                     player_outfit = requested_outfit;
-                    shared_world.update_player_look_type(character.id, player_outfit.look_type)?;
+                    shared_world.update_player_outfit(character.id, player_outfit)?;
                     observed_visibility_epoch = shared_world.visibility_epoch();
                 }
                 let applied_outfit = encode_native_otclient_creature_outfit(
@@ -8574,11 +8588,28 @@ mod tests {
             .unwrap();
         assert_eq!(shared.visibility_epoch(), 2);
         assert_eq!(
-            shared.visible_players(101, 128, 220).unwrap()[0].look_type,
-            128
+            shared.visible_players(101, 128, 220).unwrap()[0].outfit,
+            NativeOtClientClassicOutfit {
+                look_type: 128,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+            }
         );
 
-        shared.update_player_look_type(102, 129).unwrap();
+        shared
+            .update_player_outfit(
+                102,
+                NativeOtClientClassicOutfit {
+                    look_type: 129,
+                    head: 1,
+                    body: 2,
+                    legs: 3,
+                    feet: 4,
+                },
+            )
+            .unwrap();
 
         assert_eq!(shared.visibility_epoch(), 3);
         let visible = shared.visible_players(101, 128, 220).unwrap();
@@ -8592,7 +8623,16 @@ mod tests {
                 z: 7
             })
         );
-        assert_eq!(visible[0].look_type, 129);
+        assert_eq!(
+            visible[0].outfit,
+            NativeOtClientClassicOutfit {
+                look_type: 129,
+                head: 1,
+                body: 2,
+                legs: 3,
+                feet: 4,
+            }
+        );
         shared.remove_player(102).unwrap();
         shared.remove_player(101).unwrap();
     }
@@ -8673,8 +8713,9 @@ mod tests {
             .position(|window| window == knight_name)
             .unwrap();
         assert_eq!(
-            initial_druid_view.0[initial_knight_name_index + knight_name.len() + 2],
-            128
+            &initial_druid_view.0[initial_knight_name_index + knight_name.len() + 2
+                ..initial_knight_name_index + knight_name.len() + 7],
+            &[128, 0, 0, 0, 0]
         );
 
         write_frame(
@@ -8720,8 +8761,9 @@ mod tests {
             .position(|window| window == knight_name)
             .unwrap();
         assert_eq!(
-            refreshed_druid_view.0[refreshed_knight_name_index + knight_name.len() + 2],
-            129
+            &refreshed_druid_view.0[refreshed_knight_name_index + knight_name.len() + 2
+                ..refreshed_knight_name_index + knight_name.len() + 7],
+            &[129, 1, 2, 3, 4]
         );
 
         drop(knight);
