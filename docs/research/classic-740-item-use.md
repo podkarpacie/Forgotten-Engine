@@ -25,6 +25,12 @@ The same public reference dispatches `0x84` to its battle-window parser. That pa
 
 Any Forgotten Engine support must remain a clean-room, validation-only implementation until an authoritative server-owned creature-target model is explicitly wired to the input path. It must not imply rune, wand, combat, Lua, targeting, charge, message, effect, or client-output behavior.
 
+## Rotate item (`0x85`)
+
+The same public reference dispatches `0x85` to its rotate-item parser. That parser reads one position, one client sprite/item identifier, and one stack position. The resulting payload length after the opcode is **8 bytes**: `5 + 2 + 1`.
+
+Any Forgotten Engine support must remain validation-only until a complete authoritative item-rotation model exists. It must not imply that an item can rotate, mutate, run scripts, persist, or emit a client record.
+
 ## Source
 
 1. [Podkal/Avesta-1, `protocol76.cpp` — public legacy 7.4 reference](https://github.com/Podkal/Avesta-1/blob/master/Avesta%207.4%20(OTServ_SVN%200.6.3)/source%207.4/protocol76.cpp)

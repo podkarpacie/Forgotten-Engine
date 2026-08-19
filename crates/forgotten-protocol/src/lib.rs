@@ -888,6 +888,7 @@ pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM: u8 = 0x82;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM_EX: u8 = 0x83;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM_ON_CREATURE: u8 = 0x84;
+pub const NATIVE_OTCLIENT_CLIENT_ROTATE_ITEM: u8 = 0x85;
 pub const NATIVE_OTCLIENT_CLIENT_CLOSE_CONTAINER: u8 = 0x87;
 pub const NATIVE_OTCLIENT_CLIENT_UPDATE_CONTAINER: u8 = 0xca;
 pub const NATIVE_OTCLIENT_CLIENT_LOOK_MAP: u8 = 0x8c;
@@ -1225,6 +1226,11 @@ pub enum NativeOtClientGameAction {
         source_client_thing_id: u16,
         source_stack_position: u8,
         target_creature_id: u32,
+    },
+    RotateItem {
+        position: NativeOtClientPosition,
+        client_thing_id: u16,
+        stack_position: u8,
     },
     LookMap {
         position: NativeOtClientPosition,
@@ -2013,6 +2019,20 @@ pub fn decode_native_otclient_game_action(
                 target_creature_id: reader.u32()?,
             }
         }
+        NATIVE_OTCLIENT_CLIENT_ROTATE_ITEM => {
+            if reader.remaining() != 8 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            NativeOtClientGameAction::RotateItem {
+                position: NativeOtClientPosition {
+                    x: reader.u16()?,
+                    y: reader.u16()?,
+                    z: reader.byte()?,
+                },
+                client_thing_id: reader.u16()?,
+                stack_position: reader.byte()?,
+            }
+        }
         NATIVE_OTCLIENT_CLIENT_LOOK_MAP => {
             if reader.remaining() != 8 {
                 return Err(ProtocolError::InvalidNativeGameRequest);
@@ -2112,7 +2132,7 @@ fn is_native_otclient_compatibility_interaction(opcode: u8) -> bool {
     matches!(
         opcode,
         0x77 | 0x78
-            | 0x85..=0x8b
+            | 0x86..=0x8b
             | 0x97..=0x9f
             | 0xa3..=0xad
             | 0xbe
@@ -3617,6 +3637,37 @@ mod tests {
         );
         assert!(decode_native_otclient_game_action(
             &Frame(vec![NATIVE_OTCLIENT_CLIENT_USE_ITEM_ON_CREATURE, 0]),
+            &profile,
+        )
+        .is_err());
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![
+                    NATIVE_OTCLIENT_CLIENT_ROTATE_ITEM,
+                    100,
+                    0,
+                    101,
+                    0,
+                    7,
+                    102,
+                    0,
+                    3,
+                ]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::RotateItem {
+                position: NativeOtClientPosition {
+                    x: 100,
+                    y: 101,
+                    z: 7,
+                },
+                client_thing_id: 102,
+                stack_position: 3,
+            }
+        );
+        assert!(decode_native_otclient_game_action(
+            &Frame(vec![NATIVE_OTCLIENT_CLIENT_ROTATE_ITEM, 0]),
             &profile,
         )
         .is_err());

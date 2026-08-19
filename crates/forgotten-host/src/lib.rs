@@ -584,6 +584,14 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
             source_stack_position,
             target_creature_id,
         ),
+        NativeOtClientGameAction::RotateItem {
+            position,
+            client_thing_id,
+            stack_position,
+        } => format!(
+            "action=rotate-item position={},{},{} client-thing-id={} stack-position={}",
+            position.x, position.y, position.z, client_thing_id, stack_position
+        ),
         NativeOtClientGameAction::LookMap {
             position,
             thing_id,
@@ -3620,6 +3628,50 @@ fn handle_native_otclient_game(
                         config.extended_diagnostics,
                         peer,
                         "action=use-item-on-creature outcome=deferred-invalid-server-owned-item-or-creature",
+                    ),
+                    Err(error) => return Err(error),
+                }
+            }
+            NativeOtClientGameAction::RotateItem {
+                position,
+                client_thing_id,
+                stack_position,
+            } => {
+                let Some(world_map) = config.world_map.as_deref() else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=rotate-item outcome=deferred-no-world-map",
+                    );
+                    continue;
+                };
+                let Some(intent) = native_map_item_use_intent(
+                    config.item_presentation_catalog.as_deref(),
+                    character.id,
+                    position,
+                    client_thing_id,
+                    stack_position,
+                ) else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=rotate-item outcome=deferred-unmapped-or-ambiguous-client-thing-id",
+                    );
+                    continue;
+                };
+                match shared_world.validate_player_item_use(world_map, intent) {
+                    Ok(outcome) => native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        &format!(
+                            "action=rotate-item outcome=validated server-id={} count={}",
+                            outcome.server_id, outcome.count
+                        ),
+                    ),
+                    Err(HostError::Core(_)) => native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=rotate-item outcome=deferred-invalid-server-owned-map-item",
                     ),
                     Err(error) => return Err(error),
                 }
@@ -10467,5 +10519,20 @@ mod native_diagnostics_tests {
             "action=use-item-on-creature source=100,101,7 source-client-thing-id=102 source-stack-position=3 target-creature-id=1073741825"
         );
         assert!(!battle_window_summary.contains("["));
+        let rotate_summary =
+            native_action_diagnostic_summary(&NativeOtClientGameAction::RotateItem {
+                position: forgotten_protocol::NativeOtClientPosition {
+                    x: 100,
+                    y: 101,
+                    z: 7,
+                },
+                client_thing_id: 102,
+                stack_position: 3,
+            });
+        assert_eq!(
+            rotate_summary,
+            "action=rotate-item position=100,101,7 client-thing-id=102 stack-position=3"
+        );
+        assert!(!rotate_summary.contains("["));
     }
 }
