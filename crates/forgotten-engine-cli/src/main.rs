@@ -606,6 +606,14 @@ fn run_host(
             })
             .transpose()?
             .map(Arc::new);
+        let vocation_level_up_gains = vocation_registry.as_ref().map(|registry| {
+            Arc::new(
+                registry
+                    .iter()
+                    .map(|(id, definition)| (*id, definition.level_up_gains()))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+        });
         let experience_award_policy = Arc::new(config.experience_award_policy()?);
         let death_loss_policy = DeathLossPolicy::from_config(config.death_loss_percent)?;
         let declarative_weapon_catalog = declarative_weapon_catalog.map(Arc::new);
@@ -650,6 +658,7 @@ fn run_host(
             },
             regeneration_rules,
             progression_rules,
+            vocation_level_up_gains,
             skill_rate: config.skill_rate,
             experience_award_policy: Some(experience_award_policy),
             death_loss_policy,

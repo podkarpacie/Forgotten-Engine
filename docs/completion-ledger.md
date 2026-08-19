@@ -29,6 +29,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 
 - [x] Apply `rateExp` plus bounded XML-stage fallback ranges to authoritative experience awards, and accept a direct validated legacy `config.lua` `experienceStages` literal table that replaces `rateExp` under the documented TFS precedence without executing Lua.
 - [x] Apply matching bounded `vocations.xml` `gainhp`, `gainmana`, and `gaincap` values to the stable CLI's atomic authoritative experience-level-up persistence transaction; native HUD delivery and full advancement parity remain deferred.
+- [x] Route configured vocation `gainhp`, `gainmana`, and `gaincap` values through the bounded native selected-static-defeat experience source. On a positive level increase, atomically persist level, experience, current/max health, current/max mana, and capacity; missing metadata or no gained level keeps vitals unchanged.
 - [x] Retain bounded nested TFS-style vocation formula defense and armor multipliers as fixed-point metadata without changing live mitigation behavior or claiming formula compatibility.
 - [x] Retain bounded TFS-style vocation attack-speed and base-speed metadata with verified defaults, without changing live movement or combat timing behavior.
 - [x] Award configured vocation-based fist tries from supported fixed melee events.
@@ -78,7 +79,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Add bounded deterministic static target selection that records the nearest living same-floor player under an explicit capped range, with stable tie-breaking and lifecycle cleanup; pursuit, combat, and client delivery remain deferred.
 - [x] Add a caller-triggered single deterministic cardinal target step that delegates map and occupancy validation to the authoritative movement boundary; pursuit loops, routing, AI, combat automation, and client delivery remain deferred.
 - [x] Route a real caller-triggered target step through the shared native-world visibility epoch and established full-map refresh; autonomous scheduling and real-client evidence remain deferred.
-- [x] Route a native player’s existing bounded selected-static melee transition through an immediate parser-shaped 740 creature-health record and persisted static runtime snapshot; a real defeat alone awards validated monster raw experience through the existing rate-and-stage policy and persists player level/experience. Vocation vital gains, loot, corpses, formulas, scripts, AI, and real-client confirmation remain deferred.
+- [x] Route a native player’s existing bounded selected-static melee transition through an immediate parser-shaped 740 creature-health record and persisted static runtime snapshot; a real defeat alone awards validated monster raw experience through the existing rate-and-stage policy. A positive level increase applies configured vocation gains and atomically persists level, experience, and vitals. Loot, corpses, formulas, scripts, AI, and real-client confirmation remain deferred.
 - [x] Add an explicit opt-in shared-heartbeat nearest-player target acquisition policy with capped range, deterministic ordering, and inert default heartbeat behavior; movement, combat, packets, and client target delivery remain deferred.
 - [x] Add an explicit one-step static pursuit policy that selects a bounded nearest target then reuses authoritative map/occupancy movement once per active static creature; default scheduling, routing, combat, and client delivery remain deferred.
 - [ ] Add deterministic monster/NPC state, spawn timing, movement, target selection, pathfinding boundaries, and combat participation.
@@ -96,7 +97,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 
 ### Milestone E — Complete profile-driven protocol and client compatibility: target 87%
 
-- [ ] Finish profile-driven native protocol coverage for the declared FE 7.4 surface and resolve every release-blocking real-client parser or state mismatch with captured-safe evidence. The local 740 stats-refresh path now rehydrates a vocation-level-up from authoritative level, experience, and vitals, but still needs a native gameplay source and real-client confirmation.
+- [ ] Finish profile-driven native protocol coverage for the declared FE 7.4 surface and resolve every release-blocking real-client parser or state mismatch with captured-safe evidence. The local 740 stats-refresh path rehydrates a bounded native static-defeat vocation-level-up from authoritative level, experience, and vitals, but still needs real-client confirmation and broader gameplay sources.
 - [ ] Implement and validate FE 8.0 profile runtime and protocol behavior without hardcoding release-specific assumptions.
 - [ ] Implement and validate FE 1.2 / Tibia 10.98 profile runtime and protocol behavior without hardcoding release-specific assumptions.
 - [ ] Add repeatable lawful unmodified OTCv8 tests for login, movement, state, chat, combat, inventory, interactions, lifecycle, and world simulation in every supported profile.
@@ -125,4 +126,4 @@ A ledger item can be marked complete only when all applicable conditions are met
 
 ## Current next slice
 
-The next implementation slice is **native 740 level-up HUD delivery**, followed by **inventory synchronization**. The new core/persistence transaction must first be rendered through a profile-verified player-stats refresh without reintroducing the reported client parser error. Inventory work will then expose already authoritative equipment safely before broader transfer rules. Neither slice claims full formula, spell, PvP, or TFS parity.
+The next implementation slice is **vocation-aware regeneration live wiring**, followed by **native 740 player-HUD initialization correctness**. The static-defeat transaction now has bounded authoritative persistence and reuses the existing progression refresh path, but it still lacks lawful real-client evidence. Neither slice claims full formula, spell, PvP, or TFS parity.

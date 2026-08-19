@@ -585,6 +585,8 @@ pub struct NativeOtClientHostConfig {
     /// inputs for explicit authoritative awards; weapons, spells, training, and Lua are not yet
     /// event sources.
     pub progression_rules: Option<Arc<BTreeMap<VocationId, PlayerProgressionRules>>>,
+    /// Validated legacy vocation health, mana, and capacity gains for explicit level-up sources.
+    pub vocation_level_up_gains: Option<Arc<BTreeMap<VocationId, VocationLevelUpGains>>>,
     /// Validated TFS-style global skill rate used only by the existing fixed selected-player
     /// melee fist-try award. Other combat, weapon, spell, training, and Lua sources remain
     /// separate and deferred.
@@ -3036,6 +3038,7 @@ fn handle_native_otclient_game(
                                 character.id,
                                 outcome.target_id,
                                 config.experience_award_policy.as_deref(),
+                                config.vocation_level_up_gains.as_deref(),
                             )?;
                         }
                         let health_update = encode_native_otclient_creature_health(
@@ -4499,6 +4502,7 @@ fn apply_and_persist_native_static_defeat_experience(
     player_id: u64,
     creature_id: u32,
     policy: Option<&ExperienceAwardPolicy>,
+    vocation_level_up_gains: Option<&BTreeMap<VocationId, VocationLevelUpGains>>,
 ) -> Result<Option<forgotten_core::PlayerExperienceAwardOutcome>, HostError> {
     let Some(policy) = policy else {
         return Ok(None);
@@ -4507,12 +4511,37 @@ fn apply_and_persist_native_static_defeat_experience(
     if raw_experience == 0 {
         return Ok(None);
     }
-    let outcome = shared_world.award_player_experience(player_id, raw_experience, policy)?;
+    let vocation = shared_world.player_progression(player_id)?.vocation;
+    let gains = vocation_level_up_gains
+        .and_then(|entries| entries.get(&vocation).copied())
+        .unwrap_or_default();
+    let outcome = shared_world.award_player_experience_with_vocation_gains(
+        player_id,
+        raw_experience,
+        policy,
+        gains,
+    )?;
     if outcome.awarded_experience == 0 {
         return Ok(None);
     }
-    let (player, _) = shared_world.player_and_vitals(player_id)?;
-    database.update_player_experience(player_id, player.level, player.experience)?;
+    let (player, vitals) = shared_world.player_and_vitals(player_id)?;
+    if outcome.gained_levels > 0 {
+        database.update_player_experience_and_vitals(
+            player_id,
+            player.level,
+            player.experience,
+            PersistedPlayerVitals {
+                health: vitals.health,
+                max_health: vitals.max_health,
+                mana: vitals.mana,
+                max_mana: vitals.max_mana,
+                capacity: vitals.capacity,
+                magic_level: vitals.magic_level,
+            },
+        )?;
+    } else {
+        database.update_player_experience(player_id, player.level, player.experience)?;
+    }
     Ok(Some(outcome))
 }
 
@@ -5073,6 +5102,7 @@ mod tests {
             static_target_attack_policy: StaticTargetAttackPolicy::Disabled,
             regeneration_rules: None,
             progression_rules: None,
+            vocation_level_up_gains: None,
             skill_rate: 1,
             experience_award_policy: None,
             death_loss_policy: DeathLossPolicy::DefaultFormula,
@@ -6976,7 +7006,7 @@ mod tests {
                     direction: 2,
                 }],
                 BTreeMap::new(),
-                BTreeMap::from([(creature_id, 20)]),
+                BTreeMap::from([(creature_id, 7_000)]),
             )
             .unwrap();
         let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
@@ -7073,13 +7103,22 @@ mod tests {
             &shared,
             101,
             creature_id,
-            Some(&ExperienceAwardPolicy::new(2, Vec::new()).unwrap()),
+            Some(&ExperienceAwardPolicy::new(1, Vec::new()).unwrap()),
+            Some(&BTreeMap::from([(
+                VocationId::new(0),
+                VocationLevelUpGains::new(15, 5, 25),
+            )])),
         )
         .unwrap()
         .unwrap();
-        assert_eq!(award.raw_experience, 20);
-        assert_eq!(award.awarded_experience, 40);
-        assert_eq!(database.player_by_id(101).unwrap().experience, 40);
+        assert_eq!(award.raw_experience, 7_000);
+        assert_eq!(award.awarded_experience, 7_000);
+        assert!(award.gained_levels > 0);
+        let persisted = database.player_by_id(101).unwrap();
+        assert_eq!(persisted.experience, 7_000);
+        assert!(persisted.vitals.health > PlayerVitals::default().health);
+        assert!(persisted.vitals.mana > PlayerVitals::default().mana);
+        assert!(persisted.vitals.capacity > PlayerVitals::default().capacity);
         assert_eq!(shared.visibility_epoch(), 3);
         assert!(shared.active_static_spawns().unwrap().entities.is_empty());
         persist_static_creature_runtime_to_open_database(&shared, &mut database).unwrap();
