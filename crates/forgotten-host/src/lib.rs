@@ -4519,22 +4519,34 @@ fn activate_native_map_teleport_item(
     facing: NativeOtClientCardinalDirection,
     destination: Position,
 ) -> Result<bool, HostError> {
-    let teleported = {
+    const NATIVE_OTCLIENT_MAX_TELEPORT_HOPS: usize = 8;
+    let final_destination = {
         let mut world = shared_world.lock()?;
-        if !world_map.is_walkable(destination)
-            || world.is_static_creature_occupied(destination)
-            || world.is_player_occupied(destination)
-        {
-            None
-        } else {
-            Some(
-                world
-                    .teleport_player(character_id, destination)
-                    .map_err(HostError::Core)?,
-            )
+        let mut current_destination = destination;
+        let mut visited_destinations = BTreeSet::new();
+        let mut final_destination = None;
+        for _ in 0..NATIVE_OTCLIENT_MAX_TELEPORT_HOPS {
+            if !visited_destinations.insert(current_destination)
+                || !world_map.is_walkable(current_destination)
+                || world.is_static_creature_occupied(current_destination)
+                || world.is_player_occupied(current_destination)
+            {
+                break;
+            }
+            let (_, reached_destination) = world
+                .teleport_player(character_id, current_destination)
+                .map_err(HostError::Core)?;
+            final_destination = Some(reached_destination);
+            let Some(next_destination) =
+                native_stepped_on_map_teleport_destination(world_map, reached_destination)
+            else {
+                break;
+            };
+            current_destination = next_destination;
         }
+        final_destination
     };
-    let Some((_, destination)) = teleported else {
+    let Some(destination) = final_destination else {
         return Ok(false);
     };
 
@@ -9278,6 +9290,60 @@ mod tests {
                 }],
             )
             .unwrap();
+        Arc::get_mut(native_config.world_map.as_mut().unwrap())
+            .unwrap()
+            .set_tile_items(
+                Position {
+                    x: 106,
+                    y: 105,
+                    z: 7,
+                },
+                vec![forgotten_core::WorldMapItem {
+                    server_id: 1988,
+                    client_thing_id: Some(1988),
+                    count: 1,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: Some(Position {
+                        x: 105,
+                        y: 105,
+                        z: 7,
+                    }),
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
+        Arc::get_mut(native_config.world_map.as_mut().unwrap())
+            .unwrap()
+            .set_tile_items(
+                Position {
+                    x: 105,
+                    y: 105,
+                    z: 7,
+                },
+                vec![forgotten_core::WorldMapItem {
+                    server_id: 1988,
+                    client_thing_id: Some(1988),
+                    count: 1,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: Some(Position {
+                        x: 104,
+                        y: 104,
+                        z: 7,
+                    }),
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
         let game = start_native_otclient_game(native_config, &database_path).unwrap();
 
         let mut stream = TcpStream::connect(game.local_addr()).unwrap();
@@ -9999,6 +10065,26 @@ mod tests {
             Position {
                 x: 106,
                 y: 106,
+                z: 7,
+            }
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_NORTH]),
+        )
+        .unwrap();
+        let chain_teleport_viewport = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            chain_teleport_viewport.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert_eq!(&chain_teleport_viewport.0[1..6], &[104, 0, 104, 0, 7]);
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].position,
+            Position {
+                x: 104,
+                y: 104,
                 z: 7,
             }
         );
