@@ -4411,9 +4411,27 @@ fn move_native_map_player(
         )?;
         return Ok(false);
     };
+    *facing = direction;
+    if let Some(teleport_destination) =
+        native_stepped_on_map_teleport_destination(world_map, destination)
+    {
+        if activate_native_map_teleport_item(
+            stream,
+            profile,
+            snapshot,
+            database,
+            shared_world,
+            character_id,
+            world_map,
+            player_position,
+            *facing,
+            teleport_destination,
+        )? {
+            return Ok(false);
+        }
+    }
     shared_world.mark_visibility_changed();
     database.update_player_position(character_id, destination)?;
-    *facing = direction;
     write_frame(
         stream,
         &encode_native_otclient_move_creature_at(
@@ -4446,6 +4464,18 @@ fn move_native_map_player(
     )?;
     *player_position = destination;
     Ok(true)
+}
+
+fn native_stepped_on_map_teleport_destination(
+    world_map: &WorldMap,
+    position: Position,
+) -> Option<Position> {
+    let mut destinations = world_map
+        .tile_items(position)?
+        .iter()
+        .filter_map(|item| item.teleport_destination);
+    let destination = destinations.next()?;
+    destinations.next().is_none().then_some(destination)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9125,7 +9155,7 @@ mod tests {
             .unwrap()
             .set_tile_items(
                 Position {
-                    x: 101,
+                    x: 102,
                     y: 100,
                     z: 7,
                 },
@@ -9140,6 +9170,33 @@ mod tests {
                     teleport_destination: Some(Position {
                         x: 110,
                         y: 110,
+                        z: 7,
+                    }),
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
+        Arc::get_mut(native_config.world_map.as_mut().unwrap())
+            .unwrap()
+            .set_tile_items(
+                Position {
+                    x: 110,
+                    y: 111,
+                    z: 7,
+                },
+                vec![forgotten_core::WorldMapItem {
+                    server_id: 1988,
+                    client_thing_id: Some(1988),
+                    count: 1,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: Some(Position {
+                        x: 108,
+                        y: 108,
                         z: 7,
                     }),
                     duration: None,
@@ -9784,7 +9841,7 @@ mod tests {
             &mut stream,
             &Frame(vec![
                 forgotten_protocol::NATIVE_OTCLIENT_CLIENT_USE_ITEM,
-                101,
+                102,
                 0,
                 100,
                 0,
@@ -9807,6 +9864,26 @@ mod tests {
             Position {
                 x: 110,
                 y: 110,
+                z: 7,
+            }
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_SOUTH]),
+        )
+        .unwrap();
+        let stepped_teleport_viewport = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            stepped_teleport_viewport.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert_eq!(&stepped_teleport_viewport.0[1..6], &[108, 0, 108, 0, 7]);
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].position,
+            Position {
+                x: 108,
+                y: 108,
                 z: 7,
             }
         );
