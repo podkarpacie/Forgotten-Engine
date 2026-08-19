@@ -857,6 +857,7 @@ pub const NATIVE_OTCLIENT_GAME_PING: u8 = 0x1e;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATS: u8 = 0xa0;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_SKILLS: u8 = 0xa1;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATE: u8 = 0xa2;
+pub const NATIVE_OTCLIENT_GAME_CLEAR_TARGET: u8 = 0xa3;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_MODES: u8 = 0xa7;
 pub const NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER: u8 = 0x6f;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_HEALTH: u8 = 0x8c;
@@ -2248,6 +2249,17 @@ pub fn encode_native_otclient_game_ping(
         return Err(ProtocolError::UnsupportedNativeClientProfile);
     }
     Ok(Frame(vec![NATIVE_OTCLIENT_GAME_PING]))
+}
+
+/// Encodes the classic zero-payload `ClearTarget` (`0xA3`) record for the supported native 740
+/// profile. Later profiles may append an attack-sequence field and are intentionally excluded.
+pub fn encode_native_otclient_clear_target(
+    profile: &NativeOtClientProfile,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    Ok(Frame(vec![NATIVE_OTCLIENT_GAME_CLEAR_TARGET]))
 }
 
 /// Encodes the classic three-byte `PlayerModes` (`0xA7`) record for the supported native 740
@@ -4092,6 +4104,10 @@ mod tests {
         assert_eq!(
             encode_native_otclient_game_ping(&profile).unwrap().0,
             vec![NATIVE_OTCLIENT_GAME_PING]
+        );
+        assert_eq!(
+            encode_native_otclient_clear_target(&profile).unwrap().0,
+            vec![NATIVE_OTCLIENT_GAME_CLEAR_TARGET]
         );
         assert_eq!(
             encode_native_otclient_game_death(&profile).unwrap().0,

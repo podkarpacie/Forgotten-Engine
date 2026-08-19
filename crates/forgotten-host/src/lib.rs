@@ -36,10 +36,11 @@ use forgotten_protocol::{
     encode_fe_otclient_world_tick, encode_legacy_74_character_list,
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
-    encode_native_otclient_choose_outfit, encode_native_otclient_close_container,
-    encode_native_otclient_creature_health, encode_native_otclient_creature_outfit,
-    encode_native_otclient_delete_inventory, encode_native_otclient_empty_quest_log,
-    encode_native_otclient_game_cancel_walk_facing, encode_native_otclient_game_death,
+    encode_native_otclient_choose_outfit, encode_native_otclient_clear_target,
+    encode_native_otclient_close_container, encode_native_otclient_creature_health,
+    encode_native_otclient_creature_outfit, encode_native_otclient_delete_inventory,
+    encode_native_otclient_empty_quest_log, encode_native_otclient_game_cancel_walk_facing,
+    encode_native_otclient_game_death,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
@@ -4323,13 +4324,25 @@ fn handle_native_otclient_game(
                 }
             }
             NativeOtClientGameAction::SelectTarget(native_selected_id) => {
-                apply_native_player_interaction(
+                let outcome = apply_native_player_interaction(
                     shared_world,
                     character.id,
                     native_selected_id,
                     NativePlayerInteractionKind::Target,
                     config.extended_diagnostics,
                 )?;
+                if native_selected_id != 0
+                    && matches!(outcome, NativePlayerInteractionOutcome::Rejected)
+                {
+                    let clear_target = encode_native_otclient_clear_target(&config.client_profile)
+                        .map_err(HostError::Protocol)?;
+                    write_frame(stream, &clear_target)?;
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "outbound=clear-target opcode=0xa3 fields=none reason=rejected-target",
+                    );
+                }
             }
             NativeOtClientGameAction::SelectFollow(native_selected_id) => {
                 apply_native_player_interaction(
@@ -5147,6 +5160,12 @@ enum NativePlayerInteractionKind {
     Follow,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativePlayerInteractionOutcome {
+    Applied,
+    Rejected,
+}
+
 /// A single server-owned native click-walk task. Client paths may replace its queued directions,
 /// but never its next-step deadline. This mirrors the classic one-active-event behavior without
 /// importing implementation code from another server.
@@ -5229,7 +5248,7 @@ fn apply_native_player_interaction(
     native_selected_id: u32,
     kind: NativePlayerInteractionKind,
     extended_diagnostics: bool,
-) -> Result<(), HostError> {
+) -> Result<NativePlayerInteractionOutcome, HostError> {
     if native_selected_id == 0 {
         let result = match kind {
             NativePlayerInteractionKind::Target => {
@@ -5239,7 +5258,7 @@ fn apply_native_player_interaction(
                 shared_world.set_player_follow(source_player_id, None)
             }
         };
-        return result.map(|_| ());
+        return result.map(|_| NativePlayerInteractionOutcome::Applied);
     }
     if let Some(selected_player_id) = native_player_id_to_character_id(native_selected_id) {
         let result = match kind {
@@ -5251,7 +5270,7 @@ fn apply_native_player_interaction(
             }
         };
         return match result {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(NativePlayerInteractionOutcome::Applied),
             Err(HostError::Core(forgotten_core::CoreError::UnknownPlayer(_)))
             | Err(HostError::Core(forgotten_core::CoreError::SelfInteractionNotAllowed(_))) => {
                 if extended_diagnostics {
@@ -5260,7 +5279,7 @@ fn apply_native_player_interaction(
                         kind
                     );
                 }
-                Ok(())
+                Ok(NativePlayerInteractionOutcome::Rejected)
             }
             Err(error) => Err(error),
         };
@@ -5269,7 +5288,7 @@ fn apply_native_player_interaction(
         return match shared_world
             .set_player_static_target(source_player_id, Some(native_selected_id))
         {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(NativePlayerInteractionOutcome::Applied),
             Err(HostError::Core(
                 forgotten_core::CoreError::UnknownStaticCreature(_)
                 | forgotten_core::CoreError::InactiveStaticCreature(_),
@@ -5279,7 +5298,7 @@ fn apply_native_player_interaction(
                         "> Native OTCv8 static target selection ignored native-id={native_selected_id}"
                     );
                 }
-                Ok(())
+                Ok(NativePlayerInteractionOutcome::Rejected)
             }
             Err(error) => Err(error),
         };
@@ -5291,7 +5310,7 @@ fn apply_native_player_interaction(
                 kind
             );
         }
-        Ok(())
+        Ok(NativePlayerInteractionOutcome::Rejected)
     }
 }
 
@@ -9962,6 +9981,70 @@ mod tests {
     }
 
     #[test]
+    fn native_rejected_target_selection_emits_classic_clear_target_record() {
+        let database_path = database_path("native-rejected-target-selection");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_SELECT_TARGET,
+                1,
+                0,
+                0,
+                0,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CLEAR_TARGET]
+        );
+        drop(stream);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn native_render_snapshot_detaches_packet_preparation_from_world_mutation() {
         let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
         let map = native_world_map();
@@ -11524,6 +11607,10 @@ mod tests {
         )
         .unwrap();
         write_frame(&mut stream, &Frame(vec![0xa1, 1, 0, 0, 0])).unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CLEAR_TARGET]
+        );
         write_frame(&mut stream, &Frame(vec![0x69])).unwrap();
         let cancelled = read_frame(&mut stream).unwrap();
         assert_eq!(
