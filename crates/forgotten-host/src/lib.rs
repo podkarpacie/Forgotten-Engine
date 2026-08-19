@@ -8852,6 +8852,27 @@ mod tests {
             NativeOtClientCardinalDirection::East.protocol_direction()
         );
 
+        write_frame(
+            &mut knight,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_WEST]),
+        )
+        .unwrap();
+        let peer_move_refresh = (0..3)
+            .map(|_| read_frame(&mut druid).unwrap())
+            .find(|frame| {
+                frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP)
+            })
+            .expect("peer session did not receive a viewport refresh after cardinal movement");
+        let moved_knight_name_index = peer_move_refresh
+            .0
+            .windows(knight_name.len())
+            .position(|window| window == knight_name)
+            .unwrap();
+        assert_eq!(
+            peer_move_refresh.0[moved_knight_name_index + knight_name.len() + 1],
+            NativeOtClientCardinalDirection::West.protocol_direction()
+        );
+
         drop(knight);
         drop(druid);
         game.shutdown().unwrap();
