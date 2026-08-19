@@ -1391,6 +1391,12 @@ impl SharedNativeWorld {
         Ok(changed)
     }
 
+    pub fn static_creature_experience_reward(&self, creature_id: u32) -> Result<u64, HostError> {
+        self.lock()?
+            .static_creature_experience_reward(creature_id)
+            .map_err(HostError::Core)
+    }
+
     pub fn static_creature_runtime_snapshot(
         &self,
     ) -> Result<Vec<StaticCreatureRuntimeSnapshot>, HostError> {
@@ -3023,6 +3029,15 @@ fn handle_native_otclient_game(
                             shared_world,
                             &mut database,
                         )?;
+                        if outcome.deactivated {
+                            apply_and_persist_native_static_defeat_experience(
+                                &mut database,
+                                shared_world,
+                                character.id,
+                                outcome.target_id,
+                                config.experience_award_policy.as_deref(),
+                            )?;
+                        }
                         let health_update = encode_native_otclient_creature_health(
                             &config.client_profile,
                             outcome.target_id,
@@ -4474,6 +4489,31 @@ fn apply_native_selected_static_creature_melee(
         )) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Applies an immutable raw monster reward only after the caller has confirmed an authoritative
+/// selected-static defeat. Vocation-specific vital gains remain a separate data-wiring slice.
+fn apply_and_persist_native_static_defeat_experience(
+    database: &mut EngineDatabase,
+    shared_world: &SharedNativeWorld,
+    player_id: u64,
+    creature_id: u32,
+    policy: Option<&ExperienceAwardPolicy>,
+) -> Result<Option<forgotten_core::PlayerExperienceAwardOutcome>, HostError> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    let raw_experience = shared_world.static_creature_experience_reward(creature_id)?;
+    if raw_experience == 0 {
+        return Ok(None);
+    }
+    let outcome = shared_world.award_player_experience(player_id, raw_experience, policy)?;
+    if outcome.awarded_experience == 0 {
+        return Ok(None);
+    }
+    let (player, _) = shared_world.player_and_vitals(player_id)?;
+    database.update_player_experience(player_id, player.level, player.experience)?;
+    Ok(Some(outcome))
 }
 
 fn native_player_id_to_character_id(native_id: u32) -> Option<u64> {
@@ -6916,24 +6956,28 @@ mod tests {
     fn selected_static_melee_refreshes_visibility_and_removes_a_defeated_static_target() {
         let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
         let static_spawns =
-            FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
-                id: creature_id,
-                name: "Rat".into(),
-                position: Position {
-                    x: 101,
-                    y: 100,
-                    z: 7,
-                },
-                look_type: 21,
-                head: 0,
-                body: 0,
-                legs: 0,
-                feet: 0,
-                addons: 0,
-                speed: 134,
-                health_percent: 15,
-                direction: 2,
-            }])
+            FeTfsStaticSpawnCollection::with_respawn_intervals_and_experience_rewards(
+                vec![forgotten_core::FeTfsStaticEntity {
+                    id: creature_id,
+                    name: "Rat".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    look_type: 21,
+                    head: 0,
+                    body: 0,
+                    legs: 0,
+                    feet: 0,
+                    addons: 0,
+                    speed: 134,
+                    health_percent: 15,
+                    direction: 2,
+                }],
+                BTreeMap::new(),
+                BTreeMap::from([(creature_id, 20)]),
+            )
             .unwrap();
         let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
         let map = native_world_map();
@@ -6981,6 +7025,18 @@ mod tests {
         );
         let path = database_path("selected-static-melee-runtime");
         let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("operator", "hash").unwrap();
+        database
+            .save_player(&Player {
+                id: 101,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: map.spawn(),
+                level: 8,
+                experience: 0,
+                skill_points: 0,
+            })
+            .unwrap();
         persist_static_creature_runtime_to_open_database(&shared, &mut database).unwrap();
         assert_eq!(
             database.static_creature_runtime().unwrap(),
@@ -7012,6 +7068,18 @@ mod tests {
             .unwrap();
         assert_eq!(final_hit.applied_damage, 5);
         assert!(final_hit.deactivated);
+        let award = apply_and_persist_native_static_defeat_experience(
+            &mut database,
+            &shared,
+            101,
+            creature_id,
+            Some(&ExperienceAwardPolicy::new(2, Vec::new()).unwrap()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(award.raw_experience, 20);
+        assert_eq!(award.awarded_experience, 40);
+        assert_eq!(database.player_by_id(101).unwrap().experience, 40);
         assert_eq!(shared.visibility_epoch(), 3);
         assert!(shared.active_static_spawns().unwrap().entities.is_empty());
         persist_static_creature_runtime_to_open_database(&shared, &mut database).unwrap();

@@ -118,6 +118,7 @@ pub struct FeTfsStaticEntity {
 pub struct FeTfsStaticSpawnCollection {
     pub entities: Vec<FeTfsStaticEntity>,
     respawn_intervals_seconds: BTreeMap<u32, u32>,
+    experience_rewards: BTreeMap<u32, u64>,
 }
 
 impl FeTfsStaticSpawnCollection {
@@ -128,6 +129,20 @@ impl FeTfsStaticSpawnCollection {
     pub fn with_respawn_intervals(
         entities: Vec<FeTfsStaticEntity>,
         respawn_intervals_seconds: BTreeMap<u32, u32>,
+    ) -> Result<Self, CoreError> {
+        Self::with_respawn_intervals_and_experience_rewards(
+            entities,
+            respawn_intervals_seconds,
+            BTreeMap::new(),
+        )
+    }
+
+    /// Retains immutable raw reward metadata for known static spawn IDs. Reward application is
+    /// intentionally separate from installation and remains an explicit world transition.
+    pub fn with_respawn_intervals_and_experience_rewards(
+        entities: Vec<FeTfsStaticEntity>,
+        respawn_intervals_seconds: BTreeMap<u32, u32>,
+        experience_rewards: BTreeMap<u32, u64>,
     ) -> Result<Self, CoreError> {
         if entities.len() > MAX_TFS_STATIC_SPAWNS {
             return Err(CoreError::StaticSpawnLimit(MAX_TFS_STATIC_SPAWNS));
@@ -149,9 +164,13 @@ impl FeTfsStaticSpawnCollection {
         if respawn_intervals_seconds.keys().any(|id| !ids.contains(id)) {
             return Err(CoreError::UnknownStaticCreatureSchedule);
         }
+        if experience_rewards.keys().any(|id| !ids.contains(id)) {
+            return Err(CoreError::UnknownStaticCreatureSchedule);
+        }
         Ok(Self {
             entities,
             respawn_intervals_seconds,
+            experience_rewards,
         })
     }
 
@@ -160,6 +179,13 @@ impl FeTfsStaticSpawnCollection {
             .get(&id)
             .copied()
             .unwrap_or(0)
+    }
+
+    pub fn experience_reward(&self, id: u32) -> u64 {
+        self.experience_rewards
+            .get(&id)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub fn at(&self, position: Position) -> impl Iterator<Item = &FeTfsStaticEntity> {
@@ -278,6 +304,7 @@ pub struct StaticCreatureDecisionBatch {
 #[derive(Debug, Clone)]
 struct StaticCreatureRuntime {
     entity: FeTfsStaticEntity,
+    experience_reward: u64,
     spawn_position: Position,
     active: bool,
     health_percent: u8,
@@ -2243,6 +2270,7 @@ impl WorldState {
                     entity.id,
                     StaticCreatureRuntime {
                         entity: entity.clone(),
+                        experience_reward: collection.experience_reward(entity.id),
                         spawn_position: entity.position,
                         active: true,
                         health_percent: entity.health_percent,
@@ -2447,6 +2475,13 @@ impl WorldState {
             .ok_or(CoreError::UnknownStaticCreature(id))
     }
 
+    pub fn static_creature_experience_reward(&self, id: u32) -> Result<u64, CoreError> {
+        self.static_creatures
+            .get(&id)
+            .map(|runtime| runtime.experience_reward)
+            .ok_or(CoreError::UnknownStaticCreature(id))
+    }
+
     /// Changes one active static creature's display health only. This bounded state is not
     /// connected to damage, death, targeting consequences, loot, corpses, AI, or scripts.
     /// A zero value remains a valid display percentage and does not deactivate the creature.
@@ -2490,6 +2525,12 @@ impl WorldState {
                 })
                 .collect(),
             respawn_intervals_seconds: BTreeMap::new(),
+            experience_rewards: self
+                .static_creatures
+                .iter()
+                .filter(|(_, runtime)| runtime.active && runtime.experience_reward > 0)
+                .map(|(id, runtime)| (*id, runtime.experience_reward))
+                .collect(),
         }
     }
 

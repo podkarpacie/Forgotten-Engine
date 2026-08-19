@@ -131,6 +131,7 @@ pub fn materialize_tfs_static_spawns(
 ) -> Result<FeTfsStaticSpawnCollection, ConfigError> {
     let mut entities = Vec::new();
     let mut respawn_intervals_seconds = BTreeMap::new();
+    let mut experience_rewards = BTreeMap::new();
     let mut next_id = STATIC_TFS_ENTITY_ID_START;
     for spawn_area in &companions.spawns {
         for creature in &spawn_area.creatures {
@@ -150,6 +151,9 @@ pub fn materialize_tfs_static_spawns(
             }
             if creature.spawn_interval_seconds > 0 {
                 respawn_intervals_seconds.insert(next_id, creature.spawn_interval_seconds);
+            }
+            if matches!(definition.kind, TfsEntityKind::Monster) && definition.experience > 0 {
+                experience_rewards.insert(next_id, definition.experience);
             }
             entities.push(FeTfsStaticEntity {
                 id: next_id,
@@ -174,8 +178,12 @@ pub fn materialize_tfs_static_spawns(
                 .ok_or_else(|| invalid("static TFS spawn identifier range is exhausted"))?;
         }
     }
-    FeTfsStaticSpawnCollection::with_respawn_intervals(entities, respawn_intervals_seconds)
-        .map_err(|error| invalid(format!("invalid static TFS spawn collection: {error}")))
+    FeTfsStaticSpawnCollection::with_respawn_intervals_and_experience_rewards(
+        entities,
+        respawn_intervals_seconds,
+        experience_rewards,
+    )
+    .map_err(|error| invalid(format!("invalid static TFS spawn collection: {error}")))
 }
 
 pub(crate) fn load_tfs_entity_catalog(
@@ -816,7 +824,7 @@ mod tests {
             monsters: vec![TfsEntityDefinition {
                 kind: TfsEntityKind::Monster,
                 name: "Rat".into(),
-                experience: 0,
+                experience: 25,
                 definition_path: PathBuf::from("rat.xml"),
                 script_path: None,
                 script_present: true,
@@ -872,6 +880,7 @@ mod tests {
         assert_eq!(spawns.entities[0].speed, 134);
         assert_eq!(spawns.entities[0].health_percent, 100);
         assert_eq!(spawns.entities[0].direction, 2);
+        assert_eq!(spawns.experience_reward(STATIC_TFS_ENTITY_ID_START), 25);
         assert_eq!(
             spawns.respawn_interval_seconds(STATIC_TFS_ENTITY_ID_START),
             60
