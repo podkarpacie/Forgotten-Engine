@@ -1729,6 +1729,7 @@ impl SharedNativeWorld {
                     player_id: native_player_id(player.id)?,
                     name: player.name,
                     position: native_position(player.position),
+                    health_percent: player.health_percent,
                     outfit: player_outfits.get(&player.id).copied().unwrap_or(
                         NativeOtClientClassicOutfit {
                             look_type,
@@ -1780,6 +1781,7 @@ impl SharedNativeWorld {
                     player_id: native_player_id(player.id)?,
                     name: player.name,
                     position: native_position(player.position),
+                    health_percent: player.health_percent,
                     outfit: player_outfits.get(&player.id).copied().unwrap_or(
                         NativeOtClientClassicOutfit {
                             look_type,
@@ -3281,12 +3283,24 @@ fn handle_native_otclient_game(
                             encode_native_otclient_player_stats(&config.client_profile, &snapshot)
                                 .map_err(HostError::Protocol)?;
                         write_frame(stream, &stats_update)?;
+                        let mut refreshed_snapshot = snapshot.clone();
+                        refreshed_snapshot.player_position = native_position(player_position);
+                        refreshed_snapshot.player_direction = facing.protocol_direction();
+                        let refreshed_viewport = encode_shared_native_world_viewport(
+                            &config.client_profile,
+                            &refreshed_snapshot,
+                            world_map,
+                            shared_world,
+                            character.id,
+                        )?;
+                        write_frame(stream, &refreshed_viewport)?;
                         native_diagnostic(
                             config.extended_diagnostics,
                             peer,
                             &format!(
-                                "outbound=player-stats-refresh epoch={vitals_epoch} bytes={}",
-                                stats_update.0.len()
+                                "outbound=player-stats-refresh epoch={vitals_epoch} bytes={} viewport-bytes={}",
+                                stats_update.0.len(),
+                                refreshed_viewport.0.len()
                             ),
                         );
                         observed_vitals_epoch = vitals_epoch;
@@ -8688,6 +8702,15 @@ mod tests {
             visible[0].direction,
             NativeOtClientCardinalDirection::East.protocol_direction()
         );
+
+        let (damage, vitals) = shared.apply_player_melee_damage(101, 102, 75).unwrap();
+        assert_eq!(damage.applied_damage, 75);
+        assert_eq!(vitals.health, 75);
+        assert_eq!(shared.vitals_epoch(), 1);
+        assert_eq!(
+            shared.visible_players(101, 128, 220).unwrap()[0].health_percent,
+            50
+        );
         shared.remove_player(102).unwrap();
         shared.remove_player(101).unwrap();
     }
@@ -8871,6 +8894,119 @@ mod tests {
         assert_eq!(
             peer_move_refresh.0[moved_knight_name_index + knight_name.len() + 1],
             NativeOtClientCardinalDirection::West.protocol_direction()
+        );
+
+        drop(knight);
+        drop(druid);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_vitals_refresh_rerenders_peer_health_percent() {
+        let database_path = database_path("native-peer-health");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        for (id, name, position) in [
+            (
+                1,
+                "Knight",
+                Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+            (
+                2,
+                "Druid",
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+        ] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: account_id as u64,
+                    name: name.into(),
+                    position,
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let shared_world = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let game = start_native_otclient_game_with_shared_world(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+            shared_world.clone(),
+        )
+        .unwrap();
+
+        let mut knight = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut knight,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut knight).unwrap().0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+
+        let mut druid = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut druid,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Druid",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let initial_druid_view = read_frame(&mut druid).unwrap();
+        let knight_name = [6, 0, b'K', b'n', b'i', b'g', b'h', b't'];
+        let initial_knight_name_index = initial_druid_view
+            .0
+            .windows(knight_name.len())
+            .position(|window| window == knight_name)
+            .unwrap();
+        assert_eq!(
+            initial_druid_view.0[initial_knight_name_index + knight_name.len()],
+            100
+        );
+
+        let (damage, vitals) = shared_world.apply_player_melee_damage(2, 1, 75).unwrap();
+        assert_eq!(damage.applied_damage, 75);
+        assert_eq!(vitals.health, 75);
+
+        druid
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let peer_health_refresh = (0..4)
+            .map(|_| read_frame(&mut druid).unwrap())
+            .find(|frame| {
+                frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP)
+            })
+            .expect("peer session did not receive a viewport refresh after vital change");
+        let refreshed_knight_name_index = peer_health_refresh
+            .0
+            .windows(knight_name.len())
+            .position(|window| window == knight_name)
+            .unwrap();
+        assert_eq!(
+            peer_health_refresh.0[refreshed_knight_name_index + knight_name.len()],
+            50
         );
 
         drop(knight);
@@ -9125,6 +9261,36 @@ mod tests {
         });
         config.world_map = Some(native_world_map());
         config
+    }
+
+    fn start_native_otclient_game_with_shared_world(
+        config: NativeOtClientHostConfig,
+        database_path: impl AsRef<Path>,
+        shared_world: SharedNativeWorld,
+    ) -> Result<HostHandle, HostError> {
+        config.validate()?;
+        let listener = TcpListener::bind(config.bind_addr)?;
+        listener.set_nonblocking(true)?;
+        let local_addr = listener.local_addr()?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let active_connections = Arc::new(AtomicUsize::new(0));
+        let database_path = database_path.as_ref().to_path_buf();
+        let thread_shutdown = Arc::clone(&shutdown);
+        let thread = thread::spawn(move || {
+            serve_native_otclient_game(
+                listener,
+                config,
+                database_path,
+                thread_shutdown,
+                active_connections,
+                shared_world,
+            )
+        });
+        Ok(HostHandle {
+            local_addr,
+            shutdown,
+            thread: Some(thread),
+        })
     }
 
     #[test]

@@ -1906,6 +1906,7 @@ pub struct PlayerRenderSnapshot {
     pub name: String,
     pub position: Position,
     pub level: u32,
+    pub health_percent: u8,
 }
 
 /// Stored interaction intent only. It carries no attack resolution, automatic movement, combat,
@@ -2209,11 +2210,21 @@ impl WorldState {
     pub fn player_render_snapshots(&self) -> Vec<PlayerRenderSnapshot> {
         self.players
             .values()
-            .map(|player| PlayerRenderSnapshot {
-                id: player.id,
-                name: player.name.clone(),
-                position: player.position,
-                level: player.level,
+            .map(|player| {
+                let vitals = self
+                    .player_vitals
+                    .get(&player.id)
+                    .copied()
+                    .unwrap_or_default();
+                PlayerRenderSnapshot {
+                    id: player.id,
+                    name: player.name.clone(),
+                    position: player.position,
+                    level: player.level,
+                    health_percent: ((u32::from(vitals.health) * 100)
+                        / u32::from(vitals.max_health.max(1)))
+                    .min(100) as u8,
+                }
             })
             .collect()
     }
@@ -5593,6 +5604,7 @@ mod tests {
                     z: 7,
                 },
                 level: 1,
+                health_percent: 100,
             }]
         );
         world.remove_player(8).unwrap();

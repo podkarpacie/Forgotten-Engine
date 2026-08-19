@@ -107,6 +107,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 
 ### Milestone E — Complete profile-driven protocol and client compatibility: target 87%
 
+- [x] Render the authoritative bounded player health percentage in classic native visible-player records and re-render connected peer viewports after real shared-vital changes; direct and retained-shared-world two-client socket regressions cover a 75/150 transition. Client health-delta/effect packets, broad combat delivery, and real-client confirmation remain deferred.
 - [x] Record accepted native 740 player facing directions in authoritative shared state and render the classic direction byte for visible peer sessions; direct shared-state and two-client socket regressions cover accepted turns, while broader client animation and real-client confirmation remain deferred.
 - [x] Audit the public OTCv8 development-source `PlayerStats` parser and 740 feature thresholds against FE's current 21-byte `0xA0` record; it confirms the existing classic field order and widths while retaining unmodified-client observation as a release blocker.
 - [x] Verify the parser-shaped native 740 zero-count Quest Log response through a live socket and prove the same session remains usable for a following outfit-window request; quest storage, mission lines, scripting, gameplay semantics, and real-client confirmation remain deferred.

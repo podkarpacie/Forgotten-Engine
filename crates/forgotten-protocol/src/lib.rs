@@ -1096,6 +1096,7 @@ pub struct NativeOtClientVisiblePlayer {
     pub player_id: u32,
     pub name: String,
     pub position: NativeOtClientPosition,
+    pub health_percent: u8,
     pub outfit: NativeOtClientClassicOutfit,
     pub direction: u8,
     pub speed: u16,
@@ -2470,7 +2471,7 @@ fn write_native_otclient_unknown_visible_player(
     writer.u32(0);
     writer.u32(player.player_id);
     writer.string(&player.name);
-    writer.byte(100);
+    writer.byte(player.health_percent);
     writer.byte(player.direction);
     if player.outfit.look_type == 0 {
         writer.u16(0);
@@ -3303,6 +3304,7 @@ mod tests {
                 player_id: snapshot.player_id,
                 name: "Duplicate Local".into(),
                 position: snapshot.player_position,
+                health_percent: 100,
                 outfit: NativeOtClientClassicOutfit::from_snapshot(&snapshot),
                 direction: snapshot.player_direction,
                 speed: snapshot.player_speed,
@@ -3315,6 +3317,7 @@ mod tests {
                     y: 100,
                     z: 7,
                 },
+                health_percent: 100,
                 outfit: NativeOtClientClassicOutfit::from_snapshot(&snapshot),
                 direction: snapshot.player_direction,
                 speed: snapshot.player_speed,
