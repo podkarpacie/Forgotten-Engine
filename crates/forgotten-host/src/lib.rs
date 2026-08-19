@@ -9344,6 +9344,60 @@ mod tests {
                 }],
             )
             .unwrap();
+        Arc::get_mut(native_config.world_map.as_mut().unwrap())
+            .unwrap()
+            .set_tile_items(
+                Position {
+                    x: 104,
+                    y: 103,
+                    z: 7,
+                },
+                vec![forgotten_core::WorldMapItem {
+                    server_id: 1988,
+                    client_thing_id: Some(1988),
+                    count: 1,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: Some(Position {
+                        x: 103,
+                        y: 103,
+                        z: 7,
+                    }),
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
+        Arc::get_mut(native_config.world_map.as_mut().unwrap())
+            .unwrap()
+            .set_tile_items(
+                Position {
+                    x: 103,
+                    y: 103,
+                    z: 7,
+                },
+                vec![forgotten_core::WorldMapItem {
+                    server_id: 1988,
+                    client_thing_id: Some(1988),
+                    count: 1,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: Some(Position {
+                        x: 104,
+                        y: 103,
+                        z: 7,
+                    }),
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
         let game = start_native_otclient_game(native_config, &database_path).unwrap();
 
         let mut stream = TcpStream::connect(game.local_addr()).unwrap();
@@ -10085,6 +10139,26 @@ mod tests {
             Position {
                 x: 104,
                 y: 104,
+                z: 7,
+            }
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_NORTH]),
+        )
+        .unwrap();
+        let cycle_teleport_viewport = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            cycle_teleport_viewport.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert_eq!(&cycle_teleport_viewport.0[1..6], &[104, 0, 103, 0, 7]);
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].position,
+            Position {
+                x: 104,
+                y: 103,
                 z: 7,
             }
         );
