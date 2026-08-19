@@ -224,7 +224,7 @@
 - [x] Add a bounded local validation harness for the supported CLI, SQLite migration, configuration, world import, and native protocol smoke-test paths; do not claim production coverage for deferred gameplay systems.
 - [x] Document production-release blockers and evidence requirements for a future production-readiness decision.
 - [x] Define weighted, evidence-based FE 7.4 completion categories so “more than 50% complete” means implemented, tested runtime scope rather than an unsupported claim.
-- [ ] Complete the next bounded FE 7.4 progression slice by applying configured experience rates and stages to authoritative experience awards.
+- [x] Complete the next bounded FE 7.4 progression slice by applying configured experience rates and stages to authoritative experience awards. Verified existing bounded operator award coverage for `rateExp` and optional `stages.xml` ranges; combat, quest, monster, and client reward event sources remain deferred.
 - [x] Add a bounded authoritative operator experience award that applies `rateExp` and optional `data/XML/stages.xml` ranges, updates exact level/experience state, and persists it; combat, quest, monster, and client reward event sources remain deferred.
 - [ ] Complete the next bounded FE 7.4 melee progression slice by awarding configured vocation-based skill tries without claiming weapon or spell formula support.
 - [x] Award one configured vocation-based fist try for each successful fixed selected-player melee hit and persist exact progression counters; weapon and spell formula support remains deferred.
