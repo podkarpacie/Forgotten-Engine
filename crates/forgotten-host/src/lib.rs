@@ -3647,9 +3647,10 @@ fn handle_native_otclient_game(
                     .then(|| EquipmentSlot::from_code(target_position.y as u8))
                     .flatten();
                 // Classic clients address open container windows with the high container flag
-                // in y and the window identifier in its lower four bits. The destination item
-                // index remains a client-side drop location: this bounded path appends to the
-                // already-owned top-level container and does not infer generic inventory rules.
+                // in y and the window identifier in its lower four bits. For a whole item the
+                // destination index remains a client-side drop location and FE appends to the
+                // already-owned top-level container. A requested partial stack is narrower: it
+                // must name an existing matching top-level container item at that exact index.
                 let target_container_id = (target_position.x == 0xffff
                     && target_position.y & 0x40 != 0)
                     .then_some((target_position.y & 0x0f) as u8);
@@ -3766,7 +3767,7 @@ fn handle_native_otclient_game(
                     );
                     continue;
                 };
-                if item.count != u16::from(count)
+                if item.count < u16::from(count)
                     || catalog
                         .presentation(item.server_id)
                         .map(|entry| entry.client_thing_id)
@@ -3775,7 +3776,7 @@ fn handle_native_otclient_game(
                     native_diagnostic(
                         config.extended_diagnostics,
                         peer,
-                        "action=throw-item outcome=deferred-invalid-item-identity-or-whole-item-count",
+                        "action=throw-item outcome=deferred-invalid-item-identity-or-source-count",
                     );
                     continue;
                 }
@@ -3821,6 +3822,49 @@ fn handle_native_otclient_game(
                                 config.extended_diagnostics,
                                 peer,
                                 "action=throw-item outcome=deferred-nested-container-target",
+                            );
+                            continue;
+                        }
+                        let requested_count = u16::from(count);
+                        if requested_count < item.count {
+                            let destination_index = usize::from(target_position.z);
+                            let Some(destination) = container.items.item(destination_index) else {
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    "action=throw-item outcome=deferred-missing-stack-merge-destination",
+                                );
+                                continue;
+                            };
+                            if destination.server_id != item.server_id {
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    "action=throw-item outcome=deferred-nonmatching-stack-merge-destination",
+                                );
+                                continue;
+                            }
+                            shared_world.move_equipment_stack_to_container(
+                                character.id,
+                                source_slot,
+                                container_id,
+                                requested_count,
+                            )?;
+                            let next_equipment = shared_world.player_equipment(character.id)?;
+                            let next_containers = shared_world.player_containers(character.id)?;
+                            database.replace_player_equipment(character.id, &next_equipment)?;
+                            database.replace_player_containers(character.id, &next_containers)?;
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "action=throw-item outcome=equipment-stack-to-top-level-container-merge source-slot={} container-id={} destination-index={} client-thing-id={} count={}",
+                                    source_slot.code(),
+                                    container_id,
+                                    destination_index,
+                                    source_client_thing_id,
+                                    count
+                                ),
                             );
                             continue;
                         }
@@ -9731,6 +9775,159 @@ mod tests {
                 == &vec![
                     0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0,
                     1, 102, 0, 1,
+                ]
+        }));
+        drop(client);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_throw_merges_partial_mapped_equipment_stack_into_matching_container_item() {
+        let database_path = database_path("native-equipment-container-stack-merge");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(
+            EquipmentSlot::RightHand,
+            ItemInstance::new(4526, 25).unwrap(),
+        );
+        database.replace_player_equipment(1, &equipment).unwrap();
+        let mut backpack = forgotten_core::PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        backpack
+            .items
+            .insert(ItemInstance::new(4526, 40).unwrap())
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(backpack).unwrap();
+        database.replace_player_containers(1, &containers).unwrap();
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for (server_id, client_thing_id, requires_classic_740_subtype) in
+            [(1988, 1988, false), (4526, 102, true)]
+        {
+            catalog
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id,
+                        requires_classic_740_subtype,
+                    },
+                )
+                .unwrap();
+        }
+        let mut config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        config.item_presentation_catalog = Some(Arc::new(catalog));
+        let game = start_native_otclient_game(config, &database_path).unwrap();
+        let mut client = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut client,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut client).unwrap();
+        let _equipment = read_frame(&mut client).unwrap();
+        let initial_container = read_frame(&mut client).unwrap();
+        assert_eq!(initial_container.0.first(), Some(&0x6e));
+
+        write_frame(
+            &mut client,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                255,
+                255,
+                EquipmentSlot::RightHand.code(),
+                0,
+                0,
+                102,
+                0,
+                0,
+                255,
+                255,
+                0x40 | 2,
+                0,
+                0,
+                10,
+            ]),
+        )
+        .unwrap();
+        for _ in 0..20 {
+            if database
+                .player_equipment(1)
+                .unwrap()
+                .item(EquipmentSlot::RightHand)
+                .map(|item| item.count)
+                == Some(15)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            database
+                .player_equipment(1)
+                .unwrap()
+                .item(EquipmentSlot::RightHand),
+            Some(&ItemInstance::new(4526, 15).unwrap())
+        );
+        assert_eq!(
+            database
+                .player_containers(1)
+                .unwrap()
+                .container(2)
+                .unwrap()
+                .items
+                .item(0),
+            Some(&ItemInstance::new(4526, 50).unwrap())
+        );
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let updates = (0..2)
+            .map(|_| read_frame(&mut client).unwrap().0)
+            .collect::<Vec<_>>();
+        assert!(updates.iter().any(|frame| {
+            frame
+                == &vec![
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_SET_INVENTORY,
+                    EquipmentSlot::RightHand.code(),
+                    102,
+                    0,
+                    15,
+                ]
+        }));
+        assert!(updates.iter().any(|frame| {
+            frame
+                == &vec![
+                    0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0,
+                    1, 102, 0, 50,
                 ]
         }));
         drop(client);
