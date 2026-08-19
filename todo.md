@@ -234,6 +234,7 @@
 - [x] Apply configured experience rates and `stages.xml` ranges to authoritative operator experience awards, with exact regression coverage; combat/quest/monster event sources remain deferred.
 - [x] Apply configured vocation progression formulas to fixed-melee fist skill-try awards, with no claim of weapon or spell formulas.
 - [ ] Deliver bounded client-visible lifecycle state: condition health updates, death state, temple respawn, and only verified loss policies.
+- [x] Emit one parser-shaped native 740 death frame after a persisted lethal condition transition at a validated town temple. A live socket regression verifies the frame and persisted dead/zero-health state; temple respawn delivery and real-client confirmation remain deferred.
 - [x] Persist and hydrate authoritative dead/respawn/loss state across restarts without claiming client death screens, automatic timers, teleport packets, or unverified default-loss behavior.
 - [x] Persist and hydrate deterministic elapsed progress for bounded poison, burning, and energy schedules across restarts; client effect packets and condition-driven death behavior remain deferred.
 - [x] Persist authoritative runtime condition schedule transitions after each native heartbeat so elapsed progress and expired schedules survive restart.
