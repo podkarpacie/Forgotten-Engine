@@ -4666,6 +4666,9 @@ impl WorldState {
             if !self.players.contains_key(&selected_player_id) {
                 return Err(CoreError::UnknownPlayer(selected_player_id));
             }
+            if self.player_respawn_state(selected_player_id)?.dead {
+                return Err(CoreError::SelectedPlayerIsDead(selected_player_id));
+            }
         }
 
         let intent = {
@@ -4952,6 +4955,7 @@ pub enum CoreError {
     PlayerTownUnassigned(u64),
     InvalidPlayerRespawnState(u64),
     PlayerIsDead(u64),
+    SelectedPlayerIsDead(u64),
     PlayerIsNotDead(u64),
     MissingRespawnPosition(u64),
     DeathLossAlreadyApplied(u64),

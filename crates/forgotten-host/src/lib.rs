@@ -5297,7 +5297,8 @@ fn apply_native_player_interaction(
         return match result {
             Ok(_) => Ok(NativePlayerInteractionOutcome::Applied),
             Err(HostError::Core(forgotten_core::CoreError::UnknownPlayer(_)))
-            | Err(HostError::Core(forgotten_core::CoreError::SelfInteractionNotAllowed(_))) => {
+            | Err(HostError::Core(forgotten_core::CoreError::SelfInteractionNotAllowed(_)))
+            | Err(HostError::Core(forgotten_core::CoreError::SelectedPlayerIsDead(_))) => {
                 if extended_diagnostics {
                     eprintln!(
                         "> Native OTCv8 {:?} selection ignored native-id={native_selected_id}",
@@ -8031,6 +8032,47 @@ mod tests {
             false,
         )
         .unwrap();
+        assert_eq!(
+            shared.player_interaction_intent(101).unwrap(),
+            PlayerInteractionIntent {
+                target_player_id: None,
+                target_static_creature_id: None,
+                follow_player_id: Some(102),
+            }
+        );
+        shared
+            .hydrate_player_respawn_state(
+                102,
+                PlayerRespawnState {
+                    dead: true,
+                    respawn_at: Some(map.spawn()),
+                    death_time: Some(1),
+                    loss_applied: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            apply_native_player_interaction(
+                &shared,
+                101,
+                NATIVE_OTCLIENT_PLAYER_ID_START + 102,
+                NativePlayerInteractionKind::Target,
+                false,
+            )
+            .unwrap(),
+            NativePlayerInteractionOutcome::Rejected
+        );
+        assert_eq!(
+            apply_native_player_interaction(
+                &shared,
+                101,
+                NATIVE_OTCLIENT_PLAYER_ID_START + 102,
+                NativePlayerInteractionKind::Follow,
+                false,
+            )
+            .unwrap(),
+            NativePlayerInteractionOutcome::Rejected
+        );
         assert_eq!(
             shared.player_interaction_intent(101).unwrap(),
             PlayerInteractionIntent {
