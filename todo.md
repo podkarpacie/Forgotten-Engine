@@ -266,7 +266,7 @@
 - [ ] Verify native 740 position persistence with an unmodified OTClientV8 build: move, exit normally, relog, and confirm the real client begins at the saved tile without a parser error or disconnect.
 - [x] Persist accepted matching native 740 player outfit changes in schema-v11 and hydrate them on the next session with a configured look-type fallback.
 - [ ] Verify native 740 outfit persistence with an unmodified OTClientV8 build: change accepted colors, relog, and confirm the stored appearance is visible without a parser error or disconnect.
-- [ ] Implement or safely acknowledge profile-verified native 740 look/inspect actions for map things and creatures; current use/look handling does not provide a visible inspection result.
+- [x] Implement or safely acknowledge profile-verified native 740 look/inspect actions for map things and creatures. Verified existing parser-backed authoritative LookMap and visible LookCreature status-text delivery with socket coverage; unmodified-client confirmation remains separate.
 - [ ] Implement a verified native 740 public-chat message layout; extended diagnostics confirm chat is currently intentionally suppressed because the profile message-mode map is incomplete.
 - [x] Confirm through public OTCv8 issue #218 that unmodified clients do not construct a message-mode map below protocol 760; retain safe native 740 visible-chat suppression rather than emitting an invalid server-side mode byte.
 - [x] Decode and safely handle the native 740 Quest Log request without ending the game session; until content exists it returns a parser-shaped empty/deferred response.
