@@ -337,3 +337,4 @@
 - [x] Parse bounded monster experience metadata from TFS entity definitions without executing XML or activating reward gameplay; malformed or overflowing values are rejected and NPC metadata remains zero.
 - [x] Route parsed monster experience through a deterministic authoritative selected-static defeat reward with existing rate/stage and SQLite progression persistence; vocation vital gains, loot, corpses, formulas, AI, scripts, and real-client confirmation remain deferred.
 - [x] Apply configured vocation health, mana, and capacity gains to a real native selected-static defeat level-up, atomically persisting the changed level, experience, and vitals.
+- [x] Restore persisted active conditions into a new native shared-world registration after disconnect/relog, preserving validated remaining timing and subsequent vital changes.

@@ -6066,8 +6066,62 @@ mod tests {
             PlayerCondition::from_persisted(PlayerConditionKind::Poison, 3, 7, 5, 1).unwrap()
         );
 
-        shared.apply_player_conditions(107, 5).unwrap();
-        persist_runtime_player_conditions(&mut database, &shared, 107).unwrap();
+        let relogged_character = database
+            .characters_for_account(account_id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let relogged_conditions = database.player_conditions(107).unwrap();
+        let relogged = SharedNativeWorld::from_static_spawns(None).unwrap();
+        relogged
+            .register_player_at_available_position_with_vitals_equipment_containers_progression_and_conditions(
+                Player {
+                    id: relogged_character.id,
+                    account_id: account_id as u64,
+                    name: relogged_character.name,
+                    position: relogged_character.position,
+                    level: relogged_character.level,
+                    experience: relogged_character.experience,
+                    skill_points: relogged_character.skill_points,
+                },
+                PlayerVitals {
+                    health: relogged_character.vitals.health,
+                    max_health: relogged_character.vitals.max_health,
+                    mana: relogged_character.vitals.mana,
+                    max_mana: relogged_character.vitals.max_mana,
+                    capacity: relogged_character.vitals.capacity,
+                    magic_level: relogged_character.vitals.magic_level,
+                },
+                NativePlayerHydration {
+                    progression: relogged_character.progression,
+                    progression_attempts: relogged_character.progression_attempts,
+                    town_id: relogged_character.town_id,
+                    respawn_state: relogged_character.respawn_state,
+                    equipment: database.player_equipment(107).unwrap(),
+                    containers: database.player_containers(107).unwrap(),
+                    conditions: relogged_conditions,
+                },
+                &map,
+            )
+            .unwrap();
+        let resumed = relogged.apply_player_conditions(107, 2).unwrap();
+        assert_eq!(resumed.applied_damage, 7);
+        assert_eq!(resumed.expired_conditions, 0);
+        persist_runtime_player_conditions(&mut database, &relogged, 107).unwrap();
+        assert_eq!(
+            database
+                .player_conditions(107)
+                .unwrap()
+                .get(&PlayerConditionKind::Poison)
+                .copied()
+                .unwrap(),
+            PlayerCondition::from_persisted(PlayerConditionKind::Poison, 3, 7, 3, 0).unwrap()
+        );
+
+        let expired = relogged.apply_player_conditions(107, 3).unwrap();
+        assert_eq!(expired.applied_damage, 7);
+        assert_eq!(expired.expired_conditions, 1);
+        persist_runtime_player_conditions(&mut database, &relogged, 107).unwrap();
         assert!(database.player_conditions(107).unwrap().is_empty());
         let _ = fs::remove_file(path);
     }

@@ -33,7 +33,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Retain bounded nested TFS-style vocation formula defense and armor multipliers as fixed-point metadata without changing live mitigation behavior or claiming formula compatibility.
 - [x] Retain bounded TFS-style vocation attack-speed and base-speed metadata with verified defaults, without changing live movement or combat timing behavior.
 - [x] Award configured vocation-based fist tries from supported fixed melee events.
-- [x] Persist authoritative condition state, including exact elapsed interval remainder, across restart.
+- [x] Persist authoritative condition state, including exact elapsed interval remainder, across restart and a fresh native-style relog registration; client condition-effect packets remain deferred.
 - [x] Activate persisted server-side death state for lethal bounded condition damage at a validated assigned town temple.
 - [x] Add an operator-controlled temple respawn that delegates to the authoritative dead-state transition and atomically persists validated position, vitals, and cleared lifecycle state; automatic client delivery remains deferred.
 - [x] Apply explicit configured `deathLosePercent` values from `1` through `100` after supported native player-melee, condition, and static-creature heartbeat deaths, atomically persisting level, experience, vitals, visible skills, exact attempts, and marked lifecycle state; default formula, promotion, blessing, and client loss delivery remain deferred.
