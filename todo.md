@@ -342,3 +342,4 @@
 - [x] Decode native 740 battle-window item input and validate one catalog-mapped authoritative map item plus one active authoritative creature target without action execution, combat, mutation, Lua, persistence, or outbound packet behavior.
 - [x] Decode native 740 rotate-item input and validate one catalog-mapped authoritative map item without item rotation, mutation, Lua, persistence, or outbound packet behavior.
 - [x] Reply to native 740 LookMap only with a verified `0xB4/0x15` bounded status text derived from an exact validated authoritative map item; defer LookCreature and all unverified inspection output.
+- [x] Reply to native 740 LookCreature only with verified `0xB4/0x15` bounded status text for a visible authoritative player or active static creature; defer off-screen, inactive, descriptions, attributes, and all broader inspection output.

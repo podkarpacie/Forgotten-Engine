@@ -3800,12 +3800,26 @@ fn handle_native_otclient_game(
                 );
             }
             NativeOtClientGameAction::LookCreature { creature_id } => {
+                let Some(message) =
+                    native_creature_inspection_message(shared_world, character.id, creature_id)?
+                else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=look-creature outcome=deferred-unavailable-or-outside-viewport",
+                    );
+                    continue;
+                };
+                let response =
+                    encode_native_otclient_status_message(&config.client_profile, &message)
+                        .map_err(HostError::Protocol)?;
+                write_frame(stream, &response)?;
                 native_diagnostic(
                     config.extended_diagnostics,
                     peer,
                     &format!(
-                        "action=look-creature creature-id={} outcome=deferred-no-safe-740-response",
-                        creature_id
+                        "outbound=status-message opcode=0xb4 bytes={} action=look-creature native-id={creature_id}",
+                        response.0.len()
                     ),
                 );
             }
@@ -4502,6 +4516,53 @@ fn native_click_walk_steps(
     path.into_iter()
         .flat_map(|direction| direction.cardinal_steps().iter().copied())
         .collect()
+}
+
+/// The selected 740 map encoder renders an 18×14 same-floor viewport centered at offset (8, 6),
+/// which yields horizontal offsets -8 through +9 and vertical offsets -6 through +7. Creature
+/// inspection is intentionally no broader than that already encoded viewport.
+fn native_classic_viewport_contains(observer: Position, target: Position) -> bool {
+    if observer.z != target.z {
+        return false;
+    }
+    let horizontal_offset = i32::from(target.x) - i32::from(observer.x);
+    let vertical_offset = i32::from(target.y) - i32::from(observer.y);
+    (-8..=9).contains(&horizontal_offset) && (-6..=7).contains(&vertical_offset)
+}
+
+/// Resolves one current native creature ID into a bounded status sentence only when the requested
+/// entity is active and already inside the observer's parser-verified classic map viewport. It
+/// does not expose off-screen, inactive, absent, or cross-floor state and changes no target,
+/// combat, visibility, persistence, or packet state by itself.
+fn native_creature_inspection_message(
+    shared_world: &SharedNativeWorld,
+    observer_id: u64,
+    native_creature_id: u32,
+) -> Result<Option<String>, HostError> {
+    let world = shared_world.lock()?;
+    let observer = world.player(observer_id).ok_or(HostError::Core(
+        forgotten_core::CoreError::UnknownPlayer(observer_id),
+    ))?;
+    let message = if let Some(player_id) = native_player_id_to_character_id(native_creature_id) {
+        let Some(target) = world.player(player_id) else {
+            return Ok(None);
+        };
+        native_classic_viewport_contains(observer.position, target.position)
+            .then(|| format!("You see {}.", target.name))
+    } else {
+        let Some(lifecycle) = world.static_creature_lifecycle(native_creature_id) else {
+            return Ok(None);
+        };
+        if !lifecycle.active
+            || !native_classic_viewport_contains(observer.position, lifecycle.position)
+        {
+            return Ok(None);
+        }
+        world
+            .static_creature(native_creature_id)
+            .map(|creature| format!("You see {}.", creature.name))
+    };
+    Ok(message.filter(|message| message.len() <= NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES))
 }
 
 fn apply_native_player_interaction(
@@ -9084,6 +9145,39 @@ mod tests {
         write_frame(
             &mut stream,
             &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_LOOK_CREATURE,
+                1,
+                0,
+                0,
+                64,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
+                forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT,
+                12,
+                0,
+                b'Y',
+                b'o',
+                b'u',
+                b' ',
+                b's',
+                b'e',
+                b'e',
+                b' ',
+                b'R',
+                b'a',
+                b't',
+                b'.',
+            ]
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
                 forgotten_protocol::NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES,
                 3,
                 1,
@@ -10580,8 +10674,10 @@ mod native_timing_tests {
 #[cfg(test)]
 mod native_diagnostics_tests {
     use super::{
-        native_action_diagnostic_summary, native_diagnostic_record, NativeOtClientGameAction,
+        native_action_diagnostic_summary, native_classic_viewport_contains,
+        native_diagnostic_record, NativeOtClientGameAction,
     };
+    use forgotten_core::Position;
     use forgotten_protocol::NativeOtClientCardinalDirection;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -10652,5 +10748,50 @@ mod native_diagnostics_tests {
             "action=rotate-item position=100,101,7 client-thing-id=102 stack-position=3"
         );
         assert!(!rotate_summary.contains("["));
+    }
+
+    #[test]
+    fn classic_creature_inspection_viewport_matches_the_encoded_map_window() {
+        let observer = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        assert!(native_classic_viewport_contains(
+            observer,
+            Position { x: 92, y: 94, z: 7 }
+        ));
+        assert!(native_classic_viewport_contains(
+            observer,
+            Position {
+                x: 109,
+                y: 107,
+                z: 7,
+            }
+        ));
+        assert!(!native_classic_viewport_contains(
+            observer,
+            Position {
+                x: 91,
+                y: 100,
+                z: 7,
+            }
+        ));
+        assert!(!native_classic_viewport_contains(
+            observer,
+            Position {
+                x: 100,
+                y: 108,
+                z: 7,
+            }
+        ));
+        assert!(!native_classic_viewport_contains(
+            observer,
+            Position {
+                x: 100,
+                y: 100,
+                z: 6,
+            }
+        ));
     }
 }
