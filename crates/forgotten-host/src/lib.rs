@@ -539,6 +539,9 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         NativeOtClientGameAction::CloseContainer(container_id) => {
             format!("action=close-container container-id={container_id}")
         }
+        NativeOtClientGameAction::UpArrowContainer(container_id) => {
+            format!("action=up-arrow-container container-id={container_id}")
+        }
         NativeOtClientGameAction::UpdateContainer(container_id) => {
             format!("action=update-container container-id={container_id}")
         }
@@ -3443,6 +3446,15 @@ fn handle_native_otclient_game(
                     peer,
                     &format!(
                         "action=close-container outcome=session-view-closed container-id={container_id}"
+                    ),
+                );
+            }
+            NativeOtClientGameAction::UpArrowContainer(container_id) => {
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "action=up-arrow-container outcome=deferred-no-supported-parent container-id={container_id}"
                     ),
                 );
             }
@@ -9332,6 +9344,24 @@ mod tests {
             read_frame(&mut stream).unwrap().0,
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_QUEST_LOG, 0, 0]
         );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_UP_ARROW_CONTAINER,
+                2,
+            ]),
+        )
+        .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        assert!(matches!(
+            read_frame(&mut stream),
+            Err(HostError::Io(error))
+                if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
+        ));
+        stream.set_read_timeout(None).unwrap();
 
         write_frame(
             &mut stream,

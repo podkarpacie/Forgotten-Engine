@@ -892,6 +892,7 @@ pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM_EX: u8 = 0x83;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM_ON_CREATURE: u8 = 0x84;
 pub const NATIVE_OTCLIENT_CLIENT_ROTATE_ITEM: u8 = 0x85;
 pub const NATIVE_OTCLIENT_CLIENT_CLOSE_CONTAINER: u8 = 0x87;
+pub const NATIVE_OTCLIENT_CLIENT_UP_ARROW_CONTAINER: u8 = 0x88;
 pub const NATIVE_OTCLIENT_CLIENT_UPDATE_CONTAINER: u8 = 0xca;
 pub const NATIVE_OTCLIENT_CLIENT_LOOK_MAP: u8 = 0x8c;
 pub const NATIVE_OTCLIENT_CLIENT_LOOK_CREATURE: u8 = 0x8d;
@@ -1246,6 +1247,7 @@ pub enum NativeOtClientGameAction {
     RequestQuestLog,
     ChangeOutfit(NativeOtClientClassicOutfit),
     CloseContainer(u8),
+    UpArrowContainer(u8),
     UpdateContainer(u8),
     SelectTarget(u32),
     SelectFollow(u32),
@@ -2091,6 +2093,9 @@ pub fn decode_native_otclient_game_action(
         }
         NATIVE_OTCLIENT_CLIENT_CLOSE_CONTAINER => {
             NativeOtClientGameAction::CloseContainer(reader.byte()?)
+        }
+        NATIVE_OTCLIENT_CLIENT_UP_ARROW_CONTAINER => {
+            NativeOtClientGameAction::UpArrowContainer(reader.byte()?)
         }
         NATIVE_OTCLIENT_CLIENT_UPDATE_CONTAINER => {
             NativeOtClientGameAction::UpdateContainer(reader.byte()?)
@@ -3565,6 +3570,21 @@ mod tests {
                 .0,
             vec![NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER, 2]
         );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_UP_ARROW_CONTAINER, 2]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::UpArrowContainer(2)
+        );
+        assert!(matches!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_UP_ARROW_CONTAINER, 2, 0]),
+                &profile,
+            ),
+            Err(ProtocolError::InvalidNativeGameRequest)
+        ));
         assert_eq!(
             decode_native_otclient_game_action(
                 &Frame(vec![NATIVE_OTCLIENT_CLIENT_UPDATE_CONTAINER, 2]),
