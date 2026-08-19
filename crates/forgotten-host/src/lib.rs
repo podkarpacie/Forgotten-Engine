@@ -2715,6 +2715,75 @@ fn persist_static_creature_runtime_to_open_database(
         .map_err(HostError::Persistence)
 }
 
+/// Applies the existing authoritative temple-respawn transition before a new native game session
+/// registers the persisted character. Stock OTCv8 740's death dialog logs out and starts another
+/// character login; there is no separate revival request to route on the prior dead session.
+/// This boundary does not add a timer, death-loss record, teleport effect, or in-session revive.
+fn respawn_persisted_native_player_for_relog(
+    database: &mut EngineDatabase,
+    player_id: u64,
+    world_map: &WorldMap,
+) -> Result<(), HostError> {
+    let character = database
+        .player_by_id(player_id)
+        .map_err(HostError::Persistence)?;
+    let mut world = WorldState::default();
+    world
+        .add_player_with_vitals_and_progression(
+            Player {
+                id: character.id,
+                account_id: 0,
+                name: character.name,
+                position: character.position,
+                level: character.level,
+                experience: character.experience,
+                skill_points: character.skill_points,
+            },
+            PlayerVitals {
+                health: character.vitals.health,
+                max_health: character.vitals.max_health,
+                mana: character.vitals.mana,
+                max_mana: character.vitals.max_mana,
+                capacity: character.vitals.capacity,
+                magic_level: character.vitals.magic_level,
+            },
+            character.progression,
+        )
+        .map_err(HostError::Core)?;
+    world
+        .replace_player_town(player_id, character.town_id)
+        .map_err(HostError::Core)?;
+    world
+        .hydrate_player_respawn_state(player_id, character.respawn_state)
+        .map_err(HostError::Core)?;
+    let outcome = world.respawn_player(player_id).map_err(HostError::Core)?;
+    if !world_map
+        .tile(outcome.position)
+        .is_some_and(|tile| tile.walkable)
+    {
+        return Err(HostError::InvalidConfiguration(
+            "native temple respawn destination is missing or not walkable in the selected world map"
+                .into(),
+        ));
+    }
+    database
+        .update_player_position_vitals_and_respawn_state(
+            player_id,
+            outcome.position,
+            PersistedPlayerVitals {
+                health: outcome.vitals.health,
+                max_health: outcome.vitals.max_health,
+                mana: outcome.vitals.mana,
+                max_mana: outcome.vitals.max_mana,
+                capacity: outcome.vitals.capacity,
+                magic_level: outcome.vitals.magic_level,
+            },
+            PlayerRespawnState::default(),
+        )
+        .map_err(HostError::Persistence)?;
+    Ok(())
+}
+
 fn handle_native_otclient_login(
     stream: &mut TcpStream,
     peer: SocketAddr,
@@ -2795,7 +2864,7 @@ fn handle_native_otclient_game(
         )?;
         return Ok(());
     };
-    let Some(character) = account
+    let Some(selected_character) = account
         .characters
         .iter()
         .find(|character| character.name == request.character_name)
@@ -2806,6 +2875,7 @@ fn handle_native_otclient_game(
         )?;
         return Ok(());
     };
+    let mut character = selected_character.clone();
     let Some(empty_world) = &config.empty_world else {
         write_frame(
             stream,
@@ -2824,6 +2894,12 @@ fn handle_native_otclient_game(
         )?;
         return Ok(());
     };
+    if character.respawn_state.dead {
+        respawn_persisted_native_player_for_relog(&mut database, character.id, world_map)?;
+        character = database
+            .player_by_id(character.id)
+            .map_err(HostError::Persistence)?;
+    }
     let account_id = u64::try_from(account.id).map_err(|_| {
         HostError::InvalidConfiguration("native numeric account IDs must be non-negative".into())
     })?;
@@ -9670,6 +9746,100 @@ mod tests {
                     0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0, 0,
                 ]
         }));
+        drop(client);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_relog_respawns_a_persisted_dead_character_at_temple_before_full_map_bootstrap() {
+        let database_path = database_path("native-relog-temple-respawn");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        let death_position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let temple_position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: death_position,
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        database
+            .update_player_position_vitals_and_respawn_state(
+                1,
+                death_position,
+                PersistedPlayerVitals {
+                    health: 0,
+                    max_health: 150,
+                    mana: 0,
+                    max_mana: 40,
+                    capacity: 4_000,
+                    magic_level: 0,
+                },
+                PlayerRespawnState {
+                    dead: true,
+                    respawn_at: Some(temple_position),
+                    death_time: Some(1),
+                    loss_applied: true,
+                },
+            )
+            .unwrap();
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+        let mut client = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut client,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let initialization = read_frame(&mut client).unwrap();
+        assert!(initialization.0.windows(6).any(|window| {
+            window
+                == [
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP,
+                    100,
+                    0,
+                    100,
+                    0,
+                    7,
+                ]
+        }));
+        let persisted = database.player_by_id(1).unwrap();
+        assert_eq!(persisted.position, temple_position);
+        assert_eq!(
+            persisted.vitals,
+            PersistedPlayerVitals {
+                health: 150,
+                max_health: 150,
+                mana: 40,
+                max_mana: 40,
+                capacity: 4_000,
+                magic_level: 0,
+            }
+        );
+        assert_eq!(persisted.respawn_state, PlayerRespawnState::default());
         drop(client);
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
