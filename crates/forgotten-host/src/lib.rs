@@ -3855,7 +3855,7 @@ fn handle_native_otclient_game(
                     }
                     Err(error) => return Err(error),
                 };
-                let message = format!("You see item #{} (count: {}).", item.server_id, item.count);
+                let message = native_map_item_inspection_message(world_map, &item);
                 let response =
                     encode_native_otclient_status_message(&config.client_profile, &message)
                         .map_err(HostError::Protocol)?;
@@ -4180,6 +4180,34 @@ fn native_validated_map_item_text<'a>(
         .then_some(item.text.as_deref())
         .flatten()
         .filter(|text| !text.is_empty())
+}
+
+fn native_map_item_inspection_message(
+    world_map: &WorldMap,
+    outcome: &PlayerItemUseOutcome,
+) -> String {
+    let message = format!(
+        "You see item #{} (count: {}).",
+        outcome.server_id, outcome.count
+    );
+    let Some(item) = world_map
+        .tile_items(outcome.position)
+        .and_then(|items| items.get(usize::from(outcome.stack_index)))
+    else {
+        return message;
+    };
+    let Some(description) = (item.server_id == outcome.server_id && item.count == outcome.count)
+        .then_some(item.description.as_deref())
+        .flatten()
+        .filter(|description| !description.is_empty())
+    else {
+        return message;
+    };
+    if message.len() + 1 + description.len() <= NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES {
+        format!("{message} {description}")
+    } else {
+        message
+    }
 }
 
 fn drain_shared_public_chat(
@@ -9143,7 +9171,7 @@ mod tests {
                     action_id: None,
                     unique_id: None,
                     text: Some("Read me".into()),
-                    description: None,
+                    description: Some("An old inscription.".into()),
                     teleport_destination: None,
                     duration: None,
                     charges: None,
@@ -9367,7 +9395,7 @@ mod tests {
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
                 forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT,
-                30,
+                50,
                 0,
                 b'Y',
                 b'o',
@@ -9398,6 +9426,26 @@ mod tests {
                 b' ',
                 b'1',
                 b')',
+                b'.',
+                b' ',
+                b'A',
+                b'n',
+                b' ',
+                b'o',
+                b'l',
+                b'd',
+                b' ',
+                b'i',
+                b'n',
+                b's',
+                b'c',
+                b'r',
+                b'i',
+                b'p',
+                b't',
+                b'i',
+                b'o',
+                b'n',
                 b'.',
             ]
         );
