@@ -861,6 +861,8 @@ pub const NATIVE_OTCLIENT_GAME_PLAYER_MODES: u8 = 0xa7;
 pub const NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER: u8 = 0x6f;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_HEALTH: u8 = 0x8c;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT: u8 = 0x8e;
+pub const NATIVE_OTCLIENT_GAME_TEXT_MESSAGE: u8 = 0xb4;
+pub const NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT: u8 = 0x15;
 pub const NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT: u8 = 0xc8;
 pub const NATIVE_OTCLIENT_GAME_CANCEL_WALK: u8 = 0xb5;
 pub const NATIVE_OTCLIENT_ENTER_GAME: u8 = 0x0f;
@@ -1374,6 +1376,26 @@ pub fn encode_native_otclient_game_login_error(message: &str) -> Frame {
     writer.byte(NATIVE_OTCLIENT_GAME_LOGIN_ERROR);
     writer.string(message);
     Frame(writer.finish())
+}
+
+/// Encodes the parser-verified classic 740 status-message record. The message class is the
+/// independently verified `MSG_STATUS_DEFAULT` value, which clients render in the default status
+/// area and console. Other protocol profiles require their own verified record layout.
+pub fn encode_native_otclient_status_message(
+    profile: &NativeOtClientProfile,
+    message: &str,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    if message.len() > NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES {
+        return Err(ProtocolError::StringTooLong(message.len()));
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_TEXT_MESSAGE);
+    writer.byte(NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT);
+    writer.string(message);
+    Ok(Frame(writer.finish()))
 }
 
 pub fn encode_native_otclient_game_login_state(
@@ -3421,6 +3443,39 @@ mod tests {
             .0,
             vec![NATIVE_OTCLIENT_GAME_CREATURE_HEALTH, 1, 0, 0, 64, 40]
         );
+        assert_eq!(
+            encode_native_otclient_status_message(&profile, "You see a rat.")
+                .unwrap()
+                .0,
+            vec![
+                NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
+                NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT,
+                14,
+                0,
+                b'Y',
+                b'o',
+                b'u',
+                b' ',
+                b's',
+                b'e',
+                b'e',
+                b' ',
+                b'a',
+                b' ',
+                b'r',
+                b'a',
+                b't',
+                b'.',
+            ]
+        );
+        assert!(matches!(
+            encode_native_otclient_status_message(
+                &profile,
+                &"x".repeat(NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES + 1),
+            ),
+            Err(ProtocolError::StringTooLong(length))
+                if length == NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES + 1
+        ));
         assert!(
             encode_native_otclient_creature_health(&profile, snapshot.player_id, 1, 0).is_err()
         );

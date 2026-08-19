@@ -31,6 +31,10 @@ The same public reference dispatches `0x85` to its rotate-item parser. That pars
 
 Any Forgotten Engine support must remain validation-only until a complete authoritative item-rotation model exists. It must not imply that an item can rotate, mutate, run scripts, persist, or emit a client record.
 
+## Inspection text response evidence
+
+The public reference sends generic classic text messages as one `0xB4` opcode, followed by one message-class byte and one length-prefixed string. Its matching classic 7.4 constants declaration defines `MSG_STATUS_DEFAULT` as **`0x15`**, documented there as a white message at the bottom of the game window and in the console. This establishes a bounded classic text-message envelope, but every inspection text body must still derive only from FE’s own validated authoritative state.
+
 ## Source
 
 1. [Podkal/Avesta-1, `protocol76.cpp` — public legacy 7.4 reference](https://github.com/Podkal/Avesta-1/blob/master/Avesta%207.4%20(OTServ_SVN%200.6.3)/source%207.4/protocol76.cpp)

@@ -49,15 +49,16 @@ use forgotten_protocol::{
     encode_native_otclient_move_creature_at, encode_native_otclient_open_container,
     encode_native_otclient_player_modes, encode_native_otclient_player_skills,
     encode_native_otclient_player_stats, encode_native_otclient_set_inventory,
-    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
-    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
-    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
-    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection,
-    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
-    NativeOtClientClassicOutfit, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
-    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerVitals,
-    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
-    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    encode_native_otclient_status_message, encode_status_binary, encode_status_xml,
+    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
+    NativeOtClientCardinalDirection, NativeOtClientClassicItemRecord,
+    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
+    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
+    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
+    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -3750,12 +3751,51 @@ fn handle_native_otclient_game(
                 thing_id,
                 stack_position,
             } => {
+                let Some(world_map) = config.world_map.as_deref() else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=look-map outcome=deferred-no-world-map",
+                    );
+                    continue;
+                };
+                let Some(intent) = native_map_item_use_intent(
+                    config.item_presentation_catalog.as_deref(),
+                    character.id,
+                    position,
+                    thing_id,
+                    stack_position,
+                ) else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=look-map outcome=deferred-unmapped-or-ambiguous-client-thing-id",
+                    );
+                    continue;
+                };
+                let item = match shared_world.validate_player_item_use(world_map, intent) {
+                    Ok(item) => item,
+                    Err(HostError::Core(_)) => {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=look-map outcome=deferred-invalid-server-owned-map-item",
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let message = format!("You see item #{} (count: {}).", item.server_id, item.count);
+                let response =
+                    encode_native_otclient_status_message(&config.client_profile, &message)
+                        .map_err(HostError::Protocol)?;
+                write_frame(stream, &response)?;
                 native_diagnostic(
                     config.extended_diagnostics,
                     peer,
                     &format!(
-                        "action=look-map position={},{},{} thing-id={} stack-position={} outcome=deferred-no-safe-740-response",
-                        position.x, position.y, position.z, thing_id, stack_position
+                        "outbound=status-message opcode=0xb4 bytes={} action=look-map server-id={} count={}",
+                        response.0.len(), item.server_id, item.count
                     ),
                 );
             }
@@ -8863,6 +8903,29 @@ mod tests {
                 },
             )
             .unwrap();
+        Arc::get_mut(native_config.world_map.as_mut().unwrap())
+            .unwrap()
+            .set_tile_items(
+                Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                vec![forgotten_core::WorldMapItem {
+                    server_id: 1988,
+                    client_thing_id: Some(1988),
+                    count: 1,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
         let game = start_native_otclient_game(native_config, &database_path).unwrap();
 
         let mut stream = TcpStream::connect(game.local_addr()).unwrap();
@@ -8960,6 +9023,61 @@ mod tests {
                 0,
                 64,
                 100,
+            ]
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_LOOK_MAP,
+                100,
+                0,
+                100,
+                0,
+                7,
+                196,
+                7,
+                0,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
+                forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT,
+                30,
+                0,
+                b'Y',
+                b'o',
+                b'u',
+                b' ',
+                b's',
+                b'e',
+                b'e',
+                b' ',
+                b'i',
+                b't',
+                b'e',
+                b'm',
+                b' ',
+                b'#',
+                b'1',
+                b'9',
+                b'8',
+                b'8',
+                b' ',
+                b'(',
+                b'c',
+                b'o',
+                b'u',
+                b'n',
+                b't',
+                b':',
+                b' ',
+                b'1',
+                b')',
+                b'.',
             ]
         );
 

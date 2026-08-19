@@ -341,3 +341,4 @@
 - [x] Decode native 740 UseItemEx and validate both catalog-mapped authoritative map-item targets without action execution, mutation, Lua, or outbound packet behavior.
 - [x] Decode native 740 battle-window item input and validate one catalog-mapped authoritative map item plus one active authoritative creature target without action execution, combat, mutation, Lua, persistence, or outbound packet behavior.
 - [x] Decode native 740 rotate-item input and validate one catalog-mapped authoritative map item without item rotation, mutation, Lua, persistence, or outbound packet behavior.
+- [x] Reply to native 740 LookMap only with a verified `0xB4/0x15` bounded status text derived from an exact validated authoritative map item; defer LookCreature and all unverified inspection output.
