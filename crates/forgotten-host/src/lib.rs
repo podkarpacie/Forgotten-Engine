@@ -9202,6 +9202,28 @@ mod tests {
             persisted.item(EquipmentSlot::LeftHand),
             Some(&ItemInstance::new(4526, 1).unwrap())
         );
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let updates = (0..4)
+            .map(|_| read_frame(&mut client).unwrap().0)
+            .collect::<Vec<_>>();
+        assert!(updates.iter().any(|frame| {
+            frame
+                == &vec![
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_DELETE_INVENTORY,
+                    EquipmentSlot::RightHand.code(),
+                ]
+        }));
+        assert!(updates.iter().any(|frame| {
+            frame
+                == &vec![
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_SET_INVENTORY,
+                    EquipmentSlot::LeftHand.code(),
+                    102,
+                    0,
+                ]
+        }));
         drop(client);
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
