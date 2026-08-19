@@ -11,9 +11,10 @@ use forgotten_core::{
     PlayerContainerStackToEquipmentOutcome, PlayerContainerToEquipmentOutcome, PlayerContainers,
     PlayerEquipment, PlayerEquipmentStackToContainerOutcome, PlayerEquipmentToContainerOutcome,
     PlayerExperienceAwardOutcome, PlayerFightMode, PlayerFightModeState, PlayerInteractionIntent,
-    PlayerItemUseIntent, PlayerItemUseOutcome, PlayerProgression, PlayerProgressionAttempts,
-    PlayerProgressionRules, PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState,
-    PlayerSkill, PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
+    PlayerItemUseExIntent, PlayerItemUseExOutcome, PlayerItemUseIntent, PlayerItemUseOutcome,
+    PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
+    PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState, PlayerSkill,
+    PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
     StaticCreatureDamageOutcome, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy,
     StaticCreatureResetSummary, StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
     StaticCreatureTargetAttackOutcome, StaticCreatureTargetStepOutcome, VocationId,
@@ -274,6 +275,39 @@ fn native_map_item_use_intent(
     .ok()
 }
 
+/// Converts a fully decoded native two-target item-use request only when both client thing IDs
+/// map uniquely through the operator-supplied presentation catalog. The returned core request is
+/// still validation-only and has no item action, persistence, or packet side effects.
+fn native_map_item_use_ex_intent(
+    catalog: Option<&NativeItemPresentationCatalog>,
+    player_id: u64,
+    source: (NativeOtClientPosition, u16, u8),
+    target: (NativeOtClientPosition, u16, u8),
+) -> Option<PlayerItemUseExIntent> {
+    let (source_position, source_client_thing_id, source_stack_position) = source;
+    let (target_position, target_client_thing_id, target_stack_position) = target;
+    let source_server_id = catalog?.unique_server_id_for_client_thing_id(source_client_thing_id)?;
+    let target_server_id = catalog?.unique_server_id_for_client_thing_id(target_client_thing_id)?;
+    PlayerItemUseExIntent::new(
+        player_id,
+        Position {
+            x: source_position.x,
+            y: source_position.y,
+            z: source_position.z,
+        },
+        source_stack_position,
+        source_server_id,
+        Position {
+            x: target_position.x,
+            y: target_position.y,
+            z: target_position.z,
+        },
+        target_stack_position,
+        target_server_id,
+    )
+    .ok()
+}
+
 fn native_classic_equipment_frames(
     profile: &NativeOtClientProfile,
     catalog: Option<&NativeItemPresentationCatalog>,
@@ -488,6 +522,26 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         } => format!(
             "action=use-item position={},{},{} client-thing-id={} stack-position={} index={}",
             position.x, position.y, position.z, client_thing_id, stack_position, index
+        ),
+        NativeOtClientGameAction::UseItemEx {
+            source_position,
+            source_client_thing_id,
+            source_stack_position,
+            target_position,
+            target_client_thing_id,
+            target_stack_position,
+        } => format!(
+            "action=use-item-ex source={},{},{} source-client-thing-id={} source-stack-position={} target={},{},{} target-client-thing-id={} target-stack-position={}",
+            source_position.x,
+            source_position.y,
+            source_position.z,
+            source_client_thing_id,
+            source_stack_position,
+            target_position.x,
+            target_position.y,
+            target_position.z,
+            target_client_thing_id,
+            target_stack_position,
         ),
         NativeOtClientGameAction::LookMap {
             position,
@@ -1225,6 +1279,18 @@ impl SharedNativeWorld {
     ) -> Result<PlayerItemUseOutcome, HostError> {
         self.lock()?
             .validate_player_item_use(map, intent)
+            .map_err(HostError::Core)
+    }
+
+    /// Validates two server-owned map-item references under the same shared-world lock. It does
+    /// not execute an item action, mutate map state, persist data, or produce client packets.
+    pub fn validate_player_item_use_ex(
+        &self,
+        map: &WorldMap,
+        intent: PlayerItemUseExIntent,
+    ) -> Result<PlayerItemUseExOutcome, HostError> {
+        self.lock()?
+            .validate_player_item_use_ex(map, intent)
             .map_err(HostError::Core)
     }
 
@@ -3397,6 +3463,63 @@ fn handle_native_otclient_game(
                         config.extended_diagnostics,
                         peer,
                         "action=use-item outcome=deferred-invalid-server-owned-map-item",
+                    ),
+                    Err(error) => return Err(error),
+                }
+            }
+            NativeOtClientGameAction::UseItemEx {
+                source_position,
+                source_client_thing_id,
+                source_stack_position,
+                target_position,
+                target_client_thing_id,
+                target_stack_position,
+            } => {
+                let Some(world_map) = config.world_map.as_deref() else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=use-item-ex outcome=deferred-no-world-map",
+                    );
+                    continue;
+                };
+                let Some(intent) = native_map_item_use_ex_intent(
+                    config.item_presentation_catalog.as_deref(),
+                    character.id,
+                    (
+                        source_position,
+                        source_client_thing_id,
+                        source_stack_position,
+                    ),
+                    (
+                        target_position,
+                        target_client_thing_id,
+                        target_stack_position,
+                    ),
+                ) else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=use-item-ex outcome=deferred-unmapped-or-ambiguous-client-thing-id",
+                    );
+                    continue;
+                };
+                match shared_world.validate_player_item_use_ex(world_map, intent) {
+                    Ok(outcome) => native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        &format!(
+                            "action=use-item-ex outcome=validated source-server-id={} source-count={} target-server-id={} target-count={}",
+                            outcome.source.server_id,
+                            outcome.source.count,
+                            outcome.target.server_id,
+                            outcome.target.count,
+                        ),
+                    ),
+                    Err(HostError::Core(_)) => native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=use-item-ex outcome=deferred-invalid-server-owned-map-item",
                     ),
                     Err(error) => return Err(error),
                 }
@@ -6642,6 +6765,14 @@ mod tests {
         assert_eq!(outcome.action_id, Some(7));
         assert!(outcome.has_text);
         assert_eq!(outcome.charges, Some(3));
+        let two_target_outcome = shared
+            .validate_player_item_use_ex(
+                &map,
+                PlayerItemUseExIntent::new(108, adjacent, 0, 1945, adjacent, 0, 1945).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(two_target_outcome.source.server_id, 1945);
+        assert_eq!(two_target_outcome.target.server_id, 1945);
         assert_eq!(shared.vitals_epoch(), 0);
     }
 
@@ -6679,6 +6810,34 @@ mod tests {
             ),
         );
         assert_eq!(
+            native_map_item_use_ex_intent(
+                Some(&catalog),
+                101,
+                (position, 102, 3),
+                (position, 102, 4)
+            ),
+            Some(
+                PlayerItemUseExIntent::new(
+                    101,
+                    Position {
+                        x: 100,
+                        y: 101,
+                        z: 7,
+                    },
+                    3,
+                    1945,
+                    Position {
+                        x: 100,
+                        y: 101,
+                        z: 7,
+                    },
+                    4,
+                    1945,
+                )
+                .unwrap()
+            ),
+        );
+        assert_eq!(
             native_map_item_use_intent(Some(&catalog), 101, position, 103, 3),
             None
         );
@@ -6693,6 +6852,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             native_map_item_use_intent(Some(&catalog), 101, position, 102, 3),
+            None
+        );
+        assert_eq!(
+            native_map_item_use_ex_intent(
+                Some(&catalog),
+                101,
+                (position, 102, 3),
+                (position, 102, 4)
+            ),
             None
         );
     }

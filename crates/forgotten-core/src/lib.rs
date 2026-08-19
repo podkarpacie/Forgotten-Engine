@@ -1963,6 +1963,50 @@ pub struct PlayerItemUseOutcome {
     pub charges: Option<u16>,
 }
 
+/// A bounded request to use one authoritative top-level map item on another authoritative
+/// top-level map item. It is validation-only: no action, charge, inventory, script, or packet
+/// behavior is activated by constructing or validating this request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerItemUseExIntent {
+    pub source: PlayerItemUseIntent,
+    pub target: PlayerItemUseIntent,
+}
+
+impl PlayerItemUseExIntent {
+    pub fn new(
+        player_id: u64,
+        source_position: Position,
+        source_stack_index: u8,
+        source_expected_server_id: u16,
+        target_position: Position,
+        target_stack_index: u8,
+        target_expected_server_id: u16,
+    ) -> Result<Self, CoreError> {
+        Ok(Self {
+            source: PlayerItemUseIntent::new(
+                player_id,
+                source_position,
+                source_stack_index,
+                source_expected_server_id,
+            )?,
+            target: PlayerItemUseIntent::new(
+                player_id,
+                target_position,
+                target_stack_index,
+                target_expected_server_id,
+            )?,
+        })
+    }
+}
+
+/// Immutable metadata observed after both halves of a bounded two-target item-use request pass
+/// the existing authoritative map, position, stack, and server-ID validation boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerItemUseExOutcome {
+    pub source: PlayerItemUseOutcome,
+    pub target: PlayerItemUseOutcome,
+}
+
 #[derive(Debug, Default)]
 pub struct WorldState {
     players: BTreeMap<u64, Player>,
@@ -2192,6 +2236,21 @@ impl WorldState {
             unique_id: item.unique_id,
             has_text: item.text.as_deref().is_some_and(|text| !text.is_empty()),
             charges: item.charges,
+        })
+    }
+
+    /// Validates both source and destination map-item references for a bounded two-target item-use
+    /// request. Both items must independently be same-tile or adjacent to the player, belong to
+    /// existing map tiles, and match their expected server IDs at the requested top-level stack
+    /// indexes. The world is never mutated and no action execution is claimed.
+    pub fn validate_player_item_use_ex(
+        &self,
+        map: &WorldMap,
+        intent: PlayerItemUseExIntent,
+    ) -> Result<PlayerItemUseExOutcome, CoreError> {
+        Ok(PlayerItemUseExOutcome {
+            source: self.validate_player_item_use(map, intent.source)?,
+            target: self.validate_player_item_use(map, intent.target)?,
         })
     }
 
@@ -5775,6 +5834,53 @@ mod tests {
                 .unwrap()
                 .count,
             2
+        );
+        assert_eq!(
+            world
+                .validate_player_item_use_ex(
+                    &map,
+                    PlayerItemUseExIntent::new(7, spawn, 0, 1945, adjacent, 0, 2376).unwrap(),
+                )
+                .unwrap(),
+            PlayerItemUseExOutcome {
+                source: PlayerItemUseOutcome {
+                    player_id: 7,
+                    position: spawn,
+                    stack_index: 0,
+                    server_id: 1945,
+                    count: 1,
+                    action_id: Some(7),
+                    unique_id: Some(42),
+                    has_text: true,
+                    charges: Some(3),
+                },
+                target: PlayerItemUseOutcome {
+                    player_id: 7,
+                    position: adjacent,
+                    stack_index: 0,
+                    server_id: 2376,
+                    count: 2,
+                    action_id: None,
+                    unique_id: None,
+                    has_text: false,
+                    charges: None,
+                },
+            }
+        );
+        assert_eq!(
+            PlayerItemUseExIntent::new(7, spawn, 0, 1945, adjacent, 0, 0),
+            Err(CoreError::InvalidItemUseIntent)
+        );
+        assert_eq!(
+            world.validate_player_item_use_ex(
+                &map,
+                PlayerItemUseExIntent::new(7, spawn, 0, 1945, far, 0, 2376).unwrap(),
+            ),
+            Err(CoreError::ItemUseOutOfRange {
+                player_id: 7,
+                from: spawn,
+                to: far,
+            })
         );
         assert_eq!(world.revision(), revision);
         assert_eq!(

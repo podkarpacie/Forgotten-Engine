@@ -68,6 +68,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Define side-effect-free authoritative validation for same-tile or adjacent exact top-level map-item use intents.
 - [x] Expose the side-effect-free map-item validation contract through synchronized host state.
 - [x] Decode bounded native 740 UseItem input and route it into synchronized no-mutation map validation only after a unique validated client-to-server item mapping; missing or ambiguous mappings remain rejected and action behavior stays deferred.
+- [x] Decode bounded native 740 UseItemEx input as two position/client-thing/stack references and route it into synchronized no-mutation validation only after both client item IDs map uniquely; both exact authoritative map items independently require existing range, tile, stack, and server-ID validation. Action execution, Lua, persistence, packets, and client-visible outcomes remain deferred.
 - [ ] Implement verified item use, use-with, move, look, doors, levers, switches, teleporters, and simple map actions.
 - [ ] Add depot, mail, and ground/container persistence with consistency and crash-recovery tests.
 - [ ] Validate legacy OTB/OTBM content mappings against active item/action runtime behavior without importing private data.
