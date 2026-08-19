@@ -11,6 +11,7 @@ use forgotten_core::{
     PlayerContainerStackToEquipmentOutcome, PlayerContainerToEquipmentOutcome, PlayerContainers,
     PlayerEquipment, PlayerEquipmentStackToContainerOutcome, PlayerEquipmentToContainerOutcome,
     PlayerExperienceAwardOutcome, PlayerFightMode, PlayerFightModeState, PlayerInteractionIntent,
+    PlayerItemUseCreatureIntent, PlayerItemUseCreatureOutcome, PlayerItemUseCreatureTarget,
     PlayerItemUseExIntent, PlayerItemUseExOutcome, PlayerItemUseIntent, PlayerItemUseOutcome,
     PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
     PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState, PlayerSkill,
@@ -308,6 +309,32 @@ fn native_map_item_use_ex_intent(
     .ok()
 }
 
+/// Converts a parsed native battle-window item request into a source item plus authoritative
+/// creature identity. The source still requires a unique catalog mapping; target validity and
+/// range remain core-owned validation and no action is executed here.
+fn native_map_item_use_creature_intent(
+    catalog: Option<&NativeItemPresentationCatalog>,
+    player_id: u64,
+    source_position: NativeOtClientPosition,
+    source_client_thing_id: u16,
+    source_stack_position: u8,
+    native_target_creature_id: u32,
+) -> Option<PlayerItemUseCreatureIntent> {
+    let source = native_map_item_use_intent(
+        catalog,
+        player_id,
+        source_position,
+        source_client_thing_id,
+        source_stack_position,
+    )?;
+    let target = native_player_id_to_character_id(native_target_creature_id)
+        .map(PlayerItemUseCreatureTarget::Player)
+        .unwrap_or(PlayerItemUseCreatureTarget::StaticCreature(
+            native_target_creature_id,
+        ));
+    Some(PlayerItemUseCreatureIntent { source, target })
+}
+
 fn native_classic_equipment_frames(
     profile: &NativeOtClientProfile,
     catalog: Option<&NativeItemPresentationCatalog>,
@@ -542,6 +569,20 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
             target_position.z,
             target_client_thing_id,
             target_stack_position,
+        ),
+        NativeOtClientGameAction::UseItemOnCreature {
+            source_position,
+            source_client_thing_id,
+            source_stack_position,
+            target_creature_id,
+        } => format!(
+            "action=use-item-on-creature source={},{},{} source-client-thing-id={} source-stack-position={} target-creature-id={}",
+            source_position.x,
+            source_position.y,
+            source_position.z,
+            source_client_thing_id,
+            source_stack_position,
+            target_creature_id,
         ),
         NativeOtClientGameAction::LookMap {
             position,
@@ -1291,6 +1332,19 @@ impl SharedNativeWorld {
     ) -> Result<PlayerItemUseExOutcome, HostError> {
         self.lock()?
             .validate_player_item_use_ex(map, intent)
+            .map_err(HostError::Core)
+    }
+
+    /// Validates one server-owned map item and one authoritative creature under the shared-world
+    /// lock. It does not select or affect the target, execute an item action, mutate state,
+    /// persist data, advance an epoch, or emit client packets.
+    pub fn validate_player_item_use_creature(
+        &self,
+        map: &WorldMap,
+        intent: PlayerItemUseCreatureIntent,
+    ) -> Result<PlayerItemUseCreatureOutcome, HostError> {
+        self.lock()?
+            .validate_player_item_use_creature(map, intent)
             .map_err(HostError::Core)
     }
 
@@ -3520,6 +3574,52 @@ fn handle_native_otclient_game(
                         config.extended_diagnostics,
                         peer,
                         "action=use-item-ex outcome=deferred-invalid-server-owned-map-item",
+                    ),
+                    Err(error) => return Err(error),
+                }
+            }
+            NativeOtClientGameAction::UseItemOnCreature {
+                source_position,
+                source_client_thing_id,
+                source_stack_position,
+                target_creature_id,
+            } => {
+                let Some(world_map) = config.world_map.as_deref() else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=use-item-on-creature outcome=deferred-no-world-map",
+                    );
+                    continue;
+                };
+                let Some(intent) = native_map_item_use_creature_intent(
+                    config.item_presentation_catalog.as_deref(),
+                    character.id,
+                    source_position,
+                    source_client_thing_id,
+                    source_stack_position,
+                    target_creature_id,
+                ) else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=use-item-on-creature outcome=deferred-unmapped-or-ambiguous-client-thing-id",
+                    );
+                    continue;
+                };
+                match shared_world.validate_player_item_use_creature(world_map, intent) {
+                    Ok(outcome) => native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        &format!(
+                            "action=use-item-on-creature outcome=validated source-server-id={} source-count={} target={:?}",
+                            outcome.source.server_id, outcome.source.count, outcome.target
+                        ),
+                    ),
+                    Err(HostError::Core(_)) => native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=use-item-on-creature outcome=deferred-invalid-server-owned-item-or-creature",
                     ),
                     Err(error) => return Err(error),
                 }
@@ -6841,6 +6941,47 @@ mod tests {
             native_map_item_use_intent(Some(&catalog), 101, position, 103, 3),
             None
         );
+        assert_eq!(
+            native_map_item_use_creature_intent(
+                Some(&catalog),
+                101,
+                position,
+                102,
+                3,
+                NATIVE_OTCLIENT_PLAYER_ID_START + 99,
+            ),
+            Some(PlayerItemUseCreatureIntent {
+                source: PlayerItemUseIntent::new(
+                    101,
+                    Position {
+                        x: 100,
+                        y: 101,
+                        z: 7,
+                    },
+                    3,
+                    1945,
+                )
+                .unwrap(),
+                target: PlayerItemUseCreatureTarget::Player(99),
+            })
+        );
+        assert_eq!(
+            native_map_item_use_creature_intent(Some(&catalog), 101, position, 102, 3, 0x4000_0001,),
+            Some(PlayerItemUseCreatureIntent {
+                source: PlayerItemUseIntent::new(
+                    101,
+                    Position {
+                        x: 100,
+                        y: 101,
+                        z: 7,
+                    },
+                    3,
+                    1945,
+                )
+                .unwrap(),
+                target: PlayerItemUseCreatureTarget::StaticCreature(0x4000_0001),
+            })
+        );
         catalog
             .insert(
                 1946,
@@ -6861,6 +7002,10 @@ mod tests {
                 (position, 102, 3),
                 (position, 102, 4)
             ),
+            None
+        );
+        assert_eq!(
+            native_map_item_use_creature_intent(Some(&catalog), 101, position, 102, 3, 0x4000_0001,),
             None
         );
     }
@@ -10306,5 +10451,21 @@ mod native_diagnostics_tests {
             }),
             "action=look-map position=100,101,7 thing-id=102 stack-position=3"
         );
+        let battle_window_summary =
+            native_action_diagnostic_summary(&NativeOtClientGameAction::UseItemOnCreature {
+                source_position: forgotten_protocol::NativeOtClientPosition {
+                    x: 100,
+                    y: 101,
+                    z: 7,
+                },
+                source_client_thing_id: 102,
+                source_stack_position: 3,
+                target_creature_id: 0x4000_0001,
+            });
+        assert_eq!(
+            battle_window_summary,
+            "action=use-item-on-creature source=100,101,7 source-client-thing-id=102 source-stack-position=3 target-creature-id=1073741825"
+        );
+        assert!(!battle_window_summary.contains("["));
     }
 }

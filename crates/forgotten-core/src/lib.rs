@@ -2007,6 +2007,44 @@ pub struct PlayerItemUseExOutcome {
     pub target: PlayerItemUseOutcome,
 }
 
+/// A server-owned creature identity addressed by a bounded map-item-on-creature validation
+/// request. This is identity data only; it neither changes selected targets nor initiates combat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerItemUseCreatureTarget {
+    Player(u64),
+    StaticCreature(u32),
+}
+
+/// A bounded request to validate one authoritative top-level map item against one authoritative
+/// player or active static-creature target. It performs no combat, action execution, Lua call,
+/// charge use, mutation, persistence, or packet delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerItemUseCreatureIntent {
+    pub source: PlayerItemUseIntent,
+    pub target: PlayerItemUseCreatureTarget,
+}
+
+/// Immutable target metadata observed after a bounded map-item-on-creature request passes the
+/// existing map-item validation and target activity/range checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerItemUseCreatureTargetOutcome {
+    Player {
+        player_id: u64,
+        position: Position,
+    },
+    StaticCreature {
+        creature_id: u32,
+        position: Position,
+        health_percent: u8,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerItemUseCreatureOutcome {
+    pub source: PlayerItemUseOutcome,
+    pub target: PlayerItemUseCreatureTargetOutcome,
+}
+
 #[derive(Debug, Default)]
 pub struct WorldState {
     players: BTreeMap<u64, Player>,
@@ -2252,6 +2290,61 @@ impl WorldState {
             source: self.validate_player_item_use(map, intent.source)?,
             target: self.validate_player_item_use(map, intent.target)?,
         })
+    }
+
+    /// Validates one exact authoritative top-level map item and one authoritative creature target.
+    /// The source item must meet the existing map, stack, server-ID, and range requirements. The
+    /// target must be a live player or an active static creature on the same or an adjacent tile.
+    /// This is validation-only and does not select, attack, affect, or otherwise mutate a target.
+    pub fn validate_player_item_use_creature(
+        &self,
+        map: &WorldMap,
+        intent: PlayerItemUseCreatureIntent,
+    ) -> Result<PlayerItemUseCreatureOutcome, CoreError> {
+        let source = self.validate_player_item_use(map, intent.source)?;
+        let player = self
+            .player(intent.source.player_id)
+            .ok_or(CoreError::UnknownPlayer(intent.source.player_id))?;
+        let target = match intent.target {
+            PlayerItemUseCreatureTarget::Player(player_id) => {
+                let target = self
+                    .player(player_id)
+                    .ok_or(CoreError::UnknownPlayer(player_id))?;
+                if self.player_respawn_state(player_id)?.dead {
+                    return Err(CoreError::PlayerIsDead(player_id));
+                }
+                PlayerItemUseCreatureTargetOutcome::Player {
+                    player_id,
+                    position: target.position,
+                }
+            }
+            PlayerItemUseCreatureTarget::StaticCreature(creature_id) => {
+                let target = self
+                    .static_creatures
+                    .get(&creature_id)
+                    .ok_or(CoreError::UnknownStaticCreature(creature_id))?;
+                if !target.active {
+                    return Err(CoreError::InactiveStaticCreature(creature_id));
+                }
+                PlayerItemUseCreatureTargetOutcome::StaticCreature {
+                    creature_id,
+                    position: target.entity.position,
+                    health_percent: target.health_percent,
+                }
+            }
+        };
+        let target_position = match target {
+            PlayerItemUseCreatureTargetOutcome::Player { position, .. }
+            | PlayerItemUseCreatureTargetOutcome::StaticCreature { position, .. } => position,
+        };
+        if player.position != target_position && !player.position.is_adjacent_to(target_position) {
+            return Err(CoreError::ItemUseOutOfRange {
+                player_id: intent.source.player_id,
+                from: player.position,
+                to: target_position,
+            });
+        }
+        Ok(PlayerItemUseCreatureOutcome { source, target })
     }
 
     pub fn set_player_target(
@@ -5921,6 +6014,167 @@ mod tests {
                 expected_server_id: 2376,
             })
         );
+    }
+
+    #[test]
+    fn authoritative_map_item_use_creature_is_bounded_side_effect_free_and_target_validated() {
+        let mut world = WorldState::default();
+        let source_player = player();
+        let spawn = source_player.position;
+        let adjacent = Position {
+            x: spawn.x + 1,
+            y: spawn.y,
+            z: spawn.z,
+        };
+        let far = Position {
+            x: spawn.x + 2,
+            y: spawn.y,
+            z: spawn.z,
+        };
+        world.add_player(source_player).unwrap();
+        world
+            .add_player(Player {
+                id: 8,
+                account_id: 8,
+                name: "Druid".into(),
+                position: Position {
+                    x: spawn.x,
+                    y: spawn.y + 1,
+                    z: spawn.z,
+                },
+                level: 8,
+                experience: 0,
+                skill_points: 0,
+            })
+            .unwrap();
+        let near_static_id = 0x4000_0001;
+        let far_static_id = 0x4000_0002;
+        world
+            .install_static_creatures(
+                &FeTfsStaticSpawnCollection::new(vec![
+                    FeTfsStaticEntity {
+                        id: near_static_id,
+                        name: "Rat".into(),
+                        position: adjacent,
+                        look_type: 21,
+                        head: 0,
+                        body: 0,
+                        legs: 0,
+                        feet: 0,
+                        addons: 0,
+                        speed: 134,
+                        health_percent: 75,
+                        direction: 2,
+                    },
+                    FeTfsStaticEntity {
+                        id: far_static_id,
+                        name: "Snake".into(),
+                        position: far,
+                        look_type: 21,
+                        head: 0,
+                        body: 0,
+                        legs: 0,
+                        feet: 0,
+                        addons: 0,
+                        speed: 134,
+                        health_percent: 100,
+                        direction: 2,
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let mut map = WorldMap::new("item-use-creature", spawn);
+        map.set_tile(
+            spawn,
+            WorldMapTile {
+                ground_thing_id: 102,
+                walkable: true,
+            },
+        )
+        .unwrap();
+        map.set_tile_items(
+            spawn,
+            vec![WorldMapItem {
+                server_id: 1945,
+                client_thing_id: Some(1945),
+                count: 1,
+                action_id: Some(7),
+                unique_id: None,
+                text: None,
+                description: None,
+                teleport_destination: None,
+                duration: None,
+                charges: Some(3),
+                children: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let revision = world.revision();
+        let source = PlayerItemUseIntent::new(7, spawn, 0, 1945).unwrap();
+        let static_outcome = world
+            .validate_player_item_use_creature(
+                &map,
+                PlayerItemUseCreatureIntent {
+                    source,
+                    target: PlayerItemUseCreatureTarget::StaticCreature(near_static_id),
+                },
+            )
+            .unwrap();
+        assert_eq!(static_outcome.source.server_id, 1945);
+        assert_eq!(
+            static_outcome.target,
+            PlayerItemUseCreatureTargetOutcome::StaticCreature {
+                creature_id: near_static_id,
+                position: adjacent,
+                health_percent: 75,
+            }
+        );
+        assert_eq!(
+            world
+                .validate_player_item_use_creature(
+                    &map,
+                    PlayerItemUseCreatureIntent {
+                        source,
+                        target: PlayerItemUseCreatureTarget::Player(8),
+                    },
+                )
+                .unwrap()
+                .target,
+            PlayerItemUseCreatureTargetOutcome::Player {
+                player_id: 8,
+                position: Position {
+                    x: spawn.x,
+                    y: spawn.y + 1,
+                    z: spawn.z,
+                },
+            }
+        );
+        assert_eq!(
+            world.validate_player_item_use_creature(
+                &map,
+                PlayerItemUseCreatureIntent {
+                    source,
+                    target: PlayerItemUseCreatureTarget::StaticCreature(999),
+                },
+            ),
+            Err(CoreError::UnknownStaticCreature(999))
+        );
+        assert_eq!(
+            world.validate_player_item_use_creature(
+                &map,
+                PlayerItemUseCreatureIntent {
+                    source,
+                    target: PlayerItemUseCreatureTarget::StaticCreature(far_static_id),
+                },
+            ),
+            Err(CoreError::ItemUseOutOfRange {
+                player_id: 7,
+                from: spawn,
+                to: far,
+            })
+        );
+        assert_eq!(world.revision(), revision);
     }
 
     #[test]

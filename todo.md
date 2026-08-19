@@ -339,3 +339,4 @@
 - [x] Apply configured vocation health, mana, and capacity gains to a real native selected-static defeat level-up, atomically persisting the changed level, experience, and vitals.
 - [x] Restore persisted active conditions into a new native shared-world registration after disconnect/relog, preserving validated remaining timing and subsequent vital changes.
 - [x] Decode native 740 UseItemEx and validate both catalog-mapped authoritative map-item targets without action execution, mutation, Lua, or outbound packet behavior.
+- [x] Decode native 740 battle-window item input and validate one catalog-mapped authoritative map item plus one active authoritative creature target without action execution, combat, mutation, Lua, persistence, or outbound packet behavior.
