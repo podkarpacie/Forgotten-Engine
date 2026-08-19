@@ -2047,6 +2047,107 @@ pub struct PlayerItemUseCreatureOutcome {
     pub target: PlayerItemUseCreatureTargetOutcome,
 }
 
+/// Maximum number of validated worker handoff commands that one future authoritative tick may
+/// accept. This primitive is intentionally separate from `WorldState`: current gameplay mutation
+/// remains synchronous while the command-queue integration contract is still being designed.
+pub const MAX_DETERMINISTIC_COMMAND_BATCH: usize = 4_096;
+
+/// Stable key for a future validated command handoff. Sorting by this key makes application order
+/// independent of worker scheduling order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeterministicWorldCommandKey {
+    pub tick: u64,
+    pub player_id: u64,
+    pub session_sequence: u64,
+}
+
+/// One payload awaiting future authoritative-world application. The payload has no execution
+/// trait and cannot mutate a world through this foundational type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeterministicWorldCommand<T> {
+    pub key: DeterministicWorldCommandKey,
+    pub payload: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeterministicWorldCommandBatchError {
+    InvalidLimit(usize),
+    CapacityExceeded { limit: usize },
+    DuplicateKey(DeterministicWorldCommandKey),
+}
+
+/// A bounded, caller-synchronized collection of already validated commands. It offers no worker
+/// threads, no world reference, and no execution function. A future authoritative tick may drain
+/// it in stable key order after it has taken exclusive ownership of the batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeterministicWorldCommandBatch<T> {
+    limit: usize,
+    commands: Vec<DeterministicWorldCommand<T>>,
+}
+
+impl<T> DeterministicWorldCommandBatch<T> {
+    pub fn new(limit: usize) -> Result<Self, DeterministicWorldCommandBatchError> {
+        if limit == 0 || limit > MAX_DETERMINISTIC_COMMAND_BATCH {
+            return Err(DeterministicWorldCommandBatchError::InvalidLimit(limit));
+        }
+        Ok(Self {
+            limit,
+            commands: Vec::new(),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.commands.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Accepts a command only when its stable key is unique inside the current batch. Callers may
+    /// submit concurrently only through their own synchronization boundary.
+    pub fn push(
+        &mut self,
+        command: DeterministicWorldCommand<T>,
+    ) -> Result<(), DeterministicWorldCommandBatchError> {
+        if self
+            .commands
+            .iter()
+            .any(|existing| existing.key == command.key)
+        {
+            return Err(DeterministicWorldCommandBatchError::DuplicateKey(
+                command.key,
+            ));
+        }
+        if self.commands.len() >= self.limit {
+            return Err(DeterministicWorldCommandBatchError::CapacityExceeded {
+                limit: self.limit,
+            });
+        }
+        self.commands.push(command);
+        Ok(())
+    }
+
+    /// Removes every queued command in deterministic application order. This does not apply a
+    /// payload and does not access `WorldState`.
+    pub fn drain_sorted(&mut self) -> Vec<DeterministicWorldCommand<T>> {
+        let mut commands = std::mem::take(&mut self.commands);
+        commands.sort_by_key(|command| command.key);
+        commands
+    }
+}
+
+impl<T> Default for DeterministicWorldCommandBatch<T> {
+    fn default() -> Self {
+        Self::new(MAX_DETERMINISTIC_COMMAND_BATCH)
+            .expect("the built-in deterministic command-batch limit is valid")
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct WorldState {
     players: BTreeMap<u64, Player>,
@@ -4946,6 +5047,127 @@ mod tests {
             Ok(ServerStatus::Online)
         );
         assert!(ServerStatus::Online.apply(LifecycleCommand::Ready).is_err());
+    }
+
+    #[test]
+    fn deterministic_command_batch_orders_worker_handoffs_and_rejects_duplicates() {
+        let mut batch = DeterministicWorldCommandBatch::new(3).unwrap();
+        let commands = [
+            DeterministicWorldCommand {
+                key: DeterministicWorldCommandKey {
+                    tick: 8,
+                    player_id: 9,
+                    session_sequence: 2,
+                },
+                payload: "third",
+            },
+            DeterministicWorldCommand {
+                key: DeterministicWorldCommandKey {
+                    tick: 7,
+                    player_id: 10,
+                    session_sequence: 1,
+                },
+                payload: "first",
+            },
+            DeterministicWorldCommand {
+                key: DeterministicWorldCommandKey {
+                    tick: 8,
+                    player_id: 9,
+                    session_sequence: 1,
+                },
+                payload: "second",
+            },
+        ];
+        for command in commands.clone() {
+            batch.push(command).unwrap();
+        }
+        assert_eq!(batch.len(), 3);
+        assert_eq!(
+            batch.push(commands[1].clone()),
+            Err(DeterministicWorldCommandBatchError::DuplicateKey(
+                commands[1].key
+            ))
+        );
+        assert_eq!(
+            batch
+                .drain_sorted()
+                .into_iter()
+                .map(|command| command.payload)
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn deterministic_command_batch_is_bounded_and_external_mutex_handoffs_remain_ordered() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        assert_eq!(
+            DeterministicWorldCommandBatch::<u8>::new(0),
+            Err(DeterministicWorldCommandBatchError::InvalidLimit(0))
+        );
+        let batch = Arc::new(Mutex::new(DeterministicWorldCommandBatch::new(2).unwrap()));
+        thread::scope(|scope| {
+            for (player_id, sequence) in [(9, 2), (8, 1)] {
+                let batch = Arc::clone(&batch);
+                scope.spawn(move || {
+                    batch
+                        .lock()
+                        .unwrap()
+                        .push(DeterministicWorldCommand {
+                            key: DeterministicWorldCommandKey {
+                                tick: 4,
+                                player_id,
+                                session_sequence: sequence,
+                            },
+                            payload: player_id,
+                        })
+                        .unwrap();
+                });
+            }
+        });
+        let mut batch = batch.lock().unwrap();
+        assert_eq!(
+            batch
+                .drain_sorted()
+                .into_iter()
+                .map(|command| command.payload)
+                .collect::<Vec<_>>(),
+            vec![8, 9]
+        );
+        batch
+            .push(DeterministicWorldCommand {
+                key: DeterministicWorldCommandKey {
+                    tick: 5,
+                    player_id: 1,
+                    session_sequence: 1,
+                },
+                payload: 1,
+            })
+            .unwrap();
+        batch
+            .push(DeterministicWorldCommand {
+                key: DeterministicWorldCommandKey {
+                    tick: 5,
+                    player_id: 2,
+                    session_sequence: 1,
+                },
+                payload: 2,
+            })
+            .unwrap();
+        assert_eq!(
+            batch.push(DeterministicWorldCommand {
+                key: DeterministicWorldCommandKey {
+                    tick: 5,
+                    player_id: 3,
+                    session_sequence: 1,
+                },
+                payload: 3,
+            }),
+            Err(DeterministicWorldCommandBatchError::CapacityExceeded { limit: 2 })
+        );
     }
 
     #[test]

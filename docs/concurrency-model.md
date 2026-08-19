@@ -39,6 +39,25 @@ world will apply a sorted batch at each tick, publish an immutable snapshot, and
 before packet encoding or network writes. This preserves reproducible outcomes while allowing
 decoding, encoding, and disconnected-content work to use available CPU cores.
 
+## Implemented command-batch foundation
+
+`forgotten-core` now provides a bounded `DeterministicWorldCommandBatch<T>` for future validated
+worker handoff. Each command carries a `DeterministicWorldCommandKey` containing the planned tick,
+player ID, and session-local sequence. A batch rejects duplicate keys, rejects capacity overflow,
+and drains commands sorted by that exact key. The primitive holds an opaque payload and exposes no
+world reference or execution method.
+
+| Guarantee | Current foundation | Still deferred |
+| --- | --- | --- |
+| Stable ordering | `drain_sorted()` orders by `(tick, player_id, session_sequence)`. | Applying commands to `WorldState` at a scheduled tick. |
+| Bounded handoff | A caller chooses a nonzero limit no greater than 4,096 commands. | Producer backpressure, queues, and admission policy. |
+| Duplicate safety | A duplicate ordering key is rejected before it can obscure deterministic order. | Session lifecycle and reconnect sequence ownership. |
+| Thread ownership | Callers may synchronize producer access externally; the foundation itself has no workers. | Worker pools, gameplay mutation on workers, and a performance claim. |
+
+> This is a preparation boundary, not a concurrent gameplay engine. Existing authoritative world
+> mutations remain synchronized through the current host/world boundary until a sorted-batch
+> application contract, snapshot publication, benchmark scenario, and full regression gates exist.
+
 ## Benchmark and regression gate
 
 The multithreaded rollout must be measured rather than assumed to be faster. Each implementation
