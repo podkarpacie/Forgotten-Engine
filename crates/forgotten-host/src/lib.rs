@@ -391,6 +391,18 @@ fn native_classic_equipment_delta_frames(
         .collect()
 }
 
+/// Produces the sole client-control frame associated with FE's bounded selected-static-target
+/// deactivation. It does not cover generic creature removal, loot, corpses, effects, or AI.
+fn native_static_target_deactivation_frames(
+    profile: &NativeOtClientProfile,
+    deactivated: bool,
+) -> Result<Vec<Frame>, ProtocolError> {
+    if !deactivated {
+        return Ok(Vec::new());
+    }
+    Ok(vec![encode_native_otclient_clear_target(profile)?])
+}
+
 fn native_classic_container_frame(
     profile: &NativeOtClientProfile,
     catalog: Option<&NativeItemPresentationCatalog>,
@@ -3352,6 +3364,19 @@ fn handle_native_otclient_game(
                                 config.experience_award_policy.as_deref(),
                                 config.vocation_level_up_gains.as_deref(),
                             )?;
+                            for frame in native_static_target_deactivation_frames(
+                                &config.client_profile,
+                                outcome.deactivated,
+                            )
+                            .map_err(HostError::Protocol)?
+                            {
+                                write_frame(stream, &frame)?;
+                            }
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "outbound=clear-target opcode=0xa3 fields=none reason=static-target-deactivated",
+                            );
                         }
                         let health_update = encode_native_otclient_creature_health(
                             &config.client_profile,
@@ -8139,6 +8164,22 @@ mod tests {
                 64,
                 40,
             ]]
+        );
+    }
+
+    #[test]
+    fn static_target_deactivation_emits_only_classic_clear_target_control() {
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+        assert!(native_static_target_deactivation_frames(&profile, false)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            native_static_target_deactivation_frames(&profile, true)
+                .unwrap()
+                .into_iter()
+                .map(|frame| frame.0)
+                .collect::<Vec<_>>(),
+            vec![vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CLEAR_TARGET]]
         );
     }
 
