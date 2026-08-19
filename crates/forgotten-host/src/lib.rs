@@ -3531,6 +3531,11 @@ fn handle_native_otclient_game(
                     && source_stack_position == 0)
                     .then(|| EquipmentSlot::from_code(source_position.y as u8))
                     .flatten();
+                let source_container =
+                    (source_position.x == 0xffff && source_position.y & 0x40 != 0).then_some((
+                        (source_position.y & 0x0f) as u8,
+                        usize::from(source_position.z),
+                    ));
                 let target_slot = (target_position.x == 0xffff
                     && target_position.y & 0x40 == 0
                     && target_position.z == 0)
@@ -3551,14 +3556,6 @@ fn handle_native_otclient_game(
                     );
                     continue;
                 };
-                let Some(source_slot) = source_slot else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=throw-item outcome=deferred-non-equipment-source-position",
-                    );
-                    continue;
-                };
                 if count == 0 {
                     native_diagnostic(
                         config.extended_diagnostics,
@@ -3567,6 +3564,94 @@ fn handle_native_otclient_game(
                     );
                     continue;
                 }
+                if let Some((container_id, item_index)) = source_container {
+                    let Some(target_slot) = target_slot else {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-unsupported-container-source-target",
+                        );
+                        continue;
+                    };
+                    let equipment = shared_world.player_equipment(character.id)?;
+                    if equipment.item(target_slot).is_some() {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-occupied-equipment-target",
+                        );
+                        continue;
+                    }
+                    let containers = shared_world.player_containers(character.id)?;
+                    let Some(container) = containers.container(container_id) else {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-unknown-container-source",
+                        );
+                        continue;
+                    };
+                    if container.has_parent {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-nested-container-source",
+                        );
+                        continue;
+                    }
+                    let Some(item) = container.items.item(item_index) else {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-unknown-container-source-item",
+                        );
+                        continue;
+                    };
+                    if item.count != u16::from(count)
+                        || catalog
+                            .presentation(item.server_id)
+                            .map(|entry| entry.client_thing_id)
+                            != Some(source_client_thing_id)
+                    {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-invalid-container-item-identity-or-whole-item-count",
+                        );
+                        continue;
+                    }
+                    shared_world.move_container_item_to_equipment(
+                        character.id,
+                        container_id,
+                        item_index,
+                        target_slot,
+                    )?;
+                    let next_equipment = shared_world.player_equipment(character.id)?;
+                    let next_containers = shared_world.player_containers(character.id)?;
+                    database.replace_player_equipment(character.id, &next_equipment)?;
+                    database.replace_player_containers(character.id, &next_containers)?;
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        &format!(
+                            "action=throw-item outcome=top-level-container-to-equipment container-id={} item-index={} target-slot={} client-thing-id={} count={}",
+                            container_id,
+                            item_index,
+                            target_slot.code(),
+                            source_client_thing_id,
+                            count
+                        ),
+                    );
+                    continue;
+                }
+                let Some(source_slot) = source_slot else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=throw-item outcome=deferred-non-equipment-source-position",
+                    );
+                    continue;
+                };
                 let equipment = shared_world.player_equipment(character.id)?;
                 let Some(item) = equipment.item(source_slot).cloned() else {
                     native_diagnostic(
@@ -9432,6 +9517,157 @@ mod tests {
                 == &vec![
                     0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0,
                     1, 102, 0, 1,
+                ]
+        }));
+        drop(client);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_throw_moves_one_mapped_top_level_container_item_to_empty_equipment_slot() {
+        let database_path = database_path("native-container-equipment-transfer");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let mut container = forgotten_core::PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        container
+            .items
+            .insert(ItemInstance::new(4526, 1).unwrap())
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(container).unwrap();
+        database.replace_player_containers(1, &containers).unwrap();
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for (server_id, client_thing_id, requires_classic_740_subtype) in
+            [(1988, 1988, false), (4526, 102, true)]
+        {
+            catalog
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id,
+                        requires_classic_740_subtype,
+                    },
+                )
+                .unwrap();
+        }
+        let mut config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        config.item_presentation_catalog = Some(Arc::new(catalog));
+        let game = start_native_otclient_game(config, &database_path).unwrap();
+        let mut client = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut client,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut client).unwrap();
+        let initial_container = read_frame(&mut client).unwrap();
+        assert_eq!(
+            initial_container.0,
+            vec![
+                0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0, 1,
+                102, 0, 1,
+            ]
+        );
+
+        write_frame(
+            &mut client,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                255,
+                255,
+                0x40 | 2,
+                0,
+                0,
+                102,
+                0,
+                0,
+                255,
+                255,
+                EquipmentSlot::RightHand.code(),
+                0,
+                0,
+                1,
+            ]),
+        )
+        .unwrap();
+        for _ in 0..20 {
+            if database
+                .player_equipment(1)
+                .unwrap()
+                .item(EquipmentSlot::RightHand)
+                .is_some()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            database
+                .player_equipment(1)
+                .unwrap()
+                .item(EquipmentSlot::RightHand),
+            Some(&ItemInstance::new(4526, 1).unwrap())
+        );
+        assert!(database
+            .player_containers(1)
+            .unwrap()
+            .container(2)
+            .unwrap()
+            .items
+            .is_empty());
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let updates = (0..2)
+            .map(|_| read_frame(&mut client).unwrap().0)
+            .collect::<Vec<_>>();
+        assert!(
+            updates.iter().any(|frame| {
+                frame
+                    == &vec![
+                        forgotten_protocol::NATIVE_OTCLIENT_GAME_SET_INVENTORY,
+                        EquipmentSlot::RightHand.code(),
+                        102,
+                        0,
+                        1,
+                    ]
+            }),
+            "missing mapped equipment update: {updates:?}"
+        );
+        assert!(updates.iter().any(|frame| {
+            frame
+                == &vec![
+                    0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0, 0,
                 ]
         }));
         drop(client);
