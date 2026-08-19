@@ -744,6 +744,7 @@ pub struct NativePlayerHydration {
 pub struct SharedNativeWorld {
     world: Arc<Mutex<WorldState>>,
     player_outfits: Arc<Mutex<BTreeMap<u64, NativeOtClientClassicOutfit>>>,
+    player_directions: Arc<Mutex<BTreeMap<u64, u8>>>,
     visibility_epoch: Arc<AtomicU64>,
     vitals_epoch: Arc<AtomicU64>,
     progression_epoch: Arc<AtomicU64>,
@@ -778,6 +779,7 @@ impl SharedNativeWorld {
         Ok(Self {
             world: Arc::new(Mutex::new(world)),
             player_outfits: Arc::new(Mutex::new(BTreeMap::new())),
+            player_directions: Arc::new(Mutex::new(BTreeMap::new())),
             visibility_epoch: Arc::new(AtomicU64::new(0)),
             vitals_epoch: Arc::new(AtomicU64::new(0)),
             progression_epoch: Arc::new(AtomicU64::new(0)),
@@ -1715,6 +1717,10 @@ impl SharedNativeWorld {
             .player_outfits
             .lock()
             .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let player_directions = self
+            .player_directions
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
         player_snapshots
             .into_iter()
             .filter(|player| player.id != observer_id)
@@ -1732,6 +1738,10 @@ impl SharedNativeWorld {
                             feet: 0,
                         },
                     ),
+                    direction: player_directions
+                        .get(&player.id)
+                        .copied()
+                        .unwrap_or(NativeOtClientCardinalDirection::South.protocol_direction()),
                     speed,
                 })
             })
@@ -1758,6 +1768,10 @@ impl SharedNativeWorld {
             .player_outfits
             .lock()
             .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let player_directions = self
+            .player_directions
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
         let visible_players = player_snapshots
             .into_iter()
             .filter(|player| player.id != observer_id)
@@ -1775,6 +1789,10 @@ impl SharedNativeWorld {
                             feet: 0,
                         },
                     ),
+                    direction: player_directions
+                        .get(&player.id)
+                        .copied()
+                        .unwrap_or(NativeOtClientCardinalDirection::South.protocol_direction()),
                     speed,
                 })
             })
@@ -1984,6 +2002,10 @@ impl SharedNativeWorld {
             .lock()
             .map_err(|_| HostError::SharedWorldUnavailable)?
             .remove(&id);
+        self.player_directions
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?
+            .remove(&id);
         self.mark_visibility_changed();
         Ok(())
     }
@@ -1997,6 +2019,19 @@ impl SharedNativeWorld {
             .lock()
             .map_err(|_| HostError::SharedWorldUnavailable)?
             .insert(player_id, outfit);
+        self.mark_visibility_changed();
+        Ok(())
+    }
+    pub fn update_player_facing(
+        &self,
+        player_id: u64,
+        facing: NativeOtClientCardinalDirection,
+    ) -> Result<(), HostError> {
+        self.player_and_vitals(player_id)?;
+        self.player_directions
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?
+            .insert(player_id, facing.protocol_direction());
         self.mark_visibility_changed();
         Ok(())
     }
@@ -2840,6 +2875,7 @@ fn handle_native_otclient_game(
         character.outfit,
     );
     shared_world.update_player_outfit(character.id, player_outfit)?;
+    shared_world.update_player_facing(character.id, NativeOtClientCardinalDirection::South)?;
     let player_id = native_player_id(character.id)?;
     let (authoritative_player, authoritative_vitals) =
         shared_world.player_and_vitals(character.id)?;
@@ -4007,6 +4043,8 @@ fn handle_native_otclient_game(
                     ),
                 );
                 facing = direction;
+                shared_world.update_player_facing(character.id, facing)?;
+                observed_visibility_epoch = shared_world.visibility_epoch();
                 write_frame(
                     stream,
                     &encode_native_otclient_game_cancel_walk_facing(
@@ -4486,6 +4524,7 @@ fn move_native_map_player(
         return Ok(false);
     };
     *facing = direction;
+    shared_world.update_player_facing(character_id, *facing)?;
     if let Some(teleport_destination) =
         native_stepped_on_map_teleport_destination(world_map, destination)
     {
@@ -4667,6 +4706,7 @@ fn move_native_map_player_diagonal(
         return Ok(false);
     };
     *facing = steps[1];
+    shared_world.update_player_facing(character_id, *facing)?;
     if let Some(teleport_destination) =
         native_stepped_on_map_teleport_destination(world_map, destination)
     {
@@ -8633,6 +8673,21 @@ mod tests {
                 feet: 4,
             }
         );
+        assert_eq!(
+            visible[0].direction,
+            NativeOtClientCardinalDirection::South.protocol_direction()
+        );
+
+        shared
+            .update_player_facing(102, NativeOtClientCardinalDirection::East)
+            .unwrap();
+
+        assert_eq!(shared.visibility_epoch(), 4);
+        let visible = shared.visible_players(101, 128, 220).unwrap();
+        assert_eq!(
+            visible[0].direction,
+            NativeOtClientCardinalDirection::East.protocol_direction()
+        );
         shared.remove_player(102).unwrap();
         shared.remove_player(101).unwrap();
     }
@@ -8764,6 +8819,37 @@ mod tests {
             &refreshed_druid_view.0[refreshed_knight_name_index + knight_name.len() + 2
                 ..refreshed_knight_name_index + knight_name.len() + 7],
             &[129, 1, 2, 3, 4]
+        );
+
+        write_frame(
+            &mut knight,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_TURN_EAST]),
+        )
+        .unwrap();
+        let turn_ack = (0..3)
+            .map(|_| read_frame(&mut knight).unwrap())
+            .find(|frame| {
+                frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK)
+            })
+            .expect("turn acknowledgement was not delivered");
+        assert_eq!(
+            turn_ack.0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 1]
+        );
+        let peer_turn_refresh = (0..3)
+            .map(|_| read_frame(&mut druid).unwrap())
+            .find(|frame| {
+                frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP)
+            })
+            .expect("peer session did not receive a viewport refresh after turn");
+        let turned_knight_name_index = peer_turn_refresh
+            .0
+            .windows(knight_name.len())
+            .position(|window| window == knight_name)
+            .unwrap();
+        assert_eq!(
+            peer_turn_refresh.0[turned_knight_name_index + knight_name.len() + 1],
+            NativeOtClientCardinalDirection::East.protocol_direction()
         );
 
         drop(knight);
