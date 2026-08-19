@@ -229,6 +229,7 @@
 - [ ] Complete the next bounded FE 7.4 melee progression slice by awarding configured vocation-based skill tries without claiming weapon or spell formula support.
 - [x] Award one configured vocation-based fist try for each successful fixed selected-player melee hit and persist exact progression counters; weapon and spell formula support remains deferred.
 - [ ] Continue FE 7.4 world-interaction, content-runtime, social, and operational milestones with regression coverage and explicit capability reporting until the documented completion model exceeds 50%.
+- [x] Award configured vocation-based melee skill tries after accepted native FE 7.4 melee outcomes only when the authoritative progression, persistence, and client-refresh paths are independently covered. Verified existing selected-player melee coverage for rate-scaled configured fist tries, authoritative progression, and SQLite persistence; broader weapon and spell formula behavior remains deferred.
 - [x] Publish a weighted FE 7.4 completion ledger with evidence requirements for each system category and a rule for reporting progress above 50%.
 - [x] Apply configured experience rates and `stages.xml` ranges to authoritative operator experience awards, with exact regression coverage; combat/quest/monster event sources remain deferred.
 - [x] Apply configured vocation progression formulas to fixed-melee fist skill-try awards, with no claim of weapon or spell formulas.
