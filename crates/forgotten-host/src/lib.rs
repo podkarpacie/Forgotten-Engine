@@ -3526,13 +3526,23 @@ fn handle_native_otclient_game(
                 count,
             } => {
                 let source_slot = (source_position.x == 0xffff
+                    && source_position.y & 0x40 == 0
                     && source_position.z == 0
                     && source_stack_position == 0)
                     .then(|| EquipmentSlot::from_code(source_position.y as u8))
                     .flatten();
-                let target_slot = (target_position.x == 0xffff && target_position.z == 0)
+                let target_slot = (target_position.x == 0xffff
+                    && target_position.y & 0x40 == 0
+                    && target_position.z == 0)
                     .then(|| EquipmentSlot::from_code(target_position.y as u8))
                     .flatten();
+                // Classic clients address open container windows with the high container flag
+                // in y and the window identifier in its lower four bits. The destination item
+                // index remains a client-side drop location: this bounded path appends to the
+                // already-owned top-level container and does not infer generic inventory rules.
+                let target_container_id = (target_position.x == 0xffff
+                    && target_position.y & 0x40 != 0)
+                    .then_some((target_position.y & 0x0f) as u8);
                 let Some(catalog) = config.item_presentation_catalog.as_deref() else {
                     native_diagnostic(
                         config.extended_diagnostics,
@@ -3541,23 +3551,23 @@ fn handle_native_otclient_game(
                     );
                     continue;
                 };
-                let (Some(source_slot), Some(target_slot)) = (source_slot, target_slot) else {
+                let Some(source_slot) = source_slot else {
                     native_diagnostic(
                         config.extended_diagnostics,
                         peer,
-                        "action=throw-item outcome=deferred-non-equipment-position",
+                        "action=throw-item outcome=deferred-non-equipment-source-position",
                     );
                     continue;
                 };
-                if source_slot == target_slot || count == 0 {
+                if count == 0 {
                     native_diagnostic(
                         config.extended_diagnostics,
                         peer,
-                        "action=throw-item outcome=deferred-invalid-slot-or-count",
+                        "action=throw-item outcome=deferred-zero-count",
                     );
                     continue;
                 }
-                let mut equipment = shared_world.player_equipment(character.id)?;
+                let equipment = shared_world.player_equipment(character.id)?;
                 let Some(item) = equipment.item(source_slot).cloned() else {
                     native_diagnostic(
                         config.extended_diagnostics,
@@ -3566,8 +3576,7 @@ fn handle_native_otclient_game(
                     );
                     continue;
                 };
-                if equipment.item(target_slot).is_some()
-                    || item.count != u16::from(count)
+                if item.count != u16::from(count)
                     || catalog
                         .presentation(item.server_id)
                         .map(|entry| entry.client_thing_id)
@@ -3576,25 +3585,84 @@ fn handle_native_otclient_game(
                     native_diagnostic(
                         config.extended_diagnostics,
                         peer,
-                        "action=throw-item outcome=deferred-invalid-item-identity-count-or-occupied-target",
+                        "action=throw-item outcome=deferred-invalid-item-identity-or-whole-item-count",
                     );
                     continue;
                 }
-                equipment.unequip(source_slot);
-                equipment.equip(target_slot, item);
-                database.replace_player_equipment(character.id, &equipment)?;
-                shared_world.replace_player_equipment(character.id, equipment)?;
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "action=throw-item outcome=equipment-slot-transfer source-slot={} target-slot={} client-thing-id={} count={}",
-                        source_slot.code(),
-                        target_slot.code(),
-                        source_client_thing_id,
-                        count
-                    ),
-                );
+                match (target_slot, target_container_id) {
+                    (Some(target_slot), None) => {
+                        if source_slot == target_slot || equipment.item(target_slot).is_some() {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-invalid-or-occupied-equipment-target",
+                            );
+                            continue;
+                        }
+                        let mut next_equipment = equipment;
+                        next_equipment.unequip(source_slot);
+                        next_equipment.equip(target_slot, item);
+                        database.replace_player_equipment(character.id, &next_equipment)?;
+                        shared_world.replace_player_equipment(character.id, next_equipment)?;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "action=throw-item outcome=equipment-slot-transfer source-slot={} target-slot={} client-thing-id={} count={}",
+                                source_slot.code(),
+                                target_slot.code(),
+                                source_client_thing_id,
+                                count
+                            ),
+                        );
+                    }
+                    (None, Some(container_id)) => {
+                        let containers = shared_world.player_containers(character.id)?;
+                        let Some(container) = containers.container(container_id) else {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-unknown-container-target",
+                            );
+                            continue;
+                        };
+                        if container.has_parent {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-nested-container-target",
+                            );
+                            continue;
+                        }
+                        shared_world.move_equipment_item_to_container(
+                            character.id,
+                            source_slot,
+                            container_id,
+                        )?;
+                        let next_equipment = shared_world.player_equipment(character.id)?;
+                        let next_containers = shared_world.player_containers(character.id)?;
+                        database.replace_player_equipment(character.id, &next_equipment)?;
+                        database.replace_player_containers(character.id, &next_containers)?;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "action=throw-item outcome=equipment-to-top-level-container source-slot={} container-id={} client-thing-id={} count={}",
+                                source_slot.code(),
+                                container_id,
+                                source_client_thing_id,
+                                count
+                            ),
+                        );
+                    }
+                    _ => {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-unsupported-target-position",
+                        );
+                    }
+                }
             }
             NativeOtClientGameAction::ChangeFightModes(request) => {
                 let mode = match request.mode {
@@ -9222,6 +9290,148 @@ mod tests {
                     EquipmentSlot::LeftHand.code(),
                     102,
                     0,
+                ]
+        }));
+        drop(client);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_throw_moves_one_mapped_equipment_item_to_top_level_container() {
+        let database_path = database_path("native-equipment-container-transfer");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(
+            EquipmentSlot::RightHand,
+            ItemInstance::new(4526, 1).unwrap(),
+        );
+        database.replace_player_equipment(1, &equipment).unwrap();
+        let mut containers = PlayerContainers::default();
+        containers
+            .insert(
+                forgotten_core::PlayerContainer::new(
+                    2,
+                    ItemInstance::new(1988, 1).unwrap(),
+                    "Backpack",
+                    false,
+                    20,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        database.replace_player_containers(1, &containers).unwrap();
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for (server_id, client_thing_id, requires_classic_740_subtype) in
+            [(1988, 1988, false), (4526, 102, true)]
+        {
+            catalog
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id,
+                        requires_classic_740_subtype,
+                    },
+                )
+                .unwrap();
+        }
+        let mut config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        config.item_presentation_catalog = Some(Arc::new(catalog));
+        let game = start_native_otclient_game(config, &database_path).unwrap();
+        let mut client = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut client,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut client).unwrap();
+        let _equipment = read_frame(&mut client).unwrap();
+        let initial_container = read_frame(&mut client).unwrap();
+        assert_eq!(initial_container.0.first(), Some(&0x6e));
+
+        write_frame(
+            &mut client,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                255,
+                255,
+                EquipmentSlot::RightHand.code(),
+                0,
+                0,
+                102,
+                0,
+                0,
+                255,
+                255,
+                0x40 | 2,
+                0,
+                0,
+                1,
+            ]),
+        )
+        .unwrap();
+        for _ in 0..20 {
+            if database
+                .player_equipment(1)
+                .unwrap()
+                .item(EquipmentSlot::RightHand)
+                .is_none()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(database
+            .player_equipment(1)
+            .unwrap()
+            .item(EquipmentSlot::RightHand)
+            .is_none());
+        let persisted_containers = database.player_containers(1).unwrap();
+        assert_eq!(
+            persisted_containers.container(2).unwrap().items.item(0),
+            Some(&ItemInstance::new(4526, 1).unwrap())
+        );
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let updates = (0..2)
+            .map(|_| read_frame(&mut client).unwrap().0)
+            .collect::<Vec<_>>();
+        assert!(updates.iter().any(|frame| {
+            frame
+                == &vec![
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_DELETE_INVENTORY,
+                    EquipmentSlot::RightHand.code(),
+                ]
+        }));
+        assert!(updates.iter().any(|frame| {
+            frame
+                == &vec![
+                    0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0,
+                    1, 102, 0, 1,
                 ]
         }));
         drop(client);
