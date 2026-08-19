@@ -876,6 +876,7 @@ pub const NATIVE_OTCLIENT_CLIENT_WALK_EAST: u8 = 0x66;
 pub const NATIVE_OTCLIENT_CLIENT_WALK_SOUTH: u8 = 0x67;
 pub const NATIVE_OTCLIENT_CLIENT_WALK_WEST: u8 = 0x68;
 pub const NATIVE_OTCLIENT_CLIENT_STOP: u8 = 0x69;
+pub const NATIVE_OTCLIENT_CLIENT_THROW_ITEM: u8 = 0x78;
 pub const NATIVE_OTCLIENT_CLIENT_WALK_NORTH_EAST: u8 = 0x6a;
 pub const NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_EAST: u8 = 0x6b;
 pub const NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_WEST: u8 = 0x6c;
@@ -1213,6 +1214,13 @@ pub enum NativeOtClientGameAction {
     Stop,
     AutoWalk(Vec<NativeOtClientAutoWalkDirection>),
     Talk(String),
+    ThrowItem {
+        source_position: NativeOtClientPosition,
+        source_client_thing_id: u16,
+        source_stack_position: u8,
+        target_position: NativeOtClientPosition,
+        count: u8,
+    },
     UseItem {
         position: NativeOtClientPosition,
         client_thing_id: u16,
@@ -2025,6 +2033,26 @@ pub fn decode_native_otclient_game_action(
             }
             NativeOtClientGameAction::AutoWalk(path)
         }
+        NATIVE_OTCLIENT_CLIENT_THROW_ITEM => {
+            if reader.remaining() != 14 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            NativeOtClientGameAction::ThrowItem {
+                source_position: NativeOtClientPosition {
+                    x: reader.u16()?,
+                    y: reader.u16()?,
+                    z: reader.byte()?,
+                },
+                source_client_thing_id: reader.u16()?,
+                source_stack_position: reader.byte()?,
+                target_position: NativeOtClientPosition {
+                    x: reader.u16()?,
+                    y: reader.u16()?,
+                    z: reader.byte()?,
+                },
+                count: reader.byte()?,
+            }
+        }
         NATIVE_OTCLIENT_CLIENT_USE_ITEM => {
             if reader.remaining() != 9 {
                 return Err(ProtocolError::InvalidNativeGameRequest);
@@ -2191,7 +2219,7 @@ pub fn decode_native_otclient_game_action(
 fn is_native_otclient_compatibility_interaction(opcode: u8) -> bool {
     matches!(
         opcode,
-        0x77 | 0x78
+            0x77
             | 0x86..=0x8b
             | 0x97..=0x9f
             | 0xa3..=0xad
@@ -3676,6 +3704,49 @@ mod tests {
         assert_eq!(
             decode_native_otclient_game_action(
                 &Frame(vec![
+                    NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                    255,
+                    255,
+                    5,
+                    0,
+                    1,
+                    102,
+                    0,
+                    0,
+                    255,
+                    255,
+                    6,
+                    0,
+                    2,
+                    1,
+                ]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::ThrowItem {
+                source_position: NativeOtClientPosition {
+                    x: 0xffff,
+                    y: 5,
+                    z: 1,
+                },
+                source_client_thing_id: 102,
+                source_stack_position: 0,
+                target_position: NativeOtClientPosition {
+                    x: 0xffff,
+                    y: 6,
+                    z: 2,
+                },
+                count: 1,
+            }
+        );
+        assert!(decode_native_otclient_game_action(
+            &Frame(vec![NATIVE_OTCLIENT_CLIENT_THROW_ITEM; 14]),
+            &profile,
+        )
+        .is_err());
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![
                     NATIVE_OTCLIENT_CLIENT_USE_ITEM,
                     100,
                     0,
@@ -3858,11 +3929,11 @@ mod tests {
         .is_err());
         assert_eq!(
             decode_native_otclient_game_action(
-                &Frame(vec![0x78, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                &Frame(vec![0x77, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
                 &profile,
             )
             .unwrap(),
-            NativeOtClientGameAction::IgnoredInteraction(0x78)
+            NativeOtClientGameAction::IgnoredInteraction(0x77)
         );
         assert_eq!(
             decode_native_otclient_game_action(

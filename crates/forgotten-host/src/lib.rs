@@ -532,6 +532,24 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         NativeOtClientGameAction::Talk(message) => {
             format!("action=talk text-bytes={}", message.len())
         }
+        NativeOtClientGameAction::ThrowItem {
+            source_position,
+            source_client_thing_id,
+            source_stack_position,
+            target_position,
+            count,
+        } => format!(
+            "action=throw-item source={},{},{} source-client-thing-id={} source-stack-position={} target={},{},{} count={}",
+            source_position.x,
+            source_position.y,
+            source_position.z,
+            source_client_thing_id,
+            source_stack_position,
+            target_position.x,
+            target_position.y,
+            target_position.z,
+            count
+        ),
         NativeOtClientGameAction::ChangeFightModes(request) => format!(
             "action=change-fight-modes mode={:?} chase={} secure={}",
             request.mode, request.chase, request.secure
@@ -3500,6 +3518,30 @@ fn handle_native_otclient_game(
                     .map_err(HostError::Protocol)?,
             )?,
             NativeOtClientGameAction::PingBack | NativeOtClientGameAction::EnterGame => {}
+            NativeOtClientGameAction::ThrowItem {
+                source_position,
+                source_client_thing_id,
+                source_stack_position,
+                target_position,
+                count,
+            } => {
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "action=throw-item outcome=deferred source={},{},{} client-thing-id={} stack-position={} target={},{},{} count={}",
+                        source_position.x,
+                        source_position.y,
+                        source_position.z,
+                        source_client_thing_id,
+                        source_stack_position,
+                        target_position.x,
+                        target_position.y,
+                        target_position.z,
+                        count
+                    ),
+                );
+            }
             NativeOtClientGameAction::ChangeFightModes(request) => {
                 let mode = match request.mode {
                     NativeOtClientFightMode::Attack => PlayerFightMode::Attack,
