@@ -8731,6 +8731,86 @@ mod tests {
     }
 
     #[test]
+    fn native_empty_quest_log_response_keeps_session_usable() {
+        let database_path = database_path("native-empty-quest-log");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_QUEST_LOG, 0, 0]
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT,
+                128,
+                0,
+                0,
+                0,
+                0,
+                128,
+                128,
+            ]
+        );
+
+        drop(stream);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn native_render_snapshot_detaches_packet_preparation_from_world_mutation() {
         let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
         let map = native_world_map();

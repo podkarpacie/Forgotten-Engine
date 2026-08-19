@@ -107,6 +107,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 
 ### Milestone E — Complete profile-driven protocol and client compatibility: target 87%
 
+- [x] Verify the parser-shaped native 740 zero-count Quest Log response through a live socket and prove the same session remains usable for a following outfit-window request; quest storage, mission lines, scripting, gameplay semantics, and real-client confirmation remain deferred.
 - [x] Record an accepted native 740 player outfit's current look type in authoritative shared state, advance visibility only after persistence, and refresh visible peer sessions through the existing full-map path; shared-state and two-client socket regressions cover the boundary. Peer colour propagation, addons, mounts, and real-client confirmation remain deferred.
 - [ ] Finish profile-driven native protocol coverage for the declared FE 7.4 surface and resolve every release-blocking real-client parser or state mismatch with captured-safe evidence. The local 740 stats-refresh path rehydrates a bounded native static-defeat vocation-level-up from authoritative level, experience, and vitals, but still needs real-client confirmation and broader gameplay sources.
 - [ ] Implement and validate FE 8.0 profile runtime and protocol behavior without hardcoding release-specific assumptions.
