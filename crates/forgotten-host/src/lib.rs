@@ -48,17 +48,17 @@ use forgotten_protocol::{
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
     encode_native_otclient_move_creature_at, encode_native_otclient_open_container,
     encode_native_otclient_player_modes, encode_native_otclient_player_skills,
-    encode_native_otclient_player_stats, encode_native_otclient_set_inventory,
-    encode_native_otclient_status_message, encode_status_binary, encode_status_xml,
-    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
-    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
-    NativeOtClientCardinalDirection, NativeOtClientClassicItemRecord,
-    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
-    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
-    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
-    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    encode_native_otclient_player_stats, encode_native_otclient_read_only_text_window,
+    encode_native_otclient_set_inventory, encode_native_otclient_status_message,
+    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
+    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
+    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection,
+    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
+    NativeOtClientClassicOutfit, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
+    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerVitals,
+    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
+    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -3556,6 +3556,26 @@ fn handle_native_otclient_game(
                                     ),
                                 );
                             }
+                        } else if let Some(text) =
+                            native_validated_map_item_text(world_map, &outcome)
+                        {
+                            let text_window = encode_native_otclient_read_only_text_window(
+                                &config.client_profile,
+                                0,
+                                client_thing_id,
+                                text,
+                            )
+                            .map_err(HostError::Protocol)?;
+                            write_frame(stream, &text_window)?;
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "action=use-item outcome=read-only-text-window server-id={} text-bytes={} index={index}",
+                                    outcome.server_id,
+                                    text.len(),
+                                ),
+                            );
                         } else {
                             native_diagnostic(
                                 config.extended_diagnostics,
@@ -4147,6 +4167,19 @@ fn encode_shared_native_world_viewport(
         Some(&render_snapshot.visible_players),
     )
     .map_err(HostError::Protocol)
+}
+
+fn native_validated_map_item_text<'a>(
+    world_map: &'a WorldMap,
+    outcome: &PlayerItemUseOutcome,
+) -> Option<&'a str> {
+    let item = world_map
+        .tile_items(outcome.position)?
+        .get(usize::from(outcome.stack_index))?;
+    (item.server_id == outcome.server_id && item.count == outcome.count)
+        .then_some(item.text.as_deref())
+        .flatten()
+        .filter(|text| !text.is_empty())
 }
 
 fn drain_shared_public_chat(
@@ -9079,7 +9112,7 @@ mod tests {
                     count: 1,
                     action_id: None,
                     unique_id: None,
-                    text: None,
+                    text: Some("Read me".into()),
                     description: None,
                     teleport_destination: None,
                     duration: None,
@@ -9212,6 +9245,48 @@ mod tests {
                 0,
                 64,
                 100,
+            ]
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_USE_ITEM,
+                100,
+                0,
+                100,
+                0,
+                7,
+                196,
+                7,
+                0,
+                0,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_EDIT_TEXT,
+                0,
+                0,
+                0,
+                0,
+                196,
+                7,
+                7,
+                0,
+                7,
+                0,
+                b'R',
+                b'e',
+                b'a',
+                b'd',
+                b' ',
+                b'm',
+                b'e',
+                0,
+                0,
             ]
         );
 

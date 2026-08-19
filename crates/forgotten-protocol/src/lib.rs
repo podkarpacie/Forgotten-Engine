@@ -861,6 +861,7 @@ pub const NATIVE_OTCLIENT_GAME_PLAYER_MODES: u8 = 0xa7;
 pub const NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER: u8 = 0x6f;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_HEALTH: u8 = 0x8c;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT: u8 = 0x8e;
+pub const NATIVE_OTCLIENT_GAME_EDIT_TEXT: u8 = 0x96;
 pub const NATIVE_OTCLIENT_GAME_TEXT_MESSAGE: u8 = 0xb4;
 pub const NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT: u8 = 0x15;
 pub const NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT: u8 = 0xc8;
@@ -1397,6 +1398,36 @@ pub fn encode_native_otclient_status_message(
     writer.byte(NATIVE_OTCLIENT_GAME_TEXT_MESSAGE);
     writer.byte(NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT);
     writer.string(message);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes the verified classic 740 read-only text-window layout. The selected profile reads the
+/// item as a single client item ID, then the maximum length, text, and writer. Writable date and
+/// traded fields belong to later protocol features and are deliberately absent.
+pub fn encode_native_otclient_read_only_text_window(
+    profile: &NativeOtClientProfile,
+    window_id: u32,
+    client_thing_id: u16,
+    text: &str,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() || client_thing_id == 0 {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    const CLASSIC_740_TEXT_WINDOW_FIXED_BYTES: usize = 13;
+    if text.is_empty() || text.len() + CLASSIC_740_TEXT_WINDOW_FIXED_BYTES > MAX_FRAME_SIZE {
+        return Err(ProtocolError::StringTooLong(text.len()));
+    }
+    let text_length = text
+        .len()
+        .try_into()
+        .map_err(|_| ProtocolError::StringTooLong(text.len()))?;
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_EDIT_TEXT);
+    writer.u32(window_id);
+    writer.u16(client_thing_id);
+    writer.u16(text_length);
+    writer.string(text);
+    writer.string("");
     Ok(Frame(writer.finish()))
 }
 
@@ -3570,6 +3601,37 @@ mod tests {
                 .0,
             vec![NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER, 2]
         );
+        assert_eq!(
+            encode_native_otclient_read_only_text_window(&profile, 42, 1988, "Read me")
+                .unwrap()
+                .0,
+            vec![
+                NATIVE_OTCLIENT_GAME_EDIT_TEXT,
+                42,
+                0,
+                0,
+                0,
+                196,
+                7,
+                7,
+                0,
+                7,
+                0,
+                b'R',
+                b'e',
+                b'a',
+                b'd',
+                b' ',
+                b'm',
+                b'e',
+                0,
+                0,
+            ]
+        );
+        assert!(matches!(
+            encode_native_otclient_read_only_text_window(&profile, 42, 1988, ""),
+            Err(ProtocolError::StringTooLong(0))
+        ));
         assert_eq!(
             decode_native_otclient_game_action(
                 &Frame(vec![NATIVE_OTCLIENT_CLIENT_UP_ARROW_CONTAINER, 2]),
