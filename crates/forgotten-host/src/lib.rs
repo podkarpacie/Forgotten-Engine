@@ -3864,24 +3864,12 @@ fn handle_native_otclient_game(
                             continue;
                         }
                         let requested_count = u16::from(count);
-                        if requested_count < item.count {
-                            let destination_index = usize::from(target_position.z);
-                            let Some(destination) = container.items.item(destination_index) else {
-                                native_diagnostic(
-                                    config.extended_diagnostics,
-                                    peer,
-                                    "action=throw-item outcome=deferred-missing-stack-merge-destination",
-                                );
-                                continue;
-                            };
-                            if destination.server_id != item.server_id {
-                                native_diagnostic(
-                                    config.extended_diagnostics,
-                                    peer,
-                                    "action=throw-item outcome=deferred-nonmatching-stack-merge-destination",
-                                );
-                                continue;
-                            }
+                        let destination_index = usize::from(target_position.z);
+                        if container
+                            .items
+                            .item(destination_index)
+                            .is_some_and(|destination| destination.server_id == item.server_id)
+                        {
                             shared_world.move_equipment_stack_to_container(
                                 character.id,
                                 source_slot,
@@ -3903,6 +3891,27 @@ fn handle_native_otclient_game(
                                     source_client_thing_id,
                                     count
                                 ),
+                            );
+                            continue;
+                        }
+                        if requested_count < item.count {
+                            let outcome = if container.items.item(destination_index).is_some() {
+                                "deferred-nonmatching-stack-merge-destination"
+                            } else {
+                                "deferred-missing-stack-merge-destination"
+                            };
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!("action=throw-item outcome={outcome}"),
+                            );
+                            continue;
+                        }
+                        if container.items.item(destination_index).is_some() {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-nonmatching-full-stack-merge-destination",
                             );
                             continue;
                         }
@@ -9968,6 +9977,74 @@ mod tests {
                     1, 102, 0, 50,
                 ]
         }));
+
+        write_frame(
+            &mut client,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                255,
+                255,
+                EquipmentSlot::RightHand.code(),
+                0,
+                0,
+                102,
+                0,
+                0,
+                255,
+                255,
+                0x40 | 2,
+                0,
+                0,
+                15,
+            ]),
+        )
+        .unwrap();
+        for _ in 0..20 {
+            if database
+                .player_equipment(1)
+                .unwrap()
+                .item(EquipmentSlot::RightHand)
+                .is_none()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(database
+            .player_equipment(1)
+            .unwrap()
+            .item(EquipmentSlot::RightHand)
+            .is_none());
+        assert_eq!(
+            database
+                .player_containers(1)
+                .unwrap()
+                .container(2)
+                .unwrap()
+                .items
+                .item(0),
+            Some(&ItemInstance::new(4526, 65).unwrap())
+        );
+        let full_merge_updates = (0..12)
+            .map(|_| read_frame(&mut client).unwrap().0)
+            .collect::<Vec<_>>();
+        assert!(full_merge_updates.iter().any(|frame| {
+            frame
+                == &vec![
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_DELETE_INVENTORY,
+                    EquipmentSlot::RightHand.code(),
+                ]
+        }));
+        assert!(
+            full_merge_updates.iter().any(|frame| {
+                frame
+                    == &vec![
+                        0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20,
+                        0, 1, 102, 0, 65,
+                    ]
+            }),
+            "missing full stack container refresh: {full_merge_updates:?}"
+        );
         drop(client);
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
