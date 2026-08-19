@@ -3509,19 +3509,57 @@ fn handle_native_otclient_game(
                     continue;
                 };
                 match shared_world.validate_player_item_use(world_map, intent) {
-                    Ok(outcome) => native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        &format!(
-                            "action=use-item outcome=validated server-id={} count={} action-id={:?} unique-id={:?} text={} charges={:?} index={index}",
-                            outcome.server_id,
-                            outcome.count,
-                            outcome.action_id,
-                            outcome.unique_id,
-                            outcome.has_text,
-                            outcome.charges,
-                        ),
-                    ),
+                    Ok(outcome) => {
+                        if let Some(destination) = outcome.teleport_destination {
+                            let teleported = activate_native_map_teleport_item(
+                                stream,
+                                &config.client_profile,
+                                &snapshot,
+                                &database,
+                                shared_world,
+                                character.id,
+                                world_map,
+                                &mut player_position,
+                                facing,
+                                destination,
+                            )?;
+                            if teleported {
+                                active_click_walk = None;
+                                observed_visibility_epoch = shared_world.visibility_epoch();
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    &format!(
+                                        "action=use-item outcome=teleported server-id={} destination={destination:?} index={index}",
+                                        outcome.server_id,
+                                    ),
+                                );
+                            } else {
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    &format!(
+                                        "action=use-item outcome=deferred-teleport-destination-blocked server-id={} destination={destination:?} index={index}",
+                                        outcome.server_id,
+                                    ),
+                                );
+                            }
+                        } else {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "action=use-item outcome=validated server-id={} count={} action-id={:?} unique-id={:?} text={} charges={:?} index={index}",
+                                    outcome.server_id,
+                                    outcome.count,
+                                    outcome.action_id,
+                                    outcome.unique_id,
+                                    outcome.has_text,
+                                    outcome.charges,
+                                ),
+                            );
+                        }
+                    }
                     Err(HostError::Core(_)) => native_diagnostic(
                         config.extended_diagnostics,
                         peer,
@@ -4360,6 +4398,57 @@ fn move_native_map_player(
             direction,
         )
         .map_err(HostError::Protocol)?,
+    )?;
+    *player_position = destination;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_native_map_teleport_item(
+    stream: &mut TcpStream,
+    profile: &NativeOtClientProfile,
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    database: &EngineDatabase,
+    shared_world: &SharedNativeWorld,
+    character_id: u64,
+    world_map: &WorldMap,
+    player_position: &mut Position,
+    facing: NativeOtClientCardinalDirection,
+    destination: Position,
+) -> Result<bool, HostError> {
+    let teleported = {
+        let mut world = shared_world.lock()?;
+        if !world_map.is_walkable(destination)
+            || world.is_static_creature_occupied(destination)
+            || world.is_player_occupied(destination)
+        {
+            None
+        } else {
+            Some(
+                world
+                    .teleport_player(character_id, destination)
+                    .map_err(HostError::Core)?,
+            )
+        }
+    };
+    let Some((_, destination)) = teleported else {
+        return Ok(false);
+    };
+
+    shared_world.mark_visibility_changed();
+    database.update_player_position(character_id, destination)?;
+    let mut refreshed_snapshot = snapshot.clone();
+    refreshed_snapshot.player_position = native_position(destination);
+    refreshed_snapshot.player_direction = facing.protocol_direction();
+    write_frame(
+        stream,
+        &encode_shared_native_world_viewport(
+            profile,
+            &refreshed_snapshot,
+            world_map,
+            shared_world,
+            character_id,
+        )?,
     )?;
     *player_position = destination;
     Ok(true)
@@ -8987,6 +9076,33 @@ mod tests {
                 }],
             )
             .unwrap();
+        Arc::get_mut(native_config.world_map.as_mut().unwrap())
+            .unwrap()
+            .set_tile_items(
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                vec![forgotten_core::WorldMapItem {
+                    server_id: 1988,
+                    client_thing_id: Some(1988),
+                    count: 1,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: Some(Position {
+                        x: 110,
+                        y: 110,
+                        z: 7,
+                    }),
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
         let game = start_native_otclient_game(native_config, &database_path).unwrap();
 
         let mut stream = TcpStream::connect(game.local_addr()).unwrap();
@@ -9557,6 +9673,37 @@ mod tests {
         assert_eq!(
             turned.0,
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 2]
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_USE_ITEM,
+                101,
+                0,
+                100,
+                0,
+                7,
+                196,
+                7,
+                0,
+                0,
+            ]),
+        )
+        .unwrap();
+        let teleport_viewport = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            teleport_viewport.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert_eq!(&teleport_viewport.0[1..6], &[110, 0, 110, 0, 7]);
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].position,
+            Position {
+                x: 110,
+                y: 110,
+                z: 7,
+            }
         );
 
         game.shutdown().unwrap();

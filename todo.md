@@ -343,3 +343,4 @@
 - [x] Decode native 740 rotate-item input and validate one catalog-mapped authoritative map item without item rotation, mutation, Lua, persistence, or outbound packet behavior.
 - [x] Reply to native 740 LookMap only with a verified `0xB4/0x15` bounded status text derived from an exact validated authoritative map item; defer LookCreature and all unverified inspection output.
 - [x] Reply to native 740 LookCreature only with verified `0xB4/0x15` bounded status text for a visible authoritative player or active static creature; defer off-screen, inactive, descriptions, attributes, and all broader inspection output.
+- [x] Activate an exact authoritative native 740 map teleport item only when its OTBM destination is walkable and unoccupied, atomically persist player position, and send an existing full viewport refresh; defer scripts, effects, generic map actions, and all other item behavior.

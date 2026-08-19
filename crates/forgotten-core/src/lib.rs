@@ -1961,6 +1961,7 @@ pub struct PlayerItemUseOutcome {
     pub unique_id: Option<u16>,
     pub has_text: bool,
     pub charges: Option<u16>,
+    pub teleport_destination: Option<Position>,
 }
 
 /// A bounded request to use one authoritative top-level map item on another authoritative
@@ -2274,6 +2275,7 @@ impl WorldState {
             unique_id: item.unique_id,
             has_text: item.text.as_deref().is_some_and(|text| !text.is_empty()),
             charges: item.charges,
+            teleport_destination: item.teleport_destination,
         })
     }
 
@@ -4482,6 +4484,37 @@ impl WorldState {
         Ok((from, to))
     }
 
+    /// Moves one living player to an explicit server-owned destination after the caller has
+    /// validated the destination's map semantics. This is intentionally distinct from ordinary
+    /// adjacent movement and retains both player and active static-creature occupancy guards.
+    pub fn teleport_player(
+        &mut self,
+        id: u64,
+        destination: Position,
+    ) -> Result<(Position, Position), CoreError> {
+        if self.player_respawn_state(id)?.dead {
+            return Err(CoreError::PlayerIsDead(id));
+        }
+        if self.is_static_creature_occupied(destination) {
+            return Err(CoreError::StaticCreatureOccupiesPosition(destination));
+        }
+        if self
+            .players
+            .values()
+            .any(|player| player.id != id && player.position == destination)
+        {
+            return Err(CoreError::PlayerOccupiesPosition(destination));
+        }
+        let player = self
+            .players
+            .get_mut(&id)
+            .ok_or(CoreError::UnknownPlayer(id))?;
+        let source = player.position;
+        player.position = destination;
+        self.mark_changed();
+        Ok((source, destination))
+    }
+
     pub fn empty_world_viewport(
         &self,
         id: u64,
@@ -5438,6 +5471,38 @@ mod tests {
                 },
             )
             .unwrap();
+        assert_eq!(
+            world
+                .teleport_player(
+                    7,
+                    Position {
+                        x: 250,
+                        y: 300,
+                        z: 7,
+                    },
+                )
+                .unwrap(),
+            (
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                Position {
+                    x: 250,
+                    y: 300,
+                    z: 7,
+                },
+            )
+        );
+        assert_eq!(
+            world.player(7).unwrap().position,
+            Position {
+                x: 250,
+                y: 300,
+                z: 7,
+            }
+        );
     }
 
     #[test]
@@ -5874,7 +5939,7 @@ mod tests {
                 unique_id: Some(42),
                 text: Some("Read me".into()),
                 description: None,
-                teleport_destination: None,
+                teleport_destination: Some(far),
                 duration: None,
                 charges: Some(3),
                 children: Vec::new(),
@@ -5916,6 +5981,7 @@ mod tests {
                 unique_id: Some(42),
                 has_text: true,
                 charges: Some(3),
+                teleport_destination: Some(far),
             }
         );
         assert_eq!(
@@ -5946,6 +6012,7 @@ mod tests {
                     unique_id: Some(42),
                     has_text: true,
                     charges: Some(3),
+                    teleport_destination: Some(far),
                 },
                 target: PlayerItemUseOutcome {
                     player_id: 7,
@@ -5957,6 +6024,7 @@ mod tests {
                     unique_id: None,
                     has_text: false,
                     charges: None,
+                    teleport_destination: None,
                 },
             }
         );
