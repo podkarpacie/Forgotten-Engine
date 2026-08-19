@@ -640,6 +640,9 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         NativeOtClientGameAction::SelectFollow(native_id) => {
             format!("action=select-follow native-id={native_id}")
         }
+        NativeOtClientGameAction::CancelAttackAndFollow => {
+            "action=cancel-attack-and-follow".into()
+        }
     }
 }
 
@@ -4337,6 +4340,14 @@ fn handle_native_otclient_game(
                     config.extended_diagnostics,
                 )?;
             }
+            NativeOtClientGameAction::CancelAttackAndFollow => {
+                cancel_native_player_attack_and_follow(shared_world, character.id)?;
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    "action=cancel-attack-and-follow outcome=authoritative-intents-cleared",
+                );
+            }
             NativeOtClientGameAction::Talk(message) => {
                 let recipient_count = shared_world.broadcast_public_chat(character.id, &message)?;
                 if config.extended_diagnostics {
@@ -5282,6 +5293,18 @@ fn apply_native_player_interaction(
         }
         Ok(())
     }
+}
+
+/// Clears only the existing authoritative target and follow intents for one native player. This
+/// is the bounded host effect of the classic zero-payload cancel-attack/follow control; it does
+/// not perform an attack, emit an effect, or change movement/fight-mode state.
+fn cancel_native_player_attack_and_follow(
+    shared_world: &SharedNativeWorld,
+    player_id: u64,
+) -> Result<(), HostError> {
+    shared_world.set_player_target(player_id, None)?;
+    shared_world.set_player_follow(player_id, None)?;
+    Ok(())
 }
 
 struct NativeSelectedPlayerMeleePolicy<'a> {
@@ -7927,6 +7950,19 @@ mod tests {
             false,
         )
         .unwrap();
+        apply_native_player_interaction(
+            &shared,
+            101,
+            NATIVE_OTCLIENT_PLAYER_ID_START + 102,
+            NativePlayerInteractionKind::Follow,
+            false,
+        )
+        .unwrap();
+        cancel_native_player_attack_and_follow(&shared, 101).unwrap();
+        assert_eq!(
+            shared.player_interaction_intent(101).unwrap(),
+            PlayerInteractionIntent::default()
+        );
         apply_native_player_interaction(
             &shared,
             101,
