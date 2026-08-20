@@ -2,7 +2,7 @@ use crate::ConfigError;
 use forgotten_core::{NativeItemPresentation, NativeItemPresentationCatalog};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const OTB_IDENTIFIER: &[u8; 4] = b"OTBI";
 const NODE_START: u8 = 0xfe;
@@ -143,6 +143,12 @@ impl LegacyItemDefinition {
         self.flags & (FLAG_STACKABLE | FLAG_CLIENT_CHARGES) != 0
             || matches!(self.group, OTB_ITEM_GROUP_SPLASH | OTB_ITEM_GROUP_FLUID)
     }
+
+    /// Whether this legacy OTB entry represents an item whose item count contributes to its
+    /// source weight. This does not change FE item-stack transfer behavior.
+    pub fn is_stackable(&self) -> bool {
+        self.flags & FLAG_STACKABLE != 0
+    }
 }
 
 impl LegacyItemCatalog {
@@ -212,13 +218,21 @@ impl LegacyItemCatalog {
 
     /// Returns non-empty bounded legacy slotType sets keyed by authoritative server ID. This is
     /// source metadata only and does not provide a permission decision for any equipment slot.
-    pub fn xml_slot_types_by_server_id(
-        &self,
-    ) -> BTreeMap<u16, std::collections::BTreeSet<LegacyItemSlotType>> {
+    pub fn xml_slot_types_by_server_id(&self) -> BTreeMap<u16, BTreeSet<LegacyItemSlotType>> {
         self.definitions
             .iter()
             .filter(|(_, definition)| !definition.xml_slot_types.is_empty())
             .map(|(&server_id, definition)| (server_id, definition.xml_slot_types.clone()))
+            .collect()
+    }
+
+    /// Returns authoritative server IDs for source items whose legacy OTB stack count contributes
+    /// to item weight. It is immutable presentation input and has no transfer-policy effect.
+    pub fn stackable_server_ids(&self) -> BTreeSet<u16> {
+        self.definitions
+            .iter()
+            .filter(|(_, definition)| definition.is_stackable())
+            .map(|(&server_id, _)| server_id)
             .collect()
     }
 

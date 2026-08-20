@@ -881,6 +881,13 @@ pub struct NativeOtClientHostConfig {
     /// Shielding, weapon defense, vocation multipliers, random armor, and TFS formula parity are
     /// deliberately excluded.
     pub item_armor_by_server_id: Option<Arc<BTreeMap<u16, u16>>>,
+    /// Immutable validated legacy `items.xml` source weights used only to append one bounded
+    /// classic weight sentence to an exact native map LookMap response. They do not enforce
+    /// capacity or change item-transfer behavior.
+    pub item_weight_by_server_id: Option<Arc<BTreeMap<u16, u32>>>,
+    /// Immutable source OTB stackability identifiers paired with the inspection-only weight map.
+    /// They do not alter FE item-stack transfer behavior.
+    pub stackable_item_server_ids: Option<Arc<BTreeSet<u16>>>,
     /// Immutable validated armor multiplier thousandths keyed by vocation. Missing vocation
     /// entries retain the deterministic `1.000` default; shielding and defense formulas remain
     /// outside this bridge.
@@ -4898,7 +4905,12 @@ fn handle_native_otclient_game(
                     }
                     Err(error) => return Err(error),
                 };
-                let message = native_map_item_inspection_message(world_map, &item);
+                let message = native_map_item_inspection_message(
+                    world_map,
+                    &item,
+                    config.item_weight_by_server_id.as_deref(),
+                    config.stackable_item_server_ids.as_deref(),
+                );
                 let response =
                     encode_native_otclient_status_message(&config.client_profile, &message)
                         .map_err(HostError::Protocol)?;
@@ -5250,8 +5262,10 @@ fn native_validated_map_item_text<'a>(
 fn native_map_item_inspection_message(
     world_map: &WorldMap,
     outcome: &PlayerItemUseOutcome,
+    weight_by_server_id: Option<&BTreeMap<u16, u32>>,
+    stackable_item_server_ids: Option<&BTreeSet<u16>>,
 ) -> String {
-    let message = format!(
+    let mut message = format!(
         "You see item #{} (count: {}).",
         outcome.server_id, outcome.count
     );
@@ -5261,18 +5275,40 @@ fn native_map_item_inspection_message(
     else {
         return message;
     };
-    let Some(description) = (item.server_id == outcome.server_id && item.count == outcome.count)
-        .then_some(item.description.as_deref())
-        .flatten()
-        .filter(|description| !description.is_empty())
-    else {
+    if item.server_id != outcome.server_id || item.count != outcome.count {
         return message;
-    };
-    if message.len() + 1 + description.len() <= NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES {
-        format!("{message} {description}")
-    } else {
-        message
     }
+    if let Some(unit_weight) = weight_by_server_id.and_then(|weights| weights.get(&item.server_id))
+    {
+        let total_weight =
+            if stackable_item_server_ids.is_some_and(|ids| ids.contains(&item.server_id)) {
+                unit_weight.saturating_mul(u32::from(item.count).max(1))
+            } else {
+                *unit_weight
+            };
+        let weight_detail = native_classic_weight_description(total_weight);
+        if message.len() + 1 + weight_detail.len() <= NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES {
+            message.push(' ');
+            message.push_str(&weight_detail);
+        }
+    }
+    if let Some(description) = item
+        .description
+        .as_deref()
+        .filter(|description| !description.is_empty())
+    {
+        if message.len() + 1 + description.len() <= NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES {
+            message.push(' ');
+            message.push_str(description);
+        }
+    }
+    message
+}
+
+fn native_classic_weight_description(weight: u32) -> String {
+    let whole = weight / 100;
+    let hundredths = weight % 100;
+    format!("It weighs {whole}.{hundredths:02} oz.")
 }
 
 fn drain_shared_public_chat(
@@ -6800,6 +6836,8 @@ mod tests {
             world_map: None,
             item_presentation_catalog: None,
             item_armor_by_server_id: None,
+            item_weight_by_server_id: None,
+            stackable_item_server_ids: None,
             armor_multiplier_by_vocation: None,
             static_spawns: None,
             static_target_attack_policy: StaticTargetAttackPolicy::Disabled,
@@ -8516,6 +8554,67 @@ mod tests {
         assert_eq!(two_target_outcome.source.server_id, 1945);
         assert_eq!(two_target_outcome.target.server_id, 1945);
         assert_eq!(shared.vitals_epoch(), 0);
+    }
+
+    #[test]
+    fn native_map_inspection_appends_only_exact_imported_stack_weight() {
+        let position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let mut map = WorldMap::new("weight-inspection", position);
+        map.set_tile(
+            position,
+            WorldMapTile {
+                ground_thing_id: 102,
+                walkable: true,
+            },
+        )
+        .unwrap();
+        map.set_tile_items(
+            position,
+            vec![forgotten_core::WorldMapItem {
+                server_id: 1945,
+                client_thing_id: Some(1945),
+                count: 3,
+                action_id: None,
+                unique_id: None,
+                text: None,
+                description: Some("A bounded imported description.".into()),
+                teleport_destination: None,
+                duration: None,
+                charges: None,
+                children: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let outcome = PlayerItemUseOutcome {
+            player_id: 7,
+            position,
+            stack_index: 0,
+            server_id: 1945,
+            count: 3,
+            action_id: None,
+            unique_id: None,
+            has_text: false,
+            charges: None,
+            teleport_destination: None,
+        };
+
+        assert_eq!(
+            native_map_item_inspection_message(
+                &map,
+                &outcome,
+                Some(&BTreeMap::from([(1945, 1_800)])),
+                Some(&BTreeSet::from([1945])),
+            ),
+            "You see item #1945 (count: 3). It weighs 54.00 oz. A bounded imported description."
+        );
+        assert_eq!(
+            native_map_item_inspection_message(&map, &outcome, None, None),
+            "You see item #1945 (count: 3). A bounded imported description."
+        );
     }
 
     #[test]
@@ -12830,6 +12929,8 @@ mod tests {
                 }],
             )
             .unwrap();
+        native_config.item_weight_by_server_id = Some(Arc::new(BTreeMap::from([(1988, 1_800)])));
+        native_config.stackable_item_server_ids = Some(Arc::new(BTreeSet::new()));
         let game = start_native_otclient_game(native_config, &database_path).unwrap();
 
         let mut stream = TcpStream::connect(game.local_addr()).unwrap();
@@ -12992,7 +13093,7 @@ mod tests {
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
                 forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT,
-                50,
+                70,
                 0,
                 b'Y',
                 b'o',
@@ -13023,6 +13124,26 @@ mod tests {
                 b' ',
                 b'1',
                 b')',
+                b'.',
+                b' ',
+                b'I',
+                b't',
+                b' ',
+                b'w',
+                b'e',
+                b'i',
+                b'g',
+                b'h',
+                b's',
+                b' ',
+                b'1',
+                b'8',
+                b'.',
+                b'0',
+                b'0',
+                b' ',
+                b'o',
+                b'z',
                 b'.',
                 b' ',
                 b'A',
