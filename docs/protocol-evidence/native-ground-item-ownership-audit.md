@@ -24,3 +24,8 @@ per-instance runtime identity or a content-revision reconciliation key. A schema
 stores only a tile index could apply a historic removal to the wrong item after an operator updates
 the map. FE therefore needs a validated source-map identity plus durable item-instance identity and
 reconciliation rules before it introduces a map-item removal table or journal.
+
+The in-memory map model and FE map exporter preserve deterministic tile and item ordering, but the
+exporter intentionally refuses rich imported items. Ordering alone is therefore useful input, not a
+durable identity contract. A future identity design must bind ordered item identity to the selected
+source revision and reject or explicitly reconcile incompatible map-content changes.
