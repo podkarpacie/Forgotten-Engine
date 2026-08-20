@@ -65,6 +65,8 @@ pub struct TfsEntityAppearance {
     pub speed: u16,
     /// Static entity display initializes at full health.
     pub max_health: u16,
+    /// Optional legacy monster health `now` value retained only for initial display percent.
+    pub current_health: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +167,16 @@ pub fn materialize_tfs_static_spawns(
             if matches!(definition.kind, TfsEntityKind::Monster) && definition.experience > 0 {
                 experience_rewards.insert(next_id, definition.experience);
             }
+            let health_percent = match appearance.current_health {
+                Some(current_health) if current_health > appearance.max_health => {
+                    return Err(invalid("monster health now exceeds max"));
+                }
+                Some(current_health) => {
+                    u8::try_from(u32::from(current_health) * 100 / u32::from(appearance.max_health))
+                        .map_err(|_| invalid("monster initial health percent is invalid"))?
+                }
+                None => 100,
+            };
             entities.push(FeTfsStaticEntity {
                 id: next_id,
                 name: definition.name.clone(),
@@ -180,7 +192,7 @@ pub fn materialize_tfs_static_spawns(
                 } else {
                     appearance.speed
                 },
-                health_percent: u8::from(appearance.max_health > 0) * 100,
+                health_percent,
                 direction: creature.direction % 4,
             });
             next_id = next_id
@@ -401,6 +413,7 @@ fn parse_entity_definition(
     let mut root_speed = 0u16;
     let mut look = None;
     let mut max_health = None;
+    let mut current_health = None;
     let mut direct_melee = None;
     loop {
         match reader.read_event_into(&mut buffer).map_err(xml_error)? {
@@ -416,7 +429,12 @@ fn parse_entity_definition(
                         npc_directory,
                     )?);
                 } else if definition.is_some() && depth == 2 {
-                    parse_appearance_event(&event, &mut look, &mut max_health)?;
+                    parse_appearance_event(
+                        &event,
+                        &mut look,
+                        &mut max_health,
+                        &mut current_health,
+                    )?;
                 } else if matches!(kind, TfsEntityKind::Monster) && depth == 3 {
                     parse_direct_melee_event(&event, &mut direct_melee)?;
                 }
@@ -431,7 +449,12 @@ fn parse_entity_definition(
                         npc_directory,
                     )?);
                 } else if definition.is_some() && depth + 1 == 2 {
-                    parse_appearance_event(&event, &mut look, &mut max_health)?;
+                    parse_appearance_event(
+                        &event,
+                        &mut look,
+                        &mut max_health,
+                        &mut current_health,
+                    )?;
                 } else if matches!(kind, TfsEntityKind::Monster) && depth + 1 == 3 {
                     parse_direct_melee_event(&event, &mut direct_melee)?;
                 }
@@ -464,6 +487,7 @@ fn parse_entity_definition(
         addons: look.addons,
         speed: root_speed,
         max_health: max_health.unwrap_or(1),
+        current_health,
     });
     Ok(definition)
 }
@@ -545,6 +569,7 @@ fn parse_appearance_event(
     event: &BytesStart<'_>,
     look: &mut Option<EntityLook>,
     max_health: &mut Option<u16>,
+    current_health: &mut Option<u16>,
 ) -> Result<(), ConfigError> {
     match event.name().as_ref() {
         b"look" => {
@@ -560,7 +585,10 @@ fn parse_appearance_event(
                 addons: optional_attribute_u8(event, b"addons")?.unwrap_or_default(),
             });
         }
-        b"health" => *max_health = optional_attribute_u16(event, b"max")?,
+        b"health" => {
+            *max_health = optional_attribute_u16(event, b"max")?;
+            *current_health = optional_attribute_u16(event, b"now")?;
+        }
         _ => {}
     }
     Ok(())
@@ -756,6 +784,7 @@ mod tests {
                 addons: 0,
                 speed: 134,
                 max_health: 20,
+                current_health: Some(20),
             })
         );
         assert_eq!(catalog.missing_definitions.len(), 0);
@@ -899,6 +928,7 @@ mod tests {
                     addons: 0,
                     speed: 134,
                     max_health: 20,
+                    current_health: Some(15),
                 }),
             }],
             npcs: Vec::new(),
@@ -940,7 +970,7 @@ mod tests {
         assert_eq!(spawns.entities[0].name, "Rat");
         assert_eq!(spawns.entities[0].position, position);
         assert_eq!(spawns.entities[0].speed, 134);
-        assert_eq!(spawns.entities[0].health_percent, 100);
+        assert_eq!(spawns.entities[0].health_percent, 75);
         assert_eq!(spawns.entities[0].direction, 2);
         assert_eq!(spawns.experience_reward(STATIC_TFS_ENTITY_ID_START), 25);
         assert_eq!(
