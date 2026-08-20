@@ -403,6 +403,19 @@ fn native_static_target_deactivation_frames(
     Ok(vec![encode_native_otclient_clear_target(profile)?])
 }
 
+/// Produces the sole client-control frame associated with the current native session defeating
+/// its selected player target. It does not notify other sessions, alter death presentation, or
+/// cover generic combat cancellation.
+fn native_selected_player_death_target_frames(
+    profile: &NativeOtClientProfile,
+    defeated: bool,
+) -> Result<Vec<Frame>, ProtocolError> {
+    if !defeated {
+        return Ok(Vec::new());
+    }
+    Ok(vec![encode_native_otclient_clear_target(profile)?])
+}
+
 fn native_classic_container_frame(
     profile: &NativeOtClientProfile,
     catalog: Option<&NativeItemPresentationCatalog>,
@@ -3396,6 +3409,19 @@ fn handle_native_otclient_game(
                         .map_err(HostError::Protocol)?;
                         write_frame(stream, &health_update)?;
                         if outcome.defeated {
+                            for frame in native_selected_player_death_target_frames(
+                                &config.client_profile,
+                                true,
+                            )
+                            .map_err(HostError::Protocol)?
+                            {
+                                write_frame(stream, &frame)?;
+                            }
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "outbound=clear-target opcode=0xa3 fields=none reason=selected-player-death",
+                            );
                             let death = encode_native_otclient_game_death(&config.client_profile)
                                 .map_err(HostError::Protocol)?;
                             write_frame(stream, &death)?;
@@ -8410,6 +8436,22 @@ mod tests {
             .is_empty());
         assert_eq!(
             native_static_target_deactivation_frames(&profile, true)
+                .unwrap()
+                .into_iter()
+                .map(|frame| frame.0)
+                .collect::<Vec<_>>(),
+            vec![vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CLEAR_TARGET]]
+        );
+    }
+
+    #[test]
+    fn selected_player_death_emits_only_classic_clear_target_control() {
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+        assert!(native_selected_player_death_target_frames(&profile, false)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            native_selected_player_death_target_frames(&profile, true)
                 .unwrap()
                 .into_iter()
                 .map(|frame| frame.0)
