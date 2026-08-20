@@ -2936,7 +2936,10 @@ impl WorldState {
             });
         }
         let current_health = self.player_vitals(target_player_id)?.health;
-        let potentially_lethal = current_health > 0 && requested_damage >= current_health;
+        let mitigated_damage = self
+            .player_combat_defense(target_player_id)?
+            .mitigate_physical(requested_damage);
+        let potentially_lethal = current_health > 0 && mitigated_damage >= current_health;
         let town_id = if potentially_lethal {
             let town_id = self.player_town(target_player_id)?;
             world_map
@@ -2947,7 +2950,7 @@ impl WorldState {
             None
         };
         let (applied_damage, remaining_health) =
-            self.apply_damage_to_known_target(target_player_id, requested_damage)?;
+            self.apply_damage_to_known_target(target_player_id, mitigated_damage)?;
         let death_state = town_id
             .filter(|_| remaining_health == 0 && applied_damage > 0)
             .map(|town_id| self.apply_player_death(target_player_id, town_id, world_map))
@@ -7322,6 +7325,25 @@ mod tests {
         );
         assert_eq!(world.player_vitals(7).unwrap().health, 3);
         assert_eq!(world.static_creature_target(creature_id), Ok(Some(7)));
+        world
+            .replace_player_combat_defense(7, PlayerCombatDefense::new(3).unwrap())
+            .unwrap();
+        assert_eq!(
+            world.apply_static_creature_target_damage(creature_id, 3, &map),
+            Ok(StaticCreatureTargetAttackOutcome::Applied {
+                creature_id,
+                target_player_id: 7,
+                requested_damage: 3,
+                applied_damage: 0,
+                remaining_health: 3,
+                death_state: None,
+            })
+        );
+        assert_eq!(world.player_vitals(7).unwrap().health, 3);
+        assert!(!world.player_respawn_state(7).unwrap().dead);
+        world
+            .replace_player_combat_defense(7, PlayerCombatDefense::default())
+            .unwrap();
 
         let distant_position = Position {
             x: 103,
