@@ -1034,23 +1034,57 @@ pub struct SourceMapItemToEquipmentTransferOutcome {
 
 impl SharedNativeMap {
     pub fn new(map: WorldMap) -> Self {
-        let source = Arc::new(map.clone());
+        Self::recover_from_removal_journal(map, None)
+            .expect("an empty map-item removal journal cannot invalidate a world map")
+    }
+
+    /// Restores a mutable runtime map from an immutable loaded source map and an optional durable
+    /// source-item removal journal. The core recovery primitive validates every identity against
+    /// the source revision and complete ordered source content before removing anything. A stale,
+    /// malformed, duplicate, or missing source identity fails closed without constructing an owner.
+    pub fn recover_from_removal_journal(
+        source_map: WorldMap,
+        journal: Option<&MapItemRemovalJournal>,
+    ) -> Result<Self, HostError> {
+        let source = Arc::new(source_map);
+        let mut map = (*source).clone();
+        let removed_source_items = journal
+            .map(|journal| {
+                journal
+                    .removed_items
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(journal) = journal {
+            map.apply_source_item_removals(&journal.removed_items)
+                .map_err(HostError::Core)?;
+        }
         let mut source_item_indices = BTreeMap::new();
         for (position, items) in source.tile_item_entries() {
             source_item_indices.insert(
                 position,
                 (0..items.len())
-                    .map(|index| u8::try_from(index).expect("world map item limit fits u8"))
+                    .filter_map(|index| {
+                        let item_index = u8::try_from(index).expect("world map item limit fits u8");
+                        (!removed_source_items.contains(&WorldMapItemSourceIdentity {
+                            map_revision: source.source_revision(),
+                            position,
+                            item_index,
+                        }))
+                        .then_some(item_index)
+                    })
                     .collect(),
             );
         }
-        Self {
+        Ok(Self {
             map: Arc::new(Mutex::new(map)),
             source,
             source_item_indices: Arc::new(Mutex::new(source_item_indices)),
-            removed_source_items: Arc::new(Mutex::new(BTreeSet::new())),
+            removed_source_items: Arc::new(Mutex::new(removed_source_items)),
             revision: Arc::new(AtomicU64::new(0)),
-        }
+        })
     }
 
     /// Returns an immutable point-in-time render snapshot. Callers never retain the map lock
@@ -2941,6 +2975,16 @@ pub fn start_native_otclient_game(
     let database_path = database_path.as_ref().to_path_buf();
     let shared_world = SharedNativeWorld::from_static_spawns(config.static_spawns.as_deref())?;
     restore_static_creature_runtime_from_database(&shared_world, &database_path)?;
+    let shared_map = config
+        .world_map
+        .as_deref()
+        .map(|world_map| {
+            let database = EngineDatabase::open(&database_path)?;
+            let journal = database.map_item_removal_journal()?;
+            SharedNativeMap::recover_from_removal_journal(world_map.clone(), journal.as_ref())
+        })
+        .transpose()?
+        .map(Arc::new);
     let thread_shutdown = Arc::clone(&shutdown);
     let thread = thread::spawn(move || {
         serve_native_otclient_game(
@@ -2950,6 +2994,7 @@ pub fn start_native_otclient_game(
             thread_shutdown,
             active_connections,
             shared_world,
+            shared_map,
         )
     });
     Ok(HostHandle {
@@ -3208,6 +3253,7 @@ fn serve_native_otclient_game(
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
     shared_world: SharedNativeWorld,
+    shared_map: Option<Arc<SharedNativeMap>>,
 ) -> Result<(), HostError> {
     record_event(
         &database_path,
@@ -3218,10 +3264,6 @@ fn serve_native_otclient_game(
             config.client_profile.protocol_version
         ),
     );
-    let shared_map = config
-        .world_map
-        .as_deref()
-        .map(|world_map| Arc::new(SharedNativeMap::new(world_map.clone())));
     let heartbeat_shutdown = Arc::clone(&shutdown);
     let heartbeat_world = shared_world.clone();
     let heartbeat_pursuit_policy = config.static_target_pursuit_policy;
@@ -7393,6 +7435,93 @@ mod tests {
             2148
         );
         assert_eq!(owner.revision(), 1);
+    }
+
+    #[test]
+    fn shared_native_map_recovers_revision_matched_source_item_removals() {
+        let position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let mut source_map = (*native_world_map()).clone();
+        source_map
+            .set_tile_items(
+                position,
+                vec![
+                    WorldMapItem {
+                        server_id: 2148,
+                        client_thing_id: Some(3031),
+                        count: 1,
+                        action_id: None,
+                        unique_id: None,
+                        text: None,
+                        description: None,
+                        teleport_destination: None,
+                        duration: None,
+                        charges: None,
+                        children: Vec::new(),
+                    },
+                    WorldMapItem {
+                        server_id: 2376,
+                        client_thing_id: Some(2376),
+                        count: 1,
+                        action_id: None,
+                        unique_id: None,
+                        text: None,
+                        description: None,
+                        teleport_destination: None,
+                        duration: None,
+                        charges: None,
+                        children: Vec::new(),
+                    },
+                ],
+            )
+            .unwrap();
+        let removed = source_map.source_item_identity(position, 1).unwrap();
+        let journal = MapItemRemovalJournal {
+            map_revision: source_map.source_revision(),
+            removed_items: vec![removed],
+        };
+
+        let recovered =
+            SharedNativeMap::recover_from_removal_journal(source_map.clone(), Some(&journal))
+                .unwrap();
+        let snapshot = recovered.render_snapshot().unwrap();
+        assert_eq!(snapshot.tile_items(position).unwrap().len(), 1);
+        assert_eq!(snapshot.tile_items(position).unwrap()[0].server_id, 2148);
+        assert_eq!(recovered.removal_journal().unwrap(), journal);
+        assert_eq!(recovered.revision(), 0);
+    }
+
+    #[test]
+    fn native_game_startup_rejects_a_map_item_journal_with_a_different_source_revision() {
+        let database_path = database_path("native-map-journal-revision-mismatch");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let source_map = native_world_map();
+        let incompatible_revision = WorldMapSourceRevision(source_map.source_revision().0 ^ 1);
+        database
+            .replace_map_item_removal_journal(&MapItemRemovalJournal {
+                map_revision: incompatible_revision,
+                removed_items: vec![WorldMapItemSourceIdentity {
+                    map_revision: incompatible_revision,
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    item_index: 0,
+                }],
+            })
+            .unwrap();
+        let mut config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        config.world_map = Some(source_map);
+
+        assert!(matches!(
+            start_native_otclient_game(config, &database_path),
+            Err(HostError::Core(forgotten_core::CoreError::InvalidMap(_)))
+        ));
+        let _ = fs::remove_file(database_path);
     }
 
     #[test]
@@ -12945,6 +13074,10 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let active_connections = Arc::new(AtomicUsize::new(0));
         let database_path = database_path.as_ref().to_path_buf();
+        let shared_map = config
+            .world_map
+            .as_deref()
+            .map(|world_map| Arc::new(SharedNativeMap::new(world_map.clone())));
         let thread_shutdown = Arc::clone(&shutdown);
         let thread = thread::spawn(move || {
             serve_native_otclient_game(
@@ -12954,6 +13087,7 @@ mod tests {
                 thread_shutdown,
                 active_connections,
                 shared_world,
+                shared_map,
             )
         });
         Ok(HostHandle {
