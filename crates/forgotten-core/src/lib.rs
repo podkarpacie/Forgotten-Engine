@@ -651,6 +651,51 @@ impl WorldMap {
         Ok(())
     }
 
+    /// Applies revision-bound top-level source-item removals only after validating the complete
+    /// journal against the immutable source revision and exact current ordered items. This is a
+    /// recovery primitive; persistence coordination and client delivery remain separate.
+    pub fn apply_source_item_removals(
+        &mut self,
+        removals: &[WorldMapItemSourceIdentity],
+    ) -> Result<(), CoreError> {
+        let revision = self.source_revision();
+        let mut by_position: BTreeMap<Position, Vec<usize>> = BTreeMap::new();
+        for removal in removals {
+            if removal.map_revision != revision {
+                return Err(CoreError::InvalidMap(
+                    "map-item journal source revision does not match the loaded map".into(),
+                ));
+            }
+            let index = usize::from(removal.item_index);
+            let items = self.tile_items(removal.position).ok_or_else(|| {
+                CoreError::InvalidMap("map-item journal references a missing tile item list".into())
+            })?;
+            if items.get(index).is_none() {
+                return Err(CoreError::InvalidMap(
+                    "map-item journal references a missing ordered source item".into(),
+                ));
+            }
+            let indices = by_position.entry(removal.position).or_default();
+            if indices.contains(&index) {
+                return Err(CoreError::InvalidMap(
+                    "map-item journal repeats one source item identity".into(),
+                ));
+            }
+            indices.push(index);
+        }
+        for (position, mut indices) in by_position {
+            indices.sort_unstable_by(|left, right| right.cmp(left));
+            let items = self
+                .tile_items
+                .get_mut(&position)
+                .expect("validated tile list exists");
+            for index in indices {
+                items.remove(index);
+            }
+        }
+        Ok(())
+    }
+
     pub fn tile_flags(&self, position: Position) -> u32 {
         self.tile_flags.get(&position).copied().unwrap_or_default()
     }
@@ -7459,6 +7504,45 @@ mod tests {
             first.map_revision,
             map.source_item_identity(position, 0).unwrap().map_revision
         );
+    }
+
+    #[test]
+    fn source_item_recovery_rejects_revision_mismatch_without_mutation() {
+        let position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let mut map = WorldMap::new("recovery", position);
+        map.set_tile(
+            position,
+            WorldMapTile {
+                ground_thing_id: 102,
+                walkable: true,
+            },
+        )
+        .unwrap();
+        map.set_tile_items(
+            position,
+            vec![WorldMapItem {
+                server_id: 1988,
+                client_thing_id: Some(1988),
+                count: 1,
+                action_id: None,
+                unique_id: None,
+                text: None,
+                description: None,
+                teleport_destination: None,
+                duration: None,
+                charges: None,
+                children: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let mut identity = map.source_item_identity(position, 0).unwrap();
+        identity.map_revision = WorldMapSourceRevision(identity.map_revision.0.wrapping_add(1));
+        assert!(map.apply_source_item_removals(&[identity]).is_err());
+        assert_eq!(map.tile_items(position).unwrap().len(), 1);
     }
 
     #[test]
