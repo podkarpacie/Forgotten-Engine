@@ -6,20 +6,21 @@ use forgotten_config::{DeclarativeSpellCatalog, DeclarativeWeaponCatalog};
 use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
     EquipmentSlot, ExperienceAwardPolicy, FeTfsStaticSpawnCollection, ItemInstance,
-    NativeItemPresentationCatalog, Player, PlayerCombatEvent, PlayerCombatEventOutcome,
-    PlayerCondition, PlayerConditionKind, PlayerConditionOutcome, PlayerContainer,
-    PlayerContainerStackToEquipmentOutcome, PlayerContainerToEquipmentOutcome, PlayerContainers,
-    PlayerEquipment, PlayerEquipmentStackToContainerOutcome, PlayerEquipmentToContainerOutcome,
-    PlayerExperienceAwardOutcome, PlayerFightMode, PlayerFightModeState, PlayerInteractionIntent,
-    PlayerItemUseCreatureIntent, PlayerItemUseCreatureOutcome, PlayerItemUseCreatureTarget,
-    PlayerItemUseExIntent, PlayerItemUseExOutcome, PlayerItemUseIntent, PlayerItemUseOutcome,
-    PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
-    PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState, PlayerSkill,
-    PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
-    StaticCreatureDamageOutcome, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy,
-    StaticCreatureResetSummary, StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
+    NativeItemPresentationCatalog, Player, PlayerCombatDefense, PlayerCombatEvent,
+    PlayerCombatEventOutcome, PlayerCondition, PlayerConditionKind, PlayerConditionOutcome,
+    PlayerContainer, PlayerContainerStackToEquipmentOutcome, PlayerContainerToEquipmentOutcome,
+    PlayerContainers, PlayerEquipment, PlayerEquipmentStackToContainerOutcome,
+    PlayerEquipmentToContainerOutcome, PlayerExperienceAwardOutcome, PlayerFightMode,
+    PlayerFightModeState, PlayerInteractionIntent, PlayerItemUseCreatureIntent,
+    PlayerItemUseCreatureOutcome, PlayerItemUseCreatureTarget, PlayerItemUseExIntent,
+    PlayerItemUseExOutcome, PlayerItemUseIntent, PlayerItemUseOutcome, PlayerProgression,
+    PlayerProgressionAttempts, PlayerProgressionRules, PlayerRegenerationOutcome,
+    PlayerRegenerationRules, PlayerRespawnState, PlayerSkill, PlayerSkillTryOutcome,
+    PlayerSpellCastOutcome, PlayerVitals, Position, StaticCreatureDamageOutcome,
+    StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, StaticCreatureResetSummary,
+    StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
     StaticCreatureTargetAttackOutcome, StaticCreatureTargetStepOutcome, VocationId,
-    VocationLevelUpGains, WorldMap, WorldState,
+    VocationLevelUpGains, WorldMap, WorldState, MAX_COMBAT_EVENT_DAMAGE,
 };
 use forgotten_persistence::{
     EngineDatabase, PlayerFixedDeathLossSnapshot, PlayerOutfit,
@@ -387,6 +388,52 @@ fn native_classic_mapped_equipment(
         .collect()
 }
 
+/// Derives FE's explicit armor-only physical reduction from the six armor slots used by the
+/// legacy reference boundary. This intentionally excludes hands, shields, weapons, skills,
+/// vocation multipliers, random blocking, resistance, and any claim of TFS formula parity.
+/// The sum is capped at the existing bounded combat-event maximum.
+fn native_equipment_armor_defense(
+    armor_by_server_id: Option<&BTreeMap<u16, u16>>,
+    equipment: &PlayerEquipment,
+) -> PlayerCombatDefense {
+    let Some(armor_by_server_id) = armor_by_server_id else {
+        return PlayerCombatDefense::default();
+    };
+    let armor_slots = [
+        EquipmentSlot::Head,
+        EquipmentSlot::Neck,
+        EquipmentSlot::Armor,
+        EquipmentSlot::Legs,
+        EquipmentSlot::Feet,
+        EquipmentSlot::Ring,
+    ];
+    let physical_flat_reduction = armor_slots.into_iter().fold(0_u16, |total, slot| {
+        let armor = equipment
+            .item(slot)
+            .and_then(|item| armor_by_server_id.get(&item.server_id))
+            .copied()
+            .unwrap_or_default();
+        total.saturating_add(armor).min(MAX_COMBAT_EVENT_DAMAGE)
+    });
+    PlayerCombatDefense {
+        physical_flat_reduction,
+    }
+}
+
+/// Replaces only the existing profile-neutral physical reduction after authoritative equipment
+/// hydration or an accepted native transfer. It never persists derived state independently.
+fn sync_native_equipment_armor_defense(
+    shared_world: &SharedNativeWorld,
+    player_id: u64,
+    armor_by_server_id: Option<&BTreeMap<u16, u16>>,
+    equipment: &PlayerEquipment,
+) -> Result<bool, HostError> {
+    shared_world.replace_player_combat_defense(
+        player_id,
+        native_equipment_armor_defense(armor_by_server_id, equipment),
+    )
+}
+
 /// Produces only the parser-verified equipment delta for one native session. An item without a
 /// current catalog mapping is not shown; if it replaced a previously mapped item the old visual
 /// slot is explicitly deleted so the client cannot retain stale equipment state.
@@ -745,6 +792,10 @@ pub struct NativeOtClientHostConfig {
     /// Validated operator-supplied server-to-client item metadata. It is retained for later
     /// parser-safe inventory delivery and does not itself enable inventory packets.
     pub item_presentation_catalog: Option<Arc<NativeItemPresentationCatalog>>,
+    /// Immutable validated `items.xml` armor values for the explicit native armor-only bridge.
+    /// Shielding, weapon defense, vocation multipliers, random armor, and TFS formula parity are
+    /// deliberately excluded.
+    pub item_armor_by_server_id: Option<Arc<BTreeMap<u16, u16>>>,
     /// Immutable display-only TFS spawn entities. No AI, combat, movement, or Lua behavior is
     /// attached at this host boundary.
     pub static_spawns: Option<Arc<FeTfsStaticSpawnCollection>>,
@@ -1030,6 +1081,16 @@ impl SharedNativeWorld {
     ) -> Result<bool, HostError> {
         self.lock()?
             .replace_player_progression_attempts(player_id, attempts)
+            .map_err(HostError::Core)
+    }
+
+    pub fn replace_player_combat_defense(
+        &self,
+        player_id: u64,
+        defense: PlayerCombatDefense,
+    ) -> Result<bool, HostError> {
+        self.lock()?
+            .replace_player_combat_defense(player_id, defense)
             .map_err(HostError::Core)
     }
 
@@ -3089,6 +3150,24 @@ fn handle_native_otclient_game(
         world: shared_world.clone(),
         player_id: character.id,
     };
+    let hydrated_armor_defense = sync_native_equipment_armor_defense(
+        shared_world,
+        character.id,
+        config.item_armor_by_server_id.as_deref(),
+        &bootstrap_equipment,
+    )?;
+    native_diagnostic(
+        config.extended_diagnostics,
+        peer,
+        &format!(
+            "combat=equipment-armor-hydration physical-flat-reduction={} changed={hydrated_armor_defense}",
+            native_equipment_armor_defense(
+                config.item_armor_by_server_id.as_deref(),
+                &bootstrap_equipment,
+            )
+            .physical_flat_reduction
+        ),
+    );
     let chat_events = shared_world.register_public_chat_recipient(character.id)?;
     if initial_position != character.position {
         database.update_player_position(character.id, initial_position)?;
@@ -3423,6 +3502,7 @@ fn handle_native_otclient_game(
                                 progression_rules: config.progression_rules.as_deref(),
                                 skill_rate: config.skill_rate,
                                 death_loss_policy: config.death_loss_policy,
+                                armor_by_server_id: config.item_armor_by_server_id.as_deref(),
                                 declarative_weapon_catalog: config
                                     .declarative_weapon_catalog
                                     .as_deref(),
@@ -5602,6 +5682,7 @@ struct NativeSelectedPlayerMeleePolicy<'a> {
     progression_rules: Option<&'a BTreeMap<VocationId, PlayerProgressionRules>>,
     skill_rate: u32,
     death_loss_policy: DeathLossPolicy,
+    armor_by_server_id: Option<&'a BTreeMap<u16, u16>>,
     declarative_weapon_catalog: Option<&'a DeclarativeWeaponCatalog>,
 }
 
@@ -5625,6 +5706,13 @@ fn apply_native_selected_player_melee(
     else {
         return Ok(None);
     };
+    let target_equipment = shared_world.player_equipment(target_id)?;
+    sync_native_equipment_armor_defense(
+        shared_world,
+        target_id,
+        policy.armor_by_server_id,
+        &target_equipment,
+    )?;
     let combat_result = if let Some(catalog) = policy.declarative_weapon_catalog {
         let Some(event) =
             shared_world.equipped_declarative_melee_event(attacker_id, target_id, catalog)?
@@ -6437,6 +6525,7 @@ mod tests {
             empty_world: None,
             world_map: None,
             item_presentation_catalog: None,
+            item_armor_by_server_id: None,
             static_spawns: None,
             static_target_attack_policy: StaticTargetAttackPolicy::Disabled,
             static_target_pursuit_policy: StaticTargetPursuitPolicy::Disabled,
@@ -6538,6 +6627,42 @@ mod tests {
             native_classic_equipment_frames(&incompatible_profile, Some(&catalog), &equipment,)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_equipment_armor_defense_sums_only_the_six_explicit_armor_slots() {
+        let mut equipment = PlayerEquipment::default();
+        for (slot, server_id) in [
+            (EquipmentSlot::Head, 100),
+            (EquipmentSlot::Neck, 101),
+            (EquipmentSlot::Armor, 102),
+            (EquipmentSlot::Legs, 103),
+            (EquipmentSlot::Feet, 104),
+            (EquipmentSlot::Ring, 105),
+            (EquipmentSlot::LeftHand, 106),
+            (EquipmentSlot::RightHand, 107),
+        ] {
+            equipment.equip(slot, ItemInstance::new(server_id, 1).unwrap());
+        }
+        let armor_by_server_id = BTreeMap::from([
+            (100, 1),
+            (101, 2),
+            (102, 3),
+            (103, 4),
+            (104, 5),
+            (105, 6),
+            (106, 500),
+            (107, 500),
+        ]);
+
+        assert_eq!(
+            native_equipment_armor_defense(Some(&armor_by_server_id), &equipment),
+            PlayerCombatDefense::new(21).unwrap()
+        );
+        assert_eq!(
+            native_equipment_armor_defense(None, &equipment),
+            PlayerCombatDefense::default()
         );
     }
 
@@ -8889,6 +9014,7 @@ mod tests {
                 progression_rules: None,
                 skill_rate: 1,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
+                armor_by_server_id: None,
                 declarative_weapon_catalog: None,
             },
         )
@@ -8997,6 +9123,7 @@ mod tests {
                 progression_rules: None,
                 skill_rate: 1,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
+                armor_by_server_id: None,
                 declarative_weapon_catalog: Some(&catalog),
             },
         )
@@ -9009,6 +9136,12 @@ mod tests {
             ItemInstance::new(2376, 1).unwrap(),
         );
         shared.replace_player_equipment(111, equipment).unwrap();
+        let mut target_equipment = PlayerEquipment::default();
+        target_equipment.equip(EquipmentSlot::Armor, ItemInstance::new(2463, 1).unwrap());
+        shared
+            .replace_player_equipment(112, target_equipment)
+            .unwrap();
+        let armor_by_server_id = BTreeMap::from([(2463, 3)]);
         let (_native_target_id, vitals, outcome) = apply_native_selected_player_melee(
             &mut database,
             &shared,
@@ -9018,14 +9151,15 @@ mod tests {
                 progression_rules: None,
                 skill_rate: 1,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
+                armor_by_server_id: Some(&armor_by_server_id),
                 declarative_weapon_catalog: Some(&catalog),
             },
         )
         .unwrap()
         .unwrap();
         assert_eq!(outcome.requested_damage, 12);
-        assert_eq!(outcome.applied_damage, 12);
-        assert_eq!(vitals.health, 8);
+        assert_eq!(outcome.applied_damage, 9);
+        assert_eq!(vitals.health, 11);
         assert_eq!(
             database
                 .characters_for_account(account_id)
@@ -9035,7 +9169,7 @@ mod tests {
                 .unwrap()
                 .vitals
                 .health,
-            8
+            11
         );
         let _ = fs::remove_file(path);
     }
@@ -9115,6 +9249,7 @@ mod tests {
                 progression_rules: Some(&rules_by_vocation),
                 skill_rate: 2,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
+                armor_by_server_id: None,
                 declarative_weapon_catalog: None,
             },
         )
@@ -9222,6 +9357,7 @@ mod tests {
                 progression_rules: Some(&rules_by_vocation),
                 skill_rate: 1,
                 death_loss_policy: DeathLossPolicy::FixedPercent(10),
+                armor_by_server_id: None,
                 declarative_weapon_catalog: None,
             },
         )

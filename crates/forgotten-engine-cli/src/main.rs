@@ -443,6 +443,9 @@ fn run_host(
         .as_ref()
         .map(|catalog| catalog.native_item_presentation_catalog())
         .transpose()?;
+    let item_armor_by_server_id = item_catalog
+        .as_ref()
+        .map(|catalog| catalog.native_xml_armor_by_server_id());
     let world_map = Arc::new(match &item_catalog {
         Some(catalog) => apply_legacy_item_metadata(&raw_world_map, catalog)?,
         None => raw_world_map,
@@ -651,6 +654,7 @@ fn run_host(
             empty_world,
             world_map: Some(Arc::clone(&world_map)),
             item_presentation_catalog: item_presentation_catalog.map(Arc::new),
+            item_armor_by_server_id: item_armor_by_server_id.map(Arc::new),
             static_spawns: (!static_spawns.entities.is_empty()).then(|| Arc::new(static_spawns)),
             static_target_attack_policy: match config.static_creature_target_attack_damage {
                 0 => StaticTargetAttackPolicy::Disabled,

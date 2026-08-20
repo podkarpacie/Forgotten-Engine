@@ -137,6 +137,22 @@ impl LegacyItemCatalog {
         Ok(catalog)
     }
 
+    /// Returns only bounded legacy XML armor values keyed by their authoritative server IDs.
+    /// The result is immutable input for FE's explicit armor-only mitigation bridge; it does not
+    /// interpret shield defense, weapon defense, vocation multipliers, random blocking, or any
+    /// profile-specific TFS formula.
+    pub fn native_xml_armor_by_server_id(&self) -> BTreeMap<u16, u16> {
+        self.definitions
+            .iter()
+            .filter_map(|(&server_id, definition)| {
+                definition
+                    .xml_armor
+                    .filter(|armor| *armor > 0)
+                    .map(|armor| (server_id, armor))
+            })
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.definitions.len()
     }
@@ -800,6 +816,20 @@ mod tests {
         assert_eq!(definition.xml_attack_speed_millis, Some(1_600));
         assert_eq!(definition.xml_weapon_type, Some(LegacyWeaponType::Sword));
         assert_eq!(catalog.definition(101), None);
+    }
+
+    #[test]
+    fn exports_only_positive_validated_xml_armor_values_by_server_id() {
+        let mut catalog = combat_metadata_catalog();
+        apply_items_xml(
+            &mut catalog,
+            br#"<items><item id="100" armor="13"/></items>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog.native_xml_armor_by_server_id(),
+            BTreeMap::from([(100, 13)])
+        );
     }
 
     #[test]

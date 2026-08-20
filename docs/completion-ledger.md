@@ -46,6 +46,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Decode and retain bounded native fight-mode, chase-mode, and secure-mode state with verified defaults, without attaching unverified combat, pursuit, persistence, packet, or UI behavior.
 - [x] Append the verified three-byte native 740 player-modes record to initialization from authoritative fight-mode state and emit it after a real accepted native mode change; persistence, later PvP-mode variants, and formula effects remain deferred.
 - [x] Define bounded profile-neutral flat physical mitigation without silently inventing TFS formulas.
+- [x] On the existing typed declarative native selected-player weapon path only, derive the target's capped profile-neutral physical reduction from validated positive `items.xml` armor values in the authoritative head, neck, armor, legs, feet, and ring slots; shielding, skills, vocation multipliers, randomness, fixed fallback melee, and TFS formula parity remain deferred.
 - [ ] Map verified profile-specific armor, shielding, equipment, weapon, and resistance formulas into the typed mitigation contract.
 - [x] Parse bounded FE-owned scriptless weapon declarations that can construct typed physical adjacent-melee events.
 - [x] Bind validated declarative weapons only to authoritative right-hand equipment on the profile-approved native selected-melee path, without executing scripts.
@@ -69,7 +70,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Decode native 740 UpArrowContainer (`0x88`) as exactly one session-view container ID and safely acknowledge it without packet output or state mutation until a verified parent, nested, and browse-field container model exists.
 - [x] Expose existing complete-item equipment/container transactions through the shared world and advance both native refresh epochs only after core success; client routing is now tested only for whole-item transfers between one fixed equipment slot and one owned non-nested top-level container in either direction.
 - [x] Add a bounded generic `DeterministicWorldCommandBatch<T>` foundation for future validated worker handoff. Its explicit `(tick, player_id, session_sequence)` key orders drain output, duplicates are rejected, and capacity is bounded at 4,096. Core regressions cover ordering, duplicate rejection, capacity, and external mutex handoff. It cannot mutate `WorldState`, creates no worker, and makes no performance claim.
-- [x] Retain bounded legacy `items.xml` armor, defense, extra-defense, attack-speed, and verified weapon-type metadata for known OTB items without changing live combat behavior or claiming formula compatibility.
+- [x] Retain bounded legacy `items.xml` armor, defense, extra-defense, attack-speed, and verified weapon-type metadata for known OTB items. Positive armor is now a narrowly scoped immutable input for the declarative native weapon bridge; all other fields remain non-executing metadata and no formula compatibility is claimed.
 - [ ] Synchronize inventory, equipment, and containers in each supported native session profile.
 - [ ] Implement authoritative item transfer, stack splitting/merging, capacity, and ownership rules across equipment, ground, containers, depot, and inbox surfaces.
 - [x] Define side-effect-free authoritative validation for same-tile or adjacent exact top-level map-item use intents.
@@ -155,4 +156,4 @@ A ledger item can be marked complete only when all applicable conditions are met
 
 ## Current next slice
 
-The next implementation slice is **native 740 temple-respawn delivery**, followed by **profile-driven combat-event research**. The completed bounded equipment/container routes have authoritative persistence and parser-verified socket coverage, but they still lack lawful real-client evidence. Neither slice claims generic inventory, full lifecycle delivery, formula, spell, PvP, or TFS parity.
+The next implementation slice is **profile-driven combat-event research beyond the armor-only declarative weapon bridge**, followed by broader native inventory and container synchronization. The completed bounded equipment/container routes have authoritative persistence and parser-verified socket coverage, but they still lack lawful real-client evidence. Neither slice claims generic inventory, full lifecycle delivery, formula, spell, PvP, or TFS parity.
