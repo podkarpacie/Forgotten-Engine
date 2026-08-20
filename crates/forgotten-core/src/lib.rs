@@ -2282,17 +2282,7 @@ impl WorldState {
         self.player_combat_cooldowns.remove(&id);
         self.player_spell_cooldowns.remove(&id);
         self.player_interactions.remove(&id);
-        self.player_interactions.retain(|_, intent| {
-            if intent.target_player_id == Some(id) {
-                intent.target_player_id = None;
-            }
-            if intent.follow_player_id == Some(id) {
-                intent.follow_player_id = None;
-            }
-            intent.target_player_id.is_some()
-                || intent.target_static_creature_id.is_some()
-                || intent.follow_player_id.is_some()
-        });
+        self.clear_player_interaction_references(id);
         for runtime in self.static_creatures.values_mut() {
             if runtime.target_player_id == Some(id) {
                 runtime.target_player_id = None;
@@ -2300,6 +2290,23 @@ impl WorldState {
         }
         self.mark_changed();
         Ok(player)
+    }
+
+    /// Invalidates only target and follow references to a player that is no longer an active
+    /// interaction candidate. The player may be removed or remain present with a recorded death
+    /// state; packet delivery and broader combat cancellation remain host concerns.
+    fn clear_player_interaction_references(&mut self, unavailable_player_id: u64) {
+        self.player_interactions.retain(|_, intent| {
+            if intent.target_player_id == Some(unavailable_player_id) {
+                intent.target_player_id = None;
+            }
+            if intent.follow_player_id == Some(unavailable_player_id) {
+                intent.follow_player_id = None;
+            }
+            intent.target_player_id.is_some()
+                || intent.target_static_creature_id.is_some()
+                || intent.follow_player_id.is_some()
+        });
     }
 
     pub fn is_player_occupied(&self, position: Position) -> bool {
@@ -3659,6 +3666,7 @@ impl WorldState {
             loss_applied: false,
         };
         self.player_respawn_states.insert(player_id, state);
+        self.clear_player_interaction_references(player_id);
         self.mark_changed();
         Ok(state)
     }
@@ -5919,6 +5927,51 @@ mod tests {
         );
         assert_eq!(
             world.set_player_target(source.id, None),
+            Ok(PlayerInteractionIntent::default())
+        );
+    }
+
+    #[test]
+    fn player_death_clears_other_players_target_and_follow_intents() {
+        let mut world = WorldState::default();
+        let source = player();
+        let selected = Player {
+            id: 8,
+            account_id: 3,
+            name: "Druid".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            ..source.clone()
+        };
+        world.add_player(source.clone()).unwrap();
+        world.add_player(selected.clone()).unwrap();
+        world
+            .set_player_target(source.id, Some(selected.id))
+            .unwrap();
+        world
+            .set_player_follow(source.id, Some(selected.id))
+            .unwrap();
+
+        let temple = Position {
+            x: 110,
+            y: 120,
+            z: 7,
+        };
+        let mut map = WorldMap::new("dead-interaction-target", temple);
+        map.set_town(WorldMapTown {
+            id: 42,
+            name: "Thais".to_owned(),
+            temple_position: temple,
+        })
+        .unwrap();
+
+        world.apply_player_death(selected.id, 42, &map).unwrap();
+        assert!(world.player_respawn_state(selected.id).unwrap().dead);
+        assert_eq!(
+            world.player_interaction_intent(source.id),
             Ok(PlayerInteractionIntent::default())
         );
     }

@@ -9131,6 +9131,7 @@ mod tests {
             .unwrap();
         shared.replace_player_town(202, 1).unwrap();
         shared.set_player_target(201, Some(202)).unwrap();
+        shared.set_player_follow(201, Some(202)).unwrap();
         let multiplier = forgotten_core::ProgressionMultiplier::new(1_000).unwrap();
         let rules = PlayerProgressionRules {
             magic_level_multiplier: multiplier,
@@ -9164,6 +9165,10 @@ mod tests {
             }
         );
         assert_eq!(shared.player_and_vitals(202).unwrap().0.experience, 4_410);
+        assert_eq!(
+            shared.player_interaction_intent(201).unwrap(),
+            PlayerInteractionIntent::default()
+        );
         let persisted = database
             .characters_for_account(account_id)
             .unwrap()
