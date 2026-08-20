@@ -92,6 +92,7 @@ struct NativeWorldHeartbeatOutcome {
     changed_static_targets: usize,
     static_target_attacks: usize,
     static_target_attack_player_ids: BTreeSet<u64>,
+    followed_player_ids: BTreeSet<u64>,
 }
 
 struct NativeHeartbeatConfig {
@@ -208,12 +209,17 @@ fn advance_native_shared_world_heartbeat_with_static_target_policies(
                 })?,
             )?,
     };
+    let followed_player_ids = world_map
+        .map(|map| shared_world.follow_player_targets_once(map))
+        .transpose()?
+        .unwrap_or_default();
     Ok(NativeWorldHeartbeatOutcome {
         tick,
         reactivated_static_creatures,
         changed_static_targets,
         static_target_attacks: static_target_attack_summary.applied_attacks,
         static_target_attack_player_ids: static_target_attack_summary.affected_player_ids,
+        followed_player_ids,
     })
 }
 
@@ -257,6 +263,13 @@ fn run_native_shared_world_heartbeat(
                 config.death_loss_policy,
                 config.progression_rules.as_deref(),
             )?;
+        }
+        if !outcome.followed_player_ids.is_empty() {
+            let database = EngineDatabase::open(&config.database_path)?;
+            for player_id in outcome.followed_player_ids {
+                let (player, _) = shared_world.player_and_vitals(player_id)?;
+                database.update_player_position(player_id, player.position)?;
+            }
         }
     }
     Ok(())
@@ -1741,6 +1754,22 @@ impl SharedNativeWorld {
             self.mark_visibility_changed();
         }
         Ok(summary)
+    }
+
+    /// Runs one deterministic player-follow pass under the authoritative world lock. It does not
+    /// pathfind, retry blocked routes, attack, emit a target packet, or alter follow selection.
+    pub fn follow_player_targets_once(
+        &self,
+        world_map: &WorldMap,
+    ) -> Result<BTreeSet<u64>, HostError> {
+        let moved_player_ids = self
+            .lock()?
+            .follow_player_targets_once(world_map)
+            .map_err(HostError::Core)?;
+        if !moved_player_ids.is_empty() {
+            self.mark_visibility_changed();
+        }
+        Ok(moved_player_ids)
     }
 
     /// Applies one explicit bounded static target-attack pass under the shared-world lock. It
@@ -14149,6 +14178,7 @@ mod tests {
                 changed_static_targets: 0,
                 static_target_attacks: 0,
                 static_target_attack_player_ids: BTreeSet::new(),
+                followed_player_ids: BTreeSet::new(),
             }
         );
         assert_eq!(
@@ -14172,6 +14202,7 @@ mod tests {
                 changed_static_targets: 1,
                 static_target_attacks: 0,
                 static_target_attack_player_ids: BTreeSet::new(),
+                followed_player_ids: BTreeSet::new(),
             }
         );
         assert_eq!(
@@ -14220,6 +14251,7 @@ mod tests {
                 changed_static_targets: 0,
                 static_target_attacks: 0,
                 static_target_attack_player_ids: BTreeSet::new(),
+                followed_player_ids: BTreeSet::new(),
             }
         );
         assert_eq!(shared.visibility_epoch(), visibility_epoch + 1);
@@ -14300,6 +14332,7 @@ mod tests {
                 changed_static_targets: 1,
                 static_target_attacks: 0,
                 static_target_attack_player_ids: BTreeSet::new(),
+                followed_player_ids: BTreeSet::new(),
             }
         );
         assert_eq!(shared.player_vitals(101).unwrap().health, 5);
@@ -14321,6 +14354,7 @@ mod tests {
                 changed_static_targets: 0,
                 static_target_attacks: 1,
                 static_target_attack_player_ids: BTreeSet::from([101]),
+                followed_player_ids: BTreeSet::new(),
             }
         );
         assert_eq!(shared.player_vitals(101).unwrap().health, 3);
@@ -14332,6 +14366,70 @@ mod tests {
             ),
             Err(HostError::InvalidConfiguration(_))
         ));
+    }
+
+    #[test]
+    fn native_shared_heartbeat_steps_a_current_player_follow_intent_once() {
+        let map = native_world_map();
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        for (id, name, position) in [
+            (101_u64, "Knight", map.spawn()),
+            (
+                102_u64,
+                "Druid",
+                Position {
+                    x: 103,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+        ] {
+            shared
+                .register_player_at_available_position(
+                    Player {
+                        id,
+                        account_id: id,
+                        name: name.into(),
+                        position,
+                        level: 8,
+                        experience: 0,
+                        skill_points: 0,
+                    },
+                    &map,
+                )
+                .unwrap();
+        }
+        shared.set_player_follow(101, Some(102)).unwrap();
+        let visibility_epoch = shared.visibility_epoch();
+
+        assert_eq!(
+            advance_native_shared_world_heartbeat_with_static_target_policies(
+                &shared,
+                1,
+                StaticTargetAcquisitionPolicy::Disabled,
+                StaticTargetPursuitPolicy::Disabled,
+                StaticTargetAttackPolicy::Disabled,
+                Some(&map),
+            )
+            .unwrap(),
+            NativeWorldHeartbeatOutcome {
+                tick: 1,
+                reactivated_static_creatures: 0,
+                changed_static_targets: 0,
+                static_target_attacks: 0,
+                static_target_attack_player_ids: BTreeSet::new(),
+                followed_player_ids: BTreeSet::from([101]),
+            }
+        );
+        assert_eq!(shared.visibility_epoch(), visibility_epoch + 1);
+        assert_eq!(
+            shared.player_and_vitals(101).unwrap().0.position,
+            Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            }
+        );
     }
 
     #[test]
@@ -14374,6 +14472,7 @@ mod tests {
                 changed_static_targets: 0,
                 static_target_attacks: 0,
                 static_target_attack_player_ids: BTreeSet::new(),
+                followed_player_ids: BTreeSet::new(),
             }
         );
         assert_eq!(shared.visibility_epoch(), epoch_before);
@@ -14385,6 +14484,7 @@ mod tests {
                 changed_static_targets: 0,
                 static_target_attacks: 0,
                 static_target_attack_player_ids: BTreeSet::new(),
+                followed_player_ids: BTreeSet::new(),
             }
         );
         assert_eq!(shared.visibility_epoch(), epoch_before + 1);

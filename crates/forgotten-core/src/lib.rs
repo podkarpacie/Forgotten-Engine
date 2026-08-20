@@ -4593,6 +4593,73 @@ impl WorldState {
         Ok(())
     }
 
+    /// Executes one deterministic follow pass over current player follow intents. Each living
+    /// source may take at most one direct cardinal distance-reducing step toward a living player
+    /// target. This does not pathfind, retry blocked routes, move diagonally, attack, or change
+    /// interaction state.
+    pub fn follow_player_targets_once(
+        &mut self,
+        world_map: &WorldMap,
+    ) -> Result<BTreeSet<u64>, CoreError> {
+        let player_ids = self.players.keys().copied().collect::<Vec<_>>();
+        let mut moved_player_ids = BTreeSet::new();
+        for player_id in player_ids {
+            let Some(target_player_id) = self
+                .player_interactions
+                .get(&player_id)
+                .and_then(|intent| intent.follow_player_id)
+            else {
+                continue;
+            };
+            let Some(source) = self.players.get(&player_id).cloned() else {
+                continue;
+            };
+            let Some(target) = self.players.get(&target_player_id).cloned() else {
+                continue;
+            };
+            if self.player_respawn_state(player_id)?.dead
+                || self.player_respawn_state(target_player_id)?.dead
+                || source.position.is_adjacent_to(target.position)
+                || source.position.z != target.position.z
+            {
+                continue;
+            }
+            let x_distance = source.position.x.abs_diff(target.position.x);
+            let y_distance = source.position.y.abs_diff(target.position.y);
+            let x_direction = match target.position.x.cmp(&source.position.x) {
+                std::cmp::Ordering::Less => Some(CardinalDirection::West),
+                std::cmp::Ordering::Greater => Some(CardinalDirection::East),
+                std::cmp::Ordering::Equal => None,
+            };
+            let y_direction = match target.position.y.cmp(&source.position.y) {
+                std::cmp::Ordering::Less => Some(CardinalDirection::North),
+                std::cmp::Ordering::Greater => Some(CardinalDirection::South),
+                std::cmp::Ordering::Equal => None,
+            };
+            let preferred = if x_distance >= y_distance {
+                [x_direction, y_direction]
+            } else {
+                [y_direction, x_direction]
+            };
+            for direction in preferred.into_iter().flatten() {
+                let destination = source.position.step(direction)?;
+                if !world_map.is_walkable(destination)
+                    || self.is_static_creature_occupied(destination)
+                    || self
+                        .players
+                        .values()
+                        .any(|player| player.id != player_id && player.position == destination)
+                {
+                    continue;
+                }
+                self.move_player_cardinal(player_id, direction)?;
+                moved_player_ids.insert(player_id);
+                break;
+            }
+        }
+        Ok(moved_player_ids)
+    }
+
     pub fn move_player_cardinal(
         &mut self,
         id: u64,
@@ -5931,6 +5998,77 @@ mod tests {
         assert_eq!(
             world.set_player_target(source.id, None),
             Ok(PlayerInteractionIntent::default())
+        );
+    }
+
+    #[test]
+    fn player_follow_step_is_single_deterministic_and_does_not_route_around_occupancy() {
+        let mut source = player();
+        source.position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let target = Player {
+            id: 8,
+            account_id: 3,
+            name: "Druid".into(),
+            position: Position {
+                x: 103,
+                y: 100,
+                z: 7,
+            },
+            ..source.clone()
+        };
+        let mut map = WorldMap::new("player-follow", source.position);
+        for x in 100..=103 {
+            map.set_tile(
+                Position { x, y: 100, z: 7 },
+                WorldMapTile {
+                    ground_thing_id: 102,
+                    walkable: true,
+                },
+            )
+            .unwrap();
+        }
+        let mut world = WorldState::default();
+        world.add_player(source.clone()).unwrap();
+        world.add_player(target.clone()).unwrap();
+        world.set_player_follow(source.id, Some(target.id)).unwrap();
+
+        assert_eq!(
+            world.follow_player_targets_once(&map).unwrap(),
+            BTreeSet::from([source.id])
+        );
+        assert_eq!(
+            world.player(source.id).unwrap().position,
+            Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            }
+        );
+
+        let blocker = Player {
+            id: 9,
+            account_id: 4,
+            name: "Blocker".into(),
+            position: Position {
+                x: 102,
+                y: 100,
+                z: 7,
+            },
+            ..source
+        };
+        world.add_player(blocker).unwrap();
+        assert!(world.follow_player_targets_once(&map).unwrap().is_empty());
+        assert_eq!(
+            world.player(7).unwrap().position,
+            Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            }
         );
     }
 
