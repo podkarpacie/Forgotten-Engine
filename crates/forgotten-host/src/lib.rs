@@ -4037,7 +4037,9 @@ fn handle_native_otclient_game(
                             );
                             continue;
                         };
-                        if container_id == target_container_id
+                        if closed_container_ids.contains(&container_id)
+                            || closed_container_ids.contains(&target_container_id)
+                            || container_id == target_container_id
                             || source_container.has_parent
                             || target_container.has_parent
                         {

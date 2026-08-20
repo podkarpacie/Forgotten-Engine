@@ -2,8 +2,9 @@
 
 ## Bounded implemented behavior
 
-Native 740 ThrowItem now accepts one caller-owned mapped item from a current non-nested top-level
-container window to a distinct current non-nested top-level container window. The source address,
+Native 740 ThrowItem now accepts one caller-owned mapped item from a current open non-nested
+top-level container window to a distinct current open non-nested top-level container window. A
+closed source or target window is rejected before any authoritative mutation. The source address,
 source item index, requested count, and requested client thing ID must exactly match the current
 authoritative state.
 
@@ -14,6 +15,6 @@ epoch only after the successful transition.
 
 ## Deliberate exclusions
 
-Same-container reordering, nested containers, closed views, swaps, destination placement rules,
-ground and depot movement, capacity/weight, arbitrary stackability, scripts, and generic inventory
+Same-container reordering, nested containers, swaps, destination placement rules, ground and depot
+movement, capacity/weight, arbitrary stackability, scripts, and generic inventory
 behavior remain deferred.
