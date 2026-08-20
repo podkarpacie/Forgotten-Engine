@@ -1282,6 +1282,102 @@ impl EngineDatabase {
         Ok(())
     }
 
+    /// Replaces a player's complete bounded inventory and the complete revision-bound source-map
+    /// removal journal in one SQLite transaction. Callers use this only after validating a
+    /// composite authoritative map-to-inventory transition; a failed commit leaves both durable
+    /// collections unchanged.
+    pub fn replace_player_inventory_and_map_item_removal_journal(
+        &mut self,
+        player_id: u64,
+        equipment: &PlayerEquipment,
+        containers: &PlayerContainers,
+        journal: &MapItemRemovalJournal,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let mut seen = BTreeMap::new();
+        for item in &journal.removed_items {
+            if item.map_revision != journal.map_revision {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "every item must use the journal map revision".into(),
+                ));
+            }
+            if seen.insert((item.position, item.item_index), ()).is_some() {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "duplicate source item identity".into(),
+                ));
+            }
+        }
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM player_equipment WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM player_container_items WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM player_containers WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        for (slot, item) in equipment.iter() {
+            transaction.execute(
+                "INSERT INTO player_equipment (player_id, slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    player_id as i64,
+                    i64::from(slot.code()),
+                    i64::from(item.server_id),
+                    i64::from(item.count),
+                    item.action_id.map(i64::from),
+                    item.unique_id.map(i64::from),
+                ],
+            )?;
+        }
+        for (container_id, container) in containers.iter() {
+            transaction.execute(
+                "INSERT INTO player_containers (player_id, container_id, server_id, count, name, has_parent, capacity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    player_id as i64,
+                    i64::from(container_id),
+                    i64::from(container.container_item.server_id),
+                    i64::from(container.container_item.count),
+                    container.name,
+                    i64::from(u8::from(container.has_parent)),
+                    i64::from(container.items.capacity()),
+                ],
+            )?;
+            for (slot, item) in container.items.iter().enumerate() {
+                transaction.execute(
+                    "INSERT INTO player_container_items (player_id, container_id, slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        player_id as i64,
+                        i64::from(container_id),
+                        slot as i64,
+                        i64::from(item.server_id),
+                        i64::from(item.count),
+                        item.action_id.map(i64::from),
+                        item.unique_id.map(i64::from),
+                    ],
+                )?;
+            }
+        }
+        transaction.execute("DELETE FROM map_item_removal_journal", [])?;
+        for item in &journal.removed_items {
+            transaction.execute(
+                "INSERT INTO map_item_removal_journal (map_revision, x, y, z, item_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    format!("{:016x}", journal.map_revision.0),
+                    i64::from(item.position.x),
+                    i64::from(item.position.y),
+                    i64::from(item.position.z),
+                    i64::from(item.item_index),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Loads player-owned containers in client-window order. Raw database values are never
     /// trusted: invalid IDs, item fields, names, capacity, parent flags, or sparse item slots are
     /// rejected before they can be admitted into authoritative world state.
@@ -2754,6 +2850,108 @@ mod tests {
             database.player_equipment(999),
             Err(PersistenceError::UnknownPlayer(999))
         ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn atomically_replaces_player_inventory_and_map_item_removal_journal() {
+        let path = temporary_path("inventory-map-item-journal-transaction");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("admin", "hash").unwrap();
+        database
+            .save_player(&Player {
+                id: 7,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let mut initial_equipment = PlayerEquipment::default();
+        initial_equipment.equip(
+            EquipmentSlot::RightHand,
+            ItemInstance::new(2376, 1).unwrap(),
+        );
+        database
+            .replace_player_inventory(7, &initial_equipment, &PlayerContainers::default())
+            .unwrap();
+        let initial_journal = MapItemRemovalJournal {
+            map_revision: WorldMapSourceRevision(0x1010),
+            removed_items: vec![WorldMapItemSourceIdentity {
+                map_revision: WorldMapSourceRevision(0x1010),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                item_index: 0,
+            }],
+        };
+        database
+            .replace_map_item_removal_journal(&initial_journal)
+            .unwrap();
+
+        let mut replacement_equipment = PlayerEquipment::default();
+        replacement_equipment.equip(EquipmentSlot::Armor, ItemInstance::new(2463, 1).unwrap());
+        let replacement_journal = MapItemRemovalJournal {
+            map_revision: WorldMapSourceRevision(0x2020),
+            removed_items: vec![WorldMapItemSourceIdentity {
+                map_revision: WorldMapSourceRevision(0x2020),
+                position: Position {
+                    x: 102,
+                    y: 100,
+                    z: 7,
+                },
+                item_index: 1,
+            }],
+        };
+        database
+            .replace_player_inventory_and_map_item_removal_journal(
+                7,
+                &replacement_equipment,
+                &PlayerContainers::default(),
+                &replacement_journal,
+            )
+            .unwrap();
+        assert_eq!(database.player_equipment(7).unwrap(), replacement_equipment);
+        assert_eq!(
+            database.player_containers(7).unwrap(),
+            PlayerContainers::default()
+        );
+        assert_eq!(
+            database.map_item_removal_journal().unwrap(),
+            Some(replacement_journal.clone())
+        );
+
+        let duplicated_journal = MapItemRemovalJournal {
+            map_revision: replacement_journal.map_revision,
+            removed_items: vec![
+                replacement_journal.removed_items[0],
+                replacement_journal.removed_items[0],
+            ],
+        };
+        assert!(matches!(
+            database.replace_player_inventory_and_map_item_removal_journal(
+                7,
+                &initial_equipment,
+                &PlayerContainers::default(),
+                &duplicated_journal,
+            ),
+            Err(PersistenceError::InvalidMapItemJournal(_))
+        ));
+        assert_eq!(database.player_equipment(7).unwrap(), replacement_equipment);
+        assert_eq!(
+            database.map_item_removal_journal().unwrap(),
+            Some(replacement_journal)
+        );
+
         let _ = fs::remove_file(path);
     }
 

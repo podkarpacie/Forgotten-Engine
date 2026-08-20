@@ -20,10 +20,11 @@ use forgotten_core::{
     StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, StaticCreatureResetSummary,
     StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
     StaticCreatureTargetAttackOutcome, StaticCreatureTargetStepOutcome, VocationId,
-    VocationLevelUpGains, WorldMap, WorldMapItem, WorldState, MAX_COMBAT_EVENT_DAMAGE,
+    VocationLevelUpGains, WorldMap, WorldMapItem, WorldMapItemSourceIdentity,
+    WorldMapSourceRevision, WorldState, MAX_COMBAT_EVENT_DAMAGE,
 };
 use forgotten_persistence::{
-    EngineDatabase, PlayerFixedDeathLossSnapshot, PlayerOutfit,
+    EngineDatabase, MapItemRemovalJournal, PlayerFixedDeathLossSnapshot, PlayerOutfit,
     PlayerVitals as PersistedPlayerVitals, StaticCreatureRuntimeRecord,
 };
 use forgotten_protocol::{
@@ -1007,13 +1008,41 @@ pub struct SharedNativeWorld {
 #[derive(Debug, Clone)]
 pub struct SharedNativeMap {
     map: Arc<Mutex<WorldMap>>,
+    source: Arc<WorldMap>,
+    source_item_indices: Arc<Mutex<BTreeMap<Position, Vec<u8>>>>,
+    removed_source_items: Arc<Mutex<BTreeSet<WorldMapItemSourceIdentity>>>,
     revision: Arc<AtomicU64>,
+}
+
+/// Result of one persisted, revision-bound, whole-item transfer from an authoritative imported
+/// map tile into an empty player equipment slot. It carries no native packet data; listener routing
+/// and map delta delivery remain separate boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceMapItemToEquipmentTransferOutcome {
+    pub player_id: u64,
+    pub source_identity: WorldMapItemSourceIdentity,
+    pub item: ItemInstance,
+    pub equipment_slot: EquipmentSlot,
+    pub map_revision: u64,
 }
 
 impl SharedNativeMap {
     pub fn new(map: WorldMap) -> Self {
+        let source = Arc::new(map.clone());
+        let mut source_item_indices = BTreeMap::new();
+        for (position, items) in source.tile_item_entries() {
+            source_item_indices.insert(
+                position,
+                (0..items.len())
+                    .map(|index| u8::try_from(index).expect("world map item limit fits u8"))
+                    .collect(),
+            );
+        }
         Self {
             map: Arc::new(Mutex::new(map)),
+            source,
+            source_item_indices: Arc::new(Mutex::new(source_item_indices)),
+            removed_source_items: Arc::new(Mutex::new(BTreeSet::new())),
             revision: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -1033,6 +1062,25 @@ impl SharedNativeMap {
         self.revision.load(Ordering::SeqCst)
     }
 
+    pub fn source_revision(&self) -> WorldMapSourceRevision {
+        self.source.source_revision()
+    }
+
+    /// Returns a detached copy of the complete revision-bound removal journal owned by this map.
+    /// It never reads or writes SQLite and is primarily useful to recovery/bootstrap code.
+    pub fn removal_journal(&self) -> Result<MapItemRemovalJournal, HostError> {
+        Ok(MapItemRemovalJournal {
+            map_revision: self.source_revision(),
+            removed_items: self
+                .removed_source_items
+                .lock()
+                .map_err(|_| HostError::SharedWorldUnavailable)?
+                .iter()
+                .copied()
+                .collect(),
+        })
+    }
+
     /// Replaces one imported tile's complete ordered item list after `WorldMap` validates its
     /// per-tile limit. This is an ownership primitive only; it does not transfer an item into a
     /// player inventory, persist a change, or emit any native packet.
@@ -1041,13 +1089,175 @@ impl SharedNativeMap {
         position: Position,
         items: Vec<WorldMapItem>,
     ) -> Result<u64, HostError> {
-        self.map
+        let mut map = self
+            .map
             .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?
-            .set_tile_items(position, items)
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut source_item_indices = self
+            .source_item_indices
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        map.set_tile_items(position, items)
             .map_err(HostError::Core)?;
+        source_item_indices.remove(&position);
         Ok(self.revision.fetch_add(1, Ordering::SeqCst) + 1)
     }
+
+    /// Transfers one exact top-level imported source item into one empty equipment slot. The lock
+    /// order is always map, authoritative player world, source-index map, then removal journal.
+    /// It creates candidate map/inventory/journal state first, commits the candidate inventory and
+    /// journal through one SQLite transaction, then publishes the already validated in-memory
+    /// state and advances both affected epochs. Native ThrowItem decoding and map refresh packets
+    /// deliberately remain outside this primitive.
+    pub fn move_source_item_to_empty_equipment(
+        &self,
+        shared_world: &SharedNativeWorld,
+        database: &mut EngineDatabase,
+        player_id: u64,
+        position: Position,
+        runtime_item_index: usize,
+        equipment_slot: EquipmentSlot,
+    ) -> Result<SourceMapItemToEquipmentTransferOutcome, HostError> {
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut world = shared_world.lock()?;
+        let mut source_item_indices = self
+            .source_item_indices
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut removed_source_items = self
+            .removed_source_items
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+
+        let runtime_item = map
+            .tile_items(position)
+            .and_then(|items| items.get(runtime_item_index))
+            .cloned()
+            .ok_or(HostError::Core(forgotten_core::CoreError::UnknownMapItem {
+                position,
+                stack_index: u8::try_from(runtime_item_index).unwrap_or(u8::MAX),
+                expected_server_id: 0,
+            }))?;
+        let source_item_index = source_item_indices
+            .get(&position)
+            .and_then(|indices| indices.get(runtime_item_index))
+            .copied()
+            .ok_or_else(|| {
+                HostError::InvalidConfiguration(
+                    "map item has no source-bound runtime identity".into(),
+                )
+            })?;
+        let source_identity = self
+            .source
+            .source_item_identity(position, usize::from(source_item_index))
+            .ok_or_else(|| {
+                HostError::InvalidConfiguration(
+                    "map source item identity no longer resolves".into(),
+                )
+            })?;
+        let source_item = self
+            .source
+            .tile_items(position)
+            .and_then(|items| items.get(usize::from(source_item_index)))
+            .ok_or_else(|| {
+                HostError::InvalidConfiguration("map source item no longer resolves".into())
+            })?;
+        if source_item != &runtime_item {
+            return Err(HostError::InvalidConfiguration(
+                "map runtime item no longer matches its immutable source item".into(),
+            ));
+        }
+        let item = plain_source_map_item_to_inventory_item(&runtime_item)?;
+        let mut equipment = world
+            .player_equipment(player_id)
+            .cloned()
+            .map_err(HostError::Core)?;
+        if equipment.item(equipment_slot).is_some() {
+            return Err(HostError::Core(
+                forgotten_core::CoreError::OccupiedEquipmentSlot {
+                    player_id,
+                    slot: equipment_slot,
+                },
+            ));
+        }
+        let containers = world
+            .player_containers(player_id)
+            .cloned()
+            .map_err(HostError::Core)?;
+        if removed_source_items.contains(&source_identity) {
+            return Err(HostError::InvalidConfiguration(
+                "map source item identity has already been removed".into(),
+            ));
+        }
+        let mut next_map = map.clone();
+        let mut next_items = next_map
+            .tile_items(position)
+            .map(ToOwned::to_owned)
+            .expect("validated runtime item list exists");
+        next_items.remove(runtime_item_index);
+        next_map
+            .set_tile_items(position, next_items)
+            .map_err(HostError::Core)?;
+        equipment.equip(equipment_slot, item.clone());
+        let mut next_removed_source_items = removed_source_items.clone();
+        next_removed_source_items.insert(source_identity);
+        let next_journal = MapItemRemovalJournal {
+            map_revision: self.source_revision(),
+            removed_items: next_removed_source_items.iter().copied().collect(),
+        };
+
+        database.replace_player_inventory_and_map_item_removal_journal(
+            player_id,
+            &equipment,
+            &containers,
+            &next_journal,
+        )?;
+
+        *map = next_map;
+        let changed = world
+            .replace_player_equipment(player_id, equipment)
+            .expect("validated player remains present while shared-world lock is held");
+        debug_assert!(changed);
+        let source_indices = source_item_indices
+            .get_mut(&position)
+            .expect("validated source index list exists");
+        source_indices.remove(runtime_item_index);
+        if source_indices.is_empty() {
+            source_item_indices.remove(&position);
+        }
+        *removed_source_items = next_removed_source_items;
+        let map_revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        shared_world.equipment_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(SourceMapItemToEquipmentTransferOutcome {
+            player_id,
+            source_identity,
+            item,
+            equipment_slot,
+            map_revision,
+        })
+    }
+}
+
+fn plain_source_map_item_to_inventory_item(item: &WorldMapItem) -> Result<ItemInstance, HostError> {
+    if !item.children.is_empty()
+        || item.text.is_some()
+        || item.description.is_some()
+        || item.teleport_destination.is_some()
+        || item.duration.is_some()
+        || item.charges.is_some()
+    {
+        return Err(HostError::InvalidConfiguration(
+            "map item carries unsupported runtime attributes for inventory transfer".into(),
+        ));
+    }
+    let mut inventory_item =
+        ItemInstance::new(item.server_id, u16::from(item.count)).map_err(HostError::Core)?;
+    inventory_item.action_id = item.action_id;
+    inventory_item.unique_id = item.unique_id;
+    Ok(inventory_item)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7105,6 +7315,213 @@ mod tests {
             map.render_snapshot().unwrap().tile_items(position).unwrap()[0].server_id,
             1988
         );
+    }
+
+    #[test]
+    fn source_map_item_pickup_persists_map_inventory_and_journal_together() {
+        let database_path = database_path("source-map-item-pickup");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        let player = Player {
+            id: 701,
+            account_id: account_id as u64,
+            name: "Knight".into(),
+            position: Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            level: 8,
+            experience: 4_900,
+            skill_points: 3,
+        };
+        database.save_player(&player).unwrap();
+        let position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let mut source_map = (*native_world_map()).clone();
+        source_map
+            .set_tile_items(
+                position,
+                vec![WorldMapItem {
+                    server_id: 2148,
+                    client_thing_id: Some(3031),
+                    count: 7,
+                    action_id: Some(12),
+                    unique_id: Some(34),
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
+        let shared_map = SharedNativeMap::new(source_map.clone());
+        let shared_world = SharedNativeWorld::from_static_spawns(None).unwrap();
+        shared_world
+            .register_player_at_available_position(player, &source_map)
+            .unwrap();
+
+        let outcome = shared_map
+            .move_source_item_to_empty_equipment(
+                &shared_world,
+                &mut database,
+                701,
+                position,
+                0,
+                EquipmentSlot::RightHand,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.player_id, 701);
+        assert_eq!(
+            outcome.source_identity.map_revision,
+            source_map.source_revision()
+        );
+        assert_eq!(outcome.source_identity.position, position);
+        assert_eq!(outcome.source_identity.item_index, 0);
+        assert_eq!(outcome.item.server_id, 2148);
+        assert_eq!(outcome.item.count, 7);
+        assert_eq!(outcome.item.action_id, Some(12));
+        assert_eq!(outcome.item.unique_id, Some(34));
+        assert_eq!(outcome.equipment_slot, EquipmentSlot::RightHand);
+        assert_eq!(outcome.map_revision, 1);
+        assert_eq!(shared_map.revision(), 1);
+        assert_eq!(shared_world.equipment_epoch(), 1);
+        assert!(shared_map
+            .render_snapshot()
+            .unwrap()
+            .tile_items(position)
+            .unwrap()
+            .is_empty());
+        let equipment = shared_world.player_equipment(701).unwrap();
+        assert_eq!(
+            equipment.item(EquipmentSlot::RightHand),
+            Some(&outcome.item)
+        );
+        assert_eq!(database.player_equipment(701).unwrap(), equipment);
+        assert_eq!(
+            database.map_item_removal_journal().unwrap(),
+            Some(MapItemRemovalJournal {
+                map_revision: source_map.source_revision(),
+                removed_items: vec![outcome.source_identity],
+            })
+        );
+        assert_eq!(
+            shared_map.removal_journal().unwrap(),
+            database.map_item_removal_journal().unwrap().unwrap()
+        );
+
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn source_map_item_pickup_rejects_occupied_slot_without_mutating_map_or_persistence() {
+        let database_path = database_path("source-map-item-pickup-occupied-slot");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        let player = Player {
+            id: 702,
+            account_id: account_id as u64,
+            name: "Knight".into(),
+            position: Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            level: 8,
+            experience: 4_900,
+            skill_points: 3,
+        };
+        database.save_player(&player).unwrap();
+        let position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let mut source_map = (*native_world_map()).clone();
+        source_map
+            .set_tile_items(
+                position,
+                vec![WorldMapItem {
+                    server_id: 2148,
+                    client_thing_id: Some(3031),
+                    count: 1,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
+        let shared_map = SharedNativeMap::new(source_map.clone());
+        let shared_world = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let mut occupied_equipment = PlayerEquipment::default();
+        occupied_equipment.equip(
+            EquipmentSlot::RightHand,
+            ItemInstance::new(2376, 1).unwrap(),
+        );
+        shared_world
+            .register_player_at_available_position_with_vitals_and_equipment(
+                player,
+                PlayerVitals::default(),
+                occupied_equipment.clone(),
+                &source_map,
+            )
+            .unwrap();
+        database
+            .replace_player_equipment(702, &occupied_equipment)
+            .unwrap();
+        let equipment_epoch = shared_world.equipment_epoch();
+
+        assert!(matches!(
+            shared_map.move_source_item_to_empty_equipment(
+                &shared_world,
+                &mut database,
+                702,
+                position,
+                0,
+                EquipmentSlot::RightHand,
+            ),
+            Err(HostError::Core(
+                forgotten_core::CoreError::OccupiedEquipmentSlot {
+                    player_id: 702,
+                    slot: EquipmentSlot::RightHand,
+                }
+            ))
+        ));
+
+        assert_eq!(shared_map.revision(), 0);
+        assert_eq!(shared_world.equipment_epoch(), equipment_epoch);
+        assert_eq!(
+            shared_map
+                .render_snapshot()
+                .unwrap()
+                .tile_items(position)
+                .unwrap()[0]
+                .server_id,
+            2148
+        );
+        assert_eq!(
+            shared_world.player_equipment(702).unwrap(),
+            occupied_equipment
+        );
+        assert_eq!(database.player_equipment(702).unwrap(), occupied_equipment);
+        assert_eq!(database.map_item_removal_journal().unwrap(), None);
+
+        let _ = fs::remove_file(database_path);
     }
 
     #[test]
