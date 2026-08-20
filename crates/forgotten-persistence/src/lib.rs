@@ -1552,6 +1552,66 @@ impl EngineDatabase {
         Ok(())
     }
 
+    /// Loads the complete journal without applying it to any map. Callers must compare the loaded
+    /// revision with the current `WorldMap::source_revision()` before considering recovery.
+    pub fn map_item_removal_journal(
+        &self,
+    ) -> Result<Option<MapItemRemovalJournal>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT map_revision, x, y, z, item_index FROM map_item_removal_journal ORDER BY map_revision, x, y, z, item_index",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut journal: Option<MapItemRemovalJournal> = None;
+        for row in rows {
+            let (revision, x, y, z, item_index) = row?;
+            let revision = u64::from_str_radix(&revision, 16).map_err(|_| {
+                PersistenceError::InvalidMapItemJournal(
+                    "map revision must be hexadecimal u64".into(),
+                )
+            })?;
+            let identity = WorldMapItemSourceIdentity {
+                map_revision: WorldMapSourceRevision(revision),
+                position: Position {
+                    x: u16::try_from(x).map_err(|_| {
+                        PersistenceError::InvalidMapItemJournal("x does not fit u16".into())
+                    })?,
+                    y: u16::try_from(y).map_err(|_| {
+                        PersistenceError::InvalidMapItemJournal("y does not fit u16".into())
+                    })?,
+                    z: u8::try_from(z).map_err(|_| {
+                        PersistenceError::InvalidMapItemJournal("z does not fit u8".into())
+                    })?,
+                },
+                item_index: u8::try_from(item_index).map_err(|_| {
+                    PersistenceError::InvalidMapItemJournal("item index does not fit u8".into())
+                })?,
+            };
+            match &mut journal {
+                Some(existing) if existing.map_revision != identity.map_revision => {
+                    return Err(PersistenceError::InvalidMapItemJournal(
+                        "journal contains multiple map revisions".into(),
+                    ))
+                }
+                Some(existing) => existing.removed_items.push(identity),
+                None => {
+                    journal = Some(MapItemRemovalJournal {
+                        map_revision: identity.map_revision,
+                        removed_items: vec![identity],
+                    })
+                }
+            }
+        }
+        Ok(journal)
+    }
+
     fn migrate(&mut self) -> Result<(), PersistenceError> {
         self.connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);\
