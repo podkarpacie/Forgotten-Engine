@@ -389,6 +389,34 @@ fn native_classic_mapped_equipment(
         .collect()
 }
 
+/// Resolves the one classic fixed-inventory form that can safely share the ordinary LookMap
+/// packet. Container-view positions and every nonzero stack index remain outside this bounded
+/// inspection route.
+fn native_classic_equipment_look_item(
+    catalog: Option<&NativeItemPresentationCatalog>,
+    equipment: &PlayerEquipment,
+    position: NativeOtClientPosition,
+    client_thing_id: u16,
+    stack_position: u8,
+) -> Option<(EquipmentSlot, ItemInstance)> {
+    if position.x != u16::MAX || position.y & 0x40 != 0 || position.z != 0 || stack_position != 0 {
+        return None;
+    }
+    let slot = EquipmentSlot::from_code(position.y as u8)?;
+    let item = equipment.item(slot)?.clone();
+    let record = native_classic_item_record(catalog, &item)?;
+    (record.client_thing_id == client_thing_id).then_some((slot, item))
+}
+
+fn native_equipment_item_inspection_message(slot: EquipmentSlot, item: &ItemInstance) -> String {
+    format!(
+        "Equipment slot {}: item {} (count {}).",
+        slot.code(),
+        item.server_id,
+        item.count
+    )
+}
+
 /// Derives FE's explicit armor-only physical reduction from the six armor slots used by the
 /// legacy reference boundary. This intentionally excludes hands, shields, weapons, skills,
 /// vocation multipliers, random blocking, resistance, and any claim of TFS formula parity.
@@ -4621,6 +4649,31 @@ fn handle_native_otclient_game(
                 thing_id,
                 stack_position,
             } => {
+                let equipment = shared_world.player_equipment(character.id)?;
+                if let Some((slot, item)) = native_classic_equipment_look_item(
+                    config.item_presentation_catalog.as_deref(),
+                    &equipment,
+                    position,
+                    thing_id,
+                    stack_position,
+                ) {
+                    let response = encode_native_otclient_status_message(
+                        &config.client_profile,
+                        &native_equipment_item_inspection_message(slot, &item),
+                    )
+                    .map_err(HostError::Protocol)?;
+                    write_frame(stream, &response)?;
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        &format!(
+                            "action=look-map outcome=equipment-slot-inspection slot={} item-id={}",
+                            slot.code(),
+                            item.server_id
+                        ),
+                    );
+                    continue;
+                }
                 let Some(world_map) = config.world_map.as_deref() else {
                     native_diagnostic(
                         config.extended_diagnostics,
@@ -6700,6 +6753,58 @@ mod tests {
             native_equipment_armor_defense(None, &equipment, 1_000),
             PlayerCombatDefense::default()
         );
+    }
+
+    #[test]
+    fn native_classic_equipment_look_requires_one_exact_mapped_fixed_slot_item() {
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                2463,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 100,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(EquipmentSlot::Armor, ItemInstance::new(2463, 1).unwrap());
+        let position = NativeOtClientPosition {
+            x: u16::MAX,
+            y: EquipmentSlot::Armor.code().into(),
+            z: 0,
+        };
+
+        assert_eq!(
+            native_classic_equipment_look_item(Some(&catalog), &equipment, position, 100, 0),
+            Some((EquipmentSlot::Armor, ItemInstance::new(2463, 1).unwrap()))
+        );
+        assert_eq!(
+            native_equipment_item_inspection_message(
+                EquipmentSlot::Armor,
+                &ItemInstance::new(2463, 1).unwrap(),
+            ),
+            "Equipment slot 4: item 2463 (count 1)."
+        );
+        assert!(
+            native_classic_equipment_look_item(Some(&catalog), &equipment, position, 99, 0)
+                .is_none()
+        );
+        assert!(
+            native_classic_equipment_look_item(Some(&catalog), &equipment, position, 100, 1)
+                .is_none()
+        );
+        assert!(native_classic_equipment_look_item(
+            Some(&catalog),
+            &equipment,
+            NativeOtClientPosition {
+                y: position.y | 0x40,
+                ..position
+            },
+            100,
+            0,
+        )
+        .is_none());
     }
 
     #[test]
@@ -10064,6 +10169,95 @@ mod tests {
                     0,
                 ]
         }));
+        drop(client);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_look_map_inspects_one_exact_mapped_equipment_slot() {
+        let database_path = database_path("native-equipment-look");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(
+            EquipmentSlot::RightHand,
+            ItemInstance::new(4526, 1).unwrap(),
+        );
+        database.replace_player_equipment(1, &equipment).unwrap();
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                4526,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 102,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        let mut config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        config.item_presentation_catalog = Some(Arc::new(catalog));
+        let game = start_native_otclient_game(config, &database_path).unwrap();
+        let mut client = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut client,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut client).unwrap();
+        let _equipment = read_frame(&mut client).unwrap();
+        write_frame(
+            &mut client,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_LOOK_MAP,
+                255,
+                255,
+                EquipmentSlot::RightHand.code(),
+                0,
+                0,
+                102,
+                0,
+                0,
+            ]),
+        )
+        .unwrap();
+        let response = read_frame(&mut client).unwrap();
+        let expected_message = "Equipment slot 5: item 4526 (count 1).";
+        assert_eq!(
+            response.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE
+        );
+        assert_eq!(
+            response.0[1],
+            forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT
+        );
+        assert_eq!(
+            u16::from_le_bytes([response.0[2], response.0[3]]) as usize,
+            expected_message.len()
+        );
+        assert_eq!(&response.0[4..], expected_message.as_bytes());
+
         drop(client);
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
