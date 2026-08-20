@@ -79,3 +79,34 @@ The next valid experiment is a **batched, multi-session** preparation scenario t
 mutation serialized, reports queue depth and saturation, and compares end-to-end frame preparation
 after snapshot publication. Listener integration remains deferred until that scenario demonstrates
 a benefit without changing byte-level packet order or authoritative outcomes.
+
+## Concurrent three-stream follow-up
+
+A second local release-mode experiment ran three synchronized immutable request streams. Each
+stream prepared 500 copies of the same captured native 740 viewport per sample. The direct case
+used three concurrent encoder threads. The worker case used three independent bounded
+`NativeRenderPreparationWorker` instances, one per stream. Each of the resulting 1,500 frames per
+sample was required to be byte-identical to the direct reference frame.
+
+| Parameter | Value |
+|---|---:|
+| Samples per path | 35 |
+| Streams / workers | 3 / 3 |
+| Frames per sample | 1,500 |
+| Total frames per path | 52,500 |
+| Direct median per frame | 17.008 µs |
+| Worker median per frame | 21.625 µs |
+| Worker/direct median ratio | 1.271× |
+| Worker median overhead | 27.14% |
+
+| Path | Median sample | p95 sample | Min–max sample |
+|---|---:|---:|---:|
+| Direct concurrent encoder | 25,512 µs | 29,465 µs | 15,584–30,058 µs |
+| Three bounded render workers | 32,437 µs | 36,566 µs | 25,137–38,192 µs |
+
+The direct parallel path remained faster even after amortizing setup across three concurrent
+streams. This result confirms that the staged worker hand-off is a correctness and isolation
+foundation, not a demonstrated throughput improvement. It remains disconnected from the production
+listener. A future benchmark must include a bounded shared queue, realistic heterogeneous snapshots,
+queue-depth/saturation telemetry, and end-to-end post-publication work before any listener
+integration is considered.

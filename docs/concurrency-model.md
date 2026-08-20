@@ -99,3 +99,7 @@ cost for this isolated one-frame scenario.
 > claim that it accelerates a small isolated frame and establishes the baseline required before a
 > multi-session batch experiment can be considered. The complete method, raw samples, host context,
 > and limitations are recorded in `docs/benchmarks/native-render-preparation-v7.4.44.md`.
+
+A follow-up with three concurrent immutable request streams and three workers also remained slower:
+the direct median was 17.008 µs per frame, while the worker median was 21.625 µs per frame. This
+removes any basis for a current live-listener integration or multithreaded throughput claim.

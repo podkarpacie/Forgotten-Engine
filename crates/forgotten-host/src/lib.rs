@@ -10999,6 +10999,175 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "run explicitly in release mode to collect local concurrent native-render benchmark samples"]
+    fn benchmark_native_render_preparation_concurrent_direct_and_workers() {
+        use std::sync::Barrier;
+        use std::time::Instant;
+
+        const SAMPLE_COUNT: usize = 7;
+        const SESSION_COUNT: usize = 3;
+        const ITERATIONS_PER_SESSION: usize = 500;
+
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 102,
+                    account_id: 2,
+                    name: "Druid".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+        let snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_id: native_player_id(101).unwrap(),
+            player_name: "Knight".into(),
+            player_position: native_position(map.spawn()),
+            player_level: 8,
+            player_experience: 0,
+            player_vitals: NativeOtClientPlayerVitals::default(),
+            player_skills: forgotten_core::PlayerSkills::default(),
+            ground_thing_id: 102,
+            player_look_type: 128,
+            player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
+            player_speed: 220,
+            server_beat: 50,
+        };
+        let render_snapshot = shared.native_render_snapshot(101, 128, 220).unwrap();
+        let expected = encode_native_otclient_map_viewport_with_static_spawns_and_players(
+            &profile,
+            &snapshot,
+            &map,
+            Some(&render_snapshot.static_spawns),
+            Some(&render_snapshot.visible_players),
+        )
+        .unwrap();
+
+        let mut direct_samples = Vec::with_capacity(SAMPLE_COUNT);
+        for _ in 0..SAMPLE_COUNT {
+            let barrier = Arc::new(Barrier::new(SESSION_COUNT + 1));
+            let mut sessions = Vec::with_capacity(SESSION_COUNT);
+            for _ in 0..SESSION_COUNT {
+                let barrier = Arc::clone(&barrier);
+                let profile = profile.clone();
+                let snapshot = snapshot.clone();
+                let map = Arc::clone(&map);
+                let render_snapshot = render_snapshot.clone();
+                let expected = expected.clone();
+                sessions.push(thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..ITERATIONS_PER_SESSION {
+                        let prepared =
+                            encode_native_otclient_map_viewport_with_static_spawns_and_players(
+                                &profile,
+                                &snapshot,
+                                &map,
+                                Some(&render_snapshot.static_spawns),
+                                Some(&render_snapshot.visible_players),
+                            )
+                            .unwrap();
+                        assert_eq!(prepared, expected);
+                    }
+                }));
+            }
+            let started = Instant::now();
+            barrier.wait();
+            for session in sessions {
+                session.join().unwrap();
+            }
+            direct_samples.push(started.elapsed());
+        }
+
+        let (first_worker, first_worker_thread) =
+            NativeRenderPreparationWorker::start(Duration::from_secs(1));
+        let (second_worker, second_worker_thread) =
+            NativeRenderPreparationWorker::start(Duration::from_secs(1));
+        let (third_worker, third_worker_thread) =
+            NativeRenderPreparationWorker::start(Duration::from_secs(1));
+        let workers = [
+            first_worker.clone(),
+            second_worker.clone(),
+            third_worker.clone(),
+        ];
+        let mut worker_samples = Vec::with_capacity(SAMPLE_COUNT);
+        for _ in 0..SAMPLE_COUNT {
+            let barrier = Arc::new(Barrier::new(SESSION_COUNT + 1));
+            let mut sessions = Vec::with_capacity(SESSION_COUNT);
+            for worker in workers.clone() {
+                let barrier = Arc::clone(&barrier);
+                let profile = profile.clone();
+                let snapshot = snapshot.clone();
+                let map = Arc::clone(&map);
+                let render_snapshot = render_snapshot.clone();
+                let expected = expected.clone();
+                sessions.push(thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..ITERATIONS_PER_SESSION {
+                        let prepared = worker
+                            .prepare(
+                                profile.clone(),
+                                snapshot.clone(),
+                                Arc::clone(&map),
+                                render_snapshot.clone(),
+                            )
+                            .unwrap();
+                        assert_eq!(prepared, expected);
+                    }
+                }));
+            }
+            let started = Instant::now();
+            barrier.wait();
+            for session in sessions {
+                session.join().unwrap();
+            }
+            worker_samples.push(started.elapsed());
+        }
+        drop(workers);
+        drop(first_worker);
+        drop(second_worker);
+        drop(third_worker);
+        first_worker_thread.join().unwrap();
+        second_worker_thread.join().unwrap();
+        third_worker_thread.join().unwrap();
+
+        let micros = |samples: &[Duration]| {
+            samples
+                .iter()
+                .map(|sample| sample.as_micros())
+                .collect::<Vec<_>>()
+        };
+        println!(
+            "native-render-concurrent-benchmark scenario=three-immutable-session-streams samples={SAMPLE_COUNT} sessions={SESSION_COUNT} iterations_per_session={ITERATIONS_PER_SESSION} direct_total_us={:?} worker_total_us={:?}",
+            micros(&direct_samples),
+            micros(&worker_samples),
+        );
+    }
+
+    #[test]
     fn shared_public_chat_broadcasts_sanitized_events_and_releases_recipients() {
         let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
         let map = native_world_map();
