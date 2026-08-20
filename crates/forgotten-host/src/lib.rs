@@ -5749,12 +5749,17 @@ fn apply_native_selected_player_melee(
             .apply_player_combat_event_with_death(event, world_map)
             .map(|(outcome, vitals, death_state)| (outcome.damage, vitals, death_state))
     } else {
-        shared_world.apply_player_melee_damage_with_death(
+        let event = PlayerCombatEvent::adjacent_melee(
             attacker_id,
             target_id,
+            CombatDamageType::Physical,
             NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE,
-            world_map,
+            CombatAttackTiming::new(1).map_err(HostError::Core)?,
         )
+        .map_err(HostError::Core)?;
+        shared_world
+            .apply_player_combat_event_with_death(event, world_map)
+            .map(|(outcome, vitals, death_state)| (outcome.damage, vitals, death_state))
     };
     let (outcome, mut vitals, mut death_state) = match combat_result {
         Ok(result) => result,
@@ -9034,6 +9039,12 @@ mod tests {
                 &map,
             )
             .unwrap();
+        let mut target_equipment = PlayerEquipment::default();
+        target_equipment.equip(EquipmentSlot::Armor, ItemInstance::new(2463, 1).unwrap());
+        shared
+            .replace_player_equipment(102, target_equipment)
+            .unwrap();
+        let armor_by_server_id = BTreeMap::from([(2463, 3)]);
         shared.set_player_target(101, Some(102)).unwrap();
 
         let (native_target_id, vitals, outcome) = apply_native_selected_player_melee(
@@ -9045,7 +9056,7 @@ mod tests {
                 progression_rules: None,
                 skill_rate: 1,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
-                armor_by_server_id: None,
+                armor_by_server_id: Some(&armor_by_server_id),
                 armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: None,
             },
@@ -9055,9 +9066,9 @@ mod tests {
         assert_eq!(native_target_id, NATIVE_OTCLIENT_PLAYER_ID_START + 102);
         assert_eq!(
             outcome.applied_damage,
-            NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE
+            NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE - 3
         );
-        assert_eq!(vitals.health, 10);
+        assert_eq!(vitals.health, 13);
         assert_eq!(shared.vitals_epoch(), 1);
         assert_eq!(
             database
@@ -9068,8 +9079,25 @@ mod tests {
                 .unwrap()
                 .vitals
                 .health,
-            10
+            13
         );
+        assert!(apply_native_selected_player_melee(
+            &mut database,
+            &shared,
+            101,
+            &map,
+            NativeSelectedPlayerMeleePolicy {
+                progression_rules: None,
+                skill_rate: 1,
+                death_loss_policy: DeathLossPolicy::DefaultFormula,
+                armor_by_server_id: Some(&armor_by_server_id),
+                armor_multiplier_by_vocation: None,
+                declarative_weapon_catalog: None,
+            },
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(shared.vitals_epoch(), 1);
         let _ = fs::remove_file(path);
     }
 
