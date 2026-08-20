@@ -1450,6 +1450,32 @@ impl SharedNativeWorld {
         Ok(outcome)
     }
 
+    /// Applies one bounded stack transfer between two distinct current container windows. It
+    /// advances only the existing container refresh epoch after the core accepts the atomic
+    /// update; native request validation, persistence, nesting, and ground behavior stay outside
+    /// this shared-world wrapper.
+    pub fn move_container_stack_to_container(
+        &self,
+        player_id: u64,
+        from_container_id: u8,
+        item_index: usize,
+        to_container_id: u8,
+        count: u16,
+    ) -> Result<forgotten_core::PlayerContainerStackToContainerOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .move_container_stack_to_container(
+                player_id,
+                from_container_id,
+                item_index,
+                to_container_id,
+                count,
+            )
+            .map_err(HostError::Core)?;
+        self.containers_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(outcome)
+    }
+
     pub fn player_conditions(
         &self,
         player_id: u64,
@@ -3992,6 +4018,80 @@ fn handle_native_otclient_game(
                     continue;
                 }
                 if let Some((container_id, item_index)) = source_container {
+                    if let Some(target_container_id) = target_container_id {
+                        let containers = shared_world.player_containers(character.id)?;
+                        let Some(source_container) = containers.container(container_id) else {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-unknown-container-source",
+                            );
+                            continue;
+                        };
+                        let Some(target_container) = containers.container(target_container_id)
+                        else {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-unknown-container-target",
+                            );
+                            continue;
+                        };
+                        if container_id == target_container_id
+                            || source_container.has_parent
+                            || target_container.has_parent
+                        {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-invalid-container-to-container-boundary",
+                            );
+                            continue;
+                        }
+                        let Some(item) = source_container.items.item(item_index) else {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-unknown-container-source-item",
+                            );
+                            continue;
+                        };
+                        if item.count < u16::from(count)
+                            || catalog
+                                .presentation(item.server_id)
+                                .map(|entry| entry.client_thing_id)
+                                != Some(source_client_thing_id)
+                        {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-invalid-container-item-identity-or-source-count",
+                            );
+                            continue;
+                        }
+                        shared_world.move_container_stack_to_container(
+                            character.id,
+                            container_id,
+                            item_index,
+                            target_container_id,
+                            u16::from(count),
+                        )?;
+                        let next_containers = shared_world.player_containers(character.id)?;
+                        database.replace_player_containers(character.id, &next_containers)?;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "action=throw-item outcome=top-level-container-to-container-stack source-container-id={} item-index={} target-container-id={} client-thing-id={} count={}",
+                                container_id,
+                                item_index,
+                                target_container_id,
+                                source_client_thing_id,
+                                count
+                            ),
+                        );
+                        continue;
+                    }
                     let Some(target_slot) = target_slot else {
                         native_diagnostic(
                             config.extended_diagnostics,

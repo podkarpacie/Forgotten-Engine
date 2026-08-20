@@ -1399,6 +1399,20 @@ pub struct PlayerContainerStackToEquipmentOutcome {
     pub destination_count: u16,
 }
 
+/// Result of a bounded stack movement between two distinct caller-owned container windows. This
+/// core primitive does not infer nesting, map, capacity-weight, or client semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerContainerStackToContainerOutcome {
+    pub player_id: u64,
+    pub from_container_id: u8,
+    pub item_index: usize,
+    pub to_container_id: u8,
+    pub destination_index: usize,
+    pub moved_item: ItemInstance,
+    pub source_remaining_count: Option<u16>,
+    pub destination_count: u16,
+}
+
 /// Presentation metadata validated from an operator-supplied item catalog. It deliberately holds
 /// only the data needed to construct a classic client item record; gameplay properties stay in
 /// the content/runtime layers.
@@ -4040,6 +4054,70 @@ impl WorldState {
         })
     }
 
+    /// Moves a requested bounded count between two distinct existing player containers. The
+    /// target merges only identical instances or appends a new bounded stack; no item metadata
+    /// stackability is inferred.
+    pub fn move_container_stack_to_container(
+        &mut self,
+        player_id: u64,
+        from_container_id: u8,
+        item_index: usize,
+        to_container_id: u8,
+        count: u16,
+    ) -> Result<PlayerContainerStackToContainerOutcome, CoreError> {
+        if from_container_id == to_container_id {
+            return Err(CoreError::SamePlayerContainerTransfer {
+                player_id,
+                container_id: from_container_id,
+            });
+        }
+        let mut containers = self.player_containers(player_id)?.clone();
+        let mut source_container =
+            containers
+                .remove(from_container_id)
+                .ok_or(CoreError::UnknownPlayerContainer {
+                    player_id,
+                    container_id: from_container_id,
+                })?;
+        let mut destination_container =
+            containers
+                .remove(to_container_id)
+                .ok_or(CoreError::UnknownPlayerContainer {
+                    player_id,
+                    container_id: to_container_id,
+                })?;
+        let source = source_container.items.remove(item_index).ok_or(
+            CoreError::UnknownPlayerContainerItem {
+                player_id,
+                container_id: from_container_id,
+                item_index,
+            },
+        )?;
+        let mut remaining = source;
+        let moved_item = remaining.split_off(count)?;
+        let (destination_index, destination_count) = destination_container
+            .items
+            .merge_or_insert_stack(moved_item.clone())?;
+        let source_remaining_count = (remaining.count > 0).then_some(remaining.count);
+        if source_remaining_count.is_some() {
+            source_container.items.items.insert(item_index, remaining);
+        }
+        containers.insert(source_container)?;
+        containers.insert(destination_container)?;
+        self.player_containers.insert(player_id, containers);
+        self.mark_changed();
+        Ok(PlayerContainerStackToContainerOutcome {
+            player_id,
+            from_container_id,
+            item_index,
+            to_container_id,
+            destination_index,
+            moved_item,
+            source_remaining_count,
+            destination_count,
+        })
+    }
+
     pub fn update_player_vitals(
         &mut self,
         player_id: u64,
@@ -4992,6 +5070,10 @@ pub enum CoreError {
         available: u16,
     },
     IncompatibleItemStacks,
+    SamePlayerContainerTransfer {
+        player_id: u64,
+        container_id: u8,
+    },
     ItemStackCountOverflow {
         existing: u16,
         incoming: u16,
@@ -5550,6 +5632,77 @@ mod tests {
                 .items
                 .item(0),
             Some(&shield)
+        );
+    }
+
+    #[test]
+    fn authoritative_container_stack_transfer_merges_between_distinct_containers() {
+        let gold = 2148;
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        let mut source =
+            PlayerContainer::new(0, ItemInstance::new(1988, 1).unwrap(), "Backpack", false, 2)
+                .unwrap();
+        source
+            .items
+            .insert(ItemInstance::new(gold, 40).unwrap())
+            .unwrap();
+        let mut destination =
+            PlayerContainer::new(1, ItemInstance::new(1988, 1).unwrap(), "Bag", false, 2).unwrap();
+        destination
+            .items
+            .insert(ItemInstance::new(gold, 20).unwrap())
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(source).unwrap();
+        containers.insert(destination).unwrap();
+        world.replace_player_containers(7, containers).unwrap();
+
+        assert_eq!(
+            world
+                .move_container_stack_to_container(7, 0, 0, 1, 15)
+                .unwrap(),
+            PlayerContainerStackToContainerOutcome {
+                player_id: 7,
+                from_container_id: 0,
+                item_index: 0,
+                to_container_id: 1,
+                destination_index: 0,
+                moved_item: ItemInstance::new(gold, 15).unwrap(),
+                source_remaining_count: Some(25),
+                destination_count: 35,
+            }
+        );
+        assert_eq!(
+            world
+                .player_containers(7)
+                .unwrap()
+                .container(0)
+                .unwrap()
+                .items
+                .item(0)
+                .unwrap()
+                .count,
+            25
+        );
+        assert_eq!(
+            world
+                .player_containers(7)
+                .unwrap()
+                .container(1)
+                .unwrap()
+                .items
+                .item(0)
+                .unwrap()
+                .count,
+            35
+        );
+        assert_eq!(
+            world.move_container_stack_to_container(7, 0, 0, 0, 1),
+            Err(CoreError::SamePlayerContainerTransfer {
+                player_id: 7,
+                container_id: 0,
+            })
         );
     }
 
