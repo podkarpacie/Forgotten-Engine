@@ -363,6 +363,12 @@ pub struct WorldMapTown {
     pub temple_position: Position,
 }
 
+/// Deterministic non-cryptographic revision of the complete immutable map content. It is suitable
+/// for rejecting incompatible runtime-map journals after an operator changes map content, but it
+/// is not a security hash and does not identify a mutable runtime state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorldMapSourceRevision(pub u64);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorldMap {
     identifier: String,
@@ -374,6 +380,100 @@ pub struct WorldMap {
     house_tiles: BTreeMap<Position, u32>,
     towns: BTreeMap<u32, WorldMapTown>,
     waypoints: BTreeMap<String, Position>,
+}
+
+struct StableMapHasher(u64);
+
+impl StableMapHasher {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn new() -> Self {
+        Self(Self::OFFSET_BASIS)
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
+
+    fn byte(&mut self, value: u8) {
+        self.0 ^= u64::from(value);
+        self.0 = self.0.wrapping_mul(Self::PRIME);
+    }
+
+    fn bytes(&mut self, value: &[u8]) {
+        for byte in value {
+            self.byte(*byte);
+        }
+    }
+
+    fn bool(&mut self, value: bool) {
+        self.byte(u8::from(value));
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.bytes(&value.to_le_bytes());
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes(&value.to_le_bytes());
+    }
+
+    fn string(&mut self, value: &str) {
+        self.u32(value.len().try_into().unwrap_or(u32::MAX));
+        self.bytes(value.as_bytes());
+    }
+
+    fn optional_string(&mut self, value: Option<&str>) {
+        self.bool(value.is_some());
+        if let Some(value) = value {
+            self.string(value);
+        }
+    }
+
+    fn position(&mut self, value: Position) {
+        self.u16(value.x);
+        self.u16(value.y);
+        self.byte(value.z);
+    }
+
+    fn optional_u16(&mut self, value: Option<u16>) {
+        self.bool(value.is_some());
+        if let Some(value) = value {
+            self.u16(value);
+        }
+    }
+
+    fn optional_u32(&mut self, value: Option<u32>) {
+        self.bool(value.is_some());
+        if let Some(value) = value {
+            self.u32(value);
+        }
+    }
+
+    fn optional_position(&mut self, value: Option<Position>) {
+        self.bool(value.is_some());
+        if let Some(value) = value {
+            self.position(value);
+        }
+    }
+
+    fn world_map_item(&mut self, item: &WorldMapItem) {
+        self.u16(item.server_id);
+        self.optional_u16(item.client_thing_id);
+        self.byte(item.count);
+        self.optional_u16(item.action_id);
+        self.optional_u16(item.unique_id);
+        self.optional_string(item.text.as_deref());
+        self.optional_string(item.description.as_deref());
+        self.optional_position(item.teleport_destination);
+        self.optional_u32(item.duration);
+        self.optional_u16(item.charges);
+        self.u32(item.children.len().try_into().unwrap_or(u32::MAX));
+        for child in &item.children {
+            self.world_map_item(child);
+        }
+    }
 }
 
 impl WorldMap {
@@ -405,6 +505,66 @@ impl WorldMap {
 
     pub fn source(&self) -> &WorldMapSource {
         &self.source
+    }
+
+    /// Fingerprints the complete ordered source map content with an explicitly specified FNV-1a
+    /// byte stream. BTree-backed collections provide stable key order, while tile item order and
+    /// child order are kept exactly as loaded. Runtime ownership and persistence are deliberately
+    /// outside this immutable source-revision contract.
+    pub fn source_revision(&self) -> WorldMapSourceRevision {
+        let mut hash = StableMapHasher::new();
+        hash.string(&self.identifier);
+        hash.position(self.spawn);
+        match &self.source {
+            WorldMapSource::FeMapV1 => hash.byte(0),
+            WorldMapSource::Otbm(header) => {
+                hash.byte(1);
+                hash.u32(header.version);
+                hash.u16(header.width);
+                hash.u16(header.height);
+                hash.u32(header.item_major_version);
+                hash.u32(header.item_minor_version);
+                hash.optional_string(header.description.as_deref());
+                hash.optional_string(header.spawn_file.as_deref());
+                hash.optional_string(header.house_file.as_deref());
+            }
+        }
+        hash.u32(self.tiles.len().try_into().unwrap_or(u32::MAX));
+        for (position, tile) in &self.tiles {
+            hash.position(*position);
+            hash.u16(tile.ground_thing_id);
+            hash.bool(tile.walkable);
+        }
+        hash.u32(self.tile_items.len().try_into().unwrap_or(u32::MAX));
+        for (position, items) in &self.tile_items {
+            hash.position(*position);
+            hash.u32(items.len().try_into().unwrap_or(u32::MAX));
+            for item in items {
+                hash.world_map_item(item);
+            }
+        }
+        hash.u32(self.tile_flags.len().try_into().unwrap_or(u32::MAX));
+        for (position, flags) in &self.tile_flags {
+            hash.position(*position);
+            hash.u32(*flags);
+        }
+        hash.u32(self.house_tiles.len().try_into().unwrap_or(u32::MAX));
+        for (position, house_id) in &self.house_tiles {
+            hash.position(*position);
+            hash.u32(*house_id);
+        }
+        hash.u32(self.towns.len().try_into().unwrap_or(u32::MAX));
+        for (id, town) in &self.towns {
+            hash.u32(*id);
+            hash.string(&town.name);
+            hash.position(town.temple_position);
+        }
+        hash.u32(self.waypoints.len().try_into().unwrap_or(u32::MAX));
+        for (name, position) in &self.waypoints {
+            hash.string(name);
+            hash.position(*position);
+        }
+        WorldMapSourceRevision(hash.finish())
     }
 
     pub fn set_source(&mut self, source: WorldMapSource) {
@@ -7146,6 +7306,85 @@ mod tests {
         assert!(map.validate().is_ok());
         assert!(map.set_waypoint("", spawn).is_err());
         assert!(map.set_house_tile(spawn, 0).is_err());
+    }
+
+    #[test]
+    fn source_map_revision_is_stable_and_changes_with_complete_item_content() {
+        let spawn = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let mut map = WorldMap::new("revision", spawn);
+        map.set_tile(
+            spawn,
+            WorldMapTile {
+                ground_thing_id: 102,
+                walkable: true,
+            },
+        )
+        .unwrap();
+        map.set_tile_items(
+            spawn,
+            vec![WorldMapItem {
+                server_id: 1988,
+                client_thing_id: Some(1988),
+                count: 1,
+                action_id: Some(7),
+                unique_id: Some(8),
+                text: Some("read me".into()),
+                description: Some("a note".into()),
+                teleport_destination: Some(Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                }),
+                duration: Some(30),
+                charges: Some(2),
+                children: vec![WorldMapItem {
+                    server_id: 2000,
+                    client_thing_id: Some(2000),
+                    count: 3,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            }],
+        )
+        .unwrap();
+
+        let original = map.source_revision();
+        assert_eq!(original, map.clone().source_revision());
+
+        let mut changed = map.clone();
+        changed
+            .set_tile_items(
+                spawn,
+                vec![WorldMapItem {
+                    server_id: 1988,
+                    client_thing_id: Some(1988),
+                    count: 2,
+                    action_id: Some(7),
+                    unique_id: Some(8),
+                    text: Some("read me".into()),
+                    description: Some("a note".into()),
+                    teleport_destination: Some(Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    }),
+                    duration: Some(30),
+                    charges: Some(2),
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
+        assert_ne!(original, changed.source_revision());
     }
 
     #[test]
