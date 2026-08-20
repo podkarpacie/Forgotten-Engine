@@ -89,6 +89,7 @@ pub struct EngineConfig {
     pub skill_rate: u32,
     pub magic_rate: u32,
     pub static_creature_target_attack_damage: u16,
+    pub static_creature_target_pursuit_range: u8,
     pub experience_stages: Option<ExperienceStages>,
     pub experience_stages_source: Option<ExperienceStagesSource>,
     pub death_loss_percent: i32,
@@ -269,6 +270,15 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
             message: "must be between 0 and 100".into(),
         });
     }
+    let static_creature_target_pursuit_range =
+        optional_u16(&values, "staticCreatureTargetPursuitRange", 0)?;
+    if static_creature_target_pursuit_range > 8 {
+        return Err(ConfigError::InvalidValue {
+            key: "staticCreatureTargetPursuitRange",
+            message: "must be between 0 and 8".into(),
+        });
+    }
+    let static_creature_target_pursuit_range = static_creature_target_pursuit_range as u8;
     let content_directory = world_directory.join("data");
     let (experience_stages, experience_stages_source) = match configured_experience_stages {
         Some(Some(stages)) => (Some(stages), Some(ExperienceStagesSource::LegacyConfigLua)),
@@ -406,6 +416,7 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         skill_rate,
         magic_rate,
         static_creature_target_attack_damage,
+        static_creature_target_pursuit_range,
         experience_stages,
         experience_stages_source,
         death_loss_percent,
@@ -1348,6 +1359,7 @@ fn is_recognized_config_key(key: &str) -> bool {
             | "rateSkill"
             | "rateMagic"
             | "staticCreatureTargetAttackDamage"
+            | "staticCreatureTargetPursuitRange"
             | "deathLosePercent"
             | "serverName"
             | "mapName"
@@ -1707,6 +1719,7 @@ experienceStages = {
         assert_eq!(config.skill_rate, 1);
         assert_eq!(config.magic_rate, 1);
         assert_eq!(config.static_creature_target_attack_damage, 0);
+        assert_eq!(config.static_creature_target_pursuit_range, 0);
         assert_eq!(config.death_loss_percent, -1);
         assert!(!config.otclient_v8_native_enabled);
         let _ = fs::remove_dir_all(world);
@@ -1741,6 +1754,41 @@ experienceStages = {
             load(&world),
             Err(ConfigError::InvalidValue {
                 key: "staticCreatureTargetAttackDamage",
+                ..
+            })
+        ));
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn loads_a_bounded_opt_in_static_target_pursuit_range() {
+        let world = temporary_world("static-target-pursuit-range");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}staticCreatureTargetPursuitRange = 4\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            load(&world).unwrap().static_creature_target_pursuit_range,
+            4
+        );
+
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}staticCreatureTargetPursuitRange = 9\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            load(&world),
+            Err(ConfigError::InvalidValue {
+                key: "staticCreatureTargetPursuitRange",
                 ..
             })
         ));

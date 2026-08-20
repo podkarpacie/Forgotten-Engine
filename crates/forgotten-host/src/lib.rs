@@ -92,6 +92,15 @@ struct NativeWorldHeartbeatOutcome {
     static_target_attack_player_ids: BTreeSet<u64>,
 }
 
+struct NativeHeartbeatConfig {
+    pursuit_policy: StaticTargetPursuitPolicy,
+    attack_policy: StaticTargetAttackPolicy,
+    world_map: Option<Arc<WorldMap>>,
+    database_path: PathBuf,
+    death_loss_policy: DeathLossPolicy,
+    progression_rules: Option<Arc<BTreeMap<VocationId, PlayerProgressionRules>>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticTargetAcquisitionPolicy {
     Disabled,
@@ -153,6 +162,7 @@ fn advance_native_shared_world_heartbeat_with_target_policy(
         shared_world,
         elapsed_seconds,
         target_policy,
+        StaticTargetPursuitPolicy::Disabled,
         StaticTargetAttackPolicy::Disabled,
         None,
     )
@@ -162,14 +172,28 @@ fn advance_native_shared_world_heartbeat_with_static_target_policies(
     shared_world: &SharedNativeWorld,
     elapsed_seconds: u16,
     target_policy: StaticTargetAcquisitionPolicy,
+    pursuit_policy: StaticTargetPursuitPolicy,
     attack_policy: StaticTargetAttackPolicy,
     world_map: Option<&WorldMap>,
 ) -> Result<NativeWorldHeartbeatOutcome, HostError> {
     let tick = shared_world.advance_ticks(elapsed_seconds)?;
     let reactivated_static_creatures = shared_world.reactivate_due_static_creatures()?.reactivated;
-    let changed_static_targets = shared_world
+    let mut changed_static_targets = shared_world
         .acquire_static_creature_targets(target_policy)?
         .changed_static_targets;
+    let pursuit_summary = match pursuit_policy {
+        StaticTargetPursuitPolicy::Disabled => StaticTargetPursuitSummary::default(),
+        StaticTargetPursuitPolicy::NearestLivingPlayerOneStep { .. } => shared_world
+            .pursue_static_creature_targets_once(
+                world_map.ok_or_else(|| {
+                    HostError::InvalidConfiguration(
+                        "static target pursuit policy requires a loaded world map".into(),
+                    )
+                })?,
+                pursuit_policy,
+            )?,
+    };
+    changed_static_targets += pursuit_summary.changed_static_targets;
     let static_target_attack_summary = match attack_policy {
         StaticTargetAttackPolicy::Disabled => StaticTargetAttackSummary::default(),
         StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { .. } => shared_world
@@ -194,11 +218,7 @@ fn advance_native_shared_world_heartbeat_with_static_target_policies(
 fn run_native_shared_world_heartbeat(
     shared_world: SharedNativeWorld,
     shutdown: Arc<AtomicBool>,
-    attack_policy: StaticTargetAttackPolicy,
-    world_map: Option<Arc<WorldMap>>,
-    database_path: PathBuf,
-    death_loss_policy: DeathLossPolicy,
-    progression_rules: Option<Arc<BTreeMap<VocationId, PlayerProgressionRules>>>,
+    config: NativeHeartbeatConfig,
 ) -> Result<(), HostError> {
     let mut last_tick = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
@@ -212,7 +232,7 @@ fn run_native_shared_world_heartbeat(
             continue;
         }
         last_tick += Duration::from_secs(u64::from(elapsed_seconds));
-        let target_policy = match attack_policy {
+        let target_policy = match config.attack_policy {
             StaticTargetAttackPolicy::Disabled => StaticTargetAcquisitionPolicy::Disabled,
             StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { .. } => {
                 StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 }
@@ -222,17 +242,18 @@ fn run_native_shared_world_heartbeat(
             &shared_world,
             elapsed_seconds,
             target_policy,
-            attack_policy,
-            world_map.as_deref(),
+            config.pursuit_policy,
+            config.attack_policy,
+            config.world_map.as_deref(),
         )?;
         if !outcome.static_target_attack_player_ids.is_empty() {
-            let mut database = EngineDatabase::open(&database_path)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
             persist_static_target_attack_vitals(
                 &mut database,
                 &shared_world,
                 &outcome.static_target_attack_player_ids,
-                death_loss_policy,
-                progression_rules.as_deref(),
+                config.death_loss_policy,
+                config.progression_rules.as_deref(),
             )?;
         }
     }
@@ -731,6 +752,10 @@ pub struct NativeOtClientHostConfig {
     /// each active static creature to its already selected adjacent target. Formula, persistence,
     /// packet, loot, corpse, script, and general AI behavior remain separate and deferred.
     pub static_target_attack_policy: StaticTargetAttackPolicy,
+    /// Disabled by default. When enabled, each heartbeat may use the existing deterministic
+    /// nearest-living-player one-step pursuit primitive. It does not add general pathfinding,
+    /// attack, loot, scripts, or NPC behavior.
+    pub static_target_pursuit_policy: StaticTargetPursuitPolicy,
     /// Optional validated vocation recovery rules. Without this catalog automatic recovery is
     /// disabled; soul, condition client effects, death activation from conditions, and scripted
     /// lifecycle hooks remain deferred.
@@ -2698,6 +2723,7 @@ fn serve_native_otclient_game(
     );
     let heartbeat_shutdown = Arc::clone(&shutdown);
     let heartbeat_world = shared_world.clone();
+    let heartbeat_pursuit_policy = config.static_target_pursuit_policy;
     let heartbeat_attack_policy = config.static_target_attack_policy;
     let heartbeat_map = config.world_map.clone();
     let heartbeat_database_path = database_path.clone();
@@ -2707,11 +2733,14 @@ fn serve_native_otclient_game(
         run_native_shared_world_heartbeat(
             heartbeat_world,
             heartbeat_shutdown,
-            heartbeat_attack_policy,
-            heartbeat_map,
-            heartbeat_database_path,
-            heartbeat_death_loss_policy,
-            heartbeat_progression_rules,
+            NativeHeartbeatConfig {
+                pursuit_policy: heartbeat_pursuit_policy,
+                attack_policy: heartbeat_attack_policy,
+                world_map: heartbeat_map,
+                database_path: heartbeat_database_path,
+                death_loss_policy: heartbeat_death_loss_policy,
+                progression_rules: heartbeat_progression_rules,
+            },
         )
     });
     let service_result = loop {
@@ -6410,6 +6439,7 @@ mod tests {
             item_presentation_catalog: None,
             static_spawns: None,
             static_target_attack_policy: StaticTargetAttackPolicy::Disabled,
+            static_target_pursuit_policy: StaticTargetPursuitPolicy::Disabled,
             regeneration_rules: None,
             progression_rules: None,
             vocation_level_up_gains: None,
@@ -7601,6 +7631,7 @@ mod tests {
                 &shared,
                 1,
                 StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 },
+                StaticTargetPursuitPolicy::Disabled,
                 StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage },
                 Some(&map),
             )
@@ -7705,6 +7736,7 @@ mod tests {
             &shared,
             1,
             StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 },
+            StaticTargetPursuitPolicy::Disabled,
             StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage: 10 },
             Some(&map),
         )
@@ -13550,6 +13582,39 @@ mod tests {
             ))
         ));
         assert_eq!(shared.visibility_epoch(), visibility_epoch);
+
+        assert_eq!(
+            advance_native_shared_world_heartbeat_with_static_target_policies(
+                &shared,
+                1,
+                StaticTargetAcquisitionPolicy::Disabled,
+                StaticTargetPursuitPolicy::NearestLivingPlayerOneStep { max_range: 4 },
+                StaticTargetAttackPolicy::Disabled,
+                Some(map.as_ref()),
+            )
+            .unwrap(),
+            NativeWorldHeartbeatOutcome {
+                tick: 3,
+                reactivated_static_creatures: 0,
+                changed_static_targets: 0,
+                static_target_attacks: 0,
+                static_target_attack_player_ids: BTreeSet::new(),
+            }
+        );
+        assert_eq!(shared.visibility_epoch(), visibility_epoch + 1);
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .static_creature(creature_id)
+                .unwrap()
+                .position,
+            Position {
+                x: 102,
+                y: 100,
+                z: 7,
+            }
+        );
     }
 
     #[test]
@@ -13603,6 +13668,7 @@ mod tests {
                 &shared,
                 1,
                 StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 },
+                StaticTargetPursuitPolicy::Disabled,
                 StaticTargetAttackPolicy::Disabled,
                 Some(&map),
             )
@@ -13623,6 +13689,7 @@ mod tests {
                 &shared,
                 1,
                 StaticTargetAcquisitionPolicy::Disabled,
+                StaticTargetPursuitPolicy::Disabled,
                 StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage: 2 },
                 Some(&map),
             )

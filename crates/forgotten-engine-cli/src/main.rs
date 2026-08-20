@@ -16,7 +16,7 @@ use forgotten_host::{
     start, start_game_session, start_native_otclient_game, start_native_otclient_login,
     start_status, GameSessionHostConfig, HostConfig, LegacyLoginConfig,
     NativeOtClientEmptyWorldConfig, NativeOtClientHostConfig, StaticTargetAttackPolicy,
-    StatusHostConfig,
+    StaticTargetPursuitPolicy, StatusHostConfig,
 };
 use forgotten_persistence::{create_backup, EngineDatabase};
 use forgotten_protocol::{
@@ -655,6 +655,10 @@ fn run_host(
             static_target_attack_policy: match config.static_creature_target_attack_damage {
                 0 => StaticTargetAttackPolicy::Disabled,
                 damage => StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage },
+            },
+            static_target_pursuit_policy: match config.static_creature_target_pursuit_range {
+                0 => StaticTargetPursuitPolicy::Disabled,
+                max_range => StaticTargetPursuitPolicy::NearestLivingPlayerOneStep { max_range },
             },
             regeneration_rules,
             progression_rules,
