@@ -4391,6 +4391,118 @@ fn handle_native_otclient_game(
                     );
                     continue;
                 }
+                if source_position.x != 0xffff {
+                    let Some(target_slot) = target_slot else {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-unsupported-map-source-target",
+                        );
+                        continue;
+                    };
+                    let Some(intent) = native_map_item_use_intent(
+                        Some(catalog),
+                        character.id,
+                        source_position,
+                        source_client_thing_id,
+                        source_stack_position,
+                    ) else {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-unmapped-or-ambiguous-map-source-item",
+                        );
+                        continue;
+                    };
+                    let map_snapshot = map_owner.render_snapshot()?;
+                    let source = match shared_world.validate_player_item_use(&map_snapshot, intent)
+                    {
+                        Ok(source) => source,
+                        Err(HostError::Core(_)) => {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-invalid-server-owned-map-source",
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if source.count != count {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-map-source-requires-whole-item-count",
+                        );
+                        continue;
+                    }
+                    let source_position = Position {
+                        x: source_position.x,
+                        y: source_position.y,
+                        z: source_position.z,
+                    };
+                    let transfer = match map_owner.move_source_item_to_empty_equipment(
+                        shared_world,
+                        &mut database,
+                        character.id,
+                        source_position,
+                        usize::from(source_stack_position),
+                        target_slot,
+                    ) {
+                        Ok(transfer) => transfer,
+                        Err(HostError::Core(_) | HostError::InvalidConfiguration(_)) => {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-map-source-transfer-rejected",
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let equipment = shared_world.player_equipment(character.id)?;
+                    let current_mapped_equipment =
+                        native_classic_mapped_equipment(Some(catalog), &equipment);
+                    let equipment_updates = native_classic_equipment_delta_frames(
+                        &config.client_profile,
+                        &observed_mapped_equipment,
+                        &current_mapped_equipment,
+                    )
+                    .map_err(HostError::Protocol)?;
+                    for frame in &equipment_updates {
+                        write_frame(stream, frame)?;
+                    }
+                    observed_mapped_equipment = current_mapped_equipment;
+                    observed_equipment_epoch = shared_world.equipment_epoch();
+                    let mut refreshed_snapshot = snapshot.clone();
+                    refreshed_snapshot.player_position = native_position(player_position);
+                    refreshed_snapshot.player_direction = facing.protocol_direction();
+                    let map_snapshot = map_owner.render_snapshot()?;
+                    let refreshed_viewport = encode_shared_native_world_viewport(
+                        &config.client_profile,
+                        &refreshed_snapshot,
+                        map_snapshot.as_ref(),
+                        shared_world,
+                        character.id,
+                    )?;
+                    write_frame(stream, &refreshed_viewport)?;
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        &format!(
+                            "action=throw-item outcome=map-source-to-equipment source={:?} target-slot={} client-thing-id={} count={} source-index={} map-revision={} equipment-records={} map-refresh-bytes={}",
+                            transfer.source_identity.position,
+                            target_slot.code(),
+                            source_client_thing_id,
+                            count,
+                            transfer.source_identity.item_index,
+                            transfer.map_revision,
+                            equipment_updates.len(),
+                            refreshed_viewport.0.len(),
+                        ),
+                    );
+                    continue;
+                }
                 if let Some((container_id, item_index)) = source_container {
                     if let Some(target_container_id) = target_container_id {
                         let containers = shared_world.player_containers(character.id)?;
@@ -11414,6 +11526,143 @@ mod tests {
                     0,
                 ]
         }));
+        drop(client);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_throw_moves_one_mapped_source_map_item_to_empty_equipment_slot() {
+        let database_path = database_path("native-map-source-to-equipment");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        let source_position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: source_position,
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let mut source_map = (*native_world_map()).clone();
+        source_map
+            .set_tile_items(
+                source_position,
+                vec![WorldMapItem {
+                    server_id: 4526,
+                    client_thing_id: Some(102),
+                    count: 1,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
+        let source_identity = source_map.source_item_identity(source_position, 0).unwrap();
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                4526,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 102,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        let mut config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        config.world_map = Some(Arc::new(source_map));
+        config.item_presentation_catalog = Some(Arc::new(catalog));
+        let game = start_native_otclient_game(config, &database_path).unwrap();
+        let mut client = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut client,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut client).unwrap();
+        let _equipment = read_frame(&mut client).unwrap();
+        write_frame(
+            &mut client,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                100,
+                0,
+                100,
+                0,
+                7,
+                102,
+                0,
+                0,
+                255,
+                255,
+                EquipmentSlot::LeftHand.code(),
+                0,
+                0,
+                1,
+            ]),
+        )
+        .unwrap();
+        for _ in 0..20 {
+            if database
+                .player_equipment(1)
+                .unwrap()
+                .item(EquipmentSlot::LeftHand)
+                .is_some()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            database
+                .player_equipment(1)
+                .unwrap()
+                .item(EquipmentSlot::LeftHand),
+            Some(&ItemInstance::new(4526, 1).unwrap())
+        );
+        assert_eq!(
+            database.map_item_removal_journal().unwrap(),
+            Some(MapItemRemovalJournal {
+                map_revision: source_identity.map_revision,
+                removed_items: vec![source_identity],
+            })
+        );
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut client).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_SET_INVENTORY,
+                EquipmentSlot::LeftHand.code(),
+                102,
+                0,
+            ]
+        );
+        let refreshed_viewport = read_frame(&mut client).unwrap().0;
+        assert_eq!(
+            refreshed_viewport.first().copied(),
+            Some(forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP)
+        );
         drop(client);
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
