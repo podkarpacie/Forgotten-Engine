@@ -36,11 +36,21 @@ pub struct TfsEntityDefinition {
     /// Non-executing monster metadata retained for explicit future reward policies. NPCs and
     /// monster definitions without a root `experience` attribute retain zero.
     pub experience: u64,
+    /// One bounded direct `melee` XML declaration retained for a future scriptless static-combat
+    /// adapter. Area, ranged, status, chance, and scripted attacks remain unexecuted.
+    pub direct_melee: Option<TfsDirectMeleeAttack>,
     pub definition_path: PathBuf,
     pub script_path: Option<PathBuf>,
     pub script_present: bool,
     /// Render-only metadata from XML. Definition scripts remain unexecuted.
     pub appearance: Option<TfsEntityAppearance>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TfsDirectMeleeAttack {
+    pub interval_millis: u32,
+    pub min_damage: u16,
+    pub max_damage: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,6 +401,7 @@ fn parse_entity_definition(
     let mut root_speed = 0u16;
     let mut look = None;
     let mut max_health = None;
+    let mut direct_melee = None;
     loop {
         match reader.read_event_into(&mut buffer).map_err(xml_error)? {
             Event::Start(event) => {
@@ -406,6 +417,8 @@ fn parse_entity_definition(
                     )?);
                 } else if definition.is_some() && depth == 2 {
                     parse_appearance_event(&event, &mut look, &mut max_health)?;
+                } else if matches!(kind, TfsEntityKind::Monster) && depth == 3 {
+                    parse_direct_melee_event(&event, &mut direct_melee)?;
                 }
             }
             Event::Empty(event) => {
@@ -419,6 +432,8 @@ fn parse_entity_definition(
                     )?);
                 } else if definition.is_some() && depth + 1 == 2 {
                     parse_appearance_event(&event, &mut look, &mut max_health)?;
+                } else if matches!(kind, TfsEntityKind::Monster) && depth + 1 == 3 {
+                    parse_direct_melee_event(&event, &mut direct_melee)?;
                 }
             }
             Event::End(_) => {
@@ -439,6 +454,7 @@ fn parse_entity_definition(
             String::from_utf8_lossy(root)
         ))
     })?;
+    definition.direct_melee = direct_melee;
     definition.appearance = look.map(|look| TfsEntityAppearance {
         look_type: look.look_type,
         head: look.head,
@@ -473,6 +489,7 @@ fn entity_from_root_event(
         } else {
             0
         },
+        direct_melee: None,
         definition_path: definition_path.to_path_buf(),
         script_path,
         script_present,
@@ -488,6 +505,40 @@ struct EntityLook {
     legs: u8,
     feet: u8,
     addons: u8,
+}
+
+fn parse_direct_melee_event(
+    event: &BytesStart<'_>,
+    direct_melee: &mut Option<TfsDirectMeleeAttack>,
+) -> Result<(), ConfigError> {
+    if event.name().as_ref() != b"attack"
+        || !optional_attribute_string(event, b"name")?
+            .is_some_and(|name| name.eq_ignore_ascii_case("melee"))
+        || direct_melee.is_some()
+    {
+        return Ok(());
+    }
+    let interval_millis = required_attribute_string(event, b"interval")?
+        .parse::<u32>()
+        .map_err(|_| invalid("monster melee interval must be an unsigned integer"))?;
+    if interval_millis == 0 || interval_millis > 60_000 {
+        return Err(invalid(
+            "monster melee interval exceeds the supported bound",
+        ));
+    }
+    let parse_damage = |attribute: &[u8]| -> Result<u16, ConfigError> {
+        let value = required_attribute_string(event, attribute)?
+            .parse::<i32>()
+            .map_err(|_| invalid("monster melee damage must be a signed integer"))?;
+        u16::try_from(value.unsigned_abs())
+            .map_err(|_| invalid("monster melee damage exceeds the supported bound"))
+    };
+    *direct_melee = Some(TfsDirectMeleeAttack {
+        interval_millis,
+        min_damage: parse_damage(b"min")?,
+        max_damage: parse_damage(b"max")?,
+    });
+    Ok(())
 }
 
 fn parse_appearance_event(
@@ -671,7 +722,7 @@ mod tests {
         .unwrap();
         fs::write(
             data.join("monster/monsters/rat.xml"),
-            r#"<monster name="Rat" speed="134" experience="25"><health now="20" max="20"/><look type="21"/></monster>"#,
+            r#"<monster name="Rat" speed="134" experience="25"><health now="20" max="20"/><look type="21"/><attacks><attack name="melee" interval="2000" min="0" max="-40"/></attacks></monster>"#,
         )
         .unwrap();
         fs::write(
@@ -685,6 +736,14 @@ mod tests {
         assert!(catalog.contains(TfsEntityKind::Monster, "rat"));
         assert!(catalog.contains(TfsEntityKind::Npc, "ALICE"));
         assert_eq!(catalog.monsters[0].experience, 25);
+        assert_eq!(
+            catalog.monsters[0].direct_melee,
+            Some(TfsDirectMeleeAttack {
+                interval_millis: 2_000,
+                min_damage: 0,
+                max_damage: 40,
+            })
+        );
         assert_eq!(catalog.npcs[0].experience, 0);
         assert_eq!(
             catalog.monsters[0].appearance,
@@ -748,6 +807,7 @@ mod tests {
                 kind: TfsEntityKind::Monster,
                 name: "Rat".into(),
                 experience: 0,
+                direct_melee: None,
                 definition_path: PathBuf::from("rat.xml"),
                 script_path: None,
                 script_present: true,
@@ -757,6 +817,7 @@ mod tests {
                 kind: TfsEntityKind::Npc,
                 name: "Alice".into(),
                 experience: 0,
+                direct_melee: None,
                 definition_path: PathBuf::from("Alice.xml"),
                 script_path: None,
                 script_present: true,
@@ -825,6 +886,7 @@ mod tests {
                 kind: TfsEntityKind::Monster,
                 name: "Rat".into(),
                 experience: 25,
+                direct_melee: None,
                 definition_path: PathBuf::from("rat.xml"),
                 script_path: None,
                 script_present: true,
