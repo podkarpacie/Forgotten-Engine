@@ -83,6 +83,7 @@ const NATIVE_OTCLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const NATIVE_OTCLIENT_HEARTBEAT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const NATIVE_OTCLIENT_DEFAULT_GROUND_SPEED: u64 = 150;
 const NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY: Duration = Duration::from_secs(2);
+const DEFAULT_NATIVE_ARMOR_MULTIPLIER_MILLI: u32 = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NativeWorldHeartbeatOutcome {
@@ -395,6 +396,7 @@ fn native_classic_mapped_equipment(
 fn native_equipment_armor_defense(
     armor_by_server_id: Option<&BTreeMap<u16, u16>>,
     equipment: &PlayerEquipment,
+    armor_multiplier_milli: u32,
 ) -> PlayerCombatDefense {
     let Some(armor_by_server_id) = armor_by_server_id else {
         return PlayerCombatDefense::default();
@@ -407,7 +409,7 @@ fn native_equipment_armor_defense(
         EquipmentSlot::Feet,
         EquipmentSlot::Ring,
     ];
-    let physical_flat_reduction = armor_slots.into_iter().fold(0_u16, |total, slot| {
+    let unscaled_armor = armor_slots.into_iter().fold(0_u16, |total, slot| {
         let armor = equipment
             .item(slot)
             .and_then(|item| armor_by_server_id.get(&item.server_id))
@@ -416,7 +418,9 @@ fn native_equipment_armor_defense(
         total.saturating_add(armor).min(MAX_COMBAT_EVENT_DAMAGE)
     });
     PlayerCombatDefense {
-        physical_flat_reduction,
+        physical_flat_reduction: ((u64::from(unscaled_armor) * u64::from(armor_multiplier_milli))
+            / u64::from(DEFAULT_NATIVE_ARMOR_MULTIPLIER_MILLI))
+        .min(u64::from(MAX_COMBAT_EVENT_DAMAGE)) as u16,
     }
 }
 
@@ -426,11 +430,17 @@ fn sync_native_equipment_armor_defense(
     shared_world: &SharedNativeWorld,
     player_id: u64,
     armor_by_server_id: Option<&BTreeMap<u16, u16>>,
+    armor_multiplier_by_vocation: Option<&BTreeMap<VocationId, u32>>,
     equipment: &PlayerEquipment,
 ) -> Result<bool, HostError> {
+    let vocation = shared_world.player_progression(player_id)?.vocation;
+    let armor_multiplier_milli = armor_multiplier_by_vocation
+        .and_then(|multipliers| multipliers.get(&vocation))
+        .copied()
+        .unwrap_or(DEFAULT_NATIVE_ARMOR_MULTIPLIER_MILLI);
     shared_world.replace_player_combat_defense(
         player_id,
-        native_equipment_armor_defense(armor_by_server_id, equipment),
+        native_equipment_armor_defense(armor_by_server_id, equipment, armor_multiplier_milli),
     )
 }
 
@@ -796,6 +806,10 @@ pub struct NativeOtClientHostConfig {
     /// Shielding, weapon defense, vocation multipliers, random armor, and TFS formula parity are
     /// deliberately excluded.
     pub item_armor_by_server_id: Option<Arc<BTreeMap<u16, u16>>>,
+    /// Immutable validated armor multiplier thousandths keyed by vocation. Missing vocation
+    /// entries retain the deterministic `1.000` default; shielding and defense formulas remain
+    /// outside this bridge.
+    pub armor_multiplier_by_vocation: Option<Arc<BTreeMap<VocationId, u32>>>,
     /// Immutable display-only TFS spawn entities. No AI, combat, movement, or Lua behavior is
     /// attached at this host boundary.
     pub static_spawns: Option<Arc<FeTfsStaticSpawnCollection>>,
@@ -3154,6 +3168,7 @@ fn handle_native_otclient_game(
         shared_world,
         character.id,
         config.item_armor_by_server_id.as_deref(),
+        config.armor_multiplier_by_vocation.as_deref(),
         &bootstrap_equipment,
     )?;
     native_diagnostic(
@@ -3164,6 +3179,12 @@ fn handle_native_otclient_game(
             native_equipment_armor_defense(
                 config.item_armor_by_server_id.as_deref(),
                 &bootstrap_equipment,
+                config
+                    .armor_multiplier_by_vocation
+                    .as_deref()
+                    .and_then(|multipliers| multipliers.get(&character.progression.vocation))
+                    .copied()
+                    .unwrap_or(DEFAULT_NATIVE_ARMOR_MULTIPLIER_MILLI),
             )
             .physical_flat_reduction
         ),
@@ -3503,6 +3524,9 @@ fn handle_native_otclient_game(
                                 skill_rate: config.skill_rate,
                                 death_loss_policy: config.death_loss_policy,
                                 armor_by_server_id: config.item_armor_by_server_id.as_deref(),
+                                armor_multiplier_by_vocation: config
+                                    .armor_multiplier_by_vocation
+                                    .as_deref(),
                                 declarative_weapon_catalog: config
                                     .declarative_weapon_catalog
                                     .as_deref(),
@@ -5683,6 +5707,7 @@ struct NativeSelectedPlayerMeleePolicy<'a> {
     skill_rate: u32,
     death_loss_policy: DeathLossPolicy,
     armor_by_server_id: Option<&'a BTreeMap<u16, u16>>,
+    armor_multiplier_by_vocation: Option<&'a BTreeMap<VocationId, u32>>,
     declarative_weapon_catalog: Option<&'a DeclarativeWeaponCatalog>,
 }
 
@@ -5711,6 +5736,7 @@ fn apply_native_selected_player_melee(
         shared_world,
         target_id,
         policy.armor_by_server_id,
+        policy.armor_multiplier_by_vocation,
         &target_equipment,
     )?;
     let combat_result = if let Some(catalog) = policy.declarative_weapon_catalog {
@@ -6526,6 +6552,7 @@ mod tests {
             world_map: None,
             item_presentation_catalog: None,
             item_armor_by_server_id: None,
+            armor_multiplier_by_vocation: None,
             static_spawns: None,
             static_target_attack_policy: StaticTargetAttackPolicy::Disabled,
             static_target_pursuit_policy: StaticTargetPursuitPolicy::Disabled,
@@ -6657,11 +6684,15 @@ mod tests {
         ]);
 
         assert_eq!(
-            native_equipment_armor_defense(Some(&armor_by_server_id), &equipment),
+            native_equipment_armor_defense(Some(&armor_by_server_id), &equipment, 1_000),
             PlayerCombatDefense::new(21).unwrap()
         );
         assert_eq!(
-            native_equipment_armor_defense(None, &equipment),
+            native_equipment_armor_defense(Some(&armor_by_server_id), &equipment, 1_200),
+            PlayerCombatDefense::new(25).unwrap()
+        );
+        assert_eq!(
+            native_equipment_armor_defense(None, &equipment, 1_000),
             PlayerCombatDefense::default()
         );
     }
@@ -9015,6 +9046,7 @@ mod tests {
                 skill_rate: 1,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
                 armor_by_server_id: None,
+                armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: None,
             },
         )
@@ -9124,6 +9156,7 @@ mod tests {
                 skill_rate: 1,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
                 armor_by_server_id: None,
+                armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: Some(&catalog),
             },
         )
@@ -9141,7 +9174,8 @@ mod tests {
         shared
             .replace_player_equipment(112, target_equipment)
             .unwrap();
-        let armor_by_server_id = BTreeMap::from([(2463, 3)]);
+        let armor_by_server_id = BTreeMap::from([(2463, 5)]);
+        let armor_multiplier_by_vocation = BTreeMap::from([(VocationId::new(0), 1_200)]);
         let (_native_target_id, vitals, outcome) = apply_native_selected_player_melee(
             &mut database,
             &shared,
@@ -9152,14 +9186,15 @@ mod tests {
                 skill_rate: 1,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
                 armor_by_server_id: Some(&armor_by_server_id),
+                armor_multiplier_by_vocation: Some(&armor_multiplier_by_vocation),
                 declarative_weapon_catalog: Some(&catalog),
             },
         )
         .unwrap()
         .unwrap();
         assert_eq!(outcome.requested_damage, 12);
-        assert_eq!(outcome.applied_damage, 9);
-        assert_eq!(vitals.health, 11);
+        assert_eq!(outcome.applied_damage, 6);
+        assert_eq!(vitals.health, 14);
         assert_eq!(
             database
                 .characters_for_account(account_id)
@@ -9169,7 +9204,7 @@ mod tests {
                 .unwrap()
                 .vitals
                 .health,
-            11
+            14
         );
         let _ = fs::remove_file(path);
     }
@@ -9250,6 +9285,7 @@ mod tests {
                 skill_rate: 2,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
                 armor_by_server_id: None,
+                armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: None,
             },
         )
@@ -9358,6 +9394,7 @@ mod tests {
                 skill_rate: 1,
                 death_loss_policy: DeathLossPolicy::FixedPercent(10),
                 armor_by_server_id: None,
+                armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: None,
             },
         )

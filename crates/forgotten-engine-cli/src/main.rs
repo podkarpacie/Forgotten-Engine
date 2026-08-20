@@ -617,6 +617,14 @@ fn run_host(
                     .collect::<std::collections::BTreeMap<_, _>>(),
             )
         });
+        let armor_multiplier_by_vocation = vocation_registry.as_ref().map(|registry| {
+            Arc::new(
+                registry
+                    .iter()
+                    .map(|(id, definition)| (*id, definition.armor_multiplier.milli()))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+        });
         let experience_award_policy = Arc::new(config.experience_award_policy()?);
         let death_loss_policy = DeathLossPolicy::from_config(config.death_loss_percent)?;
         let declarative_weapon_catalog = declarative_weapon_catalog.map(Arc::new);
@@ -655,6 +663,7 @@ fn run_host(
             world_map: Some(Arc::clone(&world_map)),
             item_presentation_catalog: item_presentation_catalog.map(Arc::new),
             item_armor_by_server_id: item_armor_by_server_id.map(Arc::new),
+            armor_multiplier_by_vocation,
             static_spawns: (!static_spawns.entities.is_empty()).then(|| Arc::new(static_spawns)),
             static_target_attack_policy: match config.static_creature_target_attack_damage {
                 0 => StaticTargetAttackPolicy::Disabled,

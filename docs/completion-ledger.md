@@ -48,6 +48,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Define bounded profile-neutral flat physical mitigation without silently inventing TFS formulas.
 - [x] On the existing typed declarative native selected-player weapon path only, derive the target's capped profile-neutral physical reduction from validated positive `items.xml` armor values in the authoritative head, neck, armor, legs, feet, and ring slots; shielding, skills, vocation multipliers, randomness, fixed fallback melee, and TFS formula parity remain deferred.
 - [x] Apply that same existing profile-neutral reduction before the opt-in fixed static-creature physical attack evaluates damage and death state; creature formulas, shields, randomness, effects, and TFS combat parity remain deferred.
+- [x] Apply the parsed validated legacy vocation armor multiplier to that capped armor-only reduction with deterministic truncating integer thousandths and a `1.000` missing-entry default; defense multiplier, shielding, random armor, fixed fallback melee, and formula parity remain deferred.
 - [ ] Map verified profile-specific armor, shielding, equipment, weapon, and resistance formulas into the typed mitigation contract.
 - [x] Parse bounded FE-owned scriptless weapon declarations that can construct typed physical adjacent-melee events.
 - [x] Bind validated declarative weapons only to authoritative right-hand equipment on the profile-approved native selected-melee path, without executing scripts.
