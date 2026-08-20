@@ -46,6 +46,9 @@ pub struct LegacyItemDefinition {
     /// Operator-supplied legacy XML weight retained in its original unsigned integer form for a
     /// future capacity adapter. It never enforces capacity by itself.
     pub xml_weight: Option<u32>,
+    /// Operator-supplied legacy equipment labels retained for future placement validation. They
+    /// do not currently allow, reject, swap, or otherwise change equipped item placement.
+    pub xml_slot_types: std::collections::BTreeSet<LegacyItemSlotType>,
     pub xml_defense: Option<u16>,
     pub xml_extra_defense: Option<u16>,
     pub xml_attack_speed_millis: Option<u32>,
@@ -64,6 +67,46 @@ pub enum LegacyWeaponType {
     Wand,
     Ammunition,
     Quiver,
+}
+
+/// The bounded legacy `items.xml` slotType vocabulary. These values describe source metadata
+/// only; FE does not yet derive TFS slot masks or equipment-placement behavior from them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LegacyItemSlotType {
+    Head,
+    Body,
+    Legs,
+    Feet,
+    Backpack,
+    TwoHanded,
+    RightHand,
+    LeftHand,
+    Necklace,
+    Ring,
+    Ammo,
+    Hand,
+}
+
+impl LegacyItemSlotType {
+    fn parse(value: &str) -> Result<Self, ConfigError> {
+        match value {
+            "head" => Ok(Self::Head),
+            "body" => Ok(Self::Body),
+            "legs" => Ok(Self::Legs),
+            "feet" => Ok(Self::Feet),
+            "backpack" => Ok(Self::Backpack),
+            "two-handed" => Ok(Self::TwoHanded),
+            "right-hand" => Ok(Self::RightHand),
+            "left-hand" => Ok(Self::LeftHand),
+            "necklace" => Ok(Self::Necklace),
+            "ring" => Ok(Self::Ring),
+            "ammo" => Ok(Self::Ammo),
+            "hand" => Ok(Self::Hand),
+            _ => Err(invalid(
+                "items.xml slotType must be head, body, legs, feet, backpack, two-handed, right-hand, left-hand, necklace, ring, ammo, or hand",
+            )),
+        }
+    }
 }
 
 impl LegacyWeaponType {
@@ -164,6 +207,18 @@ impl LegacyItemCatalog {
             .filter_map(|(&server_id, definition)| {
                 definition.xml_weight.map(|weight| (server_id, weight))
             })
+            .collect()
+    }
+
+    /// Returns non-empty bounded legacy slotType sets keyed by authoritative server ID. This is
+    /// source metadata only and does not provide a permission decision for any equipment slot.
+    pub fn xml_slot_types_by_server_id(
+        &self,
+    ) -> BTreeMap<u16, std::collections::BTreeSet<LegacyItemSlotType>> {
+        self.definitions
+            .iter()
+            .filter(|(_, definition)| !definition.xml_slot_types.is_empty())
+            .map(|(&server_id, definition)| (server_id, definition.xml_slot_types.clone()))
             .collect()
     }
 
@@ -405,6 +460,7 @@ fn parse_item_node(group: u8, props: &[u8]) -> Result<Option<LegacyItemDefinitio
                 xml_blocks_pathfind: None,
                 xml_armor: None,
                 xml_weight: None,
+                xml_slot_types: std::collections::BTreeSet::new(),
                 xml_defense: None,
                 xml_extra_defense: None,
                 xml_attack_speed_millis: None,
@@ -431,6 +487,11 @@ fn apply_inline_item_attributes(
             optional_attribute_string(event, key)?.or(optional_attribute_string(event, value)?)
         {
             set_block_attribute(catalog, ids, key, parse_bool(&value, key)?)?;
+        }
+    }
+    for key in [b"slotType".as_slice(), b"slottype".as_slice()] {
+        if let Some(value) = optional_attribute_string(event, key)? {
+            set_slot_type_attribute(catalog, ids, &value)?;
         }
     }
     for key in [
@@ -474,6 +535,7 @@ fn apply_xml_attribute(
             b"blockPathFind",
             parse_bool(&value, b"blockPathFind")?,
         ),
+        "slotType" | "slottype" => set_slot_type_attribute(catalog, ids, &value),
         "armor" | "weight" | "defense" | "extraDef" | "extradef" | "attackSpeed"
         | "attackspeed" | "weaponType" | "weapontype" => {
             set_legacy_numeric_attribute(catalog, ids, key.as_bytes(), &value)
@@ -495,6 +557,20 @@ fn set_block_attribute(
             } else {
                 definition.xml_blocks_pathfind = Some(value);
             }
+        }
+    }
+    Ok(())
+}
+
+fn set_slot_type_attribute(
+    catalog: &mut LegacyItemCatalog,
+    ids: &[u16],
+    value: &str,
+) -> Result<(), ConfigError> {
+    let slot_type = LegacyItemSlotType::parse(&value.to_ascii_lowercase())?;
+    for id in ids {
+        if let Some(definition) = catalog.definitions.get_mut(id) {
+            definition.xml_slot_types.insert(slot_type);
         }
     }
     Ok(())
@@ -695,6 +771,7 @@ fn invalid(message: impl Into<String>) -> ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn framed_node(kind: u8, props: &[u8], children: &[Vec<u8>]) -> Vec<u8> {
         let mut bytes = vec![NODE_START, kind];
@@ -755,6 +832,7 @@ mod tests {
             xml_blocks_pathfind: None,
             xml_armor: None,
             xml_weight: None,
+            xml_slot_types: BTreeSet::new(),
             xml_defense: None,
             xml_extra_defense: None,
             xml_attack_speed_millis: None,
@@ -807,6 +885,7 @@ mod tests {
                     xml_blocks_pathfind: None,
                     xml_armor: None,
                     xml_weight: None,
+                    xml_slot_types: BTreeSet::new(),
                     xml_defense: None,
                     xml_extra_defense: None,
                     xml_attack_speed_millis: None,
@@ -876,6 +955,37 @@ mod tests {
     }
 
     #[test]
+    fn retains_validated_legacy_slot_type_metadata_without_equipment_behavior() {
+        let mut catalog = combat_metadata_catalog();
+        apply_items_xml(
+            &mut catalog,
+            br#"<items><item id="100"><attribute key="slotType" value="head"/><attribute key="slottype" value="right-hand"/></item></items>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog.definition(100).unwrap().xml_slot_types,
+            BTreeSet::from([LegacyItemSlotType::Head, LegacyItemSlotType::RightHand])
+        );
+
+        apply_items_xml(
+            &mut catalog,
+            br#"<items><item id="100" slotType="Two-Handed"/></items>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog.xml_slot_types_by_server_id(),
+            BTreeMap::from([(
+                100,
+                BTreeSet::from([
+                    LegacyItemSlotType::Head,
+                    LegacyItemSlotType::TwoHanded,
+                    LegacyItemSlotType::RightHand,
+                ]),
+            )])
+        );
+    }
+
+    #[test]
     fn rejects_invalid_or_unbounded_legacy_item_combat_metadata() {
         for source in [
             br#"<items><item id="100" armor="10001"/></items>"#.as_slice(),
@@ -884,6 +994,7 @@ mod tests {
             br#"<items><item id="100" attackSpeed="60001"/></items>"#,
             br#"<items><item id="100" weight="-1"/></items>"#,
             br#"<items><item id="100"><attribute key="weight" value="invalid"/></item></items>"#,
+            br#"<items><item id="100" slotType="belt"/></items>"#,
         ] {
             assert!(apply_items_xml(&mut combat_metadata_catalog(), source).is_err());
         }
