@@ -369,6 +369,16 @@ pub struct WorldMapTown {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorldMapSourceRevision(pub u64);
 
+/// Stable identity for one top-level item in one immutable source-map revision. It intentionally
+/// becomes invalid when the complete source map changes, forcing a future runtime journal to
+/// reconcile rather than applying a stale ordered index to new operator content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WorldMapItemSourceIdentity {
+    pub map_revision: WorldMapSourceRevision,
+    pub position: Position,
+    pub item_index: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorldMap {
     identifier: String,
@@ -565,6 +575,22 @@ impl WorldMap {
             hash.position(*position);
         }
         WorldMapSourceRevision(hash.finish())
+    }
+
+    /// Returns an identity only for an existing top-level source item. Child items remain part of
+    /// their root item's immutable source content and are deliberately not independently mutable.
+    pub fn source_item_identity(
+        &self,
+        position: Position,
+        item_index: usize,
+    ) -> Option<WorldMapItemSourceIdentity> {
+        let items = self.tile_items(position)?;
+        items.get(item_index)?;
+        Some(WorldMapItemSourceIdentity {
+            map_revision: self.source_revision(),
+            position,
+            item_index: item_index.try_into().ok()?,
+        })
     }
 
     pub fn set_source(&mut self, source: WorldMapSource) {
@@ -7385,6 +7411,54 @@ mod tests {
             )
             .unwrap();
         assert_ne!(original, changed.source_revision());
+    }
+
+    #[test]
+    fn source_item_identity_is_ordered_revision_bound_and_duplicate_safe() {
+        let position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let mut map = WorldMap::new("identity", position);
+        map.set_tile(
+            position,
+            WorldMapTile {
+                ground_thing_id: 102,
+                walkable: true,
+            },
+        )
+        .unwrap();
+        let item = |count| WorldMapItem {
+            server_id: 1988,
+            client_thing_id: Some(1988),
+            count,
+            action_id: None,
+            unique_id: None,
+            text: None,
+            description: None,
+            teleport_destination: None,
+            duration: None,
+            charges: None,
+            children: Vec::new(),
+        };
+        map.set_tile_items(position, vec![item(1), item(1)])
+            .unwrap();
+
+        let first = map.source_item_identity(position, 0).unwrap();
+        let second = map.source_item_identity(position, 1).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.position, position);
+        assert_eq!(first.item_index, 0);
+        assert_eq!(second.item_index, 1);
+        assert_eq!(map.source_item_identity(position, 2), None);
+
+        map.set_tile_items(position, vec![item(2), item(1)])
+            .unwrap();
+        assert_ne!(
+            first.map_revision,
+            map.source_item_identity(position, 0).unwrap().map_revision
+        );
     }
 
     #[test]
