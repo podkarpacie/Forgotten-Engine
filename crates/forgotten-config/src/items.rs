@@ -43,6 +43,9 @@ pub struct LegacyItemDefinition {
     /// Operator-supplied legacy XML metadata retained for a future profile-specific combat
     /// adapter. It never changes current FE combat behavior by itself.
     pub xml_armor: Option<u16>,
+    /// Operator-supplied legacy XML weight retained in its original unsigned integer form for a
+    /// future capacity adapter. It never enforces capacity by itself.
+    pub xml_weight: Option<u32>,
     pub xml_defense: Option<u16>,
     pub xml_extra_defense: Option<u16>,
     pub xml_attack_speed_millis: Option<u32>,
@@ -149,6 +152,17 @@ impl LegacyItemCatalog {
                     .xml_armor
                     .filter(|armor| *armor > 0)
                     .map(|armor| (server_id, armor))
+            })
+            .collect()
+    }
+
+    /// Returns source XML weight metadata keyed by authoritative server ID. The result does not
+    /// calculate carried weight, recursive container weight, vocation capacity, or eligibility.
+    pub fn xml_weight_by_server_id(&self) -> BTreeMap<u16, u32> {
+        self.definitions
+            .iter()
+            .filter_map(|(&server_id, definition)| {
+                definition.xml_weight.map(|weight| (server_id, weight))
             })
             .collect()
     }
@@ -390,6 +404,7 @@ fn parse_item_node(group: u8, props: &[u8]) -> Result<Option<LegacyItemDefinitio
                 xml_blocks_solid: None,
                 xml_blocks_pathfind: None,
                 xml_armor: None,
+                xml_weight: None,
                 xml_defense: None,
                 xml_extra_defense: None,
                 xml_attack_speed_millis: None,
@@ -420,6 +435,7 @@ fn apply_inline_item_attributes(
     }
     for key in [
         b"armor".as_slice(),
+        b"weight".as_slice(),
         b"defense".as_slice(),
         b"extraDef".as_slice(),
         b"extradef".as_slice(),
@@ -429,7 +445,7 @@ fn apply_inline_item_attributes(
         b"weapontype".as_slice(),
     ] {
         if let Some(value) = optional_attribute_string(event, key)? {
-            set_combat_attribute(catalog, ids, key, &value)?;
+            set_legacy_numeric_attribute(catalog, ids, key, &value)?;
         }
     }
     Ok(())
@@ -458,8 +474,10 @@ fn apply_xml_attribute(
             b"blockPathFind",
             parse_bool(&value, b"blockPathFind")?,
         ),
-        "armor" | "defense" | "extraDef" | "extradef" | "attackSpeed" | "attackspeed"
-        | "weaponType" | "weapontype" => set_combat_attribute(catalog, ids, key.as_bytes(), &value),
+        "armor" | "weight" | "defense" | "extraDef" | "extradef" | "attackSpeed"
+        | "attackspeed" | "weaponType" | "weapontype" => {
+            set_legacy_numeric_attribute(catalog, ids, key.as_bytes(), &value)
+        }
         _ => Ok(()),
     }
 }
@@ -482,7 +500,7 @@ fn set_block_attribute(
     Ok(())
 }
 
-fn set_combat_attribute(
+fn set_legacy_numeric_attribute(
     catalog: &mut LegacyItemCatalog,
     ids: &[u16],
     key: &[u8],
@@ -500,6 +518,7 @@ fn set_combat_attribute(
         };
         match normalized_key {
             b"armor" => definition.xml_armor = Some(parse_item_combat_u16(value, b"armor")?),
+            b"weight" => definition.xml_weight = Some(parse_item_weight(value)?),
             b"defense" => definition.xml_defense = Some(parse_item_combat_u16(value, b"defense")?),
             b"extradef" => {
                 definition.xml_extra_defense = Some(parse_item_combat_u16(value, b"extradef")?)
@@ -528,6 +547,12 @@ fn parse_item_combat_u16(value: &str, key: &[u8]) -> Result<u16, ConfigError> {
         )));
     }
     Ok(value)
+}
+
+fn parse_item_weight(value: &str) -> Result<u32, ConfigError> {
+    value
+        .parse::<u32>()
+        .map_err(|_| invalid("items.xml attribute `weight` must be an unsigned integer"))
 }
 
 fn parse_item_attack_speed(value: &str) -> Result<u32, ConfigError> {
@@ -729,6 +754,7 @@ mod tests {
             xml_blocks_solid: None,
             xml_blocks_pathfind: None,
             xml_armor: None,
+            xml_weight: None,
             xml_defense: None,
             xml_extra_defense: None,
             xml_attack_speed_millis: None,
@@ -780,6 +806,7 @@ mod tests {
                     xml_blocks_solid: None,
                     xml_blocks_pathfind: None,
                     xml_armor: None,
+                    xml_weight: None,
                     xml_defense: None,
                     xml_extra_defense: None,
                     xml_attack_speed_millis: None,
@@ -794,11 +821,12 @@ mod tests {
         let mut catalog = combat_metadata_catalog();
         apply_items_xml(
             &mut catalog,
-            br#"<items><item id="100"><attribute key="armor" value="12"/><attribute key="defense" value="24"/><attribute key="extradef" value="3"/><attribute key="attackspeed" value="1800"/><attribute key="weapontype" value="shield"/></item></items>"#,
+            br#"<items><item id="100"><attribute key="armor" value="12"/><attribute key="weight" value="1800"/><attribute key="defense" value="24"/><attribute key="extradef" value="3"/><attribute key="attackspeed" value="1800"/><attribute key="weapontype" value="shield"/></item></items>"#,
         )
         .unwrap();
         let definition = catalog.definition(100).unwrap();
         assert_eq!(definition.xml_armor, Some(12));
+        assert_eq!(definition.xml_weight, Some(1_800));
         assert_eq!(definition.xml_defense, Some(24));
         assert_eq!(definition.xml_extra_defense, Some(3));
         assert_eq!(definition.xml_attack_speed_millis, Some(1_800));
@@ -806,11 +834,12 @@ mod tests {
 
         apply_items_xml(
             &mut catalog,
-            br#"<items><item id="100" armor="13" defense="25" extraDef="4" attackSpeed="1600" weaponType="sword"/><item id="101" armor="99"/></items>"#,
+            br#"<items><item id="100" armor="13" weight="2100" defense="25" extraDef="4" attackSpeed="1600" weaponType="sword"/><item id="101" armor="99"/></items>"#,
         )
         .unwrap();
         let definition = catalog.definition(100).unwrap();
         assert_eq!(definition.xml_armor, Some(13));
+        assert_eq!(definition.xml_weight, Some(2_100));
         assert_eq!(definition.xml_defense, Some(25));
         assert_eq!(definition.xml_extra_defense, Some(4));
         assert_eq!(definition.xml_attack_speed_millis, Some(1_600));
@@ -833,12 +862,28 @@ mod tests {
     }
 
     #[test]
+    fn exports_validated_xml_weight_metadata_by_server_id_without_capacity_behavior() {
+        let mut catalog = combat_metadata_catalog();
+        apply_items_xml(
+            &mut catalog,
+            br#"<items><item id="100" weight="2500"/></items>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog.xml_weight_by_server_id(),
+            BTreeMap::from([(100, 2_500)])
+        );
+    }
+
+    #[test]
     fn rejects_invalid_or_unbounded_legacy_item_combat_metadata() {
         for source in [
             br#"<items><item id="100" armor="10001"/></items>"#.as_slice(),
             br#"<items><item id="100"><attribute key="defense" value="nope"/></item></items>"#,
             br#"<items><item id="100" weaponType="laser"/></items>"#,
             br#"<items><item id="100" attackSpeed="60001"/></items>"#,
+            br#"<items><item id="100" weight="-1"/></items>"#,
+            br#"<items><item id="100"><attribute key="weight" value="invalid"/></item></items>"#,
         ] {
             assert!(apply_items_xml(&mut combat_metadata_catalog(), source).is_err());
         }
