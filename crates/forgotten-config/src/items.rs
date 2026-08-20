@@ -14,6 +14,7 @@ const ITEM_ATTR_CLIENT_ID: u8 = 0x11;
 const FLAG_BLOCK_SOLID: u32 = 1 << 0;
 const FLAG_BLOCK_PATHFIND: u32 = 1 << 2;
 const FLAG_STACKABLE: u32 = 1 << 7;
+const MAX_ITEM_NAME_BYTES: usize = 128;
 const FLAG_CLIENT_CHARGES: u32 = 1 << 22;
 const OTB_ITEM_GROUP_SPLASH: u8 = 10;
 const OTB_ITEM_GROUP_FLUID: u8 = 11;
@@ -46,6 +47,9 @@ pub struct LegacyItemDefinition {
     /// Operator-supplied legacy XML weight retained in its original unsigned integer form for a
     /// future capacity adapter. It never enforces capacity by itself.
     pub xml_weight: Option<u32>,
+    /// Operator-supplied bounded legacy XML item name retained for exact inspected-item text. It
+    /// does not generate articles, descriptions, or other item behavior by itself.
+    pub xml_name: Option<String>,
     /// Operator-supplied legacy equipment labels retained for future placement validation. They
     /// do not currently allow, reject, swap, or otherwise change equipped item placement.
     pub xml_slot_types: std::collections::BTreeSet<LegacyItemSlotType>,
@@ -212,6 +216,20 @@ impl LegacyItemCatalog {
             .iter()
             .filter_map(|(&server_id, definition)| {
                 definition.xml_weight.map(|weight| (server_id, weight))
+            })
+            .collect()
+    }
+
+    /// Returns bounded source item names keyed by authoritative server ID. The result is
+    /// inspection metadata only and does not generate TFS name descriptions or articles.
+    pub fn xml_name_by_server_id(&self) -> BTreeMap<u16, String> {
+        self.definitions
+            .iter()
+            .filter_map(|(&server_id, definition)| {
+                definition
+                    .xml_name
+                    .as_ref()
+                    .map(|name| (server_id, name.clone()))
             })
             .collect()
     }
@@ -474,6 +492,7 @@ fn parse_item_node(group: u8, props: &[u8]) -> Result<Option<LegacyItemDefinitio
                 xml_blocks_pathfind: None,
                 xml_armor: None,
                 xml_weight: None,
+                xml_name: None,
                 xml_slot_types: std::collections::BTreeSet::new(),
                 xml_defense: None,
                 xml_extra_defense: None,
@@ -507,6 +526,9 @@ fn apply_inline_item_attributes(
         if let Some(value) = optional_attribute_string(event, key)? {
             set_slot_type_attribute(catalog, ids, &value)?;
         }
+    }
+    if let Some(value) = optional_attribute_string(event, b"name")? {
+        set_name_attribute(catalog, ids, &value)?;
     }
     for key in [
         b"armor".as_slice(),
@@ -550,6 +572,7 @@ fn apply_xml_attribute(
             parse_bool(&value, b"blockPathFind")?,
         ),
         "slotType" | "slottype" => set_slot_type_attribute(catalog, ids, &value),
+        "name" => set_name_attribute(catalog, ids, &value),
         "armor" | "weight" | "defense" | "extraDef" | "extradef" | "attackSpeed"
         | "attackspeed" | "weaponType" | "weapontype" => {
             set_legacy_numeric_attribute(catalog, ids, key.as_bytes(), &value)
@@ -585,6 +608,28 @@ fn set_slot_type_attribute(
     for id in ids {
         if let Some(definition) = catalog.definitions.get_mut(id) {
             definition.xml_slot_types.insert(slot_type);
+        }
+    }
+    Ok(())
+}
+
+fn set_name_attribute(
+    catalog: &mut LegacyItemCatalog,
+    ids: &[u16],
+    value: &str,
+) -> Result<(), ConfigError> {
+    let name = value.trim();
+    if name.is_empty() {
+        return Err(invalid("items.xml attribute `name` cannot be empty"));
+    }
+    if name.len() > MAX_ITEM_NAME_BYTES {
+        return Err(invalid(
+            "items.xml attribute `name` exceeds the supported metadata bound",
+        ));
+    }
+    for id in ids {
+        if let Some(definition) = catalog.definitions.get_mut(id) {
+            definition.xml_name = Some(name.to_owned());
         }
     }
     Ok(())
@@ -846,6 +891,7 @@ mod tests {
             xml_blocks_pathfind: None,
             xml_armor: None,
             xml_weight: None,
+            xml_name: None,
             xml_slot_types: BTreeSet::new(),
             xml_defense: None,
             xml_extra_defense: None,
@@ -899,6 +945,7 @@ mod tests {
                     xml_blocks_pathfind: None,
                     xml_armor: None,
                     xml_weight: None,
+                    xml_name: None,
                     xml_slot_types: BTreeSet::new(),
                     xml_defense: None,
                     xml_extra_defense: None,
@@ -969,6 +1016,30 @@ mod tests {
     }
 
     #[test]
+    fn retains_validated_legacy_item_names_without_description_behavior() {
+        let mut catalog = combat_metadata_catalog();
+        apply_items_xml(
+            &mut catalog,
+            br#"<items><item id="100"><attribute key="name" value="  Dragon Ham  "/></item></items>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog.definition(100).unwrap().xml_name.as_deref(),
+            Some("Dragon Ham")
+        );
+
+        apply_items_xml(
+            &mut catalog,
+            br#"<items><item id="100" name="Magic Sword"/></items>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog.xml_name_by_server_id(),
+            BTreeMap::from([(100, "Magic Sword".to_string())])
+        );
+    }
+
+    #[test]
     fn retains_validated_legacy_slot_type_metadata_without_equipment_behavior() {
         let mut catalog = combat_metadata_catalog();
         apply_items_xml(
@@ -1009,9 +1080,16 @@ mod tests {
             br#"<items><item id="100" weight="-1"/></items>"#,
             br#"<items><item id="100"><attribute key="weight" value="invalid"/></item></items>"#,
             br#"<items><item id="100" slotType="belt"/></items>"#,
+            br#"<items><item id="100" name=" "/></items>"#,
         ] {
             assert!(apply_items_xml(&mut combat_metadata_catalog(), source).is_err());
         }
+        let oversized_name = "x".repeat(MAX_ITEM_NAME_BYTES + 1);
+        let oversized_source =
+            format!(r#"<items><item id="100" name="{oversized_name}"/></items>"#);
+        assert!(
+            apply_items_xml(&mut combat_metadata_catalog(), oversized_source.as_bytes()).is_err()
+        );
     }
 
     #[test]

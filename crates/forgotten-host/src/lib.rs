@@ -885,6 +885,10 @@ pub struct NativeOtClientHostConfig {
     /// classic weight sentence to an exact native map LookMap response. They do not enforce
     /// capacity or change item-transfer behavior.
     pub item_weight_by_server_id: Option<Arc<BTreeMap<u16, u32>>>,
+    /// Immutable validated legacy `items.xml` names used only to append one bounded inspected
+    /// item-name detail after exact native map LookMap validation. They do not generate articles,
+    /// item descriptions, or item behavior.
+    pub item_name_by_server_id: Option<Arc<BTreeMap<u16, String>>>,
     /// Immutable source OTB stackability identifiers paired with the inspection-only weight map.
     /// They do not alter FE item-stack transfer behavior.
     pub stackable_item_server_ids: Option<Arc<BTreeSet<u16>>>,
@@ -4912,6 +4916,7 @@ fn handle_native_otclient_game(
                 let message = native_map_item_inspection_message(
                     world_map,
                     &item,
+                    config.item_name_by_server_id.as_deref(),
                     config.item_weight_by_server_id.as_deref(),
                     config.stackable_item_server_ids.as_deref(),
                 );
@@ -5266,6 +5271,7 @@ fn native_validated_map_item_text<'a>(
 fn native_map_item_inspection_message(
     world_map: &WorldMap,
     outcome: &PlayerItemUseOutcome,
+    name_by_server_id: Option<&BTreeMap<u16, String>>,
     weight_by_server_id: Option<&BTreeMap<u16, u32>>,
     stackable_item_server_ids: Option<&BTreeSet<u16>>,
 ) -> String {
@@ -5281,6 +5287,13 @@ fn native_map_item_inspection_message(
     };
     if item.server_id != outcome.server_id || item.count != outcome.count {
         return message;
+    }
+    if let Some(name) = name_by_server_id.and_then(|names| names.get(&item.server_id)) {
+        let name_detail = format!("Name: {name}.");
+        if message.len() + 1 + name_detail.len() <= NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES {
+            message.push(' ');
+            message.push_str(&name_detail);
+        }
     }
     if let Some(unit_weight) = weight_by_server_id.and_then(|weights| weights.get(&item.server_id))
     {
@@ -6841,6 +6854,7 @@ mod tests {
             item_presentation_catalog: None,
             item_armor_by_server_id: None,
             item_weight_by_server_id: None,
+            item_name_by_server_id: None,
             stackable_item_server_ids: None,
             armor_multiplier_by_vocation: None,
             static_spawns: None,
@@ -8610,13 +8624,24 @@ mod tests {
             native_map_item_inspection_message(
                 &map,
                 &outcome,
+                Some(&BTreeMap::from([(1945, "Dragon Ham".to_string())])),
+                Some(&BTreeMap::from([(1945, 1_800)])),
+                Some(&BTreeSet::from([1945])),
+            ),
+            "You see item #1945 (count: 3). Name: Dragon Ham. It weighs 54.00 oz. A bounded imported description."
+        );
+        assert_eq!(
+            native_map_item_inspection_message(
+                &map,
+                &outcome,
+                None,
                 Some(&BTreeMap::from([(1945, 1_800)])),
                 Some(&BTreeSet::from([1945])),
             ),
             "You see item #1945 (count: 3). It weighs 54.00 oz. A bounded imported description."
         );
         assert_eq!(
-            native_map_item_inspection_message(&map, &outcome, None, None),
+            native_map_item_inspection_message(&map, &outcome, None, None, None),
             "You see item #1945 (count: 3). A bounded imported description."
         );
     }
@@ -12934,6 +12959,8 @@ mod tests {
             )
             .unwrap();
         native_config.item_weight_by_server_id = Some(Arc::new(BTreeMap::from([(1988, 1_800)])));
+        native_config.item_name_by_server_id =
+            Some(Arc::new(BTreeMap::from([(1988, "Ham".to_string())])));
         native_config.stackable_item_server_ids = Some(Arc::new(BTreeSet::new()));
         let game = start_native_otclient_game(native_config, &database_path).unwrap();
 
@@ -13097,7 +13124,7 @@ mod tests {
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
                 forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT,
-                70,
+                81,
                 0,
                 b'Y',
                 b'o',
@@ -13128,6 +13155,17 @@ mod tests {
                 b' ',
                 b'1',
                 b')',
+                b'.',
+                b' ',
+                b'N',
+                b'a',
+                b'm',
+                b'e',
+                b':',
+                b' ',
+                b'H',
+                b'a',
+                b'm',
                 b'.',
                 b' ',
                 b'I',
