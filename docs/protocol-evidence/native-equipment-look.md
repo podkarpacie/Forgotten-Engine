@@ -16,3 +16,15 @@ equipment, map, container, persistence, or combat state.
 Container-flagged inventory positions, nonzero stack positions, map-ground items, descriptions,
 attributes, weight, generated names, writable text, generic container inspection, and full TFS
 item-description behavior remain deferred.
+
+## Open top-level container extension
+
+FE also accepts one current client-visible top-level owned container item through the same
+ordinary LookMap request. The request must use `x = 0xFFFF`, the classic container flag in `y`,
+one current container-window ID in the low four `y` bits, an item index in `z`, and stack position
+zero. The window must not have been closed in the current session, must be non-nested, and must
+hold an item whose validated native catalog client ID exactly matches the request.
+
+The response contains only the container window ID, FE server item ID, and count. Closed views,
+nested containers, absent indexes, unmatched IDs, mutation, and generic container descriptions
+remain rejected without an outbound response.

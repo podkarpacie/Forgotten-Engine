@@ -417,6 +417,40 @@ fn native_equipment_item_inspection_message(slot: EquipmentSlot, item: &ItemInst
     )
 }
 
+/// Resolves one open owned top-level container item from the classic flagged inventory address.
+/// Closed views, nested containers, nonzero stack positions, and unmatched client IDs are kept
+/// outside this read-only inspection boundary.
+fn native_classic_container_look_item(
+    catalog: Option<&NativeItemPresentationCatalog>,
+    containers: &PlayerContainers,
+    closed_container_ids: &BTreeSet<u8>,
+    position: NativeOtClientPosition,
+    client_thing_id: u16,
+    stack_position: u8,
+) -> Option<(u8, ItemInstance)> {
+    if position.x != u16::MAX || position.y & 0x40 == 0 || stack_position != 0 {
+        return None;
+    }
+    let container_id = (position.y & 0x0f) as u8;
+    if closed_container_ids.contains(&container_id) {
+        return None;
+    }
+    let container = containers.container(container_id)?;
+    if container.has_parent {
+        return None;
+    }
+    let item = container.items.item(usize::from(position.z))?.clone();
+    let record = native_classic_item_record(catalog, &item)?;
+    (record.client_thing_id == client_thing_id).then_some((container_id, item))
+}
+
+fn native_container_item_inspection_message(container_id: u8, item: &ItemInstance) -> String {
+    format!(
+        "Container {}: item {} (count {}).",
+        container_id, item.server_id, item.count
+    )
+}
+
 /// Derives FE's explicit armor-only physical reduction from the six armor slots used by the
 /// legacy reference boundary. This intentionally excludes hands, shields, weapons, skills,
 /// vocation multipliers, random blocking, resistance, and any claim of TFS formula parity.
@@ -4674,6 +4708,31 @@ fn handle_native_otclient_game(
                     );
                     continue;
                 }
+                let containers = shared_world.player_containers(character.id)?;
+                if let Some((container_id, item)) = native_classic_container_look_item(
+                    config.item_presentation_catalog.as_deref(),
+                    &containers,
+                    &closed_container_ids,
+                    position,
+                    thing_id,
+                    stack_position,
+                ) {
+                    let response = encode_native_otclient_status_message(
+                        &config.client_profile,
+                        &native_container_item_inspection_message(container_id, &item),
+                    )
+                    .map_err(HostError::Protocol)?;
+                    write_frame(stream, &response)?;
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        &format!(
+                            "action=look-map outcome=container-item-inspection container-id={} item-id={}",
+                            container_id, item.server_id
+                        ),
+                    );
+                    continue;
+                }
                 let Some(world_map) = config.world_map.as_deref() else {
                     native_diagnostic(
                         config.extended_diagnostics,
@@ -6802,6 +6861,73 @@ mod tests {
                 ..position
             },
             100,
+            0,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn native_classic_container_look_requires_one_exact_open_top_level_item() {
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                4526,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 102,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        let mut container = forgotten_core::PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Bag",
+            false,
+            20,
+        )
+        .unwrap();
+        container
+            .items
+            .insert(ItemInstance::new(4526, 3).unwrap())
+            .unwrap();
+        containers.insert(container).unwrap();
+        let position = NativeOtClientPosition {
+            x: u16::MAX,
+            y: 0x40 | 2,
+            z: 0,
+        };
+
+        assert_eq!(
+            native_classic_container_look_item(
+                Some(&catalog),
+                &containers,
+                &BTreeSet::new(),
+                position,
+                102,
+                0,
+            ),
+            Some((2, ItemInstance::new(4526, 3).unwrap()))
+        );
+        assert_eq!(
+            native_container_item_inspection_message(2, &ItemInstance::new(4526, 3).unwrap()),
+            "Container 2: item 4526 (count 3)."
+        );
+        assert!(native_classic_container_look_item(
+            Some(&catalog),
+            &containers,
+            &BTreeSet::from([2]),
+            position,
+            102,
+            0,
+        )
+        .is_none());
+        assert!(native_classic_container_look_item(
+            Some(&catalog),
+            &containers,
+            &BTreeSet::new(),
+            position,
+            101,
             0,
         )
         .is_none());
@@ -10244,6 +10370,106 @@ mod tests {
         .unwrap();
         let response = read_frame(&mut client).unwrap();
         let expected_message = "Equipment slot 5: item 4526 (count 1).";
+        assert_eq!(
+            response.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE
+        );
+        assert_eq!(
+            response.0[1],
+            forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT
+        );
+        assert_eq!(
+            u16::from_le_bytes([response.0[2], response.0[3]]) as usize,
+            expected_message.len()
+        );
+        assert_eq!(&response.0[4..], expected_message.as_bytes());
+
+        drop(client);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_look_map_inspects_one_exact_open_top_level_container_item() {
+        let database_path = database_path("native-container-look");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        let mut container = forgotten_core::PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        container
+            .items
+            .insert(ItemInstance::new(4526, 3).unwrap())
+            .unwrap();
+        containers.insert(container).unwrap();
+        database.replace_player_containers(1, &containers).unwrap();
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for (server_id, client_thing_id) in [(1988, 1988), (4526, 102)] {
+            catalog
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id,
+                        requires_classic_740_subtype: false,
+                    },
+                )
+                .unwrap();
+        }
+        let mut config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        config.item_presentation_catalog = Some(Arc::new(catalog));
+        let game = start_native_otclient_game(config, &database_path).unwrap();
+        let mut client = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut client,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut client).unwrap();
+        let _container = read_frame(&mut client).unwrap();
+        write_frame(
+            &mut client,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_LOOK_MAP,
+                255,
+                255,
+                0x40 | 2,
+                0,
+                0,
+                102,
+                0,
+                0,
+            ]),
+        )
+        .unwrap();
+        let response = read_frame(&mut client).unwrap();
+        let expected_message = "Container 2: item 4526 (count 3).";
         assert_eq!(
             response.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE
