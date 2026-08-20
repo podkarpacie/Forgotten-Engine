@@ -18,3 +18,9 @@ It does not persist map tile items. A ground-to-inventory transfer therefore nee
 state (or an equivalent recoverable journal), a defined lock order for map then world state, one
 combined rollback strategy for map and inventory state, and only then native inventory/map refresh
 delivery. The present map-owner foundation is intentionally insufficient for that composite commit.
+
+Imported map entries are ordered by tile position and item index, but they do not carry a stable
+per-instance runtime identity or a content-revision reconciliation key. A schema migration that
+stores only a tile index could apply a historic removal to the wrong item after an operator updates
+the map. FE therefore needs a validated source-map identity plus durable item-instance identity and
+reconciliation rules before it introduces a map-item removal table or journal.
