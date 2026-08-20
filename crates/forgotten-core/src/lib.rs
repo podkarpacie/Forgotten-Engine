@@ -1,6 +1,6 @@
 //! Deterministic domain primitives for Forgotten Engine.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerStatus {
@@ -2993,6 +2993,18 @@ impl WorldState {
         creature_id: u32,
         world_map: &WorldMap,
     ) -> Result<StaticCreatureTargetStepOutcome, CoreError> {
+        self.step_static_creature_toward_target_with_detour(creature_id, world_map, 0)
+    }
+
+    /// Attempts the established direct target step first, then may choose the first deterministic
+    /// cardinal detour found within the supplied path-length budget. It performs at most one
+    /// authoritative move and does not add retry scheduling, diagonal movement, combat, or AI.
+    pub fn step_static_creature_toward_target_with_detour(
+        &mut self,
+        creature_id: u32,
+        world_map: &WorldMap,
+        max_detour_steps: u8,
+    ) -> Result<StaticCreatureTargetStepOutcome, CoreError> {
         let (source, target_player_id) = {
             let runtime = self
                 .static_creatures
@@ -3062,7 +3074,71 @@ impl WorldState {
                 to,
             });
         }
-        Ok(StaticCreatureTargetStepOutcome::Blocked { target_player_id })
+        let Some(direction) = self.static_creature_detour_direction(
+            source,
+            target.position,
+            world_map,
+            max_detour_steps,
+        ) else {
+            return Ok(StaticCreatureTargetStepOutcome::Blocked { target_player_id });
+        };
+        let (from, to) = self.move_static_creature_cardinal(creature_id, direction, world_map)?;
+        Ok(StaticCreatureTargetStepOutcome::Moved {
+            target_player_id,
+            direction,
+            from,
+            to,
+        })
+    }
+
+    fn static_creature_detour_direction(
+        &self,
+        source: Position,
+        target: Position,
+        world_map: &WorldMap,
+        max_detour_steps: u8,
+    ) -> Option<CardinalDirection> {
+        if max_detour_steps == 0 {
+            return None;
+        }
+        let directions = [
+            CardinalDirection::North,
+            CardinalDirection::East,
+            CardinalDirection::South,
+            CardinalDirection::West,
+        ];
+        let mut occupied_static_positions = self.static_occupied_positions.clone();
+        occupied_static_positions.remove(&source);
+        let player_positions = self
+            .players
+            .values()
+            .map(|player| player.position)
+            .collect::<BTreeSet<_>>();
+        let mut visited = BTreeSet::from([source]);
+        let mut frontier = VecDeque::from([(source, None, 0_u8)]);
+        while let Some((position, first_direction, distance)) = frontier.pop_front() {
+            if distance >= max_detour_steps {
+                continue;
+            }
+            for direction in directions {
+                let Ok(destination) = position.step(direction) else {
+                    continue;
+                };
+                if !visited.insert(destination)
+                    || !world_map.is_walkable(destination)
+                    || player_positions.contains(&destination)
+                    || occupied_static_positions.contains(&destination)
+                {
+                    continue;
+                }
+                let first_direction = first_direction.or(Some(direction));
+                if destination.is_adjacent_to(target) {
+                    return first_direction;
+                }
+                frontier.push_back((destination, first_direction, distance + 1));
+            }
+        }
+        None
     }
 
     /// Selects safe adjacent steps without mutating state. Direction preference rotates by the
@@ -7838,6 +7914,111 @@ mod tests {
             world.step_static_creature_toward_target(creature_id, &blocked_map),
             Ok(StaticCreatureTargetStepOutcome::Blocked {
                 target_player_id: 7
+            })
+        );
+    }
+
+    #[test]
+    fn static_creature_target_detour_is_bounded_and_preserves_direct_default() {
+        let creature_id = 0x4000_0001;
+        let creature = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut target = player();
+        target.position = Position {
+            x: 102,
+            y: 100,
+            z: 7,
+        };
+        let mut map = WorldMap::new("detour-target-step", creature.position);
+        for (position, walkable) in [
+            (creature.position, true),
+            (
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                false,
+            ),
+            (
+                Position {
+                    x: 100,
+                    y: 99,
+                    z: 7,
+                },
+                true,
+            ),
+            (
+                Position {
+                    x: 101,
+                    y: 99,
+                    z: 7,
+                },
+                true,
+            ),
+            (
+                Position {
+                    x: 102,
+                    y: 99,
+                    z: 7,
+                },
+                true,
+            ),
+            (target.position, true),
+        ] {
+            map.set_tile(
+                position,
+                WorldMapTile {
+                    ground_thing_id: 102,
+                    walkable,
+                },
+            )
+            .unwrap();
+        }
+        let mut world = WorldState::default();
+        world.add_player(target).unwrap();
+        world
+            .install_static_creatures(&FeTfsStaticSpawnCollection::new(vec![creature]).unwrap())
+            .unwrap();
+        world.select_static_creature_target(creature_id, 4).unwrap();
+
+        assert_eq!(
+            world.step_static_creature_toward_target(creature_id, &map),
+            Ok(StaticCreatureTargetStepOutcome::Blocked {
+                target_player_id: 7
+            })
+        );
+        assert_eq!(
+            world.step_static_creature_toward_target_with_detour(creature_id, &map, 3),
+            Ok(StaticCreatureTargetStepOutcome::Moved {
+                target_player_id: 7,
+                direction: CardinalDirection::North,
+                from: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                to: Position {
+                    x: 100,
+                    y: 99,
+                    z: 7,
+                },
             })
         );
     }

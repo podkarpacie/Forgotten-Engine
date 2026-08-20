@@ -1775,7 +1775,11 @@ impl SharedNativeWorld {
             }
             if matches!(
                 world
-                    .step_static_creature_toward_target(creature_id, world_map)
+                    .step_static_creature_toward_target_with_detour(
+                        creature_id,
+                        world_map,
+                        max_range,
+                    )
                     .map_err(HostError::Core)?,
                 StaticCreatureTargetStepOutcome::Moved { .. }
             ) {
