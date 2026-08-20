@@ -421,12 +421,24 @@ fn native_classic_equipment_look_item(
     (record.client_thing_id == client_thing_id).then_some((slot, item))
 }
 
-fn native_equipment_item_inspection_message(slot: EquipmentSlot, item: &ItemInstance) -> String {
-    format!(
-        "Equipment slot {}: item {} (count {}).",
-        slot.code(),
-        item.server_id,
-        item.count
+fn native_equipment_item_inspection_message(
+    slot: EquipmentSlot,
+    item: &ItemInstance,
+    name_by_server_id: Option<&BTreeMap<u16, String>>,
+    weight_by_server_id: Option<&BTreeMap<u16, u32>>,
+    stackable_item_server_ids: Option<&BTreeSet<u16>>,
+) -> String {
+    native_item_inspection_metadata_details(
+        format!(
+            "Equipment slot {}: item {} (count {}).",
+            slot.code(),
+            item.server_id,
+            item.count
+        ),
+        item,
+        name_by_server_id,
+        weight_by_server_id,
+        stackable_item_server_ids,
     )
 }
 
@@ -457,10 +469,22 @@ fn native_classic_container_look_item(
     (record.client_thing_id == client_thing_id).then_some((container_id, item))
 }
 
-fn native_container_item_inspection_message(container_id: u8, item: &ItemInstance) -> String {
-    format!(
-        "Container {}: item {} (count {}).",
-        container_id, item.server_id, item.count
+fn native_container_item_inspection_message(
+    container_id: u8,
+    item: &ItemInstance,
+    name_by_server_id: Option<&BTreeMap<u16, String>>,
+    weight_by_server_id: Option<&BTreeMap<u16, u32>>,
+    stackable_item_server_ids: Option<&BTreeSet<u16>>,
+) -> String {
+    native_item_inspection_metadata_details(
+        format!(
+            "Container {}: item {} (count {}).",
+            container_id, item.server_id, item.count
+        ),
+        item,
+        name_by_server_id,
+        weight_by_server_id,
+        stackable_item_server_ids,
     )
 }
 
@@ -4839,7 +4863,13 @@ fn handle_native_otclient_game(
                 ) {
                     let response = encode_native_otclient_status_message(
                         &config.client_profile,
-                        &native_equipment_item_inspection_message(slot, &item),
+                        &native_equipment_item_inspection_message(
+                            slot,
+                            &item,
+                            config.item_name_by_server_id.as_deref(),
+                            config.item_weight_by_server_id.as_deref(),
+                            config.stackable_item_server_ids.as_deref(),
+                        ),
                     )
                     .map_err(HostError::Protocol)?;
                     write_frame(stream, &response)?;
@@ -4865,7 +4895,13 @@ fn handle_native_otclient_game(
                 ) {
                     let response = encode_native_otclient_status_message(
                         &config.client_profile,
-                        &native_container_item_inspection_message(container_id, &item),
+                        &native_container_item_inspection_message(
+                            container_id,
+                            &item,
+                            config.item_name_by_server_id.as_deref(),
+                            config.item_weight_by_server_id.as_deref(),
+                            config.stackable_item_server_ids.as_deref(),
+                        ),
                     )
                     .map_err(HostError::Protocol)?;
                     write_frame(stream, &response)?;
@@ -5326,6 +5362,37 @@ fn native_classic_weight_description(weight: u32) -> String {
     let whole = weight / 100;
     let hundredths = weight % 100;
     format!("It weighs {whole}.{hundredths:02} oz.")
+}
+
+fn native_item_inspection_metadata_details(
+    mut message: String,
+    item: &ItemInstance,
+    name_by_server_id: Option<&BTreeMap<u16, String>>,
+    weight_by_server_id: Option<&BTreeMap<u16, u32>>,
+    stackable_item_server_ids: Option<&BTreeSet<u16>>,
+) -> String {
+    if let Some(name) = name_by_server_id.and_then(|names| names.get(&item.server_id)) {
+        let name_detail = format!("Name: {name}.");
+        if message.len() + 1 + name_detail.len() <= NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES {
+            message.push(' ');
+            message.push_str(&name_detail);
+        }
+    }
+    if let Some(unit_weight) = weight_by_server_id.and_then(|weights| weights.get(&item.server_id))
+    {
+        let total_weight =
+            if stackable_item_server_ids.is_some_and(|ids| ids.contains(&item.server_id)) {
+                unit_weight.saturating_mul(u32::from(item.count).max(1))
+            } else {
+                *unit_weight
+            };
+        let weight_detail = native_classic_weight_description(total_weight);
+        if message.len() + 1 + weight_detail.len() <= NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES {
+            message.push(' ');
+            message.push_str(&weight_detail);
+        }
+    }
+    message
 }
 
 fn drain_shared_public_chat(
@@ -7029,8 +7096,21 @@ mod tests {
             native_equipment_item_inspection_message(
                 EquipmentSlot::Armor,
                 &ItemInstance::new(2463, 1).unwrap(),
+                None,
+                None,
+                None,
             ),
             "Equipment slot 4: item 2463 (count 1)."
+        );
+        assert_eq!(
+            native_equipment_item_inspection_message(
+                EquipmentSlot::Armor,
+                &ItemInstance::new(2463, 1).unwrap(),
+                Some(&BTreeMap::from([(2463, "Plate Armor".to_string())])),
+                Some(&BTreeMap::from([(2463, 8_000)])),
+                None,
+            ),
+            "Equipment slot 4: item 2463 (count 1). Name: Plate Armor. It weighs 80.00 oz."
         );
         assert!(
             native_classic_equipment_look_item(Some(&catalog), &equipment, position, 99, 0)
@@ -7097,8 +7177,24 @@ mod tests {
             Some((2, ItemInstance::new(4526, 3).unwrap()))
         );
         assert_eq!(
-            native_container_item_inspection_message(2, &ItemInstance::new(4526, 3).unwrap()),
+            native_container_item_inspection_message(
+                2,
+                &ItemInstance::new(4526, 3).unwrap(),
+                None,
+                None,
+                None,
+            ),
             "Container 2: item 4526 (count 3)."
+        );
+        assert_eq!(
+            native_container_item_inspection_message(
+                2,
+                &ItemInstance::new(4526, 3).unwrap(),
+                Some(&BTreeMap::from([(4526, "Arrow".to_string())])),
+                Some(&BTreeMap::from([(4526, 120)])),
+                Some(&BTreeSet::from([4526])),
+            ),
+            "Container 2: item 4526 (count 3). Name: Arrow. It weighs 3.60 oz."
         );
         assert!(native_classic_container_look_item(
             Some(&catalog),
