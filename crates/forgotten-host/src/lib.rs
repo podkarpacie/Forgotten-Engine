@@ -99,7 +99,7 @@ struct NativeWorldHeartbeatOutcome {
 struct NativeHeartbeatConfig {
     pursuit_policy: StaticTargetPursuitPolicy,
     attack_policy: StaticTargetAttackPolicy,
-    world_map: Option<Arc<WorldMap>>,
+    map_owner: Option<Arc<SharedNativeMap>>,
     database_path: PathBuf,
     death_loss_policy: DeathLossPolicy,
     progression_rules: Option<Arc<BTreeMap<VocationId, PlayerProgressionRules>>>,
@@ -247,13 +247,18 @@ fn run_native_shared_world_heartbeat(
                 StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 }
             }
         };
+        let world_map = config
+            .map_owner
+            .as_ref()
+            .map(|owner| owner.render_snapshot())
+            .transpose()?;
         let outcome = advance_native_shared_world_heartbeat_with_static_target_policies(
             &shared_world,
             elapsed_seconds,
             target_policy,
             config.pursuit_policy,
             config.attack_policy,
-            config.world_map.as_deref(),
+            world_map.as_deref(),
         )?;
         if !outcome.static_target_attack_player_ids.is_empty() {
             let mut database = EngineDatabase::open(&config.database_path)?;
@@ -898,6 +903,8 @@ pub struct NativeOtClientHostConfig {
     /// Emits bounded session metadata only. Packet bodies and credentials are never logged.
     pub extended_diagnostics: bool,
     pub empty_world: Option<NativeOtClientEmptyWorldConfig>,
+    /// Immutable startup map source. The game service creates one synchronized owner from this
+    /// map and sessions/heartbeat then consume detached immutable snapshots from that owner.
     pub world_map: Option<Arc<WorldMap>>,
     /// Validated operator-supplied server-to-client item metadata. It is retained for later
     /// parser-safe inventory delivery and does not itself enable inventory packets.
@@ -1001,10 +1008,9 @@ pub struct SharedNativeWorld {
     chat_recipients: Arc<Mutex<BTreeMap<u64, mpsc::SyncSender<SharedPublicChatEvent>>>>,
 }
 
-/// Synchronized owner for a mutable native world map. It exposes only whole-map render snapshots
-/// and whole-tile item replacement. The current listener still uses its immutable configured map;
-/// future ground-item transfers must establish an atomic lock order with `SharedNativeWorld` before
-/// routing client requests through this foundation.
+/// Synchronized owner for a mutable native world map. The live listener and heartbeat obtain only
+/// detached immutable snapshots from this owner. Future ground-item transfers must establish the
+/// documented atomic lock order with `SharedNativeWorld` before client routing is enabled.
 #[derive(Debug, Clone)]
 pub struct SharedNativeMap {
     map: Arc<Mutex<WorldMap>>,
@@ -3212,11 +3218,15 @@ fn serve_native_otclient_game(
             config.client_profile.protocol_version
         ),
     );
+    let shared_map = config
+        .world_map
+        .as_deref()
+        .map(|world_map| Arc::new(SharedNativeMap::new(world_map.clone())));
     let heartbeat_shutdown = Arc::clone(&shutdown);
     let heartbeat_world = shared_world.clone();
     let heartbeat_pursuit_policy = config.static_target_pursuit_policy;
     let heartbeat_attack_policy = config.static_target_attack_policy;
-    let heartbeat_map = config.world_map.clone();
+    let heartbeat_map_owner = shared_map.clone();
     let heartbeat_database_path = database_path.clone();
     let heartbeat_death_loss_policy = config.death_loss_policy;
     let heartbeat_progression_rules = config.progression_rules.clone();
@@ -3227,7 +3237,7 @@ fn serve_native_otclient_game(
             NativeHeartbeatConfig {
                 pursuit_policy: heartbeat_pursuit_policy,
                 attack_policy: heartbeat_attack_policy,
-                world_map: heartbeat_map,
+                map_owner: heartbeat_map_owner,
                 database_path: heartbeat_database_path,
                 death_loss_policy: heartbeat_death_loss_policy,
                 progression_rules: heartbeat_progression_rules,
@@ -3249,14 +3259,22 @@ fn serve_native_otclient_game(
                 let session_database_path = database_path.clone();
                 let session_connections = Arc::clone(&active_connections);
                 let session_world = shared_world.clone();
+                let session_map = shared_map.clone();
                 thread::spawn(move || {
-                    let result = handle_native_otclient_game(
-                        &mut stream,
-                        peer,
-                        &session_config,
-                        &session_database_path,
-                        &session_world,
-                    );
+                    let result = (|| {
+                        let session_config = native_session_config_with_map_snapshot(
+                            session_config,
+                            session_map.as_deref(),
+                        )?;
+                        handle_native_otclient_game(
+                            &mut stream,
+                            peer,
+                            &session_config,
+                            &session_database_path,
+                            &session_world,
+                            session_map.as_deref(),
+                        )
+                    })();
                     if let Err(error) = result {
                         eprintln!("> Native OTCv8 game session ended peer={peer} reason={error}");
                         record_event(
@@ -3284,6 +3302,19 @@ fn serve_native_otclient_game(
     persist_static_creature_runtime_to_database(&shared_world, &database_path)?;
     record_event(&database_path, "info", "native client game service stopped");
     Ok(())
+}
+
+/// Builds one session-local native configuration with a detached map snapshot from the live map
+/// owner. The immutable configuration map is an initialization input only; each accepted session
+/// receives the synchronized owner's current map state without retaining its lock.
+fn native_session_config_with_map_snapshot(
+    mut config: NativeOtClientHostConfig,
+    map_owner: Option<&SharedNativeMap>,
+) -> Result<NativeOtClientHostConfig, HostError> {
+    config.world_map = map_owner
+        .map(SharedNativeMap::render_snapshot)
+        .transpose()?;
+    Ok(config)
 }
 
 fn restore_static_creature_runtime_from_database(
@@ -3467,6 +3498,7 @@ fn handle_native_otclient_game(
     config: &NativeOtClientHostConfig,
     database_path: &Path,
     shared_world: &SharedNativeWorld,
+    map_owner: Option<&SharedNativeMap>,
 ) -> Result<(), HostError> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(config.session_timeout))?;
@@ -3505,7 +3537,7 @@ fn handle_native_otclient_game(
         )?;
         return Ok(());
     };
-    let Some(world_map) = &config.world_map else {
+    let Some(map_owner) = map_owner else {
         write_frame(
             stream,
             &encode_native_otclient_game_login_error(
@@ -3514,8 +3546,9 @@ fn handle_native_otclient_game(
         )?;
         return Ok(());
     };
+    let world_map = map_owner.render_snapshot()?;
     if character.respawn_state.dead {
-        respawn_persisted_native_player_for_relog(&mut database, character.id, world_map)?;
+        respawn_persisted_native_player_for_relog(&mut database, character.id, world_map.as_ref())?;
         character = database
             .player_by_id(character.id)
             .map_err(HostError::Persistence)?;
@@ -3562,7 +3595,7 @@ fn handle_native_otclient_game(
                 containers,
                 conditions,
             },
-            world_map,
+            world_map.as_ref(),
         ) {
         Ok(position) => position,
         Err(HostError::Core(forgotten_core::CoreError::DuplicatePlayer(_))) => {
@@ -3649,7 +3682,7 @@ fn handle_native_otclient_game(
         encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players(
             &config.client_profile,
             &snapshot,
-            world_map,
+            world_map.as_ref(),
             Some(&active_static_spawns),
             Some(&visible_players),
         )
@@ -3806,7 +3839,7 @@ fn handle_native_otclient_game(
                         let (outcome, mut vitals, death_state) = match shared_world
                             .apply_player_conditions_with_death(
                                 character.id,
-                                world_map,
+                                world_map.as_ref(),
                                 condition_elapsed_seconds,
                             ) {
                             Ok(result) => result,
@@ -3934,7 +3967,7 @@ fn handle_native_otclient_game(
                             &mut database,
                             shared_world,
                             character.id,
-                            world_map,
+                            world_map.as_ref(),
                             NativeSelectedPlayerMeleePolicy {
                                 progression_rules: config.progression_rules.as_deref(),
                                 skill_rate: config.skill_rate,
@@ -3995,7 +4028,7 @@ fn handle_native_otclient_game(
                     if let Some(outcome) = apply_native_selected_static_creature_melee(
                         shared_world,
                         character.id,
-                        world_map,
+                        world_map.as_ref(),
                     )? {
                         persist_static_creature_runtime_to_open_database(
                             shared_world,
@@ -4058,7 +4091,7 @@ fn handle_native_otclient_game(
                         let refreshed_viewport = encode_shared_native_world_viewport(
                             &config.client_profile,
                             &refreshed_snapshot,
-                            world_map,
+                            world_map.as_ref(),
                             shared_world,
                             character.id,
                         )?;
@@ -4150,7 +4183,7 @@ fn handle_native_otclient_game(
                         let refreshed_viewport = encode_shared_native_world_viewport(
                             &config.client_profile,
                             &refreshed_snapshot,
-                            world_map,
+                            world_map.as_ref(),
                             shared_world,
                             character.id,
                         )?;
@@ -4198,7 +4231,7 @@ fn handle_native_otclient_game(
                             &database,
                             shared_world,
                             character.id,
-                            world_map,
+                            world_map.as_ref(),
                             &mut player_position,
                             &mut facing,
                             direction,
@@ -5393,7 +5426,7 @@ fn handle_native_otclient_game(
                             &database,
                             shared_world,
                             character.id,
-                            world_map,
+                            world_map.as_ref(),
                             &mut player_position,
                             &mut facing,
                             direction,
@@ -5432,7 +5465,7 @@ fn handle_native_otclient_game(
                     &database,
                     shared_world,
                     character.id,
-                    world_map,
+                    world_map.as_ref(),
                     &mut player_position,
                     &mut facing,
                     direction,
@@ -5469,7 +5502,7 @@ fn handle_native_otclient_game(
                     &database,
                     shared_world,
                     character.id,
-                    world_map,
+                    world_map.as_ref(),
                     &mut player_position,
                     &mut facing,
                     direction,
@@ -7315,6 +7348,51 @@ mod tests {
             map.render_snapshot().unwrap().tile_items(position).unwrap()[0].server_id,
             1988
         );
+    }
+
+    #[test]
+    fn native_session_map_snapshot_uses_current_shared_map_owner_state() {
+        let source_map = native_world_map();
+        let position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let owner = SharedNativeMap::new((*source_map).clone());
+        owner
+            .replace_tile_items(
+                position,
+                vec![WorldMapItem {
+                    server_id: 2148,
+                    client_thing_id: Some(3031),
+                    count: 1,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
+        let mut config = native_otclient_config("127.0.0.1:0".parse().unwrap());
+        config.world_map = Some(source_map.clone());
+
+        let session_config = native_session_config_with_map_snapshot(config, Some(&owner)).unwrap();
+        assert!(source_map.tile_items(position).is_none());
+        assert_eq!(
+            session_config
+                .world_map
+                .as_ref()
+                .unwrap()
+                .tile_items(position)
+                .unwrap()[0]
+                .server_id,
+            2148
+        );
+        assert_eq!(owner.revision(), 1);
     }
 
     #[test]
