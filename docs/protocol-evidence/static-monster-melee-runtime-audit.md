@@ -8,3 +8,8 @@ Using imported interval and min/max bounds would require persistent per-creature
 server-beat conversion, deterministic bounded damage selection, migration rules, and clear
 interaction with the existing global attack policy. No per-monster combat execution is added by
 this audit.
+
+The current static lifecycle restart snapshot deliberately stores only reactivation delay and
+explicitly excludes combat cadence. The persistence schema mirrors that boundary. Adding cooldown
+execution therefore requires a coordinated core snapshot, database migration, restore, and
+heartbeat policy change rather than an isolated host-side timer.
