@@ -1,0 +1,81 @@
+# Native Render Preparation Benchmark — FE 7.4.44
+
+## Decision
+
+The bounded worker path is **not faster** than direct single-threaded viewport encoding for one
+isolated native 740 frame under this local scenario. Its median per-frame cost was **63.860 µs**,
+compared with **27.594 µs** for direct encoding. The worker was therefore **2.314×** the direct
+median cost, or **131.43%** additional median overhead.
+
+This is expected for a small per-frame workload because the worker path also pays for a bounded
+channel hand-off, snapshot ownership transfer, wake-up/scheduling, response transfer, and timeout
+boundary. It does **not** measure or justify a full parallel gameplay engine. The staged worker
+remains intentionally disconnected from the production listener.
+
+## Method
+
+The benchmark is an ignored Rust regression in `forgotten-host`:
+
+```text
+cargo +stable test --release -p forgotten-host \
+  benchmark_native_render_preparation_direct_and_worker -- --ignored --nocapture
+```
+
+It builds one fixed native 740 viewport scenario with one local player and one visible peer. Every
+iteration encodes the same already-captured immutable render snapshot. Both paths must produce a
+byte-identical frame before a sample is accepted.
+
+| Parameter | Value |
+|---|---:|
+| Build mode | `--release` |
+| Samples per path | 45 |
+| Iterations per sample | 1,000 |
+| Total frames per path | 45,000 |
+| Map/player scenario | Fixed native 740 viewport, one local player and one visible peer |
+| Direct path | In-session synchronous encoder from the immutable snapshot |
+| Worker path | One `NativeRenderPreparationWorker`, 32-request queue, one response channel |
+| Mutation during benchmark | None; packet equivalence is asserted on every iteration |
+
+The run used a local six-logical-CPU AMD EPYC sandbox with an observed load average of `0.52`,
+`0.38`, and `0.15`. It was not CPU-pinned and should not be treated as a stable cross-machine
+performance claim.
+
+## Aggregate results
+
+All timing values are microseconds for a **1,000-frame sample**. Per-frame medians divide the
+sample median by 1,000.
+
+| Path | Median sample | p95 sample | Min–max sample | Median per frame |
+|---|---:|---:|---:|---:|
+| Direct synchronous encoder | 27,594 µs | 30,889 µs | 26,908–33,105 µs | 27.594 µs |
+| Bounded worker hand-off | 63,860 µs | 70,496 µs | 56,046–72,551 µs | 63.860 µs |
+
+| Comparison | Result |
+|---|---:|
+| Worker/direct median ratio | 2.314× |
+| Worker median overhead | 131.43% |
+| Correctness result | 45,000 byte-identical frames per path |
+
+## Raw samples
+
+Each value is the duration of 1,000 frame preparations, in microseconds.
+
+| Run | Direct samples | Worker samples |
+|---|---|---|
+| 1 | 28066, 27123, 31180, 29607, 27580, 27746, 27503, 33105, 27449 | 56046, 68497, 62918, 68292, 69784, 70496, 71464, 67310, 65490 |
+| 2 | 27548, 27755, 27594, 27137, 27423, 27319, 27347, 27360, 27411 | 60341, 62987, 62888, 59844, 56707, 58410, 57100, 58399, 57851 |
+| 3 | 28615, 27315, 27303, 26975, 27391, 28720, 30889, 29742, 29693 | 69215, 63731, 63860, 60383, 67839, 66980, 68994, 72551, 70390 |
+| 4 | 28432, 27997, 27795, 28031, 28369, 28392, 28515, 27617, 27875 | 59011, 61920, 60963, 60177, 66391, 62672, 67493, 66489, 63628 |
+| 5 | 28106, 27716, 27462, 27488, 27257, 27091, 27558, 27527, 26908 | 61205, 63443, 64850, 61846, 66957, 69681, 68965, 67996, 68658 |
+
+## Limits and next measurement
+
+This benchmark measures only pre-captured viewport packet preparation. It does not measure
+authoritative lock hold time, action latency, network writes, database work, multi-session
+throughput, queue saturation, peak resident memory, or a multi-worker pool. It must not be used to
+claim an end-to-end server speedup.
+
+The next valid experiment is a **batched, multi-session** preparation scenario that keeps all world
+mutation serialized, reports queue depth and saturation, and compares end-to-end frame preparation
+after snapshot publication. Listener integration remains deferred until that scenario demonstrates
+a benefit without changing byte-level packet order or authoritative outcomes.

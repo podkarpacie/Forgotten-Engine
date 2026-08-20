@@ -86,3 +86,16 @@ ordered input batch produces byte-identical world snapshots and equivalent autho
 under one and multiple worker threads.
 
 No performance or scalability claim is made until those deterministic and measured gates pass.
+
+## Measured render-preparation baseline
+
+The first local FE 7.4.44 release-mode experiment measured the staged worker against direct
+single-threaded native 740 viewport preparation from the same fixed immutable snapshot. Across 45
+samples of 1,000 byte-identical frames each, direct encoding had a 27.594 µs median per frame and
+the worker path had a 63.860 µs median per frame. The worker is therefore 2.314× the direct median
+cost for this isolated one-frame scenario.
+
+> The hand-off worker is not connected to the production listener. This experiment disproves any
+> claim that it accelerates a small isolated frame and establishes the baseline required before a
+> multi-session batch experiment can be considered. The complete method, raw samples, host context,
+> and limitations are recorded in `docs/benchmarks/native-render-preparation-v7.4.44.md`.

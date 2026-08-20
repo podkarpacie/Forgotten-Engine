@@ -10835,6 +10835,123 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "run explicitly in release mode to collect local native-render benchmark samples"]
+    fn benchmark_native_render_preparation_direct_and_worker() {
+        use std::time::Instant;
+
+        const SAMPLE_COUNT: usize = 9;
+        const ITERATIONS_PER_SAMPLE: usize = 1_000;
+
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 102,
+                    account_id: 2,
+                    name: "Druid".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+        let snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_id: native_player_id(101).unwrap(),
+            player_name: "Knight".into(),
+            player_position: native_position(map.spawn()),
+            player_level: 8,
+            player_experience: 0,
+            player_vitals: NativeOtClientPlayerVitals::default(),
+            player_skills: forgotten_core::PlayerSkills::default(),
+            ground_thing_id: 102,
+            player_look_type: 128,
+            player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
+            player_speed: 220,
+            server_beat: 50,
+        };
+        let render_snapshot = shared.native_render_snapshot(101, 128, 220).unwrap();
+        let expected = encode_native_otclient_map_viewport_with_static_spawns_and_players(
+            &profile,
+            &snapshot,
+            &map,
+            Some(&render_snapshot.static_spawns),
+            Some(&render_snapshot.visible_players),
+        )
+        .unwrap();
+
+        let mut direct_samples = Vec::with_capacity(SAMPLE_COUNT);
+        for _ in 0..SAMPLE_COUNT {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS_PER_SAMPLE {
+                let prepared = encode_native_otclient_map_viewport_with_static_spawns_and_players(
+                    &profile,
+                    &snapshot,
+                    &map,
+                    Some(&render_snapshot.static_spawns),
+                    Some(&render_snapshot.visible_players),
+                )
+                .unwrap();
+                assert_eq!(prepared, expected);
+            }
+            direct_samples.push(started.elapsed());
+        }
+
+        let (worker, worker_thread) = NativeRenderPreparationWorker::start(Duration::from_secs(1));
+        let mut worker_samples = Vec::with_capacity(SAMPLE_COUNT);
+        for _ in 0..SAMPLE_COUNT {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS_PER_SAMPLE {
+                let prepared = worker
+                    .prepare(
+                        profile.clone(),
+                        snapshot.clone(),
+                        Arc::clone(&map),
+                        render_snapshot.clone(),
+                    )
+                    .unwrap();
+                assert_eq!(prepared, expected);
+            }
+            worker_samples.push(started.elapsed());
+        }
+        drop(worker);
+        worker_thread.join().unwrap();
+
+        let micros = |samples: &[Duration]| {
+            samples
+                .iter()
+                .map(|sample| sample.as_micros())
+                .collect::<Vec<_>>()
+        };
+        println!(
+            "native-render-benchmark scenario=two-visible-players samples={SAMPLE_COUNT} iterations_per_sample={ITERATIONS_PER_SAMPLE} direct_total_us={:?} worker_total_us={:?}",
+            micros(&direct_samples),
+            micros(&worker_samples),
+        );
+    }
+
+    #[test]
     fn shared_public_chat_broadcasts_sanitized_events_and_releases_recipients() {
         let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
         let map = native_world_map();
