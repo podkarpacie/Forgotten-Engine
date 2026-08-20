@@ -1,27 +1,45 @@
-name: Rust
+name: Rust CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
   pull_request:
-    branches: [ "main" ]
+    branches:
+      - main
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+  contents: read
 
 env:
-  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: /usr/bin/gcc
 
 jobs:
-  build:
-
-    runs-on: ubuntu-latest
+  quality:
+    name: Workspace quality gates
+    runs-on: ubuntu-24.04
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Run strict clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Validate capability matrix JSON
+        run: node -e "JSON.parse(require('fs').readFileSync('docs/capability-matrix.json', 'utf8')); console.log('capability-matrix.json: valid')"
+
+      - name: Check whitespace errors
+        run: git diff --check HEAD^
