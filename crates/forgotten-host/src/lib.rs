@@ -20,7 +20,7 @@ use forgotten_core::{
     StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, StaticCreatureResetSummary,
     StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
     StaticCreatureTargetAttackOutcome, StaticCreatureTargetStepOutcome, VocationId,
-    VocationLevelUpGains, WorldMap, WorldState, MAX_COMBAT_EVENT_DAMAGE,
+    VocationLevelUpGains, WorldMap, WorldMapItem, WorldState, MAX_COMBAT_EVENT_DAMAGE,
 };
 use forgotten_persistence::{
     EngineDatabase, PlayerFixedDeathLossSnapshot, PlayerOutfit,
@@ -998,6 +998,56 @@ pub struct SharedNativeWorld {
     equipment_epoch: Arc<AtomicU64>,
     containers_epoch: Arc<AtomicU64>,
     chat_recipients: Arc<Mutex<BTreeMap<u64, mpsc::SyncSender<SharedPublicChatEvent>>>>,
+}
+
+/// Synchronized owner for a mutable native world map. It exposes only whole-map render snapshots
+/// and whole-tile item replacement. The current listener still uses its immutable configured map;
+/// future ground-item transfers must establish an atomic lock order with `SharedNativeWorld` before
+/// routing client requests through this foundation.
+#[derive(Debug, Clone)]
+pub struct SharedNativeMap {
+    map: Arc<Mutex<WorldMap>>,
+    revision: Arc<AtomicU64>,
+}
+
+impl SharedNativeMap {
+    pub fn new(map: WorldMap) -> Self {
+        Self {
+            map: Arc::new(Mutex::new(map)),
+            revision: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Returns an immutable point-in-time render snapshot. Callers never retain the map lock
+    /// while encoding or writing protocol frames.
+    pub fn render_snapshot(&self) -> Result<Arc<WorldMap>, HostError> {
+        Ok(Arc::new(
+            self.map
+                .lock()
+                .map_err(|_| HostError::SharedWorldUnavailable)?
+                .clone(),
+        ))
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
+    }
+
+    /// Replaces one imported tile's complete ordered item list after `WorldMap` validates its
+    /// per-tile limit. This is an ownership primitive only; it does not transfer an item into a
+    /// player inventory, persist a change, or emit any native packet.
+    pub fn replace_tile_items(
+        &self,
+        position: Position,
+        items: Vec<WorldMapItem>,
+    ) -> Result<u64, HostError> {
+        self.map
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?
+            .set_tile_items(position, items)
+            .map_err(HostError::Core)?;
+        Ok(self.revision.fetch_add(1, Ordering::SeqCst) + 1)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6965,6 +7015,96 @@ mod tests {
         .unwrap();
         map.validate().unwrap();
         Arc::new(map)
+    }
+
+    #[test]
+    fn shared_native_map_replaces_tile_items_and_detaches_render_snapshots() {
+        let map = SharedNativeMap::new((*native_world_map()).clone());
+        let position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        assert_eq!(map.revision(), 0);
+        let initial = map.render_snapshot().unwrap();
+        assert_eq!(initial.tile_items(position), None);
+
+        let first_item = WorldMapItem {
+            server_id: 1988,
+            client_thing_id: Some(1988),
+            count: 1,
+            action_id: None,
+            unique_id: None,
+            text: None,
+            description: None,
+            teleport_destination: None,
+            duration: None,
+            charges: None,
+            children: Vec::new(),
+        };
+        assert_eq!(
+            map.replace_tile_items(position, vec![first_item]).unwrap(),
+            1
+        );
+        let first_snapshot = map.render_snapshot().unwrap();
+        assert_eq!(
+            first_snapshot.tile_items(position).unwrap()[0].server_id,
+            1988
+        );
+
+        assert_eq!(map.replace_tile_items(position, Vec::new()).unwrap(), 2);
+        assert_eq!(map.revision(), 2);
+        assert_eq!(
+            first_snapshot.tile_items(position).unwrap()[0].server_id,
+            1988
+        );
+        assert!(map
+            .render_snapshot()
+            .unwrap()
+            .tile_items(position)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn shared_native_map_snapshot_survives_concurrent_tile_replacement() {
+        let map = SharedNativeMap::new((*native_world_map()).clone());
+        let position = Position {
+            x: 102,
+            y: 100,
+            z: 7,
+        };
+        let snapshot_before_mutation = map.render_snapshot().unwrap();
+        let mutating_owner = map.clone();
+        std::thread::spawn(move || {
+            mutating_owner
+                .replace_tile_items(
+                    position,
+                    vec![WorldMapItem {
+                        server_id: 1988,
+                        client_thing_id: Some(1988),
+                        count: 1,
+                        action_id: None,
+                        unique_id: None,
+                        text: None,
+                        description: None,
+                        teleport_destination: None,
+                        duration: None,
+                        charges: None,
+                        children: Vec::new(),
+                    }],
+                )
+                .unwrap()
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(snapshot_before_mutation.tile_items(position), None);
+        assert_eq!(map.revision(), 1);
+        assert_eq!(
+            map.render_snapshot().unwrap().tile_items(position).unwrap()[0].server_id,
+            1988
+        );
     }
 
     #[test]
