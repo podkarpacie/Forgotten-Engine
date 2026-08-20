@@ -8,7 +8,7 @@ use forgotten_core::{
     classic_experience_for_level, EquipmentSlot, ItemInstance, Player, PlayerCondition,
     PlayerConditionKind, PlayerContainer, PlayerContainers, PlayerEquipment, PlayerProgression,
     PlayerProgressionAttempts, PlayerRespawnState, PlayerSkill, PlayerSkills, Position,
-    SkillProgress, VocationId,
+    SkillProgress, VocationId, WorldMapItemSourceIdentity, WorldMapSourceRevision,
 };
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -28,7 +28,8 @@ const SCHEMA_VERSION_CONDITION_ELAPSED: i64 = 10;
 const SCHEMA_VERSION_OUTFIT: i64 = 11;
 const SCHEMA_VERSION_STATIC_CREATURE_RUNTIME: i64 = 12;
 const SCHEMA_VERSION_STATIC_CREATURE_REACTIVATION: i64 = 13;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_STATIC_CREATURE_REACTIVATION;
+const SCHEMA_VERSION_MAP_ITEM_JOURNAL: i64 = 14;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_MAP_ITEM_JOURNAL;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 
@@ -47,6 +48,14 @@ pub struct StaticCreatureRuntimeRecord {
     pub active: bool,
     pub health_percent: u8,
     pub reactivation_remaining_seconds: Option<u32>,
+}
+
+/// Revision-bound record of top-level source-map items removed by future authoritative runtime
+/// transitions. An incompatible map revision must be treated as a caller-visible recovery state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapItemRemovalJournal {
+    pub map_revision: WorldMapSourceRevision,
+    pub removed_items: Vec<WorldMapItemSourceIdentity>,
 }
 
 /// The complete accepted authoritative state that must be persisted together after a bounded
@@ -1506,6 +1515,43 @@ impl EngineDatabase {
         Ok(records)
     }
 
+    /// Atomically replaces the complete revision-bound removal journal. Future recovery must
+    /// compare `map_revision` with the loaded immutable map before applying any removal.
+    pub fn replace_map_item_removal_journal(
+        &mut self,
+        journal: &MapItemRemovalJournal,
+    ) -> Result<(), PersistenceError> {
+        let mut seen = BTreeMap::new();
+        for item in &journal.removed_items {
+            if item.map_revision != journal.map_revision {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "every item must use the journal map revision".into(),
+                ));
+            }
+            if seen.insert((item.position, item.item_index), ()).is_some() {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "duplicate source item identity".into(),
+                ));
+            }
+        }
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM map_item_removal_journal", [])?;
+        for item in &journal.removed_items {
+            transaction.execute(
+                "INSERT INTO map_item_removal_journal (map_revision, x, y, z, item_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    format!("{:016x}", journal.map_revision.0),
+                    i64::from(item.position.x),
+                    i64::from(item.position.y),
+                    i64::from(item.position.z),
+                    i64::from(item.item_index),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn migrate(&mut self) -> Result<(), PersistenceError> {
         self.connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);\
@@ -1654,6 +1700,15 @@ impl EngineDatabase {
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![SCHEMA_VERSION_STATIC_CREATURE_REACTIVATION, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < SCHEMA_VERSION_MAP_ITEM_JOURNAL {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS map_item_removal_journal (map_revision TEXT NOT NULL, x INTEGER NOT NULL, y INTEGER NOT NULL, z INTEGER NOT NULL, item_index INTEGER NOT NULL, PRIMARY KEY (map_revision, x, y, z, item_index));",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_MAP_ITEM_JOURNAL, unix_seconds()],
             )?;
         }
         Ok(())
@@ -1929,6 +1984,7 @@ pub enum PersistenceError {
     InvalidProgressionAttemptRecord(String),
     InvalidLifecycleRecord(String),
     InvalidStaticCreatureRuntimeRecord(String),
+    InvalidMapItemJournal(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
 }
