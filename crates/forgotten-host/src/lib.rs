@@ -3675,6 +3675,7 @@ fn restore_static_creature_runtime_from_database(
             active: record.active,
             health_percent: record.health_percent,
             reactivation_remaining_seconds: record.reactivation_remaining_seconds,
+            direct_melee_damage_sequence: record.direct_melee_damage_sequence,
         })
         .collect::<Vec<_>>();
     shared_world.restore_static_creature_runtime(&snapshots)
@@ -3701,6 +3702,7 @@ fn persist_static_creature_runtime_to_open_database(
             active: snapshot.active,
             health_percent: snapshot.health_percent,
             reactivation_remaining_seconds: snapshot.reactivation_remaining_seconds,
+            direct_melee_damage_sequence: snapshot.direct_melee_damage_sequence,
         })
         .collect::<Vec<_>>();
     database
@@ -10724,8 +10726,106 @@ mod tests {
                 active: false,
                 health_percent: 42,
                 reactivation_remaining_seconds: Some(8),
+                direct_melee_damage_sequence: 0,
             }]
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn static_creature_damage_sequence_persists_across_fresh_shared_worlds() {
+        let path = database_path("static-creature-damage-sequence-persistence");
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 2;
+        let static_spawns = FeTfsStaticSpawnCollection::with_combat_metadata(
+            vec![forgotten_core::FeTfsStaticEntity {
+                id: creature_id,
+                name: "Rat".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 100,
+                direction: 2,
+            }],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::from([(
+                creature_id,
+                forgotten_core::StaticCreatureDirectMeleeDamageRange {
+                    min_damage: 2,
+                    max_damage: 4,
+                },
+            )]),
+        )
+        .unwrap();
+        let map = native_world_map();
+        let player = Player {
+            id: 101,
+            account_id: 1,
+            name: "Knight".into(),
+            position: map.spawn(),
+            level: 8,
+            experience: 0,
+            skill_points: 0,
+        };
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        shared
+            .register_player_at_available_position(player.clone(), &map)
+            .unwrap();
+        shared
+            .acquire_static_creature_targets(StaticTargetAcquisitionPolicy::NearestLivingPlayer {
+                max_range: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            shared.apply_static_creature_target_damage(creature_id, 1, &map),
+            Ok(StaticCreatureTargetAttackOutcome::Applied {
+                requested_damage: 2,
+                ..
+            })
+        ));
+        persist_static_creature_runtime_to_database(&shared, &path).unwrap();
+        assert_eq!(
+            EngineDatabase::open(&path)
+                .unwrap()
+                .static_creature_runtime()
+                .unwrap()[0]
+                .direct_melee_damage_sequence,
+            1
+        );
+
+        let fresh = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        fresh
+            .register_player_at_available_position(player, &map)
+            .unwrap();
+        assert_eq!(
+            restore_static_creature_runtime_from_database(&fresh, &path).unwrap(),
+            StaticCreatureRuntimeRestoreSummary {
+                restored: 1,
+                ignored_unknown: 0,
+            }
+        );
+        fresh
+            .acquire_static_creature_targets(StaticTargetAcquisitionPolicy::NearestLivingPlayer {
+                max_range: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            fresh.apply_static_creature_target_damage(creature_id, 1, &map),
+            Ok(StaticCreatureTargetAttackOutcome::Applied {
+                requested_damage: 3,
+                ..
+            })
+        ));
         let _ = fs::remove_file(path);
     }
 
@@ -10827,6 +10927,7 @@ mod tests {
                 active: true,
                 health_percent: 5,
                 reactivation_remaining_seconds: None,
+                direct_melee_damage_sequence: 0,
             }]
         );
         assert_eq!(
@@ -10881,6 +10982,7 @@ mod tests {
                 active: false,
                 health_percent: 0,
                 reactivation_remaining_seconds: None,
+                direct_melee_damage_sequence: 0,
             }
         );
         assert_eq!(

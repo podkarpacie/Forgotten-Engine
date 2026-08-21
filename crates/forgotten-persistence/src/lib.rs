@@ -29,7 +29,8 @@ const SCHEMA_VERSION_OUTFIT: i64 = 11;
 const SCHEMA_VERSION_STATIC_CREATURE_RUNTIME: i64 = 12;
 const SCHEMA_VERSION_STATIC_CREATURE_REACTIVATION: i64 = 13;
 const SCHEMA_VERSION_MAP_ITEM_JOURNAL: i64 = 14;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_MAP_ITEM_JOURNAL;
+const SCHEMA_VERSION_STATIC_CREATURE_DAMAGE_SEQUENCE: i64 = 15;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_STATIC_CREATURE_DAMAGE_SEQUENCE;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 
@@ -38,9 +39,10 @@ pub struct EngineDatabase {
     path: PathBuf,
 }
 
-/// The durable subset of known static-creature runtime state. The optional delay is a bounded,
-/// restart-relative reactivation value, not an autonomous scheduler. Spawn definitions,
-/// appearance, targets, AI cadence, combat, loot, and scripts remain content/runtime concerns.
+/// The durable subset of known static-creature runtime state. It includes a bounded restart-relative
+/// reactivation delay and deterministic direct-melee selection sequence, not an autonomous
+/// scheduler. Spawn definitions, appearance, targets, AI cadence, combat formulas, loot, and
+/// scripts remain content/runtime concerns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticCreatureRuntimeRecord {
     pub creature_id: u32,
@@ -48,6 +50,7 @@ pub struct StaticCreatureRuntimeRecord {
     pub active: bool,
     pub health_percent: u8,
     pub reactivation_remaining_seconds: Option<u32>,
+    pub direct_melee_damage_sequence: u64,
 }
 
 /// Revision-bound record of top-level source-map items removed by future authoritative runtime
@@ -1498,6 +1501,11 @@ impl EngineDatabase {
                     "active creatures cannot carry a reactivation delay".into(),
                 ));
             }
+            if record.direct_melee_damage_sequence > i64::MAX as u64 {
+                return Err(PersistenceError::InvalidStaticCreatureRuntimeRecord(
+                    "direct melee damage sequence does not fit SQLite INTEGER".into(),
+                ));
+            }
             if seen.insert(record.creature_id, ()).is_some() {
                 return Err(PersistenceError::InvalidStaticCreatureRuntimeRecord(
                     "duplicate static creature ID".into(),
@@ -1508,7 +1516,7 @@ impl EngineDatabase {
         transaction.execute("DELETE FROM static_creature_runtime", [])?;
         for record in records {
             transaction.execute(
-                "INSERT INTO static_creature_runtime (creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO static_creature_runtime (creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds, direct_melee_damage_sequence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     i64::from(record.creature_id),
                     i64::from(record.position.x),
@@ -1517,6 +1525,8 @@ impl EngineDatabase {
                     i64::from(u8::from(record.active)),
                     i64::from(record.health_percent),
                     record.reactivation_remaining_seconds.map(i64::from),
+                    i64::try_from(record.direct_melee_damage_sequence)
+                        .expect("validated sequence fits SQLite INTEGER"),
                 ],
             )?;
         }
@@ -1530,7 +1540,7 @@ impl EngineDatabase {
         &self,
     ) -> Result<Vec<StaticCreatureRuntimeRecord>, PersistenceError> {
         let mut statement = self.connection.prepare(
-            "SELECT creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds FROM static_creature_runtime ORDER BY creature_id",
+            "SELECT creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds, direct_melee_damage_sequence FROM static_creature_runtime ORDER BY creature_id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -1541,12 +1551,21 @@ impl EngineDatabase {
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
                 row.get::<_, Option<i64>>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })?;
         let mut records = Vec::new();
         for row in rows {
-            let (creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds) =
-                row?;
+            let (
+                creature_id,
+                x,
+                y,
+                z,
+                active,
+                health_percent,
+                reactivation_remaining_seconds,
+                direct_melee_damage_sequence,
+            ) = row?;
             let creature_id = u32::try_from(creature_id).map_err(|_| {
                 PersistenceError::InvalidStaticCreatureRuntimeRecord(
                     "creature ID does not fit u32".into(),
@@ -1600,12 +1619,19 @@ impl EngineDatabase {
                     "active creatures cannot carry a reactivation delay".into(),
                 ));
             }
+            let direct_melee_damage_sequence = u64::try_from(direct_melee_damage_sequence)
+                .map_err(|_| {
+                    PersistenceError::InvalidStaticCreatureRuntimeRecord(
+                        "direct melee damage sequence must be non-negative".into(),
+                    )
+                })?;
             records.push(StaticCreatureRuntimeRecord {
                 creature_id,
                 position,
                 active,
                 health_percent,
                 reactivation_remaining_seconds,
+                direct_melee_damage_sequence,
             });
         }
         Ok(records)
@@ -1865,6 +1891,18 @@ impl EngineDatabase {
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![SCHEMA_VERSION_MAP_ITEM_JOURNAL, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < SCHEMA_VERSION_STATIC_CREATURE_DAMAGE_SEQUENCE {
+            self.connection.execute_batch(
+                "ALTER TABLE static_creature_runtime ADD COLUMN direct_melee_damage_sequence INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![
+                    SCHEMA_VERSION_STATIC_CREATURE_DAMAGE_SEQUENCE,
+                    unix_seconds()
+                ],
             )?;
         }
         Ok(())
@@ -2288,6 +2326,7 @@ mod tests {
                 active: true,
                 health_percent: 100,
                 reactivation_remaining_seconds: None,
+                direct_melee_damage_sequence: 5,
             },
             StaticCreatureRuntimeRecord {
                 creature_id: 0x1000_0002,
@@ -2299,9 +2338,20 @@ mod tests {
                 active: false,
                 health_percent: 0,
                 reactivation_remaining_seconds: Some(42),
+                direct_melee_damage_sequence: 11,
             },
         ];
         database.replace_static_creature_runtime(&records).unwrap();
+        assert_eq!(database.static_creature_runtime().unwrap(), records);
+
+        let invalid_sequence = [StaticCreatureRuntimeRecord {
+            direct_melee_damage_sequence: u64::MAX,
+            ..records[0]
+        }];
+        assert!(matches!(
+            database.replace_static_creature_runtime(&invalid_sequence),
+            Err(PersistenceError::InvalidStaticCreatureRuntimeRecord(_))
+        ));
         assert_eq!(database.static_creature_runtime().unwrap(), records);
 
         let invalid_active_delay = [StaticCreatureRuntimeRecord {
@@ -2338,8 +2388,8 @@ mod tests {
         database
             .connection
             .execute(
-                "INSERT INTO static_creature_runtime (creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![0x1000_0001_i64, 101_i64, 102_i64, 7_i64, 1_i64, 100_i64, 3_i64],
+                "INSERT INTO static_creature_runtime (creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds, direct_melee_damage_sequence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![0x1000_0001_i64, 101_i64, 102_i64, 7_i64, 1_i64, 100_i64, Option::<i64>::None, -1_i64],
             )
             .unwrap();
         assert!(matches!(

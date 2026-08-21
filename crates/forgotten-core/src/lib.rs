@@ -280,9 +280,10 @@ pub struct StaticCreatureLifecycle {
     pub respawn_interval_seconds: u32,
 }
 
-/// The compact restart snapshot for an installed static creature. It retains only the remaining
-/// delay for the current bounded reactivation schedule; it deliberately excludes spawn identity,
-/// appearance, targets, autonomous AI cadence, combat, loot, and scripts.
+/// The compact restart snapshot for an installed static creature. It retains the remaining delay
+/// for the current bounded reactivation schedule and the deterministic direct-melee selection
+/// sequence; it deliberately excludes spawn identity, appearance, targets, autonomous AI cadence,
+/// combat formulas, loot, and scripts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticCreatureRuntimeSnapshot {
     pub id: u32,
@@ -290,6 +291,7 @@ pub struct StaticCreatureRuntimeSnapshot {
     pub active: bool,
     pub health_percent: u8,
     pub reactivation_remaining_seconds: Option<u32>,
+    pub direct_melee_damage_sequence: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2966,6 +2968,7 @@ impl WorldState {
                 reactivation_remaining_seconds: runtime.reactivation_due_tick.map(|due_tick| {
                     u32::try_from(due_tick.saturating_sub(self.tick)).unwrap_or(u32::MAX)
                 }),
+                direct_melee_damage_sequence: runtime.direct_melee_damage_sequence,
             })
             .collect()
     }
@@ -3053,6 +3056,7 @@ impl WorldState {
                     != record
                         .reactivation_remaining_seconds
                         .map(|remaining| self.tick.saturating_add(u64::from(remaining)))
+                || runtime.direct_melee_damage_sequence != record.direct_melee_damage_sequence
             {
                 changed = true;
             }
@@ -3060,6 +3064,7 @@ impl WorldState {
             runtime.active = record.active;
             runtime.health_percent = record.health_percent;
             runtime.target_player_id = None;
+            runtime.direct_melee_damage_sequence = record.direct_melee_damage_sequence;
             if record.active {
                 runtime.activated_at_tick = self.tick;
                 runtime.inactive_since_tick = None;
@@ -8233,6 +8238,7 @@ mod tests {
                 active: false,
                 health_percent: 100,
                 reactivation_remaining_seconds: Some(3),
+                direct_melee_damage_sequence: 0,
             }]
         );
 
@@ -8272,6 +8278,7 @@ mod tests {
                 active: false,
                 health_percent: 100,
                 reactivation_remaining_seconds: Some(6),
+                direct_melee_damage_sequence: 0,
             }]),
             Err(CoreError::InvalidStaticCreatureReactivationDelay {
                 id: creature_id,
@@ -8684,6 +8691,107 @@ mod tests {
             ));
         }
         assert_eq!(world.player_vitals(7).unwrap().health, 39);
+    }
+
+    #[test]
+    fn static_creature_direct_melee_damage_sequence_survives_snapshot_restore() {
+        let creature_id = 0x4000_0005;
+        let creature_position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let creature = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: creature_position,
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut target = player();
+        target.position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let map = WorldMap::new("direct-melee-sequence-restart", creature_position);
+        let static_spawns = FeTfsStaticSpawnCollection::with_combat_metadata(
+            vec![creature],
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([(
+                creature_id,
+                StaticCreatureDirectMeleeDamageRange {
+                    min_damage: 2,
+                    max_damage: 4,
+                },
+            )]),
+        )
+        .unwrap();
+        let mut world = WorldState::default();
+        world.add_player(target.clone()).unwrap();
+        world
+            .update_player_vitals(
+                target.id,
+                PlayerVitals {
+                    health: 50,
+                    max_health: 50,
+                    ..PlayerVitals::default()
+                },
+            )
+            .unwrap();
+        world.install_static_creatures(&static_spawns).unwrap();
+        world.select_static_creature_target(creature_id, 1).unwrap();
+        assert!(matches!(
+            world.apply_static_creature_target_damage(creature_id, 1, &map),
+            Ok(StaticCreatureTargetAttackOutcome::Applied {
+                requested_damage: 2,
+                ..
+            })
+        ));
+        let snapshot = world.static_creature_runtime_snapshot();
+        assert_eq!(snapshot[0].direct_melee_damage_sequence, 1);
+
+        let mut fresh = WorldState::default();
+        fresh.add_player(target.clone()).unwrap();
+        fresh
+            .update_player_vitals(
+                target.id,
+                PlayerVitals {
+                    health: 50,
+                    max_health: 50,
+                    ..PlayerVitals::default()
+                },
+            )
+            .unwrap();
+        fresh.install_static_creatures(&static_spawns).unwrap();
+        assert_eq!(
+            fresh.restore_static_creature_runtime(&snapshot),
+            Ok(StaticCreatureRuntimeRestoreSummary {
+                restored: 1,
+                ignored_unknown: 0,
+            })
+        );
+        fresh.select_static_creature_target(creature_id, 1).unwrap();
+        assert!(matches!(
+            fresh.apply_static_creature_target_damage(creature_id, 1, &map),
+            Ok(StaticCreatureTargetAttackOutcome::Applied {
+                requested_damage: 3,
+                ..
+            })
+        ));
+        assert_eq!(
+            fresh.static_creature_runtime_snapshot()[0].direct_melee_damage_sequence,
+            2
+        );
     }
 
     #[test]
@@ -9143,6 +9251,7 @@ mod tests {
                 active: false,
                 health_percent: 70,
                 reactivation_remaining_seconds: None,
+                direct_melee_damage_sequence: 0,
             },
             StaticCreatureRuntimeSnapshot {
                 id: 0x4000_9999,
@@ -9150,6 +9259,7 @@ mod tests {
                 active: true,
                 health_percent: 100,
                 reactivation_remaining_seconds: None,
+                direct_melee_damage_sequence: 0,
             },
         ];
         assert_eq!(
@@ -9167,6 +9277,7 @@ mod tests {
                 active: false,
                 health_percent: 70,
                 reactivation_remaining_seconds: None,
+                direct_melee_damage_sequence: 0,
             }]
         );
         assert_eq!(
@@ -9188,6 +9299,7 @@ mod tests {
                 active: true,
                 health_percent: 100,
                 reactivation_remaining_seconds: None,
+                direct_melee_damage_sequence: 0,
             }]),
             Err(CoreError::PlayerOccupiesStaticCreaturePosition(
                 source.position
