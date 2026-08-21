@@ -119,6 +119,7 @@ pub struct FeTfsStaticSpawnCollection {
     pub entities: Vec<FeTfsStaticEntity>,
     respawn_intervals_seconds: BTreeMap<u32, u32>,
     experience_rewards: BTreeMap<u32, u64>,
+    direct_melee_intervals_millis: BTreeMap<u32, u32>,
 }
 
 impl FeTfsStaticSpawnCollection {
@@ -144,6 +145,22 @@ impl FeTfsStaticSpawnCollection {
         respawn_intervals_seconds: BTreeMap<u32, u32>,
         experience_rewards: BTreeMap<u32, u64>,
     ) -> Result<Self, CoreError> {
+        Self::with_runtime_metadata(
+            entities,
+            respawn_intervals_seconds,
+            experience_rewards,
+            BTreeMap::new(),
+        )
+    }
+
+    /// Retains validated imported direct-melee intervals by stable static creature ID. This is
+    /// immutable spawn metadata only; attack scheduling remains an explicit runtime policy.
+    pub fn with_runtime_metadata(
+        entities: Vec<FeTfsStaticEntity>,
+        respawn_intervals_seconds: BTreeMap<u32, u32>,
+        experience_rewards: BTreeMap<u32, u64>,
+        direct_melee_intervals_millis: BTreeMap<u32, u32>,
+    ) -> Result<Self, CoreError> {
         if entities.len() > MAX_TFS_STATIC_SPAWNS {
             return Err(CoreError::StaticSpawnLimit(MAX_TFS_STATIC_SPAWNS));
         }
@@ -167,10 +184,17 @@ impl FeTfsStaticSpawnCollection {
         if experience_rewards.keys().any(|id| !ids.contains(id)) {
             return Err(CoreError::UnknownStaticCreatureSchedule);
         }
+        if direct_melee_intervals_millis
+            .iter()
+            .any(|(id, interval)| !ids.contains(id) || *interval == 0)
+        {
+            return Err(CoreError::UnknownStaticCreatureSchedule);
+        }
         Ok(Self {
             entities,
             respawn_intervals_seconds,
             experience_rewards,
+            direct_melee_intervals_millis,
         })
     }
 
@@ -186,6 +210,10 @@ impl FeTfsStaticSpawnCollection {
             .get(&id)
             .copied()
             .unwrap_or_default()
+    }
+
+    pub fn direct_melee_interval_millis(&self, id: u32) -> Option<u32> {
+        self.direct_melee_intervals_millis.get(&id).copied()
     }
 
     pub fn at(&self, position: Position) -> impl Iterator<Item = &FeTfsStaticEntity> {
@@ -3049,6 +3077,7 @@ impl WorldState {
                 .filter(|(_, runtime)| runtime.active && runtime.experience_reward > 0)
                 .map(|(id, runtime)| (*id, runtime.experience_reward))
                 .collect(),
+            direct_melee_intervals_millis: BTreeMap::new(),
         }
     }
 

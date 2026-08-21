@@ -144,6 +144,7 @@ pub fn materialize_tfs_static_spawns(
     let mut entities = Vec::new();
     let mut respawn_intervals_seconds = BTreeMap::new();
     let mut experience_rewards = BTreeMap::new();
+    let mut direct_melee_intervals_millis = BTreeMap::new();
     let mut next_id = STATIC_TFS_ENTITY_ID_START;
     for spawn_area in &companions.spawns {
         for creature in &spawn_area.creatures {
@@ -166,6 +167,11 @@ pub fn materialize_tfs_static_spawns(
             }
             if matches!(definition.kind, TfsEntityKind::Monster) && definition.experience > 0 {
                 experience_rewards.insert(next_id, definition.experience);
+            }
+            if matches!(definition.kind, TfsEntityKind::Monster) {
+                if let Some(direct_melee) = definition.direct_melee {
+                    direct_melee_intervals_millis.insert(next_id, direct_melee.interval_millis);
+                }
             }
             let health_percent = match appearance.current_health {
                 Some(current_health) if current_health > appearance.max_health => {
@@ -200,10 +206,11 @@ pub fn materialize_tfs_static_spawns(
                 .ok_or_else(|| invalid("static TFS spawn identifier range is exhausted"))?;
         }
     }
-    FeTfsStaticSpawnCollection::with_respawn_intervals_and_experience_rewards(
+    FeTfsStaticSpawnCollection::with_runtime_metadata(
         entities,
         respawn_intervals_seconds,
         experience_rewards,
+        direct_melee_intervals_millis,
     )
     .map_err(|error| invalid(format!("invalid static TFS spawn collection: {error}")))
 }
@@ -915,7 +922,11 @@ mod tests {
                 kind: TfsEntityKind::Monster,
                 name: "Rat".into(),
                 experience: 25,
-                direct_melee: None,
+                direct_melee: Some(TfsDirectMeleeAttack {
+                    interval_millis: 2_000,
+                    min_damage: 1,
+                    max_damage: 4,
+                }),
                 definition_path: PathBuf::from("rat.xml"),
                 script_path: None,
                 script_present: true,
@@ -976,6 +987,10 @@ mod tests {
         assert_eq!(
             spawns.respawn_interval_seconds(STATIC_TFS_ENTITY_ID_START),
             60
+        );
+        assert_eq!(
+            spawns.direct_melee_interval_millis(STATIC_TFS_ENTITY_ID_START),
+            Some(2_000)
         );
     }
 }
