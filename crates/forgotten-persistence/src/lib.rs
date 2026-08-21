@@ -488,6 +488,172 @@ impl EngineDatabase {
         })
     }
 
+    /// Adds one persisted player to an existing guild at its provisioned member rank. The primary
+    /// membership key remains the authoritative one-guild-per-player guard; invitation, online
+    /// authorization, and client delivery are intentionally outside this storage operation.
+    pub fn add_guild_member(
+        &mut self,
+        guild_id: u64,
+        player_id: u64,
+    ) -> Result<GuildMembershipRecord, PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let transaction = self.connection.transaction()?;
+        let guild_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guilds WHERE id = ?1)",
+            params![guild_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !guild_exists {
+            return Err(PersistenceError::UnknownGuild(guild_id));
+        }
+        let already_member = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guild_membership WHERE player_id = ?1)",
+            params![player_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if already_member {
+            return Err(PersistenceError::GuildMemberAlreadyAssigned(player_id));
+        }
+        let member_rank_id = transaction
+            .query_row(
+                "SELECT id FROM guild_ranks WHERE guild_id = ?1 AND level = 1 ORDER BY id LIMIT 1",
+                params![guild_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|id| id as u64)
+            .ok_or_else(|| {
+                PersistenceError::InvalidGuildRecord(
+                    "guild is missing its required member rank".into(),
+                )
+            })?;
+        transaction.execute(
+            "INSERT INTO guild_membership (player_id, guild_id, rank_id, nick) VALUES (?1, ?2, ?3, '')",
+            params![player_id as i64, guild_id as i64, member_rank_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(GuildMembershipRecord {
+            player_id,
+            guild_id,
+            rank_id: member_rank_id,
+            nick: String::new(),
+        })
+    }
+
+    /// Removes one non-owner player from exactly the named guild. Ownership transfer and guild
+    /// deletion are separate future transitions, so an owner cannot leave this bounded model.
+    pub fn remove_guild_member(
+        &mut self,
+        guild_id: u64,
+        player_id: u64,
+    ) -> Result<(), PersistenceError> {
+        let transaction = self.connection.transaction()?;
+        let owner_player_id = transaction
+            .query_row(
+                "SELECT owner_player_id FROM guilds WHERE id = ?1",
+                params![guild_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|id| id as u64)
+            .ok_or(PersistenceError::UnknownGuild(guild_id))?;
+        if owner_player_id == player_id {
+            return Err(PersistenceError::GuildOwnerCannotLeave {
+                guild_id,
+                player_id,
+            });
+        }
+        let member_guild_id = transaction
+            .query_row(
+                "SELECT guild_id FROM guild_membership WHERE player_id = ?1",
+                params![player_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|id| id as u64)
+            .ok_or(PersistenceError::UnknownGuildMember {
+                guild_id,
+                player_id,
+            })?;
+        if member_guild_id != guild_id {
+            return Err(PersistenceError::UnknownGuildMember {
+                guild_id,
+                player_id,
+            });
+        }
+        transaction.execute(
+            "DELETE FROM guild_membership WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Assigns one existing member to one existing rank of the same guild. It cannot create ranks,
+    /// transfer ownership, or change nicknames; those policies remain explicit future work.
+    pub fn assign_guild_member_rank(
+        &mut self,
+        guild_id: u64,
+        player_id: u64,
+        rank_id: u64,
+    ) -> Result<GuildMembershipRecord, PersistenceError> {
+        let transaction = self.connection.transaction()?;
+        let guild_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guilds WHERE id = ?1)",
+            params![guild_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !guild_exists {
+            return Err(PersistenceError::UnknownGuild(guild_id));
+        }
+        let member_guild_id = transaction
+            .query_row(
+                "SELECT guild_id FROM guild_membership WHERE player_id = ?1",
+                params![player_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|id| id as u64)
+            .ok_or(PersistenceError::UnknownGuildMember {
+                guild_id,
+                player_id,
+            })?;
+        if member_guild_id != guild_id {
+            return Err(PersistenceError::UnknownGuildMember {
+                guild_id,
+                player_id,
+            });
+        }
+        let rank_guild_id = transaction
+            .query_row(
+                "SELECT guild_id FROM guild_ranks WHERE id = ?1",
+                params![rank_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|id| id as u64)
+            .ok_or(PersistenceError::GuildRankOutsideGuild { guild_id, rank_id })?;
+        if rank_guild_id != guild_id {
+            return Err(PersistenceError::GuildRankOutsideGuild { guild_id, rank_id });
+        }
+        transaction.execute(
+            "UPDATE guild_membership SET rank_id = ?1 WHERE player_id = ?2",
+            params![rank_id as i64, player_id as i64],
+        )?;
+        let nick = transaction.query_row(
+            "SELECT nick FROM guild_membership WHERE player_id = ?1",
+            params![player_id as i64],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        Ok(GuildMembershipRecord {
+            player_id,
+            guild_id,
+            rank_id,
+            nick,
+        })
+    }
+
     pub fn guild_ranks(&self, guild_id: u64) -> Result<Vec<GuildRankRecord>, PersistenceError> {
         let mut statement = self.connection.prepare(
             "SELECT id, guild_id, name, level FROM guild_ranks WHERE guild_id = ?1 ORDER BY level DESC, id",
@@ -2566,6 +2732,19 @@ pub enum PersistenceError {
         target_player_id: u64,
     },
     GuildOwnerAlreadyMember(u64),
+    GuildMemberAlreadyAssigned(u64),
+    UnknownGuildMember {
+        guild_id: u64,
+        player_id: u64,
+    },
+    GuildOwnerCannotLeave {
+        guild_id: u64,
+        player_id: u64,
+    },
+    GuildRankOutsideGuild {
+        guild_id: u64,
+        rank_id: u64,
+    },
 }
 
 impl From<std::io::Error> for PersistenceError {
@@ -2658,6 +2837,97 @@ mod tests {
         assert!(matches!(
             database.guild_ranks(999),
             Err(PersistenceError::UnknownGuild(999))
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_transactional_guild_membership_departure_and_rank_assignment() {
+        let path = temporary_path("guild-membership-management");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        for (id, name) in [(7, "Knight"), (8, "Druid"), (9, "Sorcerer")] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: 1,
+                    name: name.into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let guild = database.create_guild(7, "Forgotten", "Welcome").unwrap();
+        let ranks = database.guild_ranks(guild.id).unwrap();
+        let vice_rank_id = ranks
+            .iter()
+            .find(|rank| rank.level == 2)
+            .expect("guild creates a vice-leader rank")
+            .id;
+        let member_rank_id = ranks
+            .iter()
+            .find(|rank| rank.level == 1)
+            .expect("guild creates a member rank")
+            .id;
+
+        assert_eq!(
+            database.add_guild_member(guild.id, 8).unwrap(),
+            GuildMembershipRecord {
+                player_id: 8,
+                guild_id: guild.id,
+                rank_id: member_rank_id,
+                nick: String::new(),
+            }
+        );
+        assert!(matches!(
+            database.add_guild_member(guild.id, 8),
+            Err(PersistenceError::GuildMemberAlreadyAssigned(8))
+        ));
+        assert_eq!(
+            database
+                .assign_guild_member_rank(guild.id, 8, vice_rank_id)
+                .unwrap(),
+            GuildMembershipRecord {
+                player_id: 8,
+                guild_id: guild.id,
+                rank_id: vice_rank_id,
+                nick: String::new(),
+            }
+        );
+
+        let other = database.create_guild(9, "Other", "").unwrap();
+        let other_rank = database.guild_ranks(other.id).unwrap()[0].id;
+        assert!(matches!(
+            database.assign_guild_member_rank(guild.id, 8, other_rank),
+            Err(PersistenceError::GuildRankOutsideGuild { guild_id, rank_id })
+                if guild_id == guild.id && rank_id == other_rank
+        ));
+        assert!(matches!(
+            database.remove_guild_member(guild.id, 7),
+            Err(PersistenceError::GuildOwnerCannotLeave { guild_id, player_id })
+                if guild_id == guild.id && player_id == 7
+        ));
+        assert!(matches!(
+            database.remove_guild_member(other.id, 8),
+            Err(PersistenceError::UnknownGuildMember { guild_id, player_id })
+                if guild_id == other.id && player_id == 8
+        ));
+
+        database.remove_guild_member(guild.id, 8).unwrap();
+        assert_eq!(database.guild_membership(8).unwrap(), None);
+        assert!(matches!(
+            database.remove_guild_member(guild.id, 8),
+            Err(PersistenceError::UnknownGuildMember { guild_id, player_id })
+                if guild_id == guild.id && player_id == 8
+        ));
+        assert!(matches!(
+            database.add_guild_member(guild.id, 999),
+            Err(PersistenceError::UnknownPlayer(999))
         ));
         let _ = fs::remove_file(path);
     }
