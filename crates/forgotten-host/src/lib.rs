@@ -5161,6 +5161,18 @@ fn handle_native_otclient_game(
                         );
                         continue;
                     }
+                    if !native_legacy_slot_types_allow_equipment_slot(
+                        config.item_slot_types_by_server_id.as_deref(),
+                        item.server_id,
+                        target_slot,
+                    ) {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-container-item-slot-type-mismatch",
+                        );
+                        continue;
+                    }
                     shared_world.move_container_item_to_equipment(
                         character.id,
                         container_id,
