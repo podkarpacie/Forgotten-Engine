@@ -19,11 +19,14 @@ pub const MAX_SANDBOXED_LUA_INSTRUCTIONS: u32 = 10_000;
 pub const MAX_SANDBOXED_LUA_CALLBACKS: usize = 64;
 pub const MAX_SANDBOXED_LUA_CALLBACK_NAME_BYTES: usize = 64;
 pub const MAX_SANDBOXED_LUA_CALLBACK_EVENT_KIND_BYTES: usize = 64;
+pub const MAX_SANDBOXED_LUA_TABLE_CREATE_ARRAY_CAPACITY: usize = 256;
+pub const MAX_SANDBOXED_LUA_TABLE_CREATE_RECORD_CAPACITY: usize = 256;
 const INSTRUCTION_LIMIT_MARKER: &str = "forgotten-engine-sandbox-instruction-limit";
 
 /// Explicit limits for one side-effect-free Lua expression evaluation. The executor creates a
-/// fresh VM per call with no standard libraries, so it offers no file, network, process, package,
-/// debug, or host API surface.
+/// fresh VM per call with no standard libraries. The sole installed compatibility helper is a
+/// VM-local, capacity-capped `table.create`; the sandbox offers no file, network, process,
+/// package, debug, or mutable host API surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SandboxedLuaLimits {
     pub max_source_bytes: usize,
@@ -130,6 +133,9 @@ impl SandboxedLuaExecutor {
             Err(_) => return rejected_runtime_outcome(0),
         };
         if lua.set_memory_limit(self.limits.max_memory_bytes).is_err() {
+            return rejected_runtime_outcome(0);
+        }
+        if install_sandboxed_tfs_compatibility_globals(&lua).is_err() {
             return rejected_runtime_outcome(0);
         }
         let instruction_checks = Arc::new(AtomicU32::new(0));
@@ -379,6 +385,9 @@ impl SandboxedLuaCallbackDispatcher {
         if lua.set_memory_limit(self.limits.max_memory_bytes).is_err() {
             return rejected_callback_outcome(0);
         }
+        if install_sandboxed_tfs_compatibility_globals(&lua).is_err() {
+            return rejected_callback_outcome(0);
+        }
         let instruction_checks = Arc::new(AtomicU32::new(0));
         let hook_checks = Arc::clone(&instruction_checks);
         let instruction_limit = self.limits.max_instructions;
@@ -439,6 +448,28 @@ fn rejected_runtime_outcome(instruction_checks: u32) -> SandboxedLuaOutcome {
         value: None,
         instruction_checks,
     }
+}
+
+fn install_sandboxed_tfs_compatibility_globals(lua: &Lua) -> Result<(), mlua::Error> {
+    let create_table =
+        lua.create_function(|lua, (array_capacity, record_capacity): (i64, i64)| {
+            let array_capacity = usize::try_from(array_capacity)
+                .ok()
+                .filter(|capacity| *capacity <= MAX_SANDBOXED_LUA_TABLE_CREATE_ARRAY_CAPACITY)
+                .ok_or_else(|| {
+                    mlua::Error::RuntimeError("invalid sandbox table array capacity".into())
+                })?;
+            let record_capacity = usize::try_from(record_capacity)
+                .ok()
+                .filter(|capacity| *capacity <= MAX_SANDBOXED_LUA_TABLE_CREATE_RECORD_CAPACITY)
+                .ok_or_else(|| {
+                    mlua::Error::RuntimeError("invalid sandbox table record capacity".into())
+                })?;
+            lua.create_table_with_capacity(array_capacity, record_capacity)
+        })?;
+    let table = lua.create_table()?;
+    table.set("create", create_table)?;
+    lua.globals().set("table", table)
 }
 
 fn sandboxed_lua_value(value: Value) -> Option<SandboxedLuaValue> {
@@ -657,7 +688,13 @@ mod tests {
                 "return function(_, _, _) counter = (counter or 0) + 1 return counter end",
             )
             .unwrap();
-        assert_eq!(dispatcher.len(), 2);
+        dispatcher
+            .register_callback(
+                "table-create",
+                "return function(_, _, value) local t = table.create(1, 1) t[1] = value return t[1] end",
+            )
+            .unwrap();
+        assert_eq!(dispatcher.len(), 3);
         assert!(!dispatcher.is_empty());
 
         let input = SandboxedLuaCallbackInput {
@@ -674,6 +711,12 @@ mod tests {
         let second = dispatcher.dispatch("fresh-state", &input);
         assert_eq!(first.value, Some(SandboxedLuaValue::Integer(1)));
         assert_eq!(second.value, Some(SandboxedLuaValue::Integer(1)));
+
+        let table_create = dispatcher.dispatch("table-create", &input);
+        assert_eq!(
+            table_create.value,
+            Some(SandboxedLuaValue::Integer(input.value))
+        );
 
         let missing = dispatcher.dispatch("missing", &input);
         assert_eq!(
@@ -837,6 +880,18 @@ mod tests {
             Some(SandboxedLuaValue::Text("fe-sandbox".into()))
         );
         assert!(text.instruction_checks > 0);
+
+        let table_create = executor.execute_expression(
+            "(function() local t = table.create(2, 1); t[1] = 42; t.answer = 7; return t[1] + t.answer end)()",
+        );
+        assert_eq!(table_create.state, SandboxedLuaExecutionState::Completed);
+        assert_eq!(table_create.value, Some(SandboxedLuaValue::Integer(49)));
+
+        let oversized_table = executor.execute_expression("table.create(257, 0)");
+        assert_eq!(
+            oversized_table.state,
+            SandboxedLuaExecutionState::RuntimeRejected
+        );
 
         let io = executor.execute_expression("io");
         assert_eq!(io.state, SandboxedLuaExecutionState::Completed);

@@ -56,6 +56,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [x] Bind validated declarative weapons only to authoritative right-hand equipment on the profile-approved native selected-melee path, without executing scripts.
 - [ ] Add verified profile-specific action paths and legacy-compatible semantics without claiming unverified TFS behavior.
 - [x] Define typed bounded spell-cast resource and cooldown accounting with no packet, target, formula, effect, or script behavior.
+- [x] Expose only a VM-local capacity-capped TFS-style `table.create` helper in FE’s fresh no-standard-library Lua expression and callback sandboxes. It cannot return tables across the existing primitive boundary or access host state, I/O, packages, TFS userdata, event routing, or gameplay mutation.
 - [x] Parse bounded FE-owned scriptless spell declarations that construct typed mana-and-cooldown events.
 - [x] Establish a direct side-effect-free Lua expression sandbox with no standard libraries, typed primitive-only output, and bounded source/memory/instruction limits; imported script execution, callbacks, and APIs remain deferred.
 - [x] Load the optional declarative spell catalog as immutable native-host input without enabling any client cast path.
