@@ -31,9 +31,11 @@ const SCHEMA_VERSION_STATIC_CREATURE_REACTIVATION: i64 = 13;
 const SCHEMA_VERSION_MAP_ITEM_JOURNAL: i64 = 14;
 const SCHEMA_VERSION_STATIC_CREATURE_DAMAGE_SEQUENCE: i64 = 15;
 const SCHEMA_VERSION_STATIC_CREATURE_MELEE_COOLDOWN: i64 = 16;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_STATIC_CREATURE_MELEE_COOLDOWN;
+const SCHEMA_VERSION_ACCOUNT_VIP_ENTRIES: i64 = 17;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_ACCOUNT_VIP_ENTRIES;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
+pub const MAX_VIP_DESCRIPTION_BYTES: usize = 128;
 
 pub struct EngineDatabase {
     connection: Connection,
@@ -61,6 +63,17 @@ pub struct StaticCreatureRuntimeRecord {
 pub struct MapItemRemovalJournal {
     pub map_revision: WorldMapSourceRevision,
     pub removed_items: Vec<WorldMapItemSourceIdentity>,
+}
+
+/// One bounded account-owned VIP entry. It retains only validated persisted-player identity and
+/// metadata; online status, notifications, quotas, client delivery, and policy remain separate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountVipEntry {
+    pub target_player_id: u64,
+    pub target_player_name: String,
+    pub description: String,
+    pub icon: u32,
+    pub notify: bool,
 }
 
 /// The complete accepted authoritative state that must be persisted together after a bounded
@@ -258,6 +271,136 @@ impl EngineDatabase {
             .into_iter()
             .find(|character| character.id == player_id)
             .ok_or(PersistenceError::UnknownPlayer(player_id))
+    }
+
+    /// Adds one exact persisted character to an account-owned VIP list. The target name is matched
+    /// against persisted character identity, not an online session or account name.
+    pub fn add_account_vip_entry(
+        &self,
+        account_id: u32,
+        target_player_name: &str,
+        description: &str,
+        icon: u32,
+        notify: bool,
+    ) -> Result<AccountVipEntry, PersistenceError> {
+        self.ensure_account_exists(account_id)?;
+        let description = validated_vip_description(description)?;
+        let target_player_name = validated_vip_target_name(target_player_name)?;
+        let (target_player_id, target_player_name) = self
+            .connection
+            .query_row(
+                "SELECT id, name FROM players WHERE name = ?1",
+                params![target_player_name],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| PersistenceError::UnknownVipTarget(target_player_name.to_owned()))?;
+        let exists = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_vip_entries WHERE account_id = ?1 AND player_id = ?2)",
+            params![account_id as i64, target_player_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if exists {
+            return Err(PersistenceError::DuplicateVipEntry {
+                account_id,
+                target_player_id,
+            });
+        }
+        self.connection.execute(
+            "INSERT INTO account_vip_entries (account_id, player_id, description, icon, notify) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                account_id as i64,
+                target_player_id as i64,
+                description,
+                icon as i64,
+                if notify { 1_i64 } else { 0_i64 },
+            ],
+        )?;
+        Ok(AccountVipEntry {
+            target_player_id,
+            target_player_name,
+            description: description.to_owned(),
+            icon,
+            notify,
+        })
+    }
+
+    /// Lists one account's persisted VIP metadata in deterministic target-name and ID order.
+    pub fn account_vip_entries(
+        &self,
+        account_id: u32,
+    ) -> Result<Vec<AccountVipEntry>, PersistenceError> {
+        self.ensure_account_exists(account_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT vip.player_id, player.name, vip.description, vip.icon, vip.notify \
+             FROM account_vip_entries AS vip \
+             JOIN players AS player ON player.id = vip.player_id \
+             WHERE vip.account_id = ?1 \
+             ORDER BY player.name COLLATE NOCASE, vip.player_id",
+        )?;
+        let entries = statement
+            .query_map(params![account_id as i64], |row| {
+                Ok(AccountVipEntry {
+                    target_player_id: row.get::<_, i64>(0)? as u64,
+                    target_player_name: row.get(1)?,
+                    description: row.get(2)?,
+                    icon: row.get::<_, i64>(3)? as u32,
+                    notify: row.get::<_, i64>(4)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::Sql)?;
+        Ok(entries)
+    }
+
+    /// Replaces metadata only for an existing account-owned VIP target.
+    pub fn edit_account_vip_entry(
+        &self,
+        account_id: u32,
+        target_player_id: u64,
+        description: &str,
+        icon: u32,
+        notify: bool,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_account_exists(account_id)?;
+        let description = validated_vip_description(description)?;
+        let affected = self.connection.execute(
+            "UPDATE account_vip_entries SET description = ?1, icon = ?2, notify = ?3 WHERE account_id = ?4 AND player_id = ?5",
+            params![
+                description,
+                icon as i64,
+                if notify { 1_i64 } else { 0_i64 },
+                account_id as i64,
+                target_player_id as i64,
+            ],
+        )?;
+        if affected == 0 {
+            return Err(PersistenceError::UnknownVipEntry {
+                account_id,
+                target_player_id,
+            });
+        }
+        Ok(())
+    }
+
+    /// Removes one existing account-owned VIP target without deleting its persisted character.
+    pub fn remove_account_vip_entry(
+        &self,
+        account_id: u32,
+        target_player_id: u64,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_account_exists(account_id)?;
+        let affected = self.connection.execute(
+            "DELETE FROM account_vip_entries WHERE account_id = ?1 AND player_id = ?2",
+            params![account_id as i64, target_player_id as i64],
+        )?;
+        if affected == 0 {
+            return Err(PersistenceError::UnknownVipEntry {
+                account_id,
+                target_player_id,
+            });
+        }
+        Ok(())
     }
 
     pub fn save_player(&self, player: &Player) -> Result<(), PersistenceError> {
@@ -1932,6 +2075,15 @@ impl EngineDatabase {
                 ],
             )?;
         }
+        if self.schema_version()? < SCHEMA_VERSION_ACCOUNT_VIP_ENTRIES {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS account_vip_entries (account_id INTEGER NOT NULL, player_id INTEGER NOT NULL, description TEXT NOT NULL, icon INTEGER NOT NULL, notify INTEGER NOT NULL, PRIMARY KEY (account_id, player_id));",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_ACCOUNT_VIP_ENTRIES, unix_seconds()],
+            )?;
+        }
         Ok(())
     }
 
@@ -1945,6 +2097,19 @@ impl EngineDatabase {
             Ok(())
         } else {
             Err(PersistenceError::UnknownPlayer(player_id))
+        }
+    }
+
+    fn ensure_account_exists(&self, account_id: u32) -> Result<(), PersistenceError> {
+        let exists = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1)",
+            params![account_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if exists {
+            Ok(())
+        } else {
+            Err(PersistenceError::UnknownAccount(account_id))
         }
     }
 
@@ -2161,6 +2326,24 @@ fn player_skills_from_record(record: [i64; 14]) -> Result<PlayerSkills, Persiste
     Ok(skills)
 }
 
+fn validated_vip_target_name(value: &str) -> Result<&str, PersistenceError> {
+    if value.trim().is_empty() || value.len() > 32 {
+        return Err(PersistenceError::InvalidVipEntry(
+            "target player name must be nonempty and at most 32 bytes".into(),
+        ));
+    }
+    Ok(value)
+}
+
+fn validated_vip_description(value: &str) -> Result<&str, PersistenceError> {
+    if value.len() > MAX_VIP_DESCRIPTION_BYTES {
+        return Err(PersistenceError::InvalidVipEntry(format!(
+            "description exceeds {MAX_VIP_DESCRIPTION_BYTES} bytes"
+        )));
+    }
+    Ok(value)
+}
+
 fn sqlite_progression_attempt(value: u64) -> Result<i64, PersistenceError> {
     i64::try_from(value).map_err(|_| {
         PersistenceError::InvalidProgressionAttemptRecord(
@@ -2206,8 +2389,18 @@ pub enum PersistenceError {
     InvalidLifecycleRecord(String),
     InvalidStaticCreatureRuntimeRecord(String),
     InvalidMapItemJournal(String),
+    InvalidVipEntry(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
+    UnknownVipTarget(String),
+    DuplicateVipEntry {
+        account_id: u32,
+        target_player_id: u64,
+    },
+    UnknownVipEntry {
+        account_id: u32,
+        target_player_id: u64,
+    },
 }
 
 impl From<std::io::Error> for PersistenceError {
@@ -2246,6 +2439,115 @@ mod tests {
         let path = temporary_path("migration");
         let database = EngineDatabase::open(&path).unwrap();
         assert_eq!(database.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_validates_edits_and_removes_account_vip_entries() {
+        let path = temporary_path("account-vip-entries");
+        let database = EngineDatabase::open(&path).unwrap();
+        let owner_account = database.create_account("owner", "hash").unwrap() as u32;
+        let target_account = database.create_account("target", "hash").unwrap() as u32;
+        let druid = database
+            .create_player_for_account(target_account, "Druid")
+            .unwrap();
+        let sorcerer = database
+            .create_player_for_account(target_account, "Sorcerer")
+            .unwrap();
+
+        assert_eq!(
+            database.account_vip_entries(owner_account).unwrap(),
+            Vec::new()
+        );
+        let added = database
+            .add_account_vip_entry(owner_account, "Druid", "friend", 4, true)
+            .unwrap();
+        assert_eq!(
+            added,
+            AccountVipEntry {
+                target_player_id: druid.id,
+                target_player_name: "Druid".into(),
+                description: "friend".into(),
+                icon: 4,
+                notify: true,
+            }
+        );
+        database
+            .add_account_vip_entry(owner_account, "Sorcerer", "trade", 2, false)
+            .unwrap();
+        assert_eq!(
+            database.account_vip_entries(owner_account).unwrap(),
+            vec![
+                added.clone(),
+                AccountVipEntry {
+                    target_player_id: sorcerer.id,
+                    target_player_name: "Sorcerer".into(),
+                    description: "trade".into(),
+                    icon: 2,
+                    notify: false,
+                },
+            ]
+        );
+        assert!(matches!(
+            database.add_account_vip_entry(owner_account, "druid", "", 0, false),
+            Err(PersistenceError::UnknownVipTarget(name)) if name == "druid"
+        ));
+        assert!(matches!(
+            database.add_account_vip_entry(owner_account, "Druid", "", 0, false),
+            Err(PersistenceError::DuplicateVipEntry {
+                account_id,
+                target_player_id,
+            }) if account_id == owner_account && target_player_id == druid.id
+        ));
+        assert!(matches!(
+            database.add_account_vip_entry(
+                owner_account,
+                "Druid",
+                &"x".repeat(MAX_VIP_DESCRIPTION_BYTES + 1),
+                0,
+                false,
+            ),
+            Err(PersistenceError::InvalidVipEntry(_))
+        ));
+
+        database
+            .edit_account_vip_entry(owner_account, druid.id, "best friend", 9, false)
+            .unwrap();
+        assert_eq!(
+            database.account_vip_entries(owner_account).unwrap()[0],
+            AccountVipEntry {
+                target_player_id: druid.id,
+                target_player_name: "Druid".into(),
+                description: "best friend".into(),
+                icon: 9,
+                notify: false,
+            }
+        );
+        assert!(matches!(
+            database.edit_account_vip_entry(owner_account, 999, "", 0, false),
+            Err(PersistenceError::UnknownVipEntry {
+                account_id,
+                target_player_id: 999,
+            }) if account_id == owner_account
+        ));
+        database
+            .remove_account_vip_entry(owner_account, druid.id)
+            .unwrap();
+        assert_eq!(
+            database.account_vip_entries(owner_account).unwrap().len(),
+            1
+        );
+        assert!(matches!(
+            database.remove_account_vip_entry(owner_account, druid.id),
+            Err(PersistenceError::UnknownVipEntry {
+                account_id,
+                target_player_id,
+            }) if account_id == owner_account && target_player_id == druid.id
+        ));
+        assert!(matches!(
+            database.account_vip_entries(9_999),
+            Err(PersistenceError::UnknownAccount(9_999))
+        ));
         let _ = fs::remove_file(path);
     }
 
