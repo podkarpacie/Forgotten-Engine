@@ -43,10 +43,11 @@ use forgotten_protocol::{
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_channel_list,
     encode_native_otclient_character_list, encode_native_otclient_choose_outfit,
-    encode_native_otclient_clear_target, encode_native_otclient_close_container,
-    encode_native_otclient_creature_health, encode_native_otclient_creature_outfit,
-    encode_native_otclient_delete_inventory, encode_native_otclient_empty_quest_log,
-    encode_native_otclient_game_cancel_walk_facing, encode_native_otclient_game_death,
+    encode_native_otclient_classic_vip_entry, encode_native_otclient_clear_target,
+    encode_native_otclient_close_container, encode_native_otclient_creature_health,
+    encode_native_otclient_creature_outfit, encode_native_otclient_delete_inventory,
+    encode_native_otclient_empty_quest_log, encode_native_otclient_game_cancel_walk_facing,
+    encode_native_otclient_game_death,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
@@ -814,6 +815,21 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
                 request.message.len()
             )
         }
+        NativeOtClientGameAction::AddVip(name) => {
+            format!("action=vip-add target-name-bytes={}", name.len())
+        }
+        NativeOtClientGameAction::RemoveVip(target_player_id) => {
+            format!("action=vip-remove target-player-id={target_player_id}")
+        }
+        NativeOtClientGameAction::EditVip {
+            target_player_id,
+            description,
+            icon,
+            notify,
+        } => format!(
+            "action=vip-edit target-player-id={target_player_id} description-bytes={} icon={icon} notify={notify}",
+            description.len()
+        ),
         NativeOtClientGameAction::ThrowItem {
             source_position,
             source_client_thing_id,
@@ -4834,6 +4850,83 @@ fn handle_native_otclient_game(
                     .map_err(HostError::Protocol)?,
             )?,
             NativeOtClientGameAction::PingBack | NativeOtClientGameAction::EnterGame => {}
+            NativeOtClientGameAction::AddVip(target_player_name) => {
+                let entry = match database.add_account_vip_entry(
+                    request.account_id,
+                    &target_player_name,
+                    "",
+                    0,
+                    false,
+                ) {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=vip-add outcome=rejected",
+                        );
+                        continue;
+                    }
+                };
+                let target_player_id = match u32::try_from(entry.target_player_id) {
+                    Ok(target_player_id) if target_player_id != 0 => target_player_id,
+                    _ => {
+                        let _ = database
+                            .remove_account_vip_entry(request.account_id, entry.target_player_id);
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=vip-add outcome=deferred-target-id-out-of-classic-range",
+                        );
+                        continue;
+                    }
+                };
+                write_frame(
+                    stream,
+                    &encode_native_otclient_classic_vip_entry(
+                        &config.client_profile,
+                        target_player_id,
+                        &entry.target_player_name,
+                        false,
+                    )
+                    .map_err(HostError::Protocol)?,
+                )?;
+            }
+            NativeOtClientGameAction::RemoveVip(target_player_id) => {
+                if database
+                    .remove_account_vip_entry(request.account_id, u64::from(target_player_id))
+                    .is_err()
+                {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=vip-remove outcome=rejected",
+                    );
+                }
+            }
+            NativeOtClientGameAction::EditVip {
+                target_player_id,
+                description,
+                icon,
+                notify,
+            } => {
+                if database
+                    .edit_account_vip_entry(
+                        request.account_id,
+                        u64::from(target_player_id),
+                        &description,
+                        icon,
+                        notify,
+                    )
+                    .is_err()
+                {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=vip-edit outcome=rejected",
+                    );
+                }
+            }
             NativeOtClientGameAction::ThrowItem {
                 source_position,
                 source_client_thing_id,
@@ -14444,6 +14537,155 @@ mod tests {
         drop(knight);
         drop(druid);
         game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_classic_vip_add_edit_and_remove_are_authenticated_and_persisted() {
+        let database_path = database_path("native-classic-vip");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        for (id, name) in [(1, "Knight"), (2, "Druid")] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: account_id as u64,
+                    name: name.into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_ADD_VIP,
+                5,
+                0,
+                b'D',
+                b'r',
+                b'u',
+                b'i',
+                b'd',
+            ]),
+        )
+        .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let vip_add = (0..4)
+            .map(|_| read_frame(&mut stream).unwrap())
+            .find(|frame| {
+                frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_VIP_ADD)
+            })
+            .expect("native VIP add response was not delivered");
+        assert_eq!(
+            vip_add.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_VIP_ADD,
+                2,
+                0,
+                0,
+                0,
+                5,
+                0,
+                b'D',
+                b'r',
+                b'u',
+                b'i',
+                b'd',
+                0,
+            ]
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_EDIT_VIP,
+                2,
+                0,
+                0,
+                0,
+                4,
+                0,
+                b'n',
+                b'o',
+                b't',
+                b'e',
+                3,
+                0,
+                0,
+                0,
+                1,
+            ]),
+        )
+        .unwrap();
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_PING_BACK]
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_REMOVE_VIP,
+                2,
+                0,
+                0,
+                0,
+            ]),
+        )
+        .unwrap();
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_PING_BACK]
+        );
+
+        drop(stream);
+        game.shutdown().unwrap();
+        let database = EngineDatabase::open(&database_path).unwrap();
+        assert!(database
+            .account_vip_entries(account_id.try_into().unwrap())
+            .unwrap()
+            .is_empty());
         let _ = fs::remove_file(database_path);
     }
 

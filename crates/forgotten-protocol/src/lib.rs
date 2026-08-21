@@ -868,6 +868,8 @@ pub const NATIVE_OTCLIENT_GAME_TEXT_MESSAGE: u8 = 0xb4;
 pub const NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT: u8 = 0x15;
 pub const NATIVE_OTCLIENT_MESSAGE_SAY: u8 = 0x01;
 pub const NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT: u8 = 0xc8;
+pub const NATIVE_OTCLIENT_GAME_VIP_ADD: u8 = 0xd2;
+pub const NATIVE_OTCLIENT_GAME_VIP_STATE: u8 = 0xd3;
 pub const NATIVE_OTCLIENT_GAME_CANCEL_WALK: u8 = 0xb5;
 pub const NATIVE_OTCLIENT_ENTER_GAME: u8 = 0x0f;
 pub const NATIVE_OTCLIENT_LEAVE_GAME: u8 = 0x14;
@@ -907,6 +909,9 @@ pub const NATIVE_OTCLIENT_CLIENT_LOOK_MAP: u8 = 0x8c;
 pub const NATIVE_OTCLIENT_CLIENT_LOOK_CREATURE: u8 = 0x8d;
 pub const NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT: u8 = 0xd2;
 pub const NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT: u8 = 0xd3;
+pub const NATIVE_OTCLIENT_CLIENT_ADD_VIP: u8 = 0xdc;
+pub const NATIVE_OTCLIENT_CLIENT_REMOVE_VIP: u8 = 0xdd;
+pub const NATIVE_OTCLIENT_CLIENT_EDIT_VIP: u8 = 0xde;
 pub const NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG: u8 = 0xf0;
 pub const NATIVE_OTCLIENT_GAME_QUEST_LOG: u8 = 0xf0;
 pub const NATIVE_OTCLIENT_GAME_CHANNELS: u8 = 0xab;
@@ -1268,6 +1273,14 @@ pub enum NativeOtClientGameAction {
     RequestChannels,
     JoinChannel(u16),
     LeaveChannel(u16),
+    AddVip(String),
+    RemoveVip(u32),
+    EditVip {
+        target_player_id: u32,
+        description: String,
+        icon: u32,
+        notify: bool,
+    },
     ChangeOutfit(NativeOtClientClassicOutfit),
     CloseContainer(u8),
     UpArrowContainer(u8),
@@ -2303,6 +2316,26 @@ pub fn decode_native_otclient_game_action(
         NATIVE_OTCLIENT_CLIENT_LEAVE_CHANNEL => {
             NativeOtClientGameAction::LeaveChannel(reader.u16()?)
         }
+        NATIVE_OTCLIENT_CLIENT_ADD_VIP => {
+            NativeOtClientGameAction::AddVip(reader.string(MAX_LOGIN_STRING_BYTES)?)
+        }
+        NATIVE_OTCLIENT_CLIENT_REMOVE_VIP => NativeOtClientGameAction::RemoveVip(reader.u32()?),
+        NATIVE_OTCLIENT_CLIENT_EDIT_VIP => {
+            let target_player_id = reader.u32()?;
+            let description = reader.string(MAX_LOGIN_STRING_BYTES)?;
+            let icon = reader.u32()?;
+            let notify = match reader.byte()? {
+                0 => false,
+                1 => true,
+                _ => return Err(ProtocolError::InvalidNativeGameRequest),
+            };
+            NativeOtClientGameAction::EditVip {
+                target_player_id,
+                description,
+                icon,
+                notify,
+            }
+        }
         NATIVE_OTCLIENT_CLIENT_TALK => {
             let mode = reader.byte()?;
             let (channel_id, recipient, message) = match mode {
@@ -2499,6 +2532,34 @@ pub fn encode_native_otclient_channel_list(
         writer.u16(channel.id);
         writer.string(&channel.name);
     }
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes one classic 740 VIP entry for the profile's no-additional-info parser branch. The
+/// record contains only the character ID, name, and explicit online/offline status; description,
+/// icon, notification, and VIP group fields belong to later client features.
+pub fn encode_native_otclient_classic_vip_entry(
+    profile: &NativeOtClientProfile,
+    target_player_id: u32,
+    target_player_name: &str,
+    online: bool,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records()
+        || target_player_id == 0
+        || target_player_name.is_empty()
+        || target_player_name.len() > MAX_LOGIN_STRING_BYTES
+    {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let fixed_bytes = 8usize;
+    if target_player_name.len() + fixed_bytes > MAX_FRAME_SIZE {
+        return Err(ProtocolError::StringTooLong(target_player_name.len()));
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_VIP_ADD);
+    writer.u32(target_player_id);
+    writer.string(target_player_name);
+    writer.byte(u8::from(online));
     Ok(Frame(writer.finish()))
 }
 
@@ -4191,6 +4252,78 @@ mod tests {
             .unwrap(),
             NativeOtClientGameAction::LeaveChannel(7)
         );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![
+                    NATIVE_OTCLIENT_CLIENT_ADD_VIP,
+                    5,
+                    0,
+                    b'D',
+                    b'r',
+                    b'u',
+                    b'i',
+                    b'd',
+                ]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::AddVip("Druid".into())
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_REMOVE_VIP, 7, 0, 0, 0]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::RemoveVip(7)
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![
+                    NATIVE_OTCLIENT_CLIENT_EDIT_VIP,
+                    7,
+                    0,
+                    0,
+                    0,
+                    4,
+                    0,
+                    b'n',
+                    b'o',
+                    b't',
+                    b'e',
+                    3,
+                    0,
+                    0,
+                    0,
+                    1,
+                ]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::EditVip {
+                target_player_id: 7,
+                description: "note".into(),
+                icon: 3,
+                notify: true,
+            }
+        );
+        assert!(decode_native_otclient_game_action(
+            &Frame(vec![
+                NATIVE_OTCLIENT_CLIENT_EDIT_VIP,
+                7,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                2,
+            ]),
+            &profile,
+        )
+        .is_err());
         assert!(decode_native_otclient_game_action(
             &Frame(vec![NATIVE_OTCLIENT_CLIENT_JOIN_CHANNEL, 7]),
             &profile,
@@ -4220,6 +4353,26 @@ mod tests {
                 .unwrap()
                 .0,
             vec![NATIVE_OTCLIENT_GAME_CHANNELS, 0]
+        );
+        assert_eq!(
+            encode_native_otclient_classic_vip_entry(&profile, 7, "Druid", false)
+                .unwrap()
+                .0,
+            vec![
+                NATIVE_OTCLIENT_GAME_VIP_ADD,
+                7,
+                0,
+                0,
+                0,
+                5,
+                0,
+                b'D',
+                b'r',
+                b'u',
+                b'i',
+                b'd',
+                0,
+            ]
         );
         assert_eq!(
             encode_native_otclient_channel_list(
