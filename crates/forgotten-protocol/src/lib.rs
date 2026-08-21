@@ -1277,6 +1277,14 @@ pub enum NativeOtClientGameAction {
     DiagonalMove(NativeOtClientAutoWalkDirection),
 }
 
+/// One classic channel-list entry prepared by an authoritative caller. The protocol layer only
+/// serializes a bounded list; it does not model joining, membership, messages, or permissions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeOtClientClassicChannel {
+    pub id: u16,
+    pub name: String,
+}
+
 /// Parsed classic fight-mode intent. This is an inbound state request only; its use in combat and
 /// client output must be established separately by the host and profile-specific evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2371,10 +2379,30 @@ pub fn encode_native_otclient_empty_quest_log(
 pub fn encode_native_otclient_empty_channel_list(
     profile: &NativeOtClientProfile,
 ) -> Result<Frame, ProtocolError> {
+    encode_native_otclient_channel_list(profile, &[])
+}
+
+/// Encodes one bounded classic 7.4 channel list. The entries must originate from a validated
+/// authoritative catalog; membership and social-system behavior are outside this codec.
+pub fn encode_native_otclient_channel_list(
+    profile: &NativeOtClientProfile,
+    channels: &[NativeOtClientClassicChannel],
+) -> Result<Frame, ProtocolError> {
     if !profile.supports_current_native_foundation() {
         return Err(ProtocolError::UnsupportedNativeClientProfile);
     }
-    Ok(Frame(vec![NATIVE_OTCLIENT_GAME_CHANNELS, 0]))
+    let count = u8::try_from(channels.len()).map_err(|_| ProtocolError::TooManyChannels)?;
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_CHANNELS);
+    writer.byte(count);
+    for channel in channels {
+        if channel.name.len() > u16::MAX as usize {
+            return Err(ProtocolError::StringTooLong(channel.name.len()));
+        }
+        writer.u16(channel.id);
+        writer.string(&channel.name);
+    }
+    Ok(Frame(writer.finish()))
 }
 
 pub fn encode_native_otclient_game_cancel_walk(
@@ -2684,6 +2712,7 @@ pub enum ProtocolError {
     InvalidNativeGameRequest,
     UnsupportedNativeClientProfile,
     TooManyCharacters,
+    TooManyChannels,
     UnsupportedAddressFamily,
     StringTooLong(usize),
     InvalidString,
@@ -4047,6 +4076,50 @@ mod tests {
                 .unwrap()
                 .0,
             vec![NATIVE_OTCLIENT_GAME_CHANNELS, 0]
+        );
+        assert_eq!(
+            encode_native_otclient_channel_list(
+                &profile,
+                &[
+                    NativeOtClientClassicChannel {
+                        id: 1,
+                        name: "World Chat".into(),
+                    },
+                    NativeOtClientClassicChannel {
+                        id: 7,
+                        name: "Trade".into(),
+                    },
+                ],
+            )
+            .unwrap()
+            .0,
+            vec![
+                NATIVE_OTCLIENT_GAME_CHANNELS,
+                2,
+                1,
+                0,
+                10,
+                0,
+                b'W',
+                b'o',
+                b'r',
+                b'l',
+                b'd',
+                b' ',
+                b'C',
+                b'h',
+                b'a',
+                b't',
+                7,
+                0,
+                5,
+                0,
+                b'T',
+                b'r',
+                b'a',
+                b'd',
+                b'e',
+            ]
         );
         assert_eq!(
             decode_native_otclient_game_action(

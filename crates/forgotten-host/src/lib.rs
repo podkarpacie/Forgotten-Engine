@@ -2,7 +2,10 @@
 //!
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
-use forgotten_config::{DeclarativeSpellCatalog, DeclarativeWeaponCatalog, LegacyItemSlotType};
+use forgotten_config::{
+    DeclarativeSpellCatalog, DeclarativeWeaponCatalog, LegacyItemSlotType,
+    LegacyPublicChannelCatalog,
+};
 use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
     EquipmentSlot, ExperienceAwardPolicy, FeTfsStaticSpawnCollection, ItemInstance,
@@ -38,11 +41,11 @@ use forgotten_protocol::{
     encode_fe_otclient_initial_world, encode_fe_otclient_movement_ack,
     encode_fe_otclient_world_tick, encode_legacy_74_character_list,
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
-    encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_character_list,
-    encode_native_otclient_choose_outfit, encode_native_otclient_clear_target,
-    encode_native_otclient_close_container, encode_native_otclient_creature_health,
-    encode_native_otclient_creature_outfit, encode_native_otclient_delete_inventory,
-    encode_native_otclient_empty_channel_list, encode_native_otclient_empty_quest_log,
+    encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_channel_list,
+    encode_native_otclient_character_list, encode_native_otclient_choose_outfit,
+    encode_native_otclient_clear_target, encode_native_otclient_close_container,
+    encode_native_otclient_creature_health, encode_native_otclient_creature_outfit,
+    encode_native_otclient_delete_inventory, encode_native_otclient_empty_quest_log,
     encode_native_otclient_game_cancel_walk_facing, encode_native_otclient_game_death,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
@@ -58,7 +61,7 @@ use forgotten_protocol::{
     generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
     CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
     Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
-    NativeOtClientCardinalDirection, NativeOtClientClassicItemRecord,
+    NativeOtClientCardinalDirection, NativeOtClientClassicChannel, NativeOtClientClassicItemRecord,
     NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
     NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
     NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
@@ -414,6 +417,19 @@ fn native_map_item_use_creature_intent(
             native_target_creature_id,
         ));
     Some(PlayerItemUseCreatureIntent { source, target })
+}
+
+fn native_classic_channel_list_entries(
+    catalog: Option<&LegacyPublicChannelCatalog>,
+) -> Vec<NativeOtClientClassicChannel> {
+    catalog
+        .into_iter()
+        .flat_map(LegacyPublicChannelCatalog::iter)
+        .map(|channel| NativeOtClientClassicChannel {
+            id: channel.id,
+            name: channel.name.clone(),
+        })
+        .collect()
 }
 
 fn native_classic_equipment_frames(
@@ -947,6 +963,10 @@ pub struct NativeOtClientHostConfig {
     /// Validated operator-supplied server-to-client item metadata. It is retained for later
     /// parser-safe inventory delivery and does not itself enable inventory packets.
     pub item_presentation_catalog: Option<Arc<NativeItemPresentationCatalog>>,
+    /// Immutable validated public entries from `data/chatchannels/chatchannels.xml`. They are
+    /// emitted only by the native Request Channels reply and do not create membership, messaging,
+    /// scripts, moderation, persistence, guild, or party behavior.
+    pub public_channel_catalog: Option<Arc<LegacyPublicChannelCatalog>>,
     /// Immutable validated `items.xml` armor values for the explicit native armor-only bridge.
     /// Shielding, weapon defense, vocation multipliers, random armor, and TFS formula parity are
     /// deliberately excluded.
@@ -5745,15 +5765,19 @@ fn handle_native_otclient_game(
                 );
             }
             NativeOtClientGameAction::RequestChannels => {
-                let channels = encode_native_otclient_empty_channel_list(&config.client_profile)
-                    .map_err(HostError::Protocol)?;
+                let entries =
+                    native_classic_channel_list_entries(config.public_channel_catalog.as_deref());
+                let channels =
+                    encode_native_otclient_channel_list(&config.client_profile, &entries)
+                        .map_err(HostError::Protocol)?;
                 write_frame(stream, &channels)?;
                 native_diagnostic(
                     config.extended_diagnostics,
                     peer,
                     &format!(
-                        "outbound=channel-list-empty opcode=0xab bytes={}",
-                        channels.0.len()
+                        "outbound=channel-list opcode=0xab entries={} bytes={}",
+                        entries.len(),
+                        channels.0.len(),
                     ),
                 );
             }
@@ -7823,7 +7847,9 @@ impl std::error::Error for HostError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forgotten_config::{parse_declarative_spells_xml, parse_declarative_weapons_xml};
+    use forgotten_config::{
+        parse_declarative_spells_xml, parse_declarative_weapons_xml, parse_tfs_public_channels_xml,
+    };
     use forgotten_core::{Player, Position, WorldMapTile};
     use forgotten_protocol::FE_7_4_PROFILE;
     use std::fs;
@@ -7892,6 +7918,7 @@ mod tests {
             empty_world: None,
             world_map: None,
             item_presentation_catalog: None,
+            public_channel_catalog: None,
             item_armor_by_server_id: None,
             item_slot_types_by_server_id: None,
             item_weight_by_server_id: None,
@@ -7951,9 +7978,31 @@ mod tests {
         ));
         assert!(native_legacy_slot_types_allow_equipment_slot(
             None,
-            4526,
-            EquipmentSlot::Head,
+            9999,
+            EquipmentSlot::RightHand,
         ));
+    }
+
+    #[test]
+    fn native_channel_list_entries_use_only_validated_public_catalog_entries() {
+        let catalog = parse_tfs_public_channels_xml(
+            br#"<channels><channel id="7" name="Trade" public="true"/><channel id="2" name="Staff" public="false"/><channel id="1" name="World Chat" public="true"/></channels>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            native_classic_channel_list_entries(Some(&catalog)),
+            vec![
+                NativeOtClientClassicChannel {
+                    id: 1,
+                    name: "World Chat".into(),
+                },
+                NativeOtClientClassicChannel {
+                    id: 7,
+                    name: "Trade".into(),
+                },
+            ]
+        );
+        assert!(native_classic_channel_list_entries(None).is_empty());
     }
 
     fn native_world_map() -> Arc<WorldMap> {

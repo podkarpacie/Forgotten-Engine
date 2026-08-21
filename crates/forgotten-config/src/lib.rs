@@ -3,6 +3,7 @@
 //! The loader recognizes a deliberately limited `config.lua` assignment subset. It does not
 //! execute Lua; a sandboxed scripting runtime belongs to a later milestone.
 
+mod channels;
 mod items;
 mod legacy_xml;
 mod otbm;
@@ -25,6 +26,10 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+pub use channels::{
+    load_tfs_public_channel_catalog, parse_tfs_public_channels_xml, LegacyPublicChannelCatalog,
+    LegacyPublicChannelDefinition,
+};
 pub use items::{LegacyItemCatalog, LegacyItemDefinition, LegacyItemSlotType};
 pub use legacy_xml::{
     LegacyHouse, LegacySpawnArea, LegacySpawnCreature, LegacySpawnKind, LegacyWorldCompanionData,

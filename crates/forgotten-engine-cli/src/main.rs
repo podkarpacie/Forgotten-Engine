@@ -1,11 +1,12 @@
 use forgotten_config::{
     apply_legacy_item_metadata, ensure_content_skeleton, load, load_declarative_spell_catalog,
     load_declarative_weapon_catalog, load_legacy_item_catalog, load_tfs_content_inventory,
-    load_tfs_entity_catalog, load_tfs_vocation_registry, load_world_companions, load_world_map,
-    materialize_tfs_static_spawns, resolve_tfs_registry_script_reference,
-    resolve_tfs_spawn_references, validate_content, world_map_path, write_template,
-    DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig, LegacyWorldCompanionData,
-    TfsEntityCatalog, TfsRegistryCategory, TfsVocationRegistry,
+    load_tfs_entity_catalog, load_tfs_public_channel_catalog, load_tfs_vocation_registry,
+    load_world_companions, load_world_map, materialize_tfs_static_spawns,
+    resolve_tfs_registry_script_reference, resolve_tfs_spawn_references, validate_content,
+    world_map_path, write_template, DeclarativeSpellCatalog, DeclarativeWeaponCatalog,
+    EngineConfig, LegacyPublicChannelCatalog, LegacyWorldCompanionData, TfsEntityCatalog,
+    TfsRegistryCategory, TfsVocationRegistry,
 };
 use forgotten_core::{
     DeathLossPolicy, EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
@@ -83,6 +84,7 @@ struct IndependentNativeStartupContent {
     companions: LegacyWorldCompanionData,
     entity_catalog: TfsEntityCatalog,
     vocation_registry: Option<TfsVocationRegistry>,
+    public_channel_catalog: Option<LegacyPublicChannelCatalog>,
     declarative_weapon_catalog: Option<DeclarativeWeaponCatalog>,
     declarative_spell_catalog: Option<DeclarativeSpellCatalog>,
 }
@@ -100,6 +102,7 @@ fn load_independent_native_startup_content(
             let companions = scope.spawn(|| load_world_companions(config, world_map));
             let entity_catalog = scope.spawn(|| load_tfs_entity_catalog(config));
             let vocation_registry = scope.spawn(|| load_tfs_vocation_registry(config));
+            let public_channel_catalog = scope.spawn(|| load_tfs_public_channel_catalog(config));
             let declarative_weapon_catalog =
                 scope.spawn(|| load_declarative_weapon_catalog(config));
             let declarative_spell_catalog = scope.spawn(|| load_declarative_spell_catalog(config));
@@ -113,6 +116,9 @@ fn load_independent_native_startup_content(
             let vocation_registry = vocation_registry
                 .join()
                 .map_err(|_| "vocation registry loader worker panicked")??;
+            let public_channel_catalog = public_channel_catalog
+                .join()
+                .map_err(|_| "public channel catalog loader worker panicked")??;
             let declarative_weapon_catalog = declarative_weapon_catalog
                 .join()
                 .map_err(|_| "weapon catalog loader worker panicked")??;
@@ -123,6 +129,7 @@ fn load_independent_native_startup_content(
                 companions,
                 entity_catalog,
                 vocation_registry,
+                public_channel_catalog,
                 declarative_weapon_catalog,
                 declarative_spell_catalog,
             })
@@ -583,6 +590,7 @@ fn run_host(
         let companions = startup_content.companions;
         let entity_catalog = startup_content.entity_catalog;
         let vocation_registry = startup_content.vocation_registry;
+        let public_channel_catalog = startup_content.public_channel_catalog.map(Arc::new);
         let declarative_weapon_catalog = startup_content.declarative_weapon_catalog;
         let declarative_spell_catalog = startup_content.declarative_spell_catalog;
         let regeneration_rules = vocation_registry
@@ -653,6 +661,12 @@ fn run_host(
                 catalog.len()
             );
         }
+        if let Some(catalog) = &public_channel_catalog {
+            println!(
+                "> Loaded {} public TFS channel definitions; joining, messages, membership, scripts, and moderation remain deferred.",
+                catalog.len()
+            );
+        }
         let static_spawns = materialize_tfs_static_spawns(&companions, &entity_catalog)?;
         if !static_spawns.entities.is_empty() {
             println!(
@@ -674,6 +688,7 @@ fn run_host(
             empty_world,
             world_map: Some(Arc::clone(&world_map)),
             item_presentation_catalog: item_presentation_catalog.map(Arc::new),
+            public_channel_catalog,
             item_armor_by_server_id: item_armor_by_server_id.map(Arc::new),
             item_slot_types_by_server_id: item_slot_types_by_server_id.map(Arc::new),
             item_weight_by_server_id: item_weight_by_server_id.map(Arc::new),
