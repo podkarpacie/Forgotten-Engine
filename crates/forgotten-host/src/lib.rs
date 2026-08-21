@@ -43,11 +43,11 @@ use forgotten_protocol::{
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
     encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_channel_list,
     encode_native_otclient_character_list, encode_native_otclient_choose_outfit,
-    encode_native_otclient_classic_vip_entry, encode_native_otclient_clear_target,
-    encode_native_otclient_close_container, encode_native_otclient_creature_health,
-    encode_native_otclient_creature_outfit, encode_native_otclient_delete_inventory,
-    encode_native_otclient_empty_quest_log, encode_native_otclient_game_cancel_walk_facing,
-    encode_native_otclient_game_death,
+    encode_native_otclient_classic_vip_entry, encode_native_otclient_classic_vip_presence,
+    encode_native_otclient_clear_target, encode_native_otclient_close_container,
+    encode_native_otclient_creature_health, encode_native_otclient_creature_outfit,
+    encode_native_otclient_delete_inventory, encode_native_otclient_empty_quest_log,
+    encode_native_otclient_game_cancel_walk_facing, encode_native_otclient_game_death,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
@@ -290,6 +290,7 @@ fn run_native_shared_world_heartbeat(
     Ok(())
 }
 const NATIVE_OTCLIENT_SHARED_CHAT_QUEUE_CAPACITY: usize = 64;
+const NATIVE_OTCLIENT_SHARED_VIP_QUEUE_CAPACITY: usize = 64;
 const NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE: u16 = 10;
 
 fn native_classic_item_record(
@@ -1111,6 +1112,7 @@ pub struct SharedNativeWorld {
     equipment_epoch: Arc<AtomicU64>,
     containers_epoch: Arc<AtomicU64>,
     chat_recipients: Arc<Mutex<BTreeMap<u64, SharedChatRecipient>>>,
+    vip_presence_recipients: Arc<Mutex<BTreeMap<u64, SharedVipPresenceRecipient>>>,
 }
 
 /// Synchronized owner for a mutable native world map. The live listener and heartbeat obtain only
@@ -1558,10 +1560,23 @@ struct SharedPublicChatEvent {
     text: String,
 }
 
+/// One queued classic VIP presence change for an exact persisted watched player ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SharedVipPresenceEvent {
+    target_player_id: u32,
+    online: bool,
+}
+
 #[derive(Debug, Clone)]
 struct SharedChatRecipient {
     player_name: String,
     sender: mpsc::SyncSender<SharedPublicChatEvent>,
+}
+
+#[derive(Debug, Clone)]
+struct SharedVipPresenceRecipient {
+    watched_player_ids: BTreeSet<u32>,
+    sender: mpsc::SyncSender<SharedVipPresenceEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -1772,6 +1787,7 @@ impl SharedNativeWorld {
             equipment_epoch: Arc::new(AtomicU64::new(0)),
             containers_epoch: Arc::new(AtomicU64::new(0)),
             chat_recipients: Arc::new(Mutex::new(BTreeMap::new())),
+            vip_presence_recipients: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -2933,6 +2949,81 @@ impl SharedNativeWorld {
         }
     }
 
+    /// Registers one active session to receive only presence changes for the persisted VIP target
+    /// IDs delivered to that same session. The queue is deliberately bounded and nonblocking so a
+    /// slow client cannot delay another player's lifecycle transition.
+    fn register_vip_presence_recipient(
+        &self,
+        player_id: u64,
+        watched_player_ids: BTreeSet<u32>,
+    ) -> Result<mpsc::Receiver<SharedVipPresenceEvent>, HostError> {
+        let (sender, receiver) = mpsc::sync_channel(NATIVE_OTCLIENT_SHARED_VIP_QUEUE_CAPACITY);
+        let mut recipients = self
+            .vip_presence_recipients
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        if recipients.contains_key(&player_id) {
+            return Err(HostError::InvalidConfiguration(
+                "VIP presence recipient already registered for player".into(),
+            ));
+        }
+        recipients.insert(
+            player_id,
+            SharedVipPresenceRecipient {
+                watched_player_ids,
+                sender,
+            },
+        );
+        Ok(receiver)
+    }
+
+    fn unregister_vip_presence_recipient(&self, player_id: u64) {
+        if let Ok(mut recipients) = self.vip_presence_recipients.lock() {
+            recipients.remove(&player_id);
+        }
+    }
+
+    /// Fans one active player's classic-compatible presence change only to active sessions whose
+    /// bounded persisted VIP list includes that exact target. There is no notification text,
+    /// privacy policy, or persisted presence state in this delivery primitive.
+    fn publish_vip_presence(
+        &self,
+        target_player_id: u64,
+        online: bool,
+    ) -> Result<usize, HostError> {
+        let target_player_id = u32::try_from(target_player_id).map_err(|_| {
+            HostError::InvalidConfiguration("VIP presence target does not fit classic ID".into())
+        })?;
+        if target_player_id == 0 {
+            return Ok(0);
+        }
+        let event = SharedVipPresenceEvent {
+            target_player_id,
+            online,
+        };
+        let mut recipients = self
+            .vip_presence_recipients
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut delivered = 0;
+        recipients.retain(|recipient_id, recipient| {
+            if *recipient_id == u64::from(target_player_id)
+                || !recipient.watched_player_ids.contains(&target_player_id)
+            {
+                return true;
+            }
+            match recipient.sender.try_send(event) {
+                Ok(()) => {
+                    delivered += 1;
+                    true
+                }
+                Err(mpsc::TrySendError::Full(_)) => true,
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            }
+        });
+        Ok(delivered)
+    }
+
     fn broadcast_public_chat(&self, sender_id: u64, message: &str) -> Result<usize, HostError> {
         self.broadcast_chat(sender_id, message, None)
     }
@@ -3224,11 +3315,16 @@ impl SharedNativeWorld {
 struct SharedNativePlayerRegistration {
     world: SharedNativeWorld,
     player_id: u64,
+    vip_presence_announced: bool,
 }
 
 impl Drop for SharedNativePlayerRegistration {
     fn drop(&mut self) {
         self.world.unregister_public_chat_recipient(self.player_id);
+        if self.vip_presence_announced {
+            let _ = self.world.publish_vip_presence(self.player_id, false);
+        }
+        self.world.unregister_vip_presence_recipient(self.player_id);
         let _ = self.world.remove_player(self.player_id);
     }
 }
@@ -4152,9 +4248,10 @@ fn handle_native_otclient_game(
         }
         Err(error) => return Err(error),
     };
-    let _registration = SharedNativePlayerRegistration {
+    let mut registration = SharedNativePlayerRegistration {
         world: shared_world.clone(),
         player_id: character.id,
+        vip_presence_announced: false,
     };
     let hydrated_armor_defense = sync_native_equipment_armor_defense(
         shared_world,
@@ -4182,6 +4279,17 @@ fn handle_native_otclient_game(
         ),
     );
     let chat_events = shared_world.register_public_chat_recipient(character.id, &character.name)?;
+    let persisted_vip_entries = database
+        .account_vip_entries(request.account_id)
+        .map_err(HostError::Persistence)?;
+    let watched_vip_player_ids = persisted_vip_entries
+        .iter()
+        .take(MAX_NATIVE_OTCLIENT_LOGIN_VIP_ENTRIES)
+        .filter_map(|entry| u32::try_from(entry.target_player_id).ok())
+        .filter(|target_player_id| *target_player_id != 0)
+        .collect();
+    let vip_presence_events =
+        shared_world.register_vip_presence_recipient(character.id, watched_vip_player_ids)?;
     if initial_position != character.position {
         database.update_player_position(character.id, initial_position)?;
     }
@@ -4304,9 +4412,6 @@ fn handle_native_otclient_game(
     for frame in &static_health_frames {
         write_frame(stream, frame)?;
     }
-    let persisted_vip_entries = database
-        .account_vip_entries(request.account_id)
-        .map_err(HostError::Persistence)?;
     let mut delivered_vip_entries = 0usize;
     let mut skipped_vip_entries = 0usize;
     for entry in persisted_vip_entries
@@ -4325,7 +4430,10 @@ fn handle_native_otclient_game(
             &config.client_profile,
             target_player_id,
             &entry.target_player_name,
-            false,
+            shared_world
+                .lock()?
+                .player(u64::from(target_player_id))
+                .is_some(),
         )
         .map_err(HostError::Protocol)?;
         write_frame(stream, &frame)?;
@@ -4336,10 +4444,12 @@ fn handle_native_otclient_game(
             .len()
             .saturating_sub(MAX_NATIVE_OTCLIENT_LOGIN_VIP_ENTRIES),
     );
+    let delivered_vip_presence_updates = shared_world.publish_vip_presence(character.id, true)?;
+    registration.vip_presence_announced = true;
     stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
     if config.extended_diagnostics {
         eprintln!(
-            "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} equipment-records={}/{} skipped-unmapped={} container-records={}/{} skipped-unmapped-or-nested={} static-health-records={} vip-records={} skipped-vip-records={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
+            "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} equipment-records={}/{} skipped-unmapped={} container-records={}/{} skipped-unmapped-or-nested={} static-health-records={} vip-records={} skipped-vip-records={} vip-presence-updates={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
             character.name,
             initialization.0.len(),
             equipment_frames.len(),
@@ -4351,6 +4461,7 @@ fn handle_native_otclient_game(
             static_health_frames.len(),
             delivered_vip_entries,
             skipped_vip_entries,
+            delivered_vip_presence_updates,
             world_map.identifier(),
             world_map.tile_count(),
             active_static_spawns.entities.len(),
@@ -4366,6 +4477,13 @@ fn handle_native_otclient_game(
     let mut closed_container_ids = BTreeSet::new();
     let mut open_public_channel_ids = BTreeSet::new();
     loop {
+        drain_shared_vip_presence(
+            stream,
+            &config.client_profile,
+            &vip_presence_events,
+            config.extended_diagnostics,
+            peer,
+        )?;
         drain_shared_public_chat(
             stream,
             &config.client_profile,
@@ -4403,6 +4521,13 @@ fn handle_native_otclient_game(
                         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                     ) =>
                 {
+                    drain_shared_vip_presence(
+                        stream,
+                        &config.client_profile,
+                        &vip_presence_events,
+                        config.extended_diagnostics,
+                        peer,
+                    )?;
                     drain_shared_public_chat(
                         stream,
                         &config.client_profile,
@@ -6793,6 +6918,39 @@ fn drain_shared_public_chat(
                         event_kind,
                         mode,
                         event.text.len(),
+                    ),
+                );
+            }
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return Ok(()),
+        }
+    }
+}
+
+/// Drains only queued presence changes for the current active session's persisted VIP targets.
+/// Queue disconnects are harmless because the enclosing native session owns both endpoints.
+fn drain_shared_vip_presence(
+    stream: &mut TcpStream,
+    profile: &NativeOtClientProfile,
+    events: &mpsc::Receiver<SharedVipPresenceEvent>,
+    extended_diagnostics: bool,
+    peer: SocketAddr,
+) -> Result<(), HostError> {
+    loop {
+        match events.try_recv() {
+            Ok(event) => {
+                let record = encode_native_otclient_classic_vip_presence(
+                    profile,
+                    event.target_player_id,
+                    event.online,
+                )
+                .map_err(HostError::Protocol)?;
+                write_frame(stream, &record)?;
+                native_diagnostic(
+                    extended_diagnostics,
+                    peer,
+                    &format!(
+                        "outbound=vip-presence opcode=0x{:02x} online={}",
+                        record.0[0], event.online
                     ),
                 );
             }
@@ -14810,6 +14968,136 @@ mod tests {
     }
 
     #[test]
+    fn native_classic_vip_watcher_receives_target_login_and_logout_presence_frames() {
+        let database_path = database_path("native-classic-vip-presence");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        for (id, name) in [(1, "Knight"), (2, "Druid")] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: account_id as u64,
+                    name: name.into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        database
+            .add_account_vip_entry(account_id.try_into().unwrap(), "Druid", "", 0, false)
+            .unwrap();
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+
+        let mut knight = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut knight,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut knight).unwrap().0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+        knight
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let initial_vip = (0..4)
+            .map(|_| read_frame(&mut knight).unwrap())
+            .find(|frame| {
+                frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_VIP_ADD)
+            })
+            .expect("watcher did not receive the persisted VIP entry");
+        assert_eq!(
+            initial_vip.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_VIP_ADD,
+                2,
+                0,
+                0,
+                0,
+                5,
+                0,
+                b'D',
+                b'r',
+                b'u',
+                b'i',
+                b'd',
+                0,
+            ]
+        );
+
+        let mut druid = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut druid,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Druid",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut druid).unwrap().0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+
+        let online = (0..4)
+            .map(|_| read_frame(&mut knight).unwrap())
+            .find(|frame| {
+                frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_VIP_STATE)
+            })
+            .expect("watcher did not receive the target online VIP frame");
+        assert_eq!(
+            online.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_VIP_STATE,
+                2,
+                0,
+                0,
+                0
+            ]
+        );
+
+        drop(druid);
+        let offline = (0..4)
+            .map(|_| read_frame(&mut knight).unwrap())
+            .find(|frame| {
+                frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_VIP_LOGOUT)
+            })
+            .expect("watcher did not receive the target offline VIP frame");
+        assert_eq!(
+            offline.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_VIP_LOGOUT,
+                2,
+                0,
+                0,
+                0
+            ]
+        );
+
+        drop(knight);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn native_configured_public_channel_lifecycle_is_authenticated_and_session_local() {
         let database_path = database_path("native-configured-public-channel");
         let database = EngineDatabase::open(&database_path).unwrap();
@@ -15858,6 +16146,82 @@ mod tests {
             Err(mpsc::TryRecvError::Disconnected)
         ));
         shared.unregister_public_chat_recipient(101);
+        shared.remove_player(101).unwrap();
+        shared.remove_player(102).unwrap();
+    }
+
+    #[test]
+    fn shared_vip_presence_delivers_only_to_matching_active_watchers() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 102,
+                    account_id: 2,
+                    name: "Druid".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let knight_events = shared
+            .register_vip_presence_recipient(101, BTreeSet::from([102]))
+            .unwrap();
+        let druid_events = shared
+            .register_vip_presence_recipient(102, BTreeSet::from([101, 102]))
+            .unwrap();
+
+        assert_eq!(shared.publish_vip_presence(102, true).unwrap(), 1);
+        assert_eq!(
+            knight_events.try_recv().unwrap(),
+            SharedVipPresenceEvent {
+                target_player_id: 102,
+                online: true,
+            }
+        );
+        assert!(matches!(
+            druid_events.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        assert_eq!(shared.publish_vip_presence(101, false).unwrap(), 1);
+        assert_eq!(
+            druid_events.try_recv().unwrap(),
+            SharedVipPresenceEvent {
+                target_player_id: 101,
+                online: false,
+            }
+        );
+
+        shared.unregister_vip_presence_recipient(101);
+        assert_eq!(shared.publish_vip_presence(102, false).unwrap(), 0);
+        assert!(matches!(
+            knight_events.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        shared.unregister_vip_presence_recipient(102);
         shared.remove_player(101).unwrap();
         shared.remove_player(102).unwrap();
     }

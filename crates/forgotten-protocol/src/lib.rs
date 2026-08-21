@@ -870,6 +870,7 @@ pub const NATIVE_OTCLIENT_MESSAGE_SAY: u8 = 0x01;
 pub const NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT: u8 = 0xc8;
 pub const NATIVE_OTCLIENT_GAME_VIP_ADD: u8 = 0xd2;
 pub const NATIVE_OTCLIENT_GAME_VIP_STATE: u8 = 0xd3;
+pub const NATIVE_OTCLIENT_GAME_VIP_LOGOUT: u8 = 0xd4;
 pub const NATIVE_OTCLIENT_GAME_CANCEL_WALK: u8 = 0xb5;
 pub const NATIVE_OTCLIENT_ENTER_GAME: u8 = 0x0f;
 pub const NATIVE_OTCLIENT_LEAVE_GAME: u8 = 0x14;
@@ -2560,6 +2561,27 @@ pub fn encode_native_otclient_classic_vip_entry(
     writer.u32(target_player_id);
     writer.string(target_player_name);
     writer.byte(u8::from(online));
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes one classic 740 live VIP presence transition. This profile predates login-pending
+/// state, so `0xd3 + id` means online and `0xd4 + id` means offline; no status byte is emitted.
+/// Newer client layouts remain outside this profile-gated codec.
+pub fn encode_native_otclient_classic_vip_presence(
+    profile: &NativeOtClientProfile,
+    target_player_id: u32,
+    online: bool,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() || target_player_id == 0 {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(if online {
+        NATIVE_OTCLIENT_GAME_VIP_STATE
+    } else {
+        NATIVE_OTCLIENT_GAME_VIP_LOGOUT
+    });
+    writer.u32(target_player_id);
     Ok(Frame(writer.finish()))
 }
 
@@ -4374,6 +4396,19 @@ mod tests {
                 0,
             ]
         );
+        assert_eq!(
+            encode_native_otclient_classic_vip_presence(&profile, 7, true)
+                .unwrap()
+                .0,
+            vec![NATIVE_OTCLIENT_GAME_VIP_STATE, 7, 0, 0, 0]
+        );
+        assert_eq!(
+            encode_native_otclient_classic_vip_presence(&profile, 7, false)
+                .unwrap()
+                .0,
+            vec![NATIVE_OTCLIENT_GAME_VIP_LOGOUT, 7, 0, 0, 0]
+        );
+        assert!(encode_native_otclient_classic_vip_presence(&profile, 0, true).is_err());
         assert_eq!(
             encode_native_otclient_channel_list(
                 &profile,
