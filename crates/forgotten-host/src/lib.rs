@@ -14211,6 +14211,193 @@ mod tests {
     }
 
     #[test]
+    fn native_configured_public_channel_lifecycle_is_authenticated_and_session_local() {
+        let database_path = database_path("native-configured-public-channel");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let mut config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        config.public_channel_catalog = Some(Arc::new(
+            parse_tfs_public_channels_xml(
+                br#"<channels><channel id="7" name="Trade" public="true"/></channels>"#,
+            )
+            .unwrap(),
+        ));
+        let game = start_native_otclient_game(config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_REQUEST_CHANNELS,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CHANNELS,
+                1,
+                7,
+                0,
+                5,
+                0,
+                b'T',
+                b'r',
+                b'a',
+                b'd',
+                b'e',
+            ]
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_JOIN_CHANNEL,
+                7,
+                0,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CHANNEL,
+                7,
+                0,
+                5,
+                0,
+                b'T',
+                b'r',
+                b'a',
+                b'd',
+                b'e',
+                0,
+                0,
+                0,
+                0,
+            ]
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_TALK,
+                5,
+                7,
+                0,
+                2,
+                0,
+                b'h',
+                b'i',
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_TALK,
+                6,
+                0,
+                b'K',
+                b'n',
+                b'i',
+                b'g',
+                b'h',
+                b't',
+                5,
+                7,
+                0,
+                2,
+                0,
+                b'h',
+                b'i',
+            ]
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_LEAVE_CHANNEL,
+                7,
+                0,
+            ]),
+        )
+        .unwrap();
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_TALK,
+                5,
+                7,
+                0,
+                7,
+                0,
+                b'i',
+                b'g',
+                b'n',
+                b'o',
+                b'r',
+                b'e',
+                b'd',
+            ]),
+        )
+        .unwrap();
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT,
+                128,
+                0,
+                0,
+                0,
+                0,
+                128,
+                128,
+            ]
+        );
+        drop(stream);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn native_rejected_target_selection_emits_classic_clear_target_record() {
         let database_path = database_path("native-rejected-target-selection");
         let database = EngineDatabase::open(&database_path).unwrap();
