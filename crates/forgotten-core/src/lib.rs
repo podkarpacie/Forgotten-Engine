@@ -1681,6 +1681,19 @@ pub struct PlayerContainerToEquipmentOutcome {
     pub item: ItemInstance,
 }
 
+/// Result of exchanging one complete top-level container item with the complete item already in
+/// an occupied fixed equipment slot. This narrow operation does not infer slot compatibility,
+/// stackability, capacity, nested containers, map interaction, or generic item-move semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerContainerToEquipmentSwapOutcome {
+    pub player_id: u64,
+    pub container_id: u8,
+    pub item_index: usize,
+    pub to_slot: EquipmentSlot,
+    pub equipped_item: ItemInstance,
+    pub container_item: ItemInstance,
+}
+
 /// Result of a bounded partial-stack movement from equipment to an existing top-level container.
 /// It does not imply item metadata stackability, ownership checks beyond the current player,
 /// capacity rules, ground transfer, recursive containers, client requests, or client delivery.
@@ -4380,6 +4393,58 @@ impl WorldState {
         })
     }
 
+    /// Exchanges one complete item in an existing non-recursive owned container with an occupied
+    /// equipment slot. Both values are prepared on cloned state, keeping all error paths atomic.
+    pub fn swap_container_item_with_equipment(
+        &mut self,
+        player_id: u64,
+        container_id: u8,
+        item_index: usize,
+        to_slot: EquipmentSlot,
+    ) -> Result<PlayerContainerToEquipmentSwapOutcome, CoreError> {
+        let mut equipment = self.player_equipment(player_id)?.clone();
+        let equipped_item = equipment
+            .unequip(to_slot)
+            .ok_or(CoreError::EmptyEquipmentSlot {
+                player_id,
+                slot: to_slot,
+            })?;
+        let mut containers = self.player_containers(player_id)?.clone();
+        let mut container =
+            containers
+                .remove(container_id)
+                .ok_or(CoreError::UnknownPlayerContainer {
+                    player_id,
+                    container_id,
+                })?;
+        let container_item =
+            container
+                .items
+                .remove(item_index)
+                .ok_or(CoreError::UnknownPlayerContainerItem {
+                    player_id,
+                    container_id,
+                    item_index,
+                })?;
+        equipment.equip(to_slot, container_item.clone());
+        container
+            .items
+            .items
+            .insert(item_index, equipped_item.clone());
+        containers.insert(container)?;
+        self.player_equipments.insert(player_id, equipment);
+        self.player_containers.insert(player_id, containers);
+        self.mark_changed();
+        Ok(PlayerContainerToEquipmentSwapOutcome {
+            player_id,
+            container_id,
+            item_index,
+            to_slot,
+            equipped_item,
+            container_item,
+        })
+    }
+
     /// Moves a requested bounded count from one equipment item into an existing top-level
     /// container. The destination merges only with an identical item instance and otherwise
     /// creates a new bounded stack. No item metadata-driven stackability is inferred.
@@ -6130,12 +6195,66 @@ mod tests {
                 .count,
             35
         );
+    }
+
+    #[test]
+    fn authoritative_container_to_occupied_equipment_swap_is_atomic_and_bounded() {
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        let sword = ItemInstance::new(2376, 1).unwrap();
+        let shield = ItemInstance::new(2512, 1).unwrap();
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(EquipmentSlot::RightHand, shield.clone());
+        world.replace_player_equipment(7, equipment).unwrap();
+        let mut backpack =
+            PlayerContainer::new(0, ItemInstance::new(1988, 1).unwrap(), "Backpack", false, 1)
+                .unwrap();
+        backpack.items.insert(sword.clone()).unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(backpack).unwrap();
+        world.replace_player_containers(7, containers).unwrap();
+        let revision_before_swap = world.revision();
+
+        let outcome = world
+            .swap_container_item_with_equipment(7, 0, 0, EquipmentSlot::RightHand)
+            .unwrap();
+        assert_eq!(outcome.container_item, sword);
+        assert_eq!(outcome.equipped_item, shield);
         assert_eq!(
-            world.move_container_stack_to_container(7, 0, 0, 0, 1),
-            Err(CoreError::SamePlayerContainerTransfer {
+            world
+                .player_equipment(7)
+                .unwrap()
+                .item(EquipmentSlot::RightHand),
+            Some(&sword)
+        );
+        assert_eq!(
+            world
+                .player_containers(7)
+                .unwrap()
+                .container(0)
+                .unwrap()
+                .items
+                .item(0),
+            Some(&shield)
+        );
+        assert_eq!(world.revision(), revision_before_swap + 1);
+
+        let revision_before_invalid_source = world.revision();
+        assert_eq!(
+            world.swap_container_item_with_equipment(7, 0, 1, EquipmentSlot::RightHand),
+            Err(CoreError::UnknownPlayerContainerItem {
                 player_id: 7,
                 container_id: 0,
+                item_index: 1,
             })
+        );
+        assert_eq!(world.revision(), revision_before_invalid_source);
+        assert_eq!(
+            world
+                .player_equipment(7)
+                .unwrap()
+                .item(EquipmentSlot::RightHand),
+            Some(&sword)
         );
     }
 

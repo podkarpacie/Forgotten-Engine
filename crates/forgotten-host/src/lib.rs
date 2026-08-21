@@ -9,16 +9,16 @@ use forgotten_core::{
     NativeItemPresentationCatalog, Player, PlayerCombatDefense, PlayerCombatEvent,
     PlayerCombatEventOutcome, PlayerCondition, PlayerConditionKind, PlayerConditionOutcome,
     PlayerContainer, PlayerContainerStackToEquipmentOutcome, PlayerContainerToEquipmentOutcome,
-    PlayerContainers, PlayerEquipment, PlayerEquipmentStackToContainerOutcome,
-    PlayerEquipmentToContainerOutcome, PlayerExperienceAwardOutcome, PlayerFightMode,
-    PlayerFightModeState, PlayerInteractionIntent, PlayerItemUseCreatureIntent,
-    PlayerItemUseCreatureOutcome, PlayerItemUseCreatureTarget, PlayerItemUseExIntent,
-    PlayerItemUseExOutcome, PlayerItemUseIntent, PlayerItemUseOutcome, PlayerProgression,
-    PlayerProgressionAttempts, PlayerProgressionRules, PlayerRegenerationOutcome,
-    PlayerRegenerationRules, PlayerRespawnState, PlayerSkill, PlayerSkillTryOutcome,
-    PlayerSpellCastOutcome, PlayerVitals, Position, StaticCreatureDamageOutcome,
-    StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, StaticCreatureResetSummary,
-    StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
+    PlayerContainerToEquipmentSwapOutcome, PlayerContainers, PlayerEquipment,
+    PlayerEquipmentStackToContainerOutcome, PlayerEquipmentToContainerOutcome,
+    PlayerExperienceAwardOutcome, PlayerFightMode, PlayerFightModeState, PlayerInteractionIntent,
+    PlayerItemUseCreatureIntent, PlayerItemUseCreatureOutcome, PlayerItemUseCreatureTarget,
+    PlayerItemUseExIntent, PlayerItemUseExOutcome, PlayerItemUseIntent, PlayerItemUseOutcome,
+    PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
+    PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState, PlayerSkill,
+    PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
+    StaticCreatureDamageOutcome, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy,
+    StaticCreatureResetSummary, StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
     StaticCreatureTargetAttackOutcome, StaticCreatureTargetStepOutcome, VocationId,
     VocationLevelUpGains, WorldMap, WorldMapItem, WorldMapItemSourceIdentity,
     WorldMapSourceRevision, WorldState, MAX_COMBAT_EVENT_DAMAGE,
@@ -1885,6 +1885,25 @@ impl SharedNativeWorld {
         let outcome = self
             .lock()?
             .move_container_item_to_equipment(player_id, container_id, item_index, to_slot)
+            .map_err(HostError::Core)?;
+        self.equipment_epoch.fetch_add(1, Ordering::SeqCst);
+        self.containers_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(outcome)
+    }
+
+    /// Exchanges a complete owned top-level container item with a complete occupied equipment
+    /// item under the shared-world lock. Persistence and native request validation remain the
+    /// caller's responsibilities; both refresh epochs advance only after core acceptance.
+    pub fn swap_container_item_with_equipment(
+        &self,
+        player_id: u64,
+        container_id: u8,
+        item_index: usize,
+        to_slot: EquipmentSlot,
+    ) -> Result<PlayerContainerToEquipmentSwapOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .swap_container_item_with_equipment(player_id, container_id, item_index, to_slot)
             .map_err(HostError::Core)?;
         self.equipment_epoch.fetch_add(1, Ordering::SeqCst);
         self.containers_epoch.fetch_add(1, Ordering::SeqCst);
@@ -4927,10 +4946,35 @@ fn handle_native_otclient_game(
                         continue;
                     }
                     if equipment.item(target_slot).is_some() {
+                        if requested_count == item.count {
+                            shared_world.swap_container_item_with_equipment(
+                                character.id,
+                                container_id,
+                                item_index,
+                                target_slot,
+                            )?;
+                            let next_equipment = shared_world.player_equipment(character.id)?;
+                            let next_containers = shared_world.player_containers(character.id)?;
+                            database.replace_player_equipment(character.id, &next_equipment)?;
+                            database.replace_player_containers(character.id, &next_containers)?;
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "action=throw-item outcome=top-level-container-to-occupied-equipment-swap container-id={} item-index={} target-slot={} client-thing-id={} count={}",
+                                    container_id,
+                                    item_index,
+                                    target_slot.code(),
+                                    source_client_thing_id,
+                                    count
+                                ),
+                            );
+                            continue;
+                        }
                         native_diagnostic(
                             config.extended_diagnostics,
                             peer,
-                            "action=throw-item outcome=deferred-occupied-equipment-target",
+                            "action=throw-item outcome=deferred-partial-or-unverified-occupied-equipment-target",
                         );
                         continue;
                     }
