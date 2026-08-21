@@ -18,6 +18,7 @@ pub const MAX_SANDBOXED_LUA_MEMORY_BYTES: usize = 64 * 1024;
 pub const MAX_SANDBOXED_LUA_INSTRUCTIONS: u32 = 10_000;
 pub const MAX_SANDBOXED_LUA_CALLBACKS: usize = 64;
 pub const MAX_SANDBOXED_LUA_CALLBACK_NAME_BYTES: usize = 64;
+pub const MAX_SANDBOXED_LUA_CALLBACK_EVENT_KIND_BYTES: usize = 64;
 const INSTRUCTION_LIMIT_MARKER: &str = "forgotten-engine-sandbox-instruction-limit";
 
 /// Explicit limits for one side-effect-free Lua expression evaluation. The executor creates a
@@ -176,12 +177,33 @@ impl SandboxedLuaExecutor {
 
 /// Typed primitive arguments admitted to one explicitly registered callback. The dispatcher does
 /// not expose world state, host objects, Lua tables, paths, files, network access, modules, or
-/// mutable server APIs. The event kind is an operator-chosen label, not a claimed TFS callback.
+/// mutable server APIs. The event kind is a nonempty operator-chosen label bounded to 64 bytes,
+/// not a claimed TFS callback. Subject IDs must fit the signed Lua integer range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxedLuaCallbackInput {
     pub event_kind: String,
     pub subject_id: u64,
     pub value: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxedLuaCallbackInputError {
+    InvalidEventKind,
+    SubjectIdOutOfRange,
+}
+
+impl SandboxedLuaCallbackInput {
+    fn validate(&self) -> Result<(), SandboxedLuaCallbackInputError> {
+        if self.event_kind.trim().is_empty()
+            || self.event_kind.len() > MAX_SANDBOXED_LUA_CALLBACK_EVENT_KIND_BYTES
+        {
+            return Err(SandboxedLuaCallbackInputError::InvalidEventKind);
+        }
+        if self.subject_id > i64::MAX as u64 {
+            return Err(SandboxedLuaCallbackInputError::SubjectIdOutOfRange);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +230,7 @@ pub enum SandboxedLuaCallbackFileRegistrationError {
 pub enum SandboxedLuaCallbackDispatchState {
     Completed,
     CallbackNotFound,
+    InputRejected,
     SourceRejected,
     InstructionLimitReached,
     RuntimeRejected,
@@ -328,6 +351,13 @@ impl SandboxedLuaCallbackDispatcher {
         callback_name: &str,
         input: &SandboxedLuaCallbackInput,
     ) -> SandboxedLuaCallbackDispatchOutcome {
+        if input.validate().is_err() {
+            return SandboxedLuaCallbackDispatchOutcome {
+                state: SandboxedLuaCallbackDispatchState::InputRejected,
+                value: None,
+                instruction_checks: 0,
+            };
+        }
         let Some(source) = self.callbacks.get(callback_name) else {
             return SandboxedLuaCallbackDispatchOutcome {
                 state: SandboxedLuaCallbackDispatchState::CallbackNotFound,
@@ -366,9 +396,8 @@ impl SandboxedLuaCallbackDispatcher {
             },
         );
         let result = lua.load(source).eval::<Function>().and_then(|callback| {
-            let subject_id = i64::try_from(input.subject_id).map_err(|_| {
-                mlua::Error::RuntimeError("subject ID exceeds signed Lua integer range".into())
-            })?;
+            let subject_id = i64::try_from(input.subject_id)
+                .expect("validated callback subject ID fits signed Lua integer range");
             callback.call::<_, Value>((input.event_kind.as_str(), subject_id, input.value))
         });
         let instruction_checks = instruction_checks.load(Ordering::Relaxed);
@@ -703,7 +732,33 @@ mod tests {
                     }
                 )
                 .state,
-            SandboxedLuaCallbackDispatchState::RuntimeRejected
+            SandboxedLuaCallbackDispatchState::InputRejected
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    "typed",
+                    &SandboxedLuaCallbackInput {
+                        event_kind: " ".into(),
+                        subject_id: 1,
+                        value: 0,
+                    }
+                )
+                .state,
+            SandboxedLuaCallbackDispatchState::InputRejected
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    "typed",
+                    &SandboxedLuaCallbackInput {
+                        event_kind: "a".repeat(MAX_SANDBOXED_LUA_CALLBACK_EVENT_KIND_BYTES + 1),
+                        subject_id: 1,
+                        value: 0,
+                    }
+                )
+                .state,
+            SandboxedLuaCallbackDispatchState::InputRejected
         );
     }
 

@@ -121,7 +121,8 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 
 ### Milestone D — Complete scripting, social, economy, housing, and administration: target 73%
 
-- [ ] Add sandboxed Lua event execution with permission limits, typed TFS/FE API contracts, safe script loading, compatibility adapters, and explicit event-family semantics. The completed expression sandbox is intentionally not an imported-script or callback runner.
+- [x] Add one bounded typed Lua callback-dispatch boundary: explicit registration is limited by callback count/name/source, canonical-root loading rejects traversal and escapes, every call uses a fresh no-standard-library VM with memory/instruction limits, and only a nonempty 64-byte event label, signed-range subject ID, numeric value, and primitive result cross the boundary. Regressions cover registration, file-root, fresh-state, instruction, typed-value, and invalid-input limits. This does not create TFS event-family semantics, world mutation, or legacy compatibility.
+- [ ] Add sandboxed Lua event execution with permission limits, typed TFS/FE API contracts, safe script loading, compatibility adapters, and explicit event-family semantics for supported event families. The bounded callback boundary is intentionally not automatic imported-script execution or a TFS API runner.
 - [ ] Add typed creature, player, item, movement, combat, and global event dispatch with compatibility adapters where evidence supports them.
 - [ ] Add parties, channels, private messages, moderation controls, and persistence.
 - [ ] Add guild baseline, banking/trading baseline, houses, beds, rent, access lists, depots, and operator administration APIs.
