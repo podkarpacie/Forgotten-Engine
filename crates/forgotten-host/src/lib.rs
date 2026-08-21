@@ -51,17 +51,18 @@ use forgotten_protocol::{
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
     encode_native_otclient_move_creature_at, encode_native_otclient_open_container,
     encode_native_otclient_player_modes, encode_native_otclient_player_skills,
-    encode_native_otclient_player_stats, encode_native_otclient_read_only_text_window,
-    encode_native_otclient_set_inventory, encode_native_otclient_status_message,
-    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
-    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
-    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
-    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection,
-    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
-    NativeOtClientClassicOutfit, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
-    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerVitals,
-    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
-    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    encode_native_otclient_player_stats, encode_native_otclient_public_say,
+    encode_native_otclient_read_only_text_window, encode_native_otclient_set_inventory,
+    encode_native_otclient_status_message, encode_status_binary, encode_status_xml,
+    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
+    NativeOtClientCardinalDirection, NativeOtClientClassicItemRecord,
+    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
+    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
+    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
+    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -6074,8 +6075,8 @@ fn native_item_inspection_metadata_details(
 }
 
 fn drain_shared_public_chat(
-    _stream: &mut TcpStream,
-    _profile: &NativeOtClientProfile,
+    stream: &mut TcpStream,
+    profile: &NativeOtClientProfile,
     events: &mpsc::Receiver<SharedPublicChatEvent>,
     extended_diagnostics: bool,
     peer: SocketAddr,
@@ -6083,11 +6084,19 @@ fn drain_shared_public_chat(
     loop {
         match events.try_recv() {
             Ok(event) => {
+                let record = encode_native_otclient_public_say(
+                    profile,
+                    &event.speaker_name,
+                    event.speaker_position,
+                    &event.text,
+                )
+                .map_err(HostError::Protocol)?;
+                write_frame(stream, &record)?;
                 native_diagnostic(
                     extended_diagnostics,
                     peer,
                     &format!(
-                        "outbound=public-chat-suppressed reason=740-no-message-mode-map text-bytes={}",
+                        "outbound=public-chat opcode=0xaa mode=1 text-bytes={}",
                         event.text.len()
                     ),
                 );
@@ -15298,15 +15307,30 @@ mod tests {
         );
 
         write_frame(&mut stream, &Frame(vec![0x96, 1, 2, 0, b'h', b'i'])).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .unwrap();
-        assert!(matches!(
-            read_frame(&mut stream),
-            Err(HostError::Io(error))
-                if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
-        ));
-        stream.set_read_timeout(None).unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_TALK,
+                6,
+                0,
+                b'K',
+                b'n',
+                b'i',
+                b'g',
+                b'h',
+                b't',
+                forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_SAY,
+                101,
+                0,
+                100,
+                0,
+                7,
+                2,
+                0,
+                b'h',
+                b'i',
+            ]
+        );
 
         write_frame(
             &mut stream,

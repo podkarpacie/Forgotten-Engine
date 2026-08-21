@@ -859,12 +859,14 @@ pub const NATIVE_OTCLIENT_GAME_PLAYER_SKILLS: u8 = 0xa1;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_STATE: u8 = 0xa2;
 pub const NATIVE_OTCLIENT_GAME_CLEAR_TARGET: u8 = 0xa3;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_MODES: u8 = 0xa7;
+pub const NATIVE_OTCLIENT_GAME_TALK: u8 = 0xaa;
 pub const NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER: u8 = 0x6f;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_HEALTH: u8 = 0x8c;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT: u8 = 0x8e;
 pub const NATIVE_OTCLIENT_GAME_EDIT_TEXT: u8 = 0x96;
 pub const NATIVE_OTCLIENT_GAME_TEXT_MESSAGE: u8 = 0xb4;
 pub const NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT: u8 = 0x15;
+pub const NATIVE_OTCLIENT_MESSAGE_SAY: u8 = 0x01;
 pub const NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT: u8 = 0xc8;
 pub const NATIVE_OTCLIENT_GAME_CANCEL_WALK: u8 = 0xb5;
 pub const NATIVE_OTCLIENT_ENTER_GAME: u8 = 0x0f;
@@ -1411,6 +1413,42 @@ pub fn encode_native_otclient_status_message(
     writer.byte(NATIVE_OTCLIENT_GAME_TEXT_MESSAGE);
     writer.byte(NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT);
     writer.string(message);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes the classic 740 server-talk record for one visible public `Say` message. The local
+/// OTCv8 parser maps server mode `1` to `MessageSay` for protocol 740, then reads the speaker
+/// position before the text. Channels, private messages, yell/whisper variants, levels, and later
+/// statement fields require separate profile-backed layouts.
+pub fn encode_native_otclient_public_say(
+    profile: &NativeOtClientProfile,
+    speaker_name: &str,
+    speaker_position: NativeOtClientPosition,
+    text: &str,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    if speaker_name.is_empty()
+        || text.is_empty()
+        || text.len() > NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES
+    {
+        return Err(ProtocolError::StringTooLong(text.len()));
+    }
+    let fixed_bytes = 8usize;
+    if speaker_name.len() + text.len() + fixed_bytes > MAX_FRAME_SIZE {
+        return Err(ProtocolError::StringTooLong(
+            speaker_name.len().saturating_add(text.len()),
+        ));
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_TALK);
+    writer.string(speaker_name);
+    writer.byte(NATIVE_OTCLIENT_MESSAGE_SAY);
+    writer.u16(speaker_position.x);
+    writer.u16(speaker_position.y);
+    writer.byte(speaker_position.z);
+    writer.string(text);
     Ok(Frame(writer.finish()))
 }
 

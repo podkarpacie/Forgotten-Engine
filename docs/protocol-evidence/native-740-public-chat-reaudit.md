@@ -1,13 +1,7 @@
 # Native 740 Public Chat Re-audit
 
-The local OTCv8 protocol dispatch recognizes server Talk (`0xAA`) generally, but its
-`buildMessageModesMap` creates the legacy Say/Whisper/Yell mappings only for protocol versions
-`760` and later. The local version `740` path has no server message-mode entries. Translating a
-mode therefore yields the client’s unknown sentinel rather than a safe Say mode.
+The local OTCv8 source dispatches server Talk as `0xAA`. Its `parseTalk` function reads the speaker name, translates one server message-mode byte, reads a position for `Say`, and then reads the text. The local versioned mode map has a `version >= 760` branch; therefore protocol `740` uses that branch. It maps `MessageSay` to server mode `1`.
 
-FE keeps the existing bounded shared chat intake and queue, but suppresses outbound native 740
-Talk frames. Sending `0xAA` with a guessed mode caused the documented client-side “unknown message
-mode 255” parser error; no guessed replacement is safe.
+FE now emits only this parser-backed public-speech layout for the native 740 profile: `0xAA`, bounded speaker name, mode `1`, authoritative speaker position, and bounded sanitized text. The existing shared recipient queue remains the fanout boundary. Direct socket coverage asserts the full record after a native Talk request.
 
-No client-visible 740 chat packet is added by this audit. A future route requires independent
-740-compatible parser evidence from the exact client build and a complete outbound field contract.
+The correction deliberately does not claim other social behavior. Whisper, yell, private messages, channels, statements, levels, mute/spam rules, visibility/range filtering, history, persistence, guild/party chat, scripts, and real-client confirmation remain deferred.
