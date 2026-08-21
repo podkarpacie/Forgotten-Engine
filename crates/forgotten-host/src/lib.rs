@@ -139,6 +139,7 @@ pub enum StaticTargetAttackPolicy {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StaticTargetAttackSummary {
     pub examined_static_creatures: usize,
+    pub cooldown_skipped_attacks: usize,
     pub applied_attacks: usize,
     pub total_applied_damage: u64,
     pub affected_player_ids: BTreeSet<u64>,
@@ -2312,17 +2313,23 @@ impl SharedNativeWorld {
             let outcome = world
                 .apply_static_creature_target_damage(creature_id, damage, world_map)
                 .map_err(HostError::Core)?;
-            if let StaticCreatureTargetAttackOutcome::Applied {
-                target_player_id,
-                applied_damage,
-                ..
-            } = outcome
-            {
-                if applied_damage > 0 {
-                    summary.applied_attacks += 1;
-                    summary.total_applied_damage += u64::from(applied_damage);
-                    summary.affected_player_ids.insert(target_player_id);
+            match outcome {
+                StaticCreatureTargetAttackOutcome::CooldownNotDue { .. } => {
+                    summary.cooldown_skipped_attacks += 1;
                 }
+                StaticCreatureTargetAttackOutcome::Applied {
+                    target_player_id,
+                    applied_damage,
+                    ..
+                } => {
+                    if applied_damage > 0 {
+                        summary.applied_attacks += 1;
+                        summary.total_applied_damage += u64::from(applied_damage);
+                        summary.affected_player_ids.insert(target_player_id);
+                    }
+                }
+                StaticCreatureTargetAttackOutcome::NoTarget
+                | StaticCreatureTargetAttackOutcome::TargetNotAdjacent { .. } => {}
             }
         }
         drop(world);
@@ -10762,6 +10769,83 @@ mod tests {
             }
         );
         assert_eq!(shared.vitals_epoch(), 1);
+    }
+
+    #[test]
+    fn shared_static_target_attack_summary_counts_direct_melee_cooldown_as_skipped() {
+        let map = native_world_map();
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 2;
+        let creature = forgotten_core::FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let shared = SharedNativeWorld::from_static_spawns(Some(
+            &FeTfsStaticSpawnCollection::with_runtime_metadata(
+                vec![creature],
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::from([(creature_id, 2_000)]),
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+        shared
+            .register_player_at_available_position_with_vitals(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                PlayerVitals {
+                    health: 10,
+                    max_health: 10,
+                    ..PlayerVitals::default()
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .select_static_creature_target(creature_id, 1)
+            .unwrap();
+
+        let first = shared
+            .attack_static_creature_targets_once(
+                StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage: 1 },
+                &map,
+            )
+            .unwrap();
+        assert_eq!(first.applied_attacks, 1);
+        assert_eq!(first.cooldown_skipped_attacks, 0);
+
+        let second = shared
+            .attack_static_creature_targets_once(
+                StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage: 1 },
+                &map,
+            )
+            .unwrap();
+        assert_eq!(second.applied_attacks, 0);
+        assert_eq!(second.total_applied_damage, 0);
+        assert_eq!(second.cooldown_skipped_attacks, 1);
     }
 
     #[test]

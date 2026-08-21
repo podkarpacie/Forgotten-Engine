@@ -303,6 +303,10 @@ pub enum StaticCreatureTargetStepOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticCreatureTargetAttackOutcome {
     NoTarget,
+    CooldownNotDue {
+        creature_id: u32,
+        due_tick: u64,
+    },
     TargetNotAdjacent {
         creature_id: u32,
         target_player_id: u64,
@@ -340,6 +344,8 @@ struct StaticCreatureRuntime {
     inactive_since_tick: Option<u64>,
     reactivation_due_tick: Option<u64>,
     respawn_interval_seconds: u32,
+    melee_cooldown_ticks: Option<u64>,
+    next_melee_due_tick: u64,
     target_player_id: Option<u64>,
 }
 
@@ -2824,6 +2830,10 @@ impl WorldState {
                         inactive_since_tick: None,
                         reactivation_due_tick: None,
                         respawn_interval_seconds: collection.respawn_interval_seconds(entity.id),
+                        melee_cooldown_ticks: collection
+                            .direct_melee_interval_millis(entity.id)
+                            .map(|interval| u64::from(interval).div_ceil(1_000)),
+                        next_melee_due_tick: self.tick,
                         target_player_id: None,
                     },
                 )
@@ -3178,7 +3188,7 @@ impl WorldState {
         requested_damage: u16,
         world_map: &WorldMap,
     ) -> Result<StaticCreatureTargetAttackOutcome, CoreError> {
-        let (source, target_player_id) = {
+        let (source, target_player_id, melee_cooldown_ticks) = {
             let runtime = self
                 .static_creatures
                 .get(&creature_id)
@@ -3186,7 +3196,17 @@ impl WorldState {
             if !runtime.active {
                 return Err(CoreError::InactiveStaticCreature(creature_id));
             }
-            (runtime.entity.position, runtime.target_player_id)
+            if self.tick < runtime.next_melee_due_tick {
+                return Ok(StaticCreatureTargetAttackOutcome::CooldownNotDue {
+                    creature_id,
+                    due_tick: runtime.next_melee_due_tick,
+                });
+            }
+            (
+                runtime.entity.position,
+                runtime.target_player_id,
+                runtime.melee_cooldown_ticks,
+            )
         };
         let Some(target_player_id) = target_player_id else {
             return Ok(StaticCreatureTargetAttackOutcome::NoTarget);
@@ -3234,6 +3254,12 @@ impl WorldState {
         }
         if applied_damage > 0 {
             self.mark_changed();
+        }
+        if let Some(cooldown_ticks) = melee_cooldown_ticks {
+            self.static_creatures
+                .get_mut(&creature_id)
+                .expect("validated static creature remains installed")
+                .next_melee_due_tick = self.tick.saturating_add(cooldown_ticks);
         }
         Ok(StaticCreatureTargetAttackOutcome::Applied {
             creature_id,
@@ -8185,6 +8211,154 @@ mod tests {
             world.apply_static_creature_target_damage(creature_id, 1, &map),
             Err(CoreError::InactiveStaticCreature(creature_id))
         );
+    }
+
+    #[test]
+    fn static_creature_direct_melee_metadata_prevents_early_repeated_attacks() {
+        let creature_id = 0x4000_0002;
+        let creature_position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let creature = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: creature_position,
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut target = player();
+        target.position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let map = WorldMap::new("direct-melee-cooldown", creature_position);
+        let mut world = WorldState::default();
+        world.add_player(target).unwrap();
+        world
+            .update_player_vitals(
+                7,
+                PlayerVitals {
+                    health: 20,
+                    max_health: 20,
+                    ..PlayerVitals::default()
+                },
+            )
+            .unwrap();
+        world
+            .install_static_creatures(
+                &FeTfsStaticSpawnCollection::with_runtime_metadata(
+                    vec![creature],
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeMap::from([(creature_id, 2_000)]),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        world.select_static_creature_target(creature_id, 1).unwrap();
+
+        assert!(matches!(
+            world.apply_static_creature_target_damage(creature_id, 1, &map),
+            Ok(StaticCreatureTargetAttackOutcome::Applied {
+                applied_damage: 1,
+                ..
+            })
+        ));
+        assert_eq!(
+            world.apply_static_creature_target_damage(creature_id, 1, &map),
+            Ok(StaticCreatureTargetAttackOutcome::CooldownNotDue {
+                creature_id,
+                due_tick: 2,
+            })
+        );
+        world.advance_tick();
+        assert_eq!(
+            world.apply_static_creature_target_damage(creature_id, 1, &map),
+            Ok(StaticCreatureTargetAttackOutcome::CooldownNotDue {
+                creature_id,
+                due_tick: 2,
+            })
+        );
+        world.advance_tick();
+        assert!(matches!(
+            world.apply_static_creature_target_damage(creature_id, 1, &map),
+            Ok(StaticCreatureTargetAttackOutcome::Applied {
+                applied_damage: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn static_creature_without_direct_melee_metadata_attacks_on_each_heartbeat() {
+        let creature_id = 0x4000_0003;
+        let creature_position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let creature = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: creature_position,
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut target = player();
+        target.position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let map = WorldMap::new("unbounded-direct-melee", creature_position);
+        let mut world = WorldState::default();
+        world.add_player(target).unwrap();
+        world
+            .update_player_vitals(
+                7,
+                PlayerVitals {
+                    health: 20,
+                    max_health: 20,
+                    ..PlayerVitals::default()
+                },
+            )
+            .unwrap();
+        world
+            .install_static_creatures(&FeTfsStaticSpawnCollection::new(vec![creature]).unwrap())
+            .unwrap();
+        world.select_static_creature_target(creature_id, 1).unwrap();
+
+        assert!(matches!(
+            world.apply_static_creature_target_damage(creature_id, 1, &map),
+            Ok(StaticCreatureTargetAttackOutcome::Applied {
+                applied_damage: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            world.apply_static_creature_target_damage(creature_id, 1, &map),
+            Ok(StaticCreatureTargetAttackOutcome::Applied {
+                applied_damage: 1,
+                ..
+            })
+        ));
     }
 
     #[test]
