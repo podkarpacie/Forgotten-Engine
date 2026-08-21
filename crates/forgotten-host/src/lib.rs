@@ -913,6 +913,9 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         NativeOtClientGameAction::JoinChannel(channel_id) => {
             format!("action=join-channel channel-id={channel_id}")
         }
+        NativeOtClientGameAction::LeaveChannel(channel_id) => {
+            format!("action=leave-channel channel-id={channel_id}")
+        }
         NativeOtClientGameAction::ChangeOutfit(outfit) => format!(
             "action=change-outfit look-type={} colors={},{},{},{}",
             outfit.look_type, outfit.head, outfit.body, outfit.legs, outfit.feet
@@ -5807,6 +5810,16 @@ fn handle_native_otclient_game(
                         "outbound=choose-outfit opcode=0xc8 bytes={} look-type={}",
                         outfit_window.0.len(),
                         player_outfit.look_type
+                    ),
+                );
+            }
+            NativeOtClientGameAction::LeaveChannel(channel_id) => {
+                let removed = open_public_channel_ids.remove(&channel_id);
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "action=leave-channel channel-id={channel_id} outcome=session-local-removed-{removed}"
                     ),
                 );
             }

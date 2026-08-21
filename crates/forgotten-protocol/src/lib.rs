@@ -895,6 +895,7 @@ pub const NATIVE_OTCLIENT_CLIENT_CANCEL_ATTACK_AND_FOLLOW: u8 = 0xbe;
 pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_CLIENT_REQUEST_CHANNELS: u8 = 0x97;
 pub const NATIVE_OTCLIENT_CLIENT_JOIN_CHANNEL: u8 = 0x98;
+pub const NATIVE_OTCLIENT_CLIENT_LEAVE_CHANNEL: u8 = 0x99;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM: u8 = 0x82;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM_EX: u8 = 0x83;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM_ON_CREATURE: u8 = 0x84;
@@ -1266,6 +1267,7 @@ pub enum NativeOtClientGameAction {
     RequestQuestLog,
     RequestChannels,
     JoinChannel(u16),
+    LeaveChannel(u16),
     ChangeOutfit(NativeOtClientClassicOutfit),
     CloseContainer(u8),
     UpArrowContainer(u8),
@@ -2266,6 +2268,9 @@ pub fn decode_native_otclient_game_action(
         NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG => NativeOtClientGameAction::RequestQuestLog,
         NATIVE_OTCLIENT_CLIENT_REQUEST_CHANNELS => NativeOtClientGameAction::RequestChannels,
         NATIVE_OTCLIENT_CLIENT_JOIN_CHANNEL => NativeOtClientGameAction::JoinChannel(reader.u16()?),
+        NATIVE_OTCLIENT_CLIENT_LEAVE_CHANNEL => {
+            NativeOtClientGameAction::LeaveChannel(reader.u16()?)
+        }
         NATIVE_OTCLIENT_CLIENT_TALK => {
             let mode = reader.byte()?;
             let (channel_id, message) = match mode {
@@ -4137,8 +4142,21 @@ mod tests {
             .unwrap(),
             NativeOtClientGameAction::JoinChannel(7)
         );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_LEAVE_CHANNEL, 7, 0]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::LeaveChannel(7)
+        );
         assert!(decode_native_otclient_game_action(
             &Frame(vec![NATIVE_OTCLIENT_CLIENT_JOIN_CHANNEL, 7]),
+            &profile,
+        )
+        .is_err());
+        assert!(decode_native_otclient_game_action(
+            &Frame(vec![NATIVE_OTCLIENT_CLIENT_LEAVE_CHANNEL, 7]),
             &profile,
         )
         .is_err());
