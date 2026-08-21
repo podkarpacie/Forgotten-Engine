@@ -10,15 +10,16 @@ use forgotten_core::{
     PlayerCombatEventOutcome, PlayerCondition, PlayerConditionKind, PlayerConditionOutcome,
     PlayerContainer, PlayerContainerStackToEquipmentOutcome, PlayerContainerToEquipmentOutcome,
     PlayerContainerToEquipmentSwapOutcome, PlayerContainers, PlayerEquipment,
-    PlayerEquipmentStackToContainerOutcome, PlayerEquipmentToContainerOutcome,
-    PlayerExperienceAwardOutcome, PlayerFightMode, PlayerFightModeState, PlayerInteractionIntent,
-    PlayerItemUseCreatureIntent, PlayerItemUseCreatureOutcome, PlayerItemUseCreatureTarget,
-    PlayerItemUseExIntent, PlayerItemUseExOutcome, PlayerItemUseIntent, PlayerItemUseOutcome,
-    PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
-    PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState, PlayerSkill,
-    PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
-    StaticCreatureDamageOutcome, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy,
-    StaticCreatureResetSummary, StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
+    PlayerEquipmentSlotSwapOutcome, PlayerEquipmentStackToContainerOutcome,
+    PlayerEquipmentToContainerOutcome, PlayerExperienceAwardOutcome, PlayerFightMode,
+    PlayerFightModeState, PlayerInteractionIntent, PlayerItemUseCreatureIntent,
+    PlayerItemUseCreatureOutcome, PlayerItemUseCreatureTarget, PlayerItemUseExIntent,
+    PlayerItemUseExOutcome, PlayerItemUseIntent, PlayerItemUseOutcome, PlayerProgression,
+    PlayerProgressionAttempts, PlayerProgressionRules, PlayerRegenerationOutcome,
+    PlayerRegenerationRules, PlayerRespawnState, PlayerSkill, PlayerSkillTryOutcome,
+    PlayerSpellCastOutcome, PlayerVitals, Position, StaticCreatureDamageOutcome,
+    StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, StaticCreatureResetSummary,
+    StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
     StaticCreatureTargetAttackOutcome, StaticCreatureTargetStepOutcome, VocationId,
     VocationLevelUpGains, WorldMap, WorldMapItem, WorldMapItemSourceIdentity,
     WorldMapSourceRevision, WorldState, MAX_COMBAT_EVENT_DAMAGE,
@@ -1907,6 +1908,23 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)?;
         self.equipment_epoch.fetch_add(1, Ordering::SeqCst);
         self.containers_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(outcome)
+    }
+
+    /// Exchanges complete items stored in two distinct occupied equipment slots under the
+    /// shared-world lock. Persistence and native request validation remain the caller's
+    /// responsibilities; the equipment refresh epoch advances only after core acceptance.
+    pub fn swap_equipment_items(
+        &self,
+        player_id: u64,
+        from_slot: EquipmentSlot,
+        to_slot: EquipmentSlot,
+    ) -> Result<PlayerEquipmentSlotSwapOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .swap_equipment_items(player_id, from_slot, to_slot)
+            .map_err(HostError::Core)?;
+        self.equipment_epoch.fetch_add(1, Ordering::SeqCst);
         Ok(outcome)
     }
 
@@ -5034,11 +5052,40 @@ fn handle_native_otclient_game(
                 }
                 match (target_slot, target_container_id) {
                     (Some(target_slot), None) => {
-                        if source_slot == target_slot || equipment.item(target_slot).is_some() {
+                        if source_slot == target_slot {
                             native_diagnostic(
                                 config.extended_diagnostics,
                                 peer,
-                                "action=throw-item outcome=deferred-invalid-or-occupied-equipment-target",
+                                "action=throw-item outcome=deferred-same-equipment-slot-target",
+                            );
+                            continue;
+                        }
+                        if equipment.item(target_slot).is_some() {
+                            if u16::from(count) != item.count {
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    "action=throw-item outcome=deferred-partial-occupied-equipment-target",
+                                );
+                                continue;
+                            }
+                            shared_world.swap_equipment_items(
+                                character.id,
+                                source_slot,
+                                target_slot,
+                            )?;
+                            let next_equipment = shared_world.player_equipment(character.id)?;
+                            database.replace_player_equipment(character.id, &next_equipment)?;
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "action=throw-item outcome=occupied-equipment-slot-swap source-slot={} target-slot={} client-thing-id={} count={}",
+                                    source_slot.code(),
+                                    target_slot.code(),
+                                    source_client_thing_id,
+                                    count
+                                ),
                             );
                             continue;
                         }
@@ -12093,6 +12140,106 @@ mod tests {
                     0,
                 ]
         }));
+        drop(client);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_throw_swaps_complete_mapped_items_between_occupied_equipment_slots() {
+        let database_path = database_path("native-occupied-slot-swap");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let sword = ItemInstance::new(4526, 1).unwrap();
+        let shield = ItemInstance::new(4527, 1).unwrap();
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(EquipmentSlot::RightHand, sword.clone());
+        equipment.equip(EquipmentSlot::LeftHand, shield.clone());
+        database.replace_player_equipment(1, &equipment).unwrap();
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                4526,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 102,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        catalog
+            .insert(
+                4527,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 103,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        let mut config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        config.item_presentation_catalog = Some(Arc::new(catalog));
+        let game = start_native_otclient_game(config, &database_path).unwrap();
+        let mut client = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut client,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut client).unwrap();
+        let _equipment = read_frame(&mut client).unwrap();
+        write_frame(
+            &mut client,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                255,
+                255,
+                EquipmentSlot::RightHand.code(),
+                0,
+                0,
+                102,
+                0,
+                0,
+                255,
+                255,
+                EquipmentSlot::LeftHand.code(),
+                0,
+                0,
+                1,
+            ]),
+        )
+        .unwrap();
+        for _ in 0..20 {
+            let persisted = database.player_equipment(1).unwrap();
+            if persisted.item(EquipmentSlot::RightHand) == Some(&shield)
+                && persisted.item(EquipmentSlot::LeftHand) == Some(&sword)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let persisted = database.player_equipment(1).unwrap();
+        assert_eq!(persisted.item(EquipmentSlot::RightHand), Some(&shield));
+        assert_eq!(persisted.item(EquipmentSlot::LeftHand), Some(&sword));
         drop(client);
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);

@@ -1694,6 +1694,18 @@ pub struct PlayerContainerToEquipmentSwapOutcome {
     pub container_item: ItemInstance,
 }
 
+/// Result of exchanging two complete items already stored in distinct occupied equipment slots.
+/// This narrow operation does not infer slot compatibility, stackability, capacity, containers,
+/// map interaction, or generic item-move semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerEquipmentSlotSwapOutcome {
+    pub player_id: u64,
+    pub from_slot: EquipmentSlot,
+    pub to_slot: EquipmentSlot,
+    pub from_item: ItemInstance,
+    pub to_item: ItemInstance,
+}
+
 /// Result of a bounded partial-stack movement from equipment to an existing top-level container.
 /// It does not imply item metadata stackability, ownership checks beyond the current player,
 /// capacity rules, ground transfer, recursive containers, client requests, or client delivery.
@@ -4445,6 +4457,47 @@ impl WorldState {
         })
     }
 
+    /// Exchanges the complete items in two distinct occupied equipment slots. Both items are
+    /// prepared on cloned state, so rejected source, target, or self-swap paths leave the
+    /// authoritative inventory and its revision unchanged.
+    pub fn swap_equipment_items(
+        &mut self,
+        player_id: u64,
+        from_slot: EquipmentSlot,
+        to_slot: EquipmentSlot,
+    ) -> Result<PlayerEquipmentSlotSwapOutcome, CoreError> {
+        if from_slot == to_slot {
+            return Err(CoreError::SameEquipmentSlotTransfer {
+                player_id,
+                slot: from_slot,
+            });
+        }
+        let mut equipment = self.player_equipment(player_id)?.clone();
+        let from_item = equipment
+            .unequip(from_slot)
+            .ok_or(CoreError::EmptyEquipmentSlot {
+                player_id,
+                slot: from_slot,
+            })?;
+        let to_item = equipment
+            .unequip(to_slot)
+            .ok_or(CoreError::EmptyEquipmentSlot {
+                player_id,
+                slot: to_slot,
+            })?;
+        equipment.equip(from_slot, to_item.clone());
+        equipment.equip(to_slot, from_item.clone());
+        self.player_equipments.insert(player_id, equipment);
+        self.mark_changed();
+        Ok(PlayerEquipmentSlotSwapOutcome {
+            player_id,
+            from_slot,
+            to_slot,
+            from_item,
+            to_item,
+        })
+    }
+
     /// Moves a requested bounded count from one equipment item into an existing top-level
     /// container. The destination merges only with an identical item instance and otherwise
     /// creates a new bounded stack. No item metadata-driven stackability is inferred.
@@ -5572,6 +5625,10 @@ pub enum CoreError {
         player_id: u64,
         container_id: u8,
     },
+    SameEquipmentSlotTransfer {
+        player_id: u64,
+        slot: EquipmentSlot,
+    },
     ItemStackCountOverflow {
         existing: u16,
         incoming: u16,
@@ -6254,6 +6311,72 @@ mod tests {
                 .player_equipment(7)
                 .unwrap()
                 .item(EquipmentSlot::RightHand),
+            Some(&sword)
+        );
+    }
+
+    #[test]
+    fn authoritative_equipment_slot_swap_is_atomic_and_bounded() {
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        let sword = ItemInstance::new(2376, 1).unwrap();
+        let shield = ItemInstance::new(2512, 1).unwrap();
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(EquipmentSlot::RightHand, sword.clone());
+        equipment.equip(EquipmentSlot::LeftHand, shield.clone());
+        world.replace_player_equipment(7, equipment).unwrap();
+        let revision_before_swap = world.revision();
+
+        let outcome = world
+            .swap_equipment_items(7, EquipmentSlot::RightHand, EquipmentSlot::LeftHand)
+            .unwrap();
+
+        assert_eq!(outcome.from_item, sword);
+        assert_eq!(outcome.to_item, shield);
+        assert_eq!(
+            world
+                .player_equipment(7)
+                .unwrap()
+                .item(EquipmentSlot::RightHand),
+            Some(&shield)
+        );
+        assert_eq!(
+            world
+                .player_equipment(7)
+                .unwrap()
+                .item(EquipmentSlot::LeftHand),
+            Some(&sword)
+        );
+        assert_eq!(world.revision(), revision_before_swap + 1);
+
+        let revision_before_rejections = world.revision();
+        assert_eq!(
+            world.swap_equipment_items(7, EquipmentSlot::RightHand, EquipmentSlot::RightHand),
+            Err(CoreError::SameEquipmentSlotTransfer {
+                player_id: 7,
+                slot: EquipmentSlot::RightHand,
+            })
+        );
+        assert_eq!(
+            world.swap_equipment_items(7, EquipmentSlot::Head, EquipmentSlot::RightHand),
+            Err(CoreError::EmptyEquipmentSlot {
+                player_id: 7,
+                slot: EquipmentSlot::Head,
+            })
+        );
+        assert_eq!(world.revision(), revision_before_rejections);
+        assert_eq!(
+            world
+                .player_equipment(7)
+                .unwrap()
+                .item(EquipmentSlot::RightHand),
+            Some(&shield)
+        );
+        assert_eq!(
+            world
+                .player_equipment(7)
+                .unwrap()
+                .item(EquipmentSlot::LeftHand),
             Some(&sword)
         );
     }
