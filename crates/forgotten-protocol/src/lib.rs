@@ -894,6 +894,10 @@ pub const NATIVE_OTCLIENT_CLIENT_TURN_WEST: u8 = 0x72;
 pub const NATIVE_OTCLIENT_CLIENT_CHANGE_FIGHT_MODES: u8 = 0xa0;
 pub const NATIVE_OTCLIENT_CLIENT_SELECT_TARGET: u8 = 0xa1;
 pub const NATIVE_OTCLIENT_CLIENT_SELECT_FOLLOW: u8 = 0xa2;
+pub const NATIVE_OTCLIENT_CLIENT_INVITE_TO_PARTY: u8 = 0xa3;
+pub const NATIVE_OTCLIENT_CLIENT_JOIN_PARTY: u8 = 0xa4;
+pub const NATIVE_OTCLIENT_CLIENT_REVOKE_PARTY_INVITATION: u8 = 0xa5;
+pub const NATIVE_OTCLIENT_CLIENT_LEAVE_PARTY: u8 = 0xa7;
 pub const NATIVE_OTCLIENT_CLIENT_CANCEL_ATTACK_AND_FOLLOW: u8 = 0xbe;
 pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_CLIENT_REQUEST_CHANNELS: u8 = 0x97;
@@ -1288,6 +1292,10 @@ pub enum NativeOtClientGameAction {
     UpdateContainer(u8),
     SelectTarget(u32),
     SelectFollow(u32),
+    PartyInvite(u32),
+    PartyJoin(u32),
+    PartyRevokeInvitation(u32),
+    PartyLeave,
     CancelAttackAndFollow,
     IgnoredInteraction(u8),
     Turn(NativeOtClientCardinalDirection),
@@ -2378,6 +2386,14 @@ pub fn decode_native_otclient_game_action(
         NATIVE_OTCLIENT_CLIENT_SELECT_FOLLOW => {
             NativeOtClientGameAction::SelectFollow(reader.u32()?)
         }
+        NATIVE_OTCLIENT_CLIENT_INVITE_TO_PARTY => {
+            NativeOtClientGameAction::PartyInvite(reader.u32()?)
+        }
+        NATIVE_OTCLIENT_CLIENT_JOIN_PARTY => NativeOtClientGameAction::PartyJoin(reader.u32()?),
+        NATIVE_OTCLIENT_CLIENT_REVOKE_PARTY_INVITATION => {
+            NativeOtClientGameAction::PartyRevokeInvitation(reader.u32()?)
+        }
+        NATIVE_OTCLIENT_CLIENT_LEAVE_PARTY => NativeOtClientGameAction::PartyLeave,
         opcode if is_native_otclient_compatibility_interaction(opcode) => {
             if reader.remaining() > NATIVE_OTCLIENT_MAX_IGNORED_INTERACTION_BYTES {
                 return Err(ProtocolError::InvalidNativeGameRequest);
@@ -4515,6 +4531,49 @@ mod tests {
             .unwrap(),
             NativeOtClientGameAction::SelectFollow(2)
         );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_INVITE_TO_PARTY, 3, 0, 0, 0]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::PartyInvite(3)
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_JOIN_PARTY, 4, 0, 0, 0]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::PartyJoin(4)
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![
+                    NATIVE_OTCLIENT_CLIENT_REVOKE_PARTY_INVITATION,
+                    5,
+                    0,
+                    0,
+                    0,
+                ]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::PartyRevokeInvitation(5)
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_LEAVE_PARTY]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::PartyLeave
+        );
+        assert!(decode_native_otclient_game_action(
+            &Frame(vec![NATIVE_OTCLIENT_CLIENT_INVITE_TO_PARTY, 3, 0, 0]),
+            &profile,
+        )
+        .is_err());
         assert!(decode_native_otclient_game_action(
             &Frame(vec![NATIVE_OTCLIENT_CLIENT_SELECT_TARGET, 0, 0, 0, 0, 0]),
             &profile,

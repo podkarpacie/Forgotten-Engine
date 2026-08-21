@@ -947,6 +947,16 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         NativeOtClientGameAction::SelectFollow(native_id) => {
             format!("action=select-follow native-id={native_id}")
         }
+        NativeOtClientGameAction::PartyInvite(native_id) => {
+            format!("action=party-invite native-id={native_id}")
+        }
+        NativeOtClientGameAction::PartyJoin(native_id) => {
+            format!("action=party-join native-id={native_id}")
+        }
+        NativeOtClientGameAction::PartyRevokeInvitation(native_id) => {
+            format!("action=party-revoke-invitation native-id={native_id}")
+        }
+        NativeOtClientGameAction::PartyLeave => "action=party-leave".into(),
         NativeOtClientGameAction::CancelAttackAndFollow => {
             "action=cancel-attack-and-follow".into()
         }
@@ -6430,6 +6440,84 @@ fn handle_native_otclient_game(
                     NativePlayerInteractionKind::Follow,
                     config.extended_diagnostics,
                 )?;
+            }
+            NativeOtClientGameAction::PartyInvite(native_target_id) => {
+                let Some(invitee_id) = native_player_id_to_character_id(native_target_id) else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=party-invite outcome=rejected-invalid-native-player-id",
+                    );
+                    continue;
+                };
+                let outcome = shared_world
+                    .lock()?
+                    .invite_to_party(character.id, invitee_id);
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    if outcome.is_ok() {
+                        "action=party-invite outcome=authoritative-invitation-created"
+                    } else {
+                        "action=party-invite outcome=rejected-core-invariant"
+                    },
+                );
+            }
+            NativeOtClientGameAction::PartyJoin(native_target_id) => {
+                let Some(leader_id) = native_player_id_to_character_id(native_target_id) else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=party-join outcome=rejected-invalid-native-player-id",
+                    );
+                    continue;
+                };
+                let outcome = shared_world
+                    .lock()?
+                    .accept_party_invitation(character.id, leader_id);
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    if outcome.is_ok() {
+                        "action=party-join outcome=authoritative-membership-created"
+                    } else {
+                        "action=party-join outcome=rejected-core-invariant"
+                    },
+                );
+            }
+            NativeOtClientGameAction::PartyRevokeInvitation(native_target_id) => {
+                let Some(invitee_id) = native_player_id_to_character_id(native_target_id) else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=party-revoke-invitation outcome=rejected-invalid-native-player-id",
+                    );
+                    continue;
+                };
+                let outcome = shared_world
+                    .lock()?
+                    .revoke_party_invitation(character.id, invitee_id);
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    if outcome.is_ok() {
+                        "action=party-revoke-invitation outcome=authoritative-invitation-removed"
+                    } else {
+                        "action=party-revoke-invitation outcome=rejected-core-invariant"
+                    },
+                );
+            }
+            NativeOtClientGameAction::PartyLeave => {
+                let outcome = shared_world.lock()?.leave_party(character.id);
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    if outcome.is_ok() {
+                        "action=party-leave outcome=authoritative-membership-removed"
+                    } else {
+                        "action=party-leave outcome=rejected-core-invariant"
+                    },
+                );
             }
             NativeOtClientGameAction::CancelAttackAndFollow => {
                 cancel_native_player_attack_and_follow(shared_world, character.id)?;
@@ -14879,6 +14967,231 @@ mod tests {
             .account_vip_entries(account_id.try_into().unwrap())
             .unwrap()
             .is_empty());
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_classic_party_requests_route_to_the_shared_session_local_core() {
+        fn party_target_frame(opcode: u8, character_id: u32) -> Frame {
+            let mut bytes = vec![opcode];
+            bytes.extend_from_slice(
+                &(forgotten_protocol::NATIVE_OTCLIENT_PLAYER_ID_START + character_id).to_le_bytes(),
+            );
+            Frame(bytes)
+        }
+
+        fn wait_for_ping_back(stream: &mut TcpStream) {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match read_frame(stream) {
+                    Ok(frame)
+                        if frame.0 == vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_PING_BACK] =>
+                    {
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(HostError::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) && Instant::now() < deadline => {}
+                    Err(error) => {
+                        panic!("native session ended before party action was observed: {error}")
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "native session did not remain usable after party action"
+                );
+            }
+        }
+
+        let database_path = database_path("native-classic-party-routing");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        for (id, name, position) in [
+            (
+                1,
+                "Knight",
+                Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+            (
+                2,
+                "Druid",
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+        ] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: account_id as u64,
+                    name: name.into(),
+                    position,
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let shared_world = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let game = start_native_otclient_game_with_shared_world(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+            shared_world.clone(),
+        )
+        .unwrap();
+
+        let mut knight = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut knight,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut knight).unwrap().0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+        let mut druid = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut druid,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Druid",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut druid).unwrap().0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+
+        write_frame(
+            &mut knight,
+            &party_target_frame(
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_INVITE_TO_PARTY,
+                2,
+            ),
+        )
+        .unwrap();
+        write_frame(
+            &mut knight,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING]),
+        )
+        .unwrap();
+        wait_for_ping_back(&mut knight);
+        write_frame(
+            &mut knight,
+            &party_target_frame(
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_REVOKE_PARTY_INVITATION,
+                2,
+            ),
+        )
+        .unwrap();
+        write_frame(
+            &mut knight,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING]),
+        )
+        .unwrap();
+        wait_for_ping_back(&mut knight);
+        write_frame(
+            &mut druid,
+            &party_target_frame(forgotten_protocol::NATIVE_OTCLIENT_CLIENT_JOIN_PARTY, 1),
+        )
+        .unwrap();
+        write_frame(
+            &mut druid,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING]),
+        )
+        .unwrap();
+        wait_for_ping_back(&mut druid);
+        assert_eq!(
+            shared_world.lock().unwrap().player_party_leader(1).unwrap(),
+            None
+        );
+        assert_eq!(
+            shared_world.lock().unwrap().player_party_leader(2).unwrap(),
+            None
+        );
+
+        write_frame(
+            &mut knight,
+            &party_target_frame(
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_INVITE_TO_PARTY,
+                2,
+            ),
+        )
+        .unwrap();
+        write_frame(
+            &mut knight,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING]),
+        )
+        .unwrap();
+        wait_for_ping_back(&mut knight);
+        write_frame(
+            &mut druid,
+            &party_target_frame(forgotten_protocol::NATIVE_OTCLIENT_CLIENT_JOIN_PARTY, 1),
+        )
+        .unwrap();
+        write_frame(
+            &mut druid,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING]),
+        )
+        .unwrap();
+        wait_for_ping_back(&mut druid);
+        assert_eq!(
+            shared_world.lock().unwrap().player_party_leader(1).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            shared_world
+                .lock()
+                .unwrap()
+                .player_party_members(1)
+                .unwrap(),
+            vec![2]
+        );
+
+        write_frame(
+            &mut druid,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_LEAVE_PARTY]),
+        )
+        .unwrap();
+        write_frame(
+            &mut druid,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING]),
+        )
+        .unwrap();
+        wait_for_ping_back(&mut druid);
+        assert_eq!(
+            shared_world.lock().unwrap().player_party_leader(1).unwrap(),
+            None
+        );
+        assert_eq!(
+            shared_world.lock().unwrap().player_party_leader(2).unwrap(),
+            None
+        );
+
+        drop(knight);
+        drop(druid);
+        game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }
 
