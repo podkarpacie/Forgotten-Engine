@@ -894,6 +894,7 @@ pub const NATIVE_OTCLIENT_CLIENT_SELECT_FOLLOW: u8 = 0xa2;
 pub const NATIVE_OTCLIENT_CLIENT_CANCEL_ATTACK_AND_FOLLOW: u8 = 0xbe;
 pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_CLIENT_REQUEST_CHANNELS: u8 = 0x97;
+pub const NATIVE_OTCLIENT_CLIENT_JOIN_CHANNEL: u8 = 0x98;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM: u8 = 0x82;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM_EX: u8 = 0x83;
 pub const NATIVE_OTCLIENT_CLIENT_USE_ITEM_ON_CREATURE: u8 = 0x84;
@@ -908,6 +909,7 @@ pub const NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT: u8 = 0xd3;
 pub const NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG: u8 = 0xf0;
 pub const NATIVE_OTCLIENT_GAME_QUEST_LOG: u8 = 0xf0;
 pub const NATIVE_OTCLIENT_GAME_CHANNELS: u8 = 0xab;
+pub const NATIVE_OTCLIENT_GAME_OPEN_CHANNEL: u8 = 0xac;
 pub const NATIVE_OTCLIENT_MAX_IGNORED_INTERACTION_BYTES: usize = 512;
 pub const NATIVE_OTCLIENT_UNKNOWN_CREATURE: u16 = 0x0061;
 pub const NATIVE_OTCLIENT_MAPPED_CREATURE: u16 = 0xffff;
@@ -1263,6 +1265,7 @@ pub enum NativeOtClientGameAction {
     RequestOutfit,
     RequestQuestLog,
     RequestChannels,
+    JoinChannel(u16),
     ChangeOutfit(NativeOtClientClassicOutfit),
     CloseContainer(u8),
     UpArrowContainer(u8),
@@ -2219,6 +2222,7 @@ pub fn decode_native_otclient_game_action(
         NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT => NativeOtClientGameAction::RequestOutfit,
         NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG => NativeOtClientGameAction::RequestQuestLog,
         NATIVE_OTCLIENT_CLIENT_REQUEST_CHANNELS => NativeOtClientGameAction::RequestChannels,
+        NATIVE_OTCLIENT_CLIENT_JOIN_CHANNEL => NativeOtClientGameAction::JoinChannel(reader.u16()?),
         NATIVE_OTCLIENT_CLIENT_TALK => {
             let mode = reader.byte()?;
             let message = match mode {
@@ -2402,6 +2406,27 @@ pub fn encode_native_otclient_channel_list(
         writer.u16(channel.id);
         writer.string(&channel.name);
     }
+    Ok(Frame(writer.finish()))
+}
+
+/// Opens one validated configured public channel with explicit empty player and invitation lists.
+/// This codec does not create session membership or enable channel messages.
+pub fn encode_native_otclient_open_public_channel(
+    profile: &NativeOtClientProfile,
+    channel: &NativeOtClientClassicChannel,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    if channel.name.len() > u16::MAX as usize {
+        return Err(ProtocolError::StringTooLong(channel.name.len()));
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_OPEN_CHANNEL);
+    writer.u16(channel.id);
+    writer.string(&channel.name);
+    writer.u16(0);
+    writer.u16(0);
     Ok(Frame(writer.finish()))
 }
 
@@ -4057,6 +4082,19 @@ mod tests {
             .unwrap(),
             NativeOtClientGameAction::RequestChannels
         );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_JOIN_CHANNEL, 7, 0]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::JoinChannel(7)
+        );
+        assert!(decode_native_otclient_game_action(
+            &Frame(vec![NATIVE_OTCLIENT_CLIENT_JOIN_CHANNEL, 7]),
+            &profile,
+        )
+        .is_err());
         assert!(decode_native_otclient_game_action(
             &Frame(vec![NATIVE_OTCLIENT_CLIENT_REQUEST_CHANNELS, 0]),
             &profile,
@@ -4119,6 +4157,33 @@ mod tests {
                 b'a',
                 b'd',
                 b'e',
+            ]
+        );
+        assert_eq!(
+            encode_native_otclient_open_public_channel(
+                &profile,
+                &NativeOtClientClassicChannel {
+                    id: 7,
+                    name: "Trade".into(),
+                },
+            )
+            .unwrap()
+            .0,
+            vec![
+                NATIVE_OTCLIENT_GAME_OPEN_CHANNEL,
+                7,
+                0,
+                5,
+                0,
+                b'T',
+                b'r',
+                b'a',
+                b'd',
+                b'e',
+                0,
+                0,
+                0,
+                0,
             ]
         );
         assert_eq!(

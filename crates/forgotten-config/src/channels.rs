@@ -24,6 +24,10 @@ pub struct LegacyPublicChannelCatalog {
 }
 
 impl LegacyPublicChannelCatalog {
+    pub fn get(&self, id: u16) -> Option<&LegacyPublicChannelDefinition> {
+        self.entries.get(&id)
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

@@ -54,19 +54,19 @@ use forgotten_protocol::{
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
     encode_native_otclient_move_creature_at, encode_native_otclient_open_container,
-    encode_native_otclient_player_modes, encode_native_otclient_player_skills,
-    encode_native_otclient_player_stats, encode_native_otclient_public_say,
-    encode_native_otclient_read_only_text_window, encode_native_otclient_set_inventory,
-    encode_native_otclient_status_message, encode_status_binary, encode_status_xml,
-    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
-    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
-    NativeOtClientCardinalDirection, NativeOtClientClassicChannel, NativeOtClientClassicItemRecord,
-    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
-    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
-    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
-    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    encode_native_otclient_open_public_channel, encode_native_otclient_player_modes,
+    encode_native_otclient_player_skills, encode_native_otclient_player_stats,
+    encode_native_otclient_public_say, encode_native_otclient_read_only_text_window,
+    encode_native_otclient_set_inventory, encode_native_otclient_status_message,
+    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
+    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
+    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection, NativeOtClientClassicChannel,
+    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
+    NativeOtClientClassicOutfit, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
+    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerVitals,
+    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
+    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -430,6 +430,20 @@ fn native_classic_channel_list_entries(
             name: channel.name.clone(),
         })
         .collect()
+}
+
+fn native_configured_public_channel(
+    catalog: Option<&LegacyPublicChannelCatalog>,
+    channel_id: u16,
+) -> Option<NativeOtClientClassicChannel> {
+    catalog.and_then(|catalog| {
+        catalog
+            .get(channel_id)
+            .map(|channel| NativeOtClientClassicChannel {
+                id: channel.id,
+                name: channel.name.clone(),
+            })
+    })
 }
 
 fn native_classic_equipment_frames(
@@ -890,6 +904,9 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         NativeOtClientGameAction::RequestOutfit => "action=request-outfit".into(),
         NativeOtClientGameAction::RequestQuestLog => "action=request-quest-log".into(),
         NativeOtClientGameAction::RequestChannels => "action=request-channels".into(),
+        NativeOtClientGameAction::JoinChannel(channel_id) => {
+            format!("action=join-channel channel-id={channel_id}")
+        }
         NativeOtClientGameAction::ChangeOutfit(outfit) => format!(
             "action=change-outfit look-type={} colors={},{},{},{}",
             outfit.look_type, outfit.head, outfit.body, outfit.legs, outfit.feet
@@ -5764,6 +5781,32 @@ fn handle_native_otclient_game(
                     ),
                 );
             }
+            NativeOtClientGameAction::JoinChannel(channel_id) => {
+                let Some(channel) = native_configured_public_channel(
+                    config.public_channel_catalog.as_deref(),
+                    channel_id,
+                ) else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=join-channel outcome=deferred-unknown-or-unconfigured-channel",
+                    );
+                    continue;
+                };
+                let open_channel =
+                    encode_native_otclient_open_public_channel(&config.client_profile, &channel)
+                        .map_err(HostError::Protocol)?;
+                write_frame(stream, &open_channel)?;
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "outbound=open-public-channel opcode=0xac channel-id={} bytes={}",
+                        channel.id,
+                        open_channel.0.len(),
+                    ),
+                );
+            }
             NativeOtClientGameAction::RequestChannels => {
                 let entries =
                     native_classic_channel_list_entries(config.public_channel_catalog.as_deref());
@@ -8003,6 +8046,15 @@ mod tests {
             ]
         );
         assert!(native_classic_channel_list_entries(None).is_empty());
+        assert_eq!(
+            native_configured_public_channel(Some(&catalog), 7),
+            Some(NativeOtClientClassicChannel {
+                id: 7,
+                name: "Trade".into(),
+            })
+        );
+        assert!(native_configured_public_channel(Some(&catalog), 2).is_none());
+        assert!(native_configured_public_channel(None, 7).is_none());
     }
 
     fn native_world_map() -> Arc<WorldMap> {
