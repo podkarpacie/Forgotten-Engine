@@ -66,8 +66,9 @@ pub const FE_MAP_EXTENSION: &str = "femap";
 pub const OTBM_MAP_EXTENSION: &str = "otbm";
 pub const FE_MAP_FORMAT: &str = "fe-map-v1";
 pub const FE_MAP_INTERCHANGE_FORMAT: &str = "fe-map-v2";
-pub const REQUIRED_CONTENT_DIRECTORIES: [&str; 15] = [
+pub const REQUIRED_CONTENT_DIRECTORIES: [&str; 16] = [
     "actions",
+    "chatchannels",
     "creaturescripts",
     "events",
     "globalevents",
@@ -645,6 +646,14 @@ pub fn ensure_content_skeleton(world_directory: impl AsRef<Path>) -> Result<(), 
         fs::write(
             default_map,
             "# Forgotten Engine original map document\nformat=fe-map-v1\nspawn=100,100,7\n# x1,y1,x2,y2,z,groundThingId,walkable\nfill=80,80,120,120,7,0,true\n",
+        )
+        .map_err(ConfigError::Io)?;
+    }
+    let channel_catalog = data.join("chatchannels").join("chatchannels.xml");
+    if !channel_catalog.exists() {
+        fs::write(
+            channel_catalog,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><channels></channels>\n",
         )
         .map_err(ConfigError::Io)?;
     }
@@ -2000,12 +2009,30 @@ experienceStages = {
         let report = validate_content(&world).unwrap();
         assert!(report.missing_directories.is_empty());
         assert!(report.empty_world_manifest.is_file());
+        let channel_catalog = world.join("data/chatchannels/chatchannels.xml");
+        assert_eq!(
+            parse_tfs_public_channels_xml(&fs::read(&channel_catalog).unwrap())
+                .unwrap()
+                .len(),
+            0
+        );
+        fs::write(
+            &channel_catalog,
+            br#"<channels><channel id="7" name="Trade" public="true"/></channels>"#,
+        )
+        .unwrap();
         fs::remove_file(&report.empty_world_manifest).unwrap();
         ensure_content_skeleton(&world).unwrap();
         assert!(validate_content(&world)
             .unwrap()
             .empty_world_manifest
             .is_file());
+        assert_eq!(
+            parse_tfs_public_channels_xml(&fs::read(&channel_catalog).unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
         let _ = fs::remove_dir_all(world);
     }
 
