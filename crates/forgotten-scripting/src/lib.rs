@@ -4,7 +4,7 @@
 //! only typed aggregate inventory metadata; it cannot receive a script path or source body and
 //! always returns a deferred no-op outcome.
 
-use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Value};
+use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Value, Variadic};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -25,7 +25,7 @@ const INSTRUCTION_LIMIT_MARKER: &str = "forgotten-engine-sandbox-instruction-lim
 
 /// Explicit limits for one side-effect-free Lua expression evaluation. The executor creates a
 /// fresh VM per call with no standard libraries. The sole installed compatibility helper is a
-/// VM-local, capacity-capped `table.create`; the sandbox offers no file, network, process,
+/// VM-local, capacity-capped `table.create` and `table.pack`; the sandbox offers no file, network, process,
 /// package, debug, or mutable host API surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SandboxedLuaLimits {
@@ -467,8 +467,23 @@ fn install_sandboxed_tfs_compatibility_globals(lua: &Lua) -> Result<(), mlua::Er
                 })?;
             lua.create_table_with_capacity(array_capacity, record_capacity)
         })?;
+    let pack_table = lua.create_function(|lua, values: Variadic<Value>| {
+        if values.len() > MAX_SANDBOXED_LUA_TABLE_CREATE_ARRAY_CAPACITY {
+            return Err(mlua::Error::RuntimeError(
+                "sandbox table.pack argument count exceeds the configured limit".into(),
+            ));
+        }
+        let argument_count = values.len();
+        let table = lua.create_table_with_capacity(argument_count, 1)?;
+        for (index, value) in values.into_iter().enumerate() {
+            table.raw_set(index + 1, value)?;
+        }
+        table.set("n", i64::try_from(argument_count).unwrap_or(i64::MAX))?;
+        Ok(table)
+    })?;
     let table = lua.create_table()?;
     table.set("create", create_table)?;
+    table.set("pack", pack_table)?;
     lua.globals().set("table", table)
 }
 
@@ -886,6 +901,21 @@ mod tests {
         );
         assert_eq!(table_create.state, SandboxedLuaExecutionState::Completed);
         assert_eq!(table_create.value, Some(SandboxedLuaValue::Integer(49)));
+
+        let table_pack = executor.execute_expression(
+            "(function() local t = table.pack(4, 'fe', nil, true); return t.n == 4 and t[1] == 4 and t[2] == 'fe' and t[3] == nil and t[4] == true end)()",
+        );
+        assert_eq!(table_pack.state, SandboxedLuaExecutionState::Completed);
+        assert_eq!(table_pack.value, Some(SandboxedLuaValue::Boolean(true)));
+
+        let oversized_pack = executor.execute_expression(&format!(
+            "table.pack({})",
+            vec!["1"; MAX_SANDBOXED_LUA_TABLE_CREATE_ARRAY_CAPACITY + 1].join(",")
+        ));
+        assert_eq!(
+            oversized_pack.state,
+            SandboxedLuaExecutionState::RuntimeRejected
+        );
 
         let oversized_table = executor.execute_expression("table.create(257, 0)");
         assert_eq!(
