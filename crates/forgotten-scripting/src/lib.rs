@@ -21,12 +21,14 @@ pub const MAX_SANDBOXED_LUA_CALLBACK_NAME_BYTES: usize = 64;
 pub const MAX_SANDBOXED_LUA_CALLBACK_EVENT_KIND_BYTES: usize = 64;
 pub const MAX_SANDBOXED_LUA_TABLE_CREATE_ARRAY_CAPACITY: usize = 256;
 pub const MAX_SANDBOXED_LUA_TABLE_CREATE_RECORD_CAPACITY: usize = 256;
+pub const MAX_SANDBOXED_LUA_MATH_ARGUMENTS: usize = 256;
 const INSTRUCTION_LIMIT_MARKER: &str = "forgotten-engine-sandbox-instruction-limit";
 
 /// Explicit limits for one side-effect-free Lua expression evaluation. The executor creates a
-/// fresh VM per call with no standard libraries. The sole installed compatibility helper is a
-/// VM-local, capacity-capped `table.create` and `table.pack`; the sandbox offers no file, network, process,
-/// package, debug, or mutable host API surface.
+/// fresh VM per call with no standard libraries. The installed compatibility surface is limited to
+/// VM-local, capacity-capped `table.create` and `table.pack`, plus deterministic `math.abs`,
+/// `math.ceil`, `math.floor`, `math.min`, and `math.max`; the sandbox offers no file, network,
+/// process, package, debug, random-state, time, or mutable host API surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SandboxedLuaLimits {
     pub max_source_bytes: usize,
@@ -484,7 +486,42 @@ fn install_sandboxed_tfs_compatibility_globals(lua: &Lua) -> Result<(), mlua::Er
     let table = lua.create_table()?;
     table.set("create", create_table)?;
     table.set("pack", pack_table)?;
-    lua.globals().set("table", table)
+    lua.globals().set("table", table)?;
+
+    let math_abs = lua.create_function(|_, value: f64| Ok(value.abs()))?;
+    let math_ceil = lua.create_function(|_, value: f64| Ok(value.ceil()))?;
+    let math_floor = lua.create_function(|_, value: f64| Ok(value.floor()))?;
+    let math_min = lua.create_function(|_, values: Variadic<f64>| {
+        if values.len() > MAX_SANDBOXED_LUA_MATH_ARGUMENTS {
+            return Err(mlua::Error::RuntimeError(
+                "sandbox math.min argument count exceeds the configured limit".into(),
+            ));
+        }
+        let mut values = values.into_iter();
+        let first = values.next().ok_or_else(|| {
+            mlua::Error::RuntimeError("sandbox math.min requires an argument".into())
+        })?;
+        values.try_fold(first, |minimum, value| Ok(minimum.min(value)))
+    })?;
+    let math_max = lua.create_function(|_, values: Variadic<f64>| {
+        if values.len() > MAX_SANDBOXED_LUA_MATH_ARGUMENTS {
+            return Err(mlua::Error::RuntimeError(
+                "sandbox math.max argument count exceeds the configured limit".into(),
+            ));
+        }
+        let mut values = values.into_iter();
+        let first = values.next().ok_or_else(|| {
+            mlua::Error::RuntimeError("sandbox math.max requires an argument".into())
+        })?;
+        values.try_fold(first, |maximum, value| Ok(maximum.max(value)))
+    })?;
+    let math = lua.create_table()?;
+    math.set("abs", math_abs)?;
+    math.set("ceil", math_ceil)?;
+    math.set("floor", math_floor)?;
+    math.set("min", math_min)?;
+    math.set("max", math_max)?;
+    lua.globals().set("math", math)
 }
 
 fn sandboxed_lua_value(value: Value) -> Option<SandboxedLuaValue> {
@@ -907,6 +944,30 @@ mod tests {
         );
         assert_eq!(table_pack.state, SandboxedLuaExecutionState::Completed);
         assert_eq!(table_pack.value, Some(SandboxedLuaValue::Boolean(true)));
+
+        let math = executor.execute_expression(
+            "math.abs(-3.5) == 3.5 and math.ceil(2.1) == 3 and math.floor(2.9) == 2 and math.min(4, -2, 7) == -2 and math.max(4, -2, 7) == 7",
+        );
+        assert_eq!(math.state, SandboxedLuaExecutionState::Completed);
+        assert_eq!(math.value, Some(SandboxedLuaValue::Boolean(true)));
+
+        assert_eq!(
+            executor.execute_expression("math.min()").state,
+            SandboxedLuaExecutionState::RuntimeRejected
+        );
+        assert_eq!(
+            executor
+                .execute_expression(&format!(
+                    "math.max({})",
+                    vec!["1"; MAX_SANDBOXED_LUA_MATH_ARGUMENTS + 1].join(",")
+                ))
+                .state,
+            SandboxedLuaExecutionState::RuntimeRejected
+        );
+        assert_eq!(
+            executor.execute_expression("math.random").value,
+            Some(SandboxedLuaValue::Nil)
+        );
 
         let oversized_pack = executor.execute_expression(&format!(
             "table.pack({})",
