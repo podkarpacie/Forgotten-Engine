@@ -3675,6 +3675,7 @@ fn restore_static_creature_runtime_from_database(
             active: record.active,
             health_percent: record.health_percent,
             reactivation_remaining_seconds: record.reactivation_remaining_seconds,
+            direct_melee_cooldown_remaining_ticks: record.direct_melee_cooldown_remaining_ticks,
             direct_melee_damage_sequence: record.direct_melee_damage_sequence,
         })
         .collect::<Vec<_>>();
@@ -3702,6 +3703,7 @@ fn persist_static_creature_runtime_to_open_database(
             active: snapshot.active,
             health_percent: snapshot.health_percent,
             reactivation_remaining_seconds: snapshot.reactivation_remaining_seconds,
+            direct_melee_cooldown_remaining_ticks: snapshot.direct_melee_cooldown_remaining_ticks,
             direct_melee_damage_sequence: snapshot.direct_melee_damage_sequence,
         })
         .collect::<Vec<_>>();
@@ -10730,6 +10732,7 @@ mod tests {
                 active: false,
                 health_percent: 42,
                 reactivation_remaining_seconds: Some(8),
+                direct_melee_cooldown_remaining_ticks: None,
                 direct_melee_damage_sequence: 0,
             }]
         );
@@ -10761,7 +10764,7 @@ mod tests {
             }],
             BTreeMap::new(),
             BTreeMap::new(),
-            BTreeMap::new(),
+            BTreeMap::from([(creature_id, 2_000)]),
             BTreeMap::from([(
                 creature_id,
                 forgotten_core::StaticCreatureDirectMeleeDamageRange {
@@ -10806,6 +10809,14 @@ mod tests {
                 .direct_melee_damage_sequence,
             1
         );
+        assert_eq!(
+            EngineDatabase::open(&path)
+                .unwrap()
+                .static_creature_runtime()
+                .unwrap()[0]
+                .direct_melee_cooldown_remaining_ticks,
+            Some(2)
+        );
 
         let fresh = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
         fresh
@@ -10823,6 +10834,14 @@ mod tests {
                 max_range: 1,
             })
             .unwrap();
+        assert!(matches!(
+            fresh.apply_static_creature_target_damage(creature_id, 1, &map),
+            Ok(StaticCreatureTargetAttackOutcome::CooldownNotDue {
+                creature_id: _,
+                due_tick: 2,
+            })
+        ));
+        advance_native_shared_world_heartbeat(&fresh, 2).unwrap();
         assert!(matches!(
             fresh.apply_static_creature_target_damage(creature_id, 1, &map),
             Ok(StaticCreatureTargetAttackOutcome::Applied {
@@ -10931,6 +10950,7 @@ mod tests {
                 active: true,
                 health_percent: 5,
                 reactivation_remaining_seconds: None,
+                direct_melee_cooldown_remaining_ticks: None,
                 direct_melee_damage_sequence: 0,
             }]
         );
@@ -10986,6 +11006,7 @@ mod tests {
                 active: false,
                 health_percent: 0,
                 reactivation_remaining_seconds: None,
+                direct_melee_cooldown_remaining_ticks: None,
                 direct_melee_damage_sequence: 0,
             }
         );

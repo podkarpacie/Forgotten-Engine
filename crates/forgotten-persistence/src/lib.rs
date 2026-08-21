@@ -30,7 +30,8 @@ const SCHEMA_VERSION_STATIC_CREATURE_RUNTIME: i64 = 12;
 const SCHEMA_VERSION_STATIC_CREATURE_REACTIVATION: i64 = 13;
 const SCHEMA_VERSION_MAP_ITEM_JOURNAL: i64 = 14;
 const SCHEMA_VERSION_STATIC_CREATURE_DAMAGE_SEQUENCE: i64 = 15;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_STATIC_CREATURE_DAMAGE_SEQUENCE;
+const SCHEMA_VERSION_STATIC_CREATURE_MELEE_COOLDOWN: i64 = 16;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_STATIC_CREATURE_MELEE_COOLDOWN;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 
@@ -40,9 +41,9 @@ pub struct EngineDatabase {
 }
 
 /// The durable subset of known static-creature runtime state. It includes a bounded restart-relative
-/// reactivation delay and deterministic direct-melee selection sequence, not an autonomous
-/// scheduler. Spawn definitions, appearance, targets, AI cadence, combat formulas, loot, and
-/// scripts remain content/runtime concerns.
+/// reactivation delay, direct-melee cooldown remainder, and deterministic direct-melee selection
+/// sequence, not an autonomous scheduler. Spawn definitions, appearance, targets, AI cadence,
+/// combat formulas, loot, and scripts remain content/runtime concerns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaticCreatureRuntimeRecord {
     pub creature_id: u32,
@@ -50,6 +51,7 @@ pub struct StaticCreatureRuntimeRecord {
     pub active: bool,
     pub health_percent: u8,
     pub reactivation_remaining_seconds: Option<u32>,
+    pub direct_melee_cooldown_remaining_ticks: Option<u32>,
     pub direct_melee_damage_sequence: u64,
 }
 
@@ -1516,7 +1518,7 @@ impl EngineDatabase {
         transaction.execute("DELETE FROM static_creature_runtime", [])?;
         for record in records {
             transaction.execute(
-                "INSERT INTO static_creature_runtime (creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds, direct_melee_damage_sequence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO static_creature_runtime (creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds, direct_melee_cooldown_remaining_ticks, direct_melee_damage_sequence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     i64::from(record.creature_id),
                     i64::from(record.position.x),
@@ -1525,6 +1527,7 @@ impl EngineDatabase {
                     i64::from(u8::from(record.active)),
                     i64::from(record.health_percent),
                     record.reactivation_remaining_seconds.map(i64::from),
+                    record.direct_melee_cooldown_remaining_ticks.map(i64::from),
                     i64::try_from(record.direct_melee_damage_sequence)
                         .expect("validated sequence fits SQLite INTEGER"),
                 ],
@@ -1540,7 +1543,7 @@ impl EngineDatabase {
         &self,
     ) -> Result<Vec<StaticCreatureRuntimeRecord>, PersistenceError> {
         let mut statement = self.connection.prepare(
-            "SELECT creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds, direct_melee_damage_sequence FROM static_creature_runtime ORDER BY creature_id",
+            "SELECT creature_id, x, y, z, active, health_percent, reactivation_remaining_seconds, direct_melee_cooldown_remaining_ticks, direct_melee_damage_sequence FROM static_creature_runtime ORDER BY creature_id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -1551,7 +1554,8 @@ impl EngineDatabase {
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
                 row.get::<_, Option<i64>>(6)?,
-                row.get::<_, i64>(7)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         })?;
         let mut records = Vec::new();
@@ -1564,6 +1568,7 @@ impl EngineDatabase {
                 active,
                 health_percent,
                 reactivation_remaining_seconds,
+                direct_melee_cooldown_remaining_ticks,
                 direct_melee_damage_sequence,
             ) = row?;
             let creature_id = u32::try_from(creature_id).map_err(|_| {
@@ -1619,6 +1624,15 @@ impl EngineDatabase {
                     "active creatures cannot carry a reactivation delay".into(),
                 ));
             }
+            let direct_melee_cooldown_remaining_ticks = direct_melee_cooldown_remaining_ticks
+                .map(|remaining_ticks| {
+                    u32::try_from(remaining_ticks).map_err(|_| {
+                        PersistenceError::InvalidStaticCreatureRuntimeRecord(
+                            "direct melee cooldown delay does not fit u32".into(),
+                        )
+                    })
+                })
+                .transpose()?;
             let direct_melee_damage_sequence = u64::try_from(direct_melee_damage_sequence)
                 .map_err(|_| {
                     PersistenceError::InvalidStaticCreatureRuntimeRecord(
@@ -1631,6 +1645,7 @@ impl EngineDatabase {
                 active,
                 health_percent,
                 reactivation_remaining_seconds,
+                direct_melee_cooldown_remaining_ticks,
                 direct_melee_damage_sequence,
             });
         }
@@ -1901,6 +1916,18 @@ impl EngineDatabase {
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![
                     SCHEMA_VERSION_STATIC_CREATURE_DAMAGE_SEQUENCE,
+                    unix_seconds()
+                ],
+            )?;
+        }
+        if self.schema_version()? < SCHEMA_VERSION_STATIC_CREATURE_MELEE_COOLDOWN {
+            self.connection.execute_batch(
+                "ALTER TABLE static_creature_runtime ADD COLUMN direct_melee_cooldown_remaining_ticks INTEGER NULL;",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![
+                    SCHEMA_VERSION_STATIC_CREATURE_MELEE_COOLDOWN,
                     unix_seconds()
                 ],
             )?;
@@ -2326,6 +2353,7 @@ mod tests {
                 active: true,
                 health_percent: 100,
                 reactivation_remaining_seconds: None,
+                direct_melee_cooldown_remaining_ticks: Some(2),
                 direct_melee_damage_sequence: 5,
             },
             StaticCreatureRuntimeRecord {
@@ -2338,6 +2366,7 @@ mod tests {
                 active: false,
                 health_percent: 0,
                 reactivation_remaining_seconds: Some(42),
+                direct_melee_cooldown_remaining_ticks: None,
                 direct_melee_damage_sequence: 11,
             },
         ];
