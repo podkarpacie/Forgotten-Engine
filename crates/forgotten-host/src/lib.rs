@@ -6112,7 +6112,7 @@ fn handle_native_otclient_game(
                 );
             }
             NativeOtClientGameAction::Talk(request) => {
-                let recipient_count = if request.mode == 5 {
+                let recipient_count = if request.mode == 7 {
                     let Some(channel_id) = request.channel_id else {
                         native_diagnostic(
                             config.extended_diagnostics,
@@ -14312,7 +14312,7 @@ mod tests {
             &mut stream,
             &Frame(vec![
                 forgotten_protocol::NATIVE_OTCLIENT_CLIENT_TALK,
-                5,
+                7,
                 7,
                 0,
                 2,
@@ -14334,7 +14334,7 @@ mod tests {
                 b'g',
                 b'h',
                 b't',
-                5,
+                7,
                 7,
                 0,
                 2,
@@ -14357,7 +14357,7 @@ mod tests {
             &mut stream,
             &Frame(vec![
                 forgotten_protocol::NATIVE_OTCLIENT_CLIENT_TALK,
-                5,
+                7,
                 7,
                 0,
                 7,

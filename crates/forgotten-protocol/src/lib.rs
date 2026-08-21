@@ -1479,7 +1479,7 @@ pub fn encode_native_otclient_public_say(
 }
 
 /// Encodes one classic 740 normal channel Talk record. The selected OTCv8 profile maps server
-/// mode `5` to a normal channel message and reads a 16-bit channel ID before the text.
+/// mode `7` to a normal channel message and reads a 16-bit channel ID before the text.
 pub fn encode_native_otclient_public_channel_say(
     profile: &NativeOtClientProfile,
     speaker_name: &str,
@@ -1505,7 +1505,7 @@ pub fn encode_native_otclient_public_channel_say(
     let mut writer = Writer::default();
     writer.byte(NATIVE_OTCLIENT_GAME_TALK);
     writer.string(speaker_name);
-    writer.byte(5);
+    writer.byte(7);
     writer.u16(channel_id);
     writer.string(text);
     Ok(Frame(writer.finish()))
@@ -2274,11 +2274,11 @@ pub fn decode_native_otclient_game_action(
         NATIVE_OTCLIENT_CLIENT_TALK => {
             let mode = reader.byte()?;
             let (channel_id, message) = match mode {
-                4 | 11 => {
+                4 | 5 | 11 => {
                     reader.string(MAX_LOGIN_STRING_BYTES)?;
                     (None, reader.string(MAX_LOGIN_STRING_BYTES)?)
                 }
-                5 | 6 | 7 | 8 | 10 | 12 => {
+                6 | 7 | 8 | 10 | 12 => {
                     let channel_id = reader.u16()?;
                     (Some(channel_id), reader.string(MAX_LOGIN_STRING_BYTES)?)
                 }
@@ -4310,12 +4310,12 @@ mod tests {
         );
         assert_eq!(
             decode_native_otclient_game_action(
-                &Frame(vec![NATIVE_OTCLIENT_CLIENT_TALK, 5, 7, 0, 2, 0, b'h', b'i']),
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_TALK, 7, 7, 0, 2, 0, b'h', b'i']),
                 &profile,
             )
             .unwrap(),
             NativeOtClientGameAction::Talk(NativeOtClientTalkRequest {
-                mode: 5,
+                mode: 7,
                 channel_id: Some(7),
                 message: "hi".into(),
             })
@@ -4334,7 +4334,7 @@ mod tests {
                 b'g',
                 b'h',
                 b't',
-                5,
+                7,
                 7,
                 0,
                 2,
