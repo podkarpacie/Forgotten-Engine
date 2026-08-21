@@ -1,6 +1,8 @@
 use crate::legacy_xml::{LegacySpawnKind, LegacyWorldCompanionData};
 use crate::{ConfigError, EngineConfig};
-use forgotten_core::{FeTfsStaticEntity, FeTfsStaticSpawnCollection};
+use forgotten_core::{
+    FeTfsStaticEntity, FeTfsStaticSpawnCollection, StaticCreatureDirectMeleeDamageRange,
+};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 use std::collections::{BTreeMap, BTreeSet};
@@ -145,6 +147,7 @@ pub fn materialize_tfs_static_spawns(
     let mut respawn_intervals_seconds = BTreeMap::new();
     let mut experience_rewards = BTreeMap::new();
     let mut direct_melee_intervals_millis = BTreeMap::new();
+    let mut direct_melee_damage_ranges = BTreeMap::new();
     let mut next_id = STATIC_TFS_ENTITY_ID_START;
     for spawn_area in &companions.spawns {
         for creature in &spawn_area.creatures {
@@ -171,6 +174,13 @@ pub fn materialize_tfs_static_spawns(
             if matches!(definition.kind, TfsEntityKind::Monster) {
                 if let Some(direct_melee) = definition.direct_melee {
                     direct_melee_intervals_millis.insert(next_id, direct_melee.interval_millis);
+                    direct_melee_damage_ranges.insert(
+                        next_id,
+                        StaticCreatureDirectMeleeDamageRange {
+                            min_damage: direct_melee.min_damage.min(direct_melee.max_damage),
+                            max_damage: direct_melee.min_damage.max(direct_melee.max_damage),
+                        },
+                    );
                 }
             }
             let health_percent = match appearance.current_health {
@@ -206,11 +216,12 @@ pub fn materialize_tfs_static_spawns(
                 .ok_or_else(|| invalid("static TFS spawn identifier range is exhausted"))?;
         }
     }
-    FeTfsStaticSpawnCollection::with_runtime_metadata(
+    FeTfsStaticSpawnCollection::with_combat_metadata(
         entities,
         respawn_intervals_seconds,
         experience_rewards,
         direct_melee_intervals_millis,
+        direct_melee_damage_ranges,
     )
     .map_err(|error| invalid(format!("invalid static TFS spawn collection: {error}")))
 }
@@ -991,6 +1002,13 @@ mod tests {
         assert_eq!(
             spawns.direct_melee_interval_millis(STATIC_TFS_ENTITY_ID_START),
             Some(2_000)
+        );
+        assert_eq!(
+            spawns.direct_melee_damage_range(STATIC_TFS_ENTITY_ID_START),
+            Some(StaticCreatureDirectMeleeDamageRange {
+                min_damage: 1,
+                max_damage: 4,
+            })
         );
     }
 }

@@ -120,6 +120,16 @@ pub struct FeTfsStaticSpawnCollection {
     respawn_intervals_seconds: BTreeMap<u32, u32>,
     experience_rewards: BTreeMap<u32, u64>,
     direct_melee_intervals_millis: BTreeMap<u32, u32>,
+    direct_melee_damage_ranges: BTreeMap<u32, StaticCreatureDirectMeleeDamageRange>,
+}
+
+/// Bounded non-negative direct-melee damage values materialized from one legacy monster
+/// declaration. The runtime deliberately chooses values deterministically; it does not claim the
+/// randomized TFS combat formula or broader combat semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticCreatureDirectMeleeDamageRange {
+    pub min_damage: u16,
+    pub max_damage: u16,
 }
 
 impl FeTfsStaticSpawnCollection {
@@ -161,6 +171,24 @@ impl FeTfsStaticSpawnCollection {
         experience_rewards: BTreeMap<u32, u64>,
         direct_melee_intervals_millis: BTreeMap<u32, u32>,
     ) -> Result<Self, CoreError> {
+        Self::with_combat_metadata(
+            entities,
+            respawn_intervals_seconds,
+            experience_rewards,
+            direct_melee_intervals_millis,
+            BTreeMap::new(),
+        )
+    }
+
+    /// Retains validated direct-melee interval and damage-range metadata together by stable
+    /// static creature ID. Damage selection remains a bounded deterministic runtime policy.
+    pub fn with_combat_metadata(
+        entities: Vec<FeTfsStaticEntity>,
+        respawn_intervals_seconds: BTreeMap<u32, u32>,
+        experience_rewards: BTreeMap<u32, u64>,
+        direct_melee_intervals_millis: BTreeMap<u32, u32>,
+        direct_melee_damage_ranges: BTreeMap<u32, StaticCreatureDirectMeleeDamageRange>,
+    ) -> Result<Self, CoreError> {
         if entities.len() > MAX_TFS_STATIC_SPAWNS {
             return Err(CoreError::StaticSpawnLimit(MAX_TFS_STATIC_SPAWNS));
         }
@@ -190,11 +218,18 @@ impl FeTfsStaticSpawnCollection {
         {
             return Err(CoreError::UnknownStaticCreatureSchedule);
         }
+        if direct_melee_damage_ranges
+            .iter()
+            .any(|(id, range)| !ids.contains(id) || range.min_damage > range.max_damage)
+        {
+            return Err(CoreError::UnknownStaticCreatureSchedule);
+        }
         Ok(Self {
             entities,
             respawn_intervals_seconds,
             experience_rewards,
             direct_melee_intervals_millis,
+            direct_melee_damage_ranges,
         })
     }
 
@@ -214,6 +249,13 @@ impl FeTfsStaticSpawnCollection {
 
     pub fn direct_melee_interval_millis(&self, id: u32) -> Option<u32> {
         self.direct_melee_intervals_millis.get(&id).copied()
+    }
+
+    pub fn direct_melee_damage_range(
+        &self,
+        id: u32,
+    ) -> Option<StaticCreatureDirectMeleeDamageRange> {
+        self.direct_melee_damage_ranges.get(&id).copied()
     }
 
     pub fn at(&self, position: Position) -> impl Iterator<Item = &FeTfsStaticEntity> {
@@ -346,6 +388,8 @@ struct StaticCreatureRuntime {
     respawn_interval_seconds: u32,
     melee_cooldown_ticks: Option<u64>,
     next_melee_due_tick: u64,
+    direct_melee_damage_range: Option<StaticCreatureDirectMeleeDamageRange>,
+    direct_melee_damage_sequence: u64,
     target_player_id: Option<u64>,
 }
 
@@ -2834,6 +2878,8 @@ impl WorldState {
                             .direct_melee_interval_millis(entity.id)
                             .map(|interval| u64::from(interval).div_ceil(1_000)),
                         next_melee_due_tick: self.tick,
+                        direct_melee_damage_range: collection.direct_melee_damage_range(entity.id),
+                        direct_melee_damage_sequence: 0,
                         target_player_id: None,
                     },
                 )
@@ -3088,6 +3134,16 @@ impl WorldState {
                 .map(|(id, runtime)| (*id, runtime.experience_reward))
                 .collect(),
             direct_melee_intervals_millis: BTreeMap::new(),
+            direct_melee_damage_ranges: self
+                .static_creatures
+                .iter()
+                .filter_map(|(id, runtime)| {
+                    runtime
+                        .active
+                        .then_some(runtime.direct_melee_damage_range.map(|range| (*id, range)))
+                        .flatten()
+                })
+                .collect(),
         }
     }
 
@@ -3185,10 +3241,10 @@ impl WorldState {
     pub fn apply_static_creature_target_damage(
         &mut self,
         creature_id: u32,
-        requested_damage: u16,
+        fallback_damage: u16,
         world_map: &WorldMap,
     ) -> Result<StaticCreatureTargetAttackOutcome, CoreError> {
-        let (source, target_player_id, melee_cooldown_ticks) = {
+        let (source, target_player_id, melee_cooldown_ticks, direct_melee_damage_range) = {
             let runtime = self
                 .static_creatures
                 .get(&creature_id)
@@ -3206,6 +3262,7 @@ impl WorldState {
                 runtime.entity.position,
                 runtime.target_player_id,
                 runtime.melee_cooldown_ticks,
+                runtime.direct_melee_damage_range,
             )
         };
         let Some(target_player_id) = target_player_id else {
@@ -3229,6 +3286,20 @@ impl WorldState {
                 target_player_id,
             });
         }
+        let requested_damage = if let Some(range) = direct_melee_damage_range {
+            let runtime = self
+                .static_creatures
+                .get_mut(&creature_id)
+                .expect("validated static creature remains installed");
+            let span = u64::from(range.max_damage) - u64::from(range.min_damage) + 1;
+            let offset = runtime.direct_melee_damage_sequence % span;
+            runtime.direct_melee_damage_sequence =
+                runtime.direct_melee_damage_sequence.saturating_add(1);
+            u16::try_from(u64::from(range.min_damage) + offset)
+                .expect("validated direct melee range fits u16")
+        } else {
+            fallback_damage
+        };
         let current_health = self.player_vitals(target_player_id)?.health;
         let mitigated_damage = self
             .player_combat_defense(target_player_id)?
@@ -8297,6 +8368,80 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn static_creature_direct_melee_damage_range_cycles_deterministically() {
+        let creature_id = 0x4000_0004;
+        let creature_position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let creature = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: creature_position,
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut target = player();
+        target.position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let map = WorldMap::new("direct-melee-range", creature_position);
+        let mut world = WorldState::default();
+        world.add_player(target).unwrap();
+        world
+            .update_player_vitals(
+                7,
+                PlayerVitals {
+                    health: 50,
+                    max_health: 50,
+                    ..PlayerVitals::default()
+                },
+            )
+            .unwrap();
+        world
+            .install_static_creatures(
+                &FeTfsStaticSpawnCollection::with_combat_metadata(
+                    vec![creature],
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeMap::from([(
+                        creature_id,
+                        StaticCreatureDirectMeleeDamageRange {
+                            min_damage: 2,
+                            max_damage: 4,
+                        },
+                    )]),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        world.select_static_creature_target(creature_id, 1).unwrap();
+
+        for requested_damage in [2, 3, 4, 2] {
+            assert!(matches!(
+                world.apply_static_creature_target_damage(creature_id, 1, &map),
+                Ok(StaticCreatureTargetAttackOutcome::Applied {
+                    requested_damage: actual,
+                    applied_damage: applied,
+                    ..
+                }) if actual == requested_damage && applied == requested_damage
+            ));
+        }
+        assert_eq!(world.player_vitals(7).unwrap().health, 39);
     }
 
     #[test]

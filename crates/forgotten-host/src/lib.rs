@@ -3917,6 +3917,15 @@ fn handle_native_otclient_game(
     .map_err(HostError::Protocol)?;
     let static_health_frames =
         native_static_creature_health_frames(&config.client_profile, &active_static_spawns)?;
+    // Establish all shared-state baselines before any initialization frame becomes observable by
+    // the peer. A concurrent mutation during bootstrap must remain pending for the first session
+    // loop rather than being silently absorbed by a post-write baseline read.
+    let mut observed_visibility_epoch = shared_world.visibility_epoch();
+    let mut observed_vitals_epoch = shared_world.vitals_epoch();
+    let mut observed_progression_epoch = shared_world.progression_epoch();
+    let mut observed_equipment_epoch = shared_world.equipment_epoch();
+    let mut observed_containers_epoch = shared_world.containers_epoch();
+    let mut observed_dead = shared_world.player_respawn_state(character.id)?.dead;
     write_frame(stream, &initialization)?;
     if character.outfit.look_type == player_outfit.look_type && player_outfit.look_type != 0 {
         let hydrated_outfit = encode_native_otclient_creature_outfit(
@@ -3970,13 +3979,7 @@ fn handle_native_otclient_game(
     let mut active_click_walk: Option<NativeActiveClickWalk> = None;
     let mut last_regeneration_tick = Instant::now();
     let mut last_condition_tick = Instant::now();
-    let mut observed_visibility_epoch = shared_world.visibility_epoch();
-    let mut observed_vitals_epoch = shared_world.vitals_epoch();
-    let mut observed_progression_epoch = shared_world.progression_epoch();
-    let mut observed_equipment_epoch = shared_world.equipment_epoch();
-    let mut observed_containers_epoch = shared_world.containers_epoch();
     let mut closed_container_ids = BTreeSet::new();
-    let mut observed_dead = shared_world.player_respawn_state(character.id)?.dead;
     loop {
         drain_shared_public_chat(
             stream,
@@ -10849,6 +10852,86 @@ mod tests {
     }
 
     #[test]
+    fn shared_static_target_attack_uses_imported_direct_melee_damage_over_fixed_fallback() {
+        let map = native_world_map();
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 3;
+        let creature = forgotten_core::FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let shared = SharedNativeWorld::from_static_spawns(Some(
+            &FeTfsStaticSpawnCollection::with_combat_metadata(
+                vec![creature],
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::from([(
+                    creature_id,
+                    forgotten_core::StaticCreatureDirectMeleeDamageRange {
+                        min_damage: 3,
+                        max_damage: 4,
+                    },
+                )]),
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+        shared
+            .register_player_at_available_position_with_vitals(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                PlayerVitals {
+                    health: 20,
+                    max_health: 20,
+                    ..PlayerVitals::default()
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .select_static_creature_target(creature_id, 1)
+            .unwrap();
+
+        let first = shared
+            .attack_static_creature_targets_once(
+                StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage: 1 },
+                &map,
+            )
+            .unwrap();
+        let second = shared
+            .attack_static_creature_targets_once(
+                StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage: 1 },
+                &map,
+            )
+            .unwrap();
+        assert_eq!(first.total_applied_damage, 3);
+        assert_eq!(second.total_applied_damage, 4);
+    }
+
+    #[test]
     fn selected_player_melee_persists_authoritative_vitals_and_returns_native_target() {
         let path = database_path("selected-player-melee");
         let mut database = EngineDatabase::open(&path).unwrap();
@@ -11806,12 +11889,28 @@ mod tests {
         druid
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
-        let peer_health_refresh = (0..12)
-            .map(|_| read_frame(&mut druid).unwrap())
-            .find(|frame| {
-                frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP)
-            })
-            .expect("peer session did not receive a viewport refresh after vital change");
+        let refresh_deadline = Instant::now() + Duration::from_secs(5);
+        let peer_health_refresh = loop {
+            match read_frame(&mut druid) {
+                Ok(frame)
+                    if frame.0.first()
+                        == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP) =>
+                {
+                    break frame;
+                }
+                Ok(_) => {}
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) && Instant::now() < refresh_deadline => {}
+                Err(error) => panic!("peer session failed before vital refresh: {error}"),
+            }
+            assert!(
+                Instant::now() < refresh_deadline,
+                "peer session did not receive a viewport refresh after vital change"
+            );
+        };
         let refreshed_knight_name_index = peer_health_refresh
             .0
             .windows(knight_name.len())
