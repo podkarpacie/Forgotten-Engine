@@ -56,17 +56,18 @@ use forgotten_protocol::{
     encode_native_otclient_move_creature_at, encode_native_otclient_open_container,
     encode_native_otclient_open_public_channel, encode_native_otclient_player_modes,
     encode_native_otclient_player_skills, encode_native_otclient_player_stats,
-    encode_native_otclient_public_say, encode_native_otclient_read_only_text_window,
-    encode_native_otclient_set_inventory, encode_native_otclient_status_message,
-    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
-    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
-    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
-    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection, NativeOtClientClassicChannel,
-    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
-    NativeOtClientClassicOutfit, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
-    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerVitals,
-    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
-    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    encode_native_otclient_public_channel_say, encode_native_otclient_public_say,
+    encode_native_otclient_read_only_text_window, encode_native_otclient_set_inventory,
+    encode_native_otclient_status_message, encode_status_binary, encode_status_xml,
+    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
+    NativeOtClientCardinalDirection, NativeOtClientClassicChannel, NativeOtClientClassicItemRecord,
+    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
+    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
+    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
+    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -805,8 +806,13 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
                 .map(|direction| direction.cardinal_steps().len())
                 .sum::<usize>()
         ),
-        NativeOtClientGameAction::Talk(message) => {
-            format!("action=talk text-bytes={}", message.len())
+        NativeOtClientGameAction::Talk(request) => {
+            format!(
+                "action=talk mode={} channel-id={} text-bytes={}",
+                request.mode,
+                request.channel_id.map_or(0, u16::from),
+                request.message.len()
+            )
         }
         NativeOtClientGameAction::ThrowItem {
             source_position,
@@ -1527,6 +1533,7 @@ fn plain_source_map_item_to_inventory_item(item: &WorldMapItem) -> Result<ItemIn
 struct SharedPublicChatEvent {
     speaker_name: String,
     speaker_position: NativeOtClientPosition,
+    channel_id: Option<u16>,
     text: String,
 }
 
@@ -2879,6 +2886,24 @@ impl SharedNativeWorld {
     }
 
     fn broadcast_public_chat(&self, sender_id: u64, message: &str) -> Result<usize, HostError> {
+        self.broadcast_chat(sender_id, message, None)
+    }
+
+    fn broadcast_configured_public_channel_chat(
+        &self,
+        sender_id: u64,
+        channel_id: u16,
+        message: &str,
+    ) -> Result<usize, HostError> {
+        self.broadcast_chat(sender_id, message, Some(channel_id))
+    }
+
+    fn broadcast_chat(
+        &self,
+        sender_id: u64,
+        message: &str,
+        channel_id: Option<u16>,
+    ) -> Result<usize, HostError> {
         let sender = self
             .lock()?
             .player(sender_id)
@@ -2892,6 +2917,7 @@ impl SharedNativeWorld {
         let event = SharedPublicChatEvent {
             speaker_name: sender.name,
             speaker_position: native_position(sender.position),
+            channel_id,
             text: truncate_native_chat_text(&body),
         };
         let mut recipients = self
@@ -4209,11 +4235,13 @@ fn handle_native_otclient_game(
     let mut last_regeneration_tick = Instant::now();
     let mut last_condition_tick = Instant::now();
     let mut closed_container_ids = BTreeSet::new();
+    let mut open_public_channel_ids = BTreeSet::new();
     loop {
         drain_shared_public_chat(
             stream,
             &config.client_profile,
             &chat_events,
+            &open_public_channel_ids,
             config.extended_diagnostics,
             peer,
         )?;
@@ -4250,6 +4278,7 @@ fn handle_native_otclient_game(
                         stream,
                         &config.client_profile,
                         &chat_events,
+                        &open_public_channel_ids,
                         config.extended_diagnostics,
                         peer,
                     )?;
@@ -5793,6 +5822,7 @@ fn handle_native_otclient_game(
                     );
                     continue;
                 };
+                open_public_channel_ids.insert(channel.id);
                 let open_channel =
                     encode_native_otclient_open_public_channel(&config.client_profile, &channel)
                         .map_err(HostError::Protocol)?;
@@ -6068,18 +6098,56 @@ fn handle_native_otclient_game(
                     "action=cancel-attack-and-follow outcome=authoritative-intents-cleared",
                 );
             }
-            NativeOtClientGameAction::Talk(message) => {
-                let recipient_count = shared_world.broadcast_public_chat(character.id, &message)?;
+            NativeOtClientGameAction::Talk(request) => {
+                let recipient_count = if request.mode == 5 {
+                    let Some(channel_id) = request.channel_id else {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=talk outcome=deferred-missing-channel-id",
+                        );
+                        continue;
+                    };
+                    if !open_public_channel_ids.contains(&channel_id)
+                        || native_configured_public_channel(
+                            config.public_channel_catalog.as_deref(),
+                            channel_id,
+                        )
+                        .is_none()
+                    {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=talk outcome=deferred-unopened-or-unconfigured-channel",
+                        );
+                        continue;
+                    }
+                    shared_world.broadcast_configured_public_channel_chat(
+                        character.id,
+                        channel_id,
+                        &request.message,
+                    )?
+                } else if request.channel_id.is_some() {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=talk outcome=deferred-unsupported-channel-mode",
+                    );
+                    continue;
+                } else {
+                    shared_world.broadcast_public_chat(character.id, &request.message)?
+                };
                 if config.extended_diagnostics {
                     eprintln!(
                         "> Native OTCv8 public chat received bytes={} recipients={recipient_count}",
-                        message.len()
+                        request.message.len()
                     );
                 }
                 drain_shared_public_chat(
                     stream,
                     &config.client_profile,
                     &chat_events,
+                    &open_public_channel_ids,
                     config.extended_diagnostics,
                     peer,
                 )?;
@@ -6431,26 +6499,49 @@ fn drain_shared_public_chat(
     stream: &mut TcpStream,
     profile: &NativeOtClientProfile,
     events: &mpsc::Receiver<SharedPublicChatEvent>,
+    open_public_channel_ids: &BTreeSet<u16>,
     extended_diagnostics: bool,
     peer: SocketAddr,
 ) -> Result<(), HostError> {
     loop {
         match events.try_recv() {
             Ok(event) => {
-                let record = encode_native_otclient_public_say(
-                    profile,
-                    &event.speaker_name,
-                    event.speaker_position,
-                    &event.text,
-                )
-                .map_err(HostError::Protocol)?;
+                let Some(record) = (match event.channel_id {
+                    Some(channel_id) if !open_public_channel_ids.contains(&channel_id) => None,
+                    Some(channel_id) => Some(
+                        encode_native_otclient_public_channel_say(
+                            profile,
+                            &event.speaker_name,
+                            channel_id,
+                            &event.text,
+                        )
+                        .map_err(HostError::Protocol)?,
+                    ),
+                    None => Some(
+                        encode_native_otclient_public_say(
+                            profile,
+                            &event.speaker_name,
+                            event.speaker_position,
+                            &event.text,
+                        )
+                        .map_err(HostError::Protocol)?,
+                    ),
+                }) else {
+                    continue;
+                };
                 write_frame(stream, &record)?;
                 native_diagnostic(
                     extended_diagnostics,
                     peer,
                     &format!(
-                        "outbound=public-chat opcode=0xaa mode=1 text-bytes={}",
-                        event.text.len()
+                        "outbound={} opcode=0xaa mode={} text-bytes={}",
+                        if event.channel_id.is_some() {
+                            "public-channel-chat"
+                        } else {
+                            "public-chat"
+                        },
+                        event.channel_id.map_or(1, |_| 5),
+                        event.text.len(),
                     ),
                 );
             }
@@ -14900,10 +14991,25 @@ mod tests {
         let expected = SharedPublicChatEvent {
             speaker_name: "Knight".into(),
             speaker_position: native_position(map.spawn()),
+            channel_id: None,
             text: "hello world".into(),
         };
         assert_eq!(knight_events.try_recv().unwrap(), expected);
         assert_eq!(druid_events.try_recv().unwrap(), expected);
+        assert_eq!(
+            shared
+                .broadcast_configured_public_channel_chat(101, 7, "  trade\n offer  ")
+                .unwrap(),
+            2
+        );
+        let channel_event = SharedPublicChatEvent {
+            speaker_name: "Knight".into(),
+            speaker_position: native_position(map.spawn()),
+            channel_id: Some(7),
+            text: "trade offer".into(),
+        };
+        assert_eq!(knight_events.try_recv().unwrap(), channel_event);
+        assert_eq!(druid_events.try_recv().unwrap(), channel_event);
         assert_eq!(shared.broadcast_public_chat(101, "   ").unwrap(), 0);
         assert_eq!(
             shared
@@ -17803,9 +17909,17 @@ mod native_diagnostics_tests {
             "action=cardinal-move direction=North"
         );
         let secret_message = "correct horse battery staple".to_owned();
-        let talk_summary =
-            native_action_diagnostic_summary(&NativeOtClientGameAction::Talk(secret_message));
-        assert_eq!(talk_summary, "action=talk text-bytes=28");
+        let talk_summary = native_action_diagnostic_summary(&NativeOtClientGameAction::Talk(
+            forgotten_protocol::NativeOtClientTalkRequest {
+                mode: 1,
+                channel_id: None,
+                message: secret_message,
+            },
+        ));
+        assert_eq!(
+            talk_summary,
+            "action=talk mode=1 channel-id=0 text-bytes=28"
+        );
         assert!(!talk_summary.contains("correct"));
         assert!(!talk_summary.contains("68 6f 72"));
         assert_eq!(
