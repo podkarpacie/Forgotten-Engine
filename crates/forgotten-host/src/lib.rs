@@ -5889,8 +5889,8 @@ fn handle_native_otclient_game(
                     NativePlayerInteractionKind::Target,
                     config.extended_diagnostics,
                 )?;
-                if native_selected_id != 0
-                    && matches!(outcome, NativePlayerInteractionOutcome::Rejected)
+                if native_selected_id == 0
+                    || matches!(outcome, NativePlayerInteractionOutcome::Rejected)
                 {
                     let clear_target = encode_native_otclient_clear_target(&config.client_profile)
                         .map_err(HostError::Protocol)?;
@@ -5898,7 +5898,11 @@ fn handle_native_otclient_game(
                     native_diagnostic(
                         config.extended_diagnostics,
                         peer,
-                        "outbound=clear-target opcode=0xa3 fields=none reason=rejected-target",
+                        if native_selected_id == 0 {
+                            "outbound=clear-target opcode=0xa3 fields=none reason=explicit-target-clear"
+                        } else {
+                            "outbound=clear-target opcode=0xa3 fields=none reason=rejected-target"
+                        },
                     );
                 }
             }
@@ -13896,6 +13900,70 @@ mod tests {
             &Frame(vec![
                 forgotten_protocol::NATIVE_OTCLIENT_CLIENT_SELECT_TARGET,
                 1,
+                0,
+                0,
+                0,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CLEAR_TARGET]
+        );
+        drop(stream);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_explicit_target_clear_emits_classic_clear_target_record() {
+        let database_path = database_path("native-explicit-target-clear");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_SELECT_TARGET,
+                0,
                 0,
                 0,
                 0,
