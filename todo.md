@@ -30,9 +30,9 @@
 - [x] Add regression coverage proving faster configured speed shortens the native auto-walk interval while retaining safe bounds.
 - [x] Cancel an active native auto-walk path when a manual cardinal move, turn, stop, or leave frame arrives.
 - [x] Prevent queued auto-walk steps from racing later client input or causing apparent teleporting.
-- [ ] Emit accepted 740 chat through a client-visible message mode and verify it is rendered by OTCv8.
+- [x] Emit accepted 740 chat through a parser-backed client-visible `Say` message mode. Protocol and native socket regressions verify the complete `0xAA` name/mode/position/text record; real-client rendering remains separately pending.
 - [x] Accept stock 740 right-click use/look frames without terminating the native session.
-- [ ] Establish and implement a verified OTCv8 740 client-visible chat layout without using an invalid generic text-message mode.
+- [x] Establish and implement a verified OTCv8 740 client-visible chat layout without using an invalid generic text-message mode. FE uses only the local parser-backed Talk `0xAA` layout with `Say` mode `1`; other chat modes remain deferred.
 - [x] Cancel and discard an in-flight auto-walk when a newer manual client action arrives.
 - [x] Serialize rapid click/manual movement so only one authoritative native movement update is in flight at a time.
 - [x] Stop sending the parser-invalid 740 server text message until its exact supported layout is confirmed.
