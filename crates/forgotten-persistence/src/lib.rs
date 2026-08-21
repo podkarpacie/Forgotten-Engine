@@ -32,10 +32,14 @@ const SCHEMA_VERSION_MAP_ITEM_JOURNAL: i64 = 14;
 const SCHEMA_VERSION_STATIC_CREATURE_DAMAGE_SEQUENCE: i64 = 15;
 const SCHEMA_VERSION_STATIC_CREATURE_MELEE_COOLDOWN: i64 = 16;
 const SCHEMA_VERSION_ACCOUNT_VIP_ENTRIES: i64 = 17;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_ACCOUNT_VIP_ENTRIES;
+const SCHEMA_VERSION_GUILDS: i64 = 18;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_GUILDS;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 pub const MAX_VIP_DESCRIPTION_BYTES: usize = 128;
+pub const MAX_GUILD_NAME_BYTES: usize = 64;
+pub const MAX_GUILD_MOTD_BYTES: usize = 255;
+pub const MAX_GUILD_NICK_BYTES: usize = 15;
 
 pub struct EngineDatabase {
     connection: Connection,
@@ -74,6 +78,36 @@ pub struct AccountVipEntry {
     pub description: String,
     pub icon: u32,
     pub notify: bool,
+}
+
+/// Durable bounded guild identity with its exact persisted owner. Invitations, wars, banks,
+/// permissions, client packets, and gameplay behavior remain outside this storage boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuildRecord {
+    pub id: u64,
+    pub name: String,
+    pub owner_player_id: u64,
+    pub motd: String,
+}
+
+/// One typed rank belonging to a guild. FE provisions the TFS-style three rank levels but does
+/// not yet provide rank management or permission semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuildRankRecord {
+    pub id: u64,
+    pub guild_id: u64,
+    pub name: String,
+    pub level: u8,
+}
+
+/// One player-owned guild membership. The primary membership key enforces a single guild per
+/// persisted player while client and gameplay delivery remain deferred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuildMembershipRecord {
+    pub player_id: u64,
+    pub guild_id: u64,
+    pub rank_id: u64,
+    pub nick: String,
 }
 
 /// The complete accepted authoritative state that must be persisted together after a bounded
@@ -401,6 +435,105 @@ impl EngineDatabase {
             });
         }
         Ok(())
+    }
+
+    /// Creates a durable guild and atomically provisions the TFS-style leader, vice-leader, and
+    /// member ranks. The owner becomes the leader and cannot already belong to another guild.
+    pub fn create_guild(
+        &mut self,
+        owner_player_id: u64,
+        name: &str,
+        motd: &str,
+    ) -> Result<GuildRecord, PersistenceError> {
+        self.ensure_player_exists(owner_player_id)?;
+        let name = validated_guild_name(name)?;
+        let motd = validated_guild_motd(motd)?;
+        let owner_has_membership = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guild_membership WHERE player_id = ?1)",
+            params![owner_player_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if owner_has_membership {
+            return Err(PersistenceError::GuildOwnerAlreadyMember(owner_player_id));
+        }
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO guilds (name, owner_player_id, created_at, motd) VALUES (?1, ?2, ?3, ?4)",
+            params![name, owner_player_id as i64, unix_seconds() as i64, motd],
+        )?;
+        let guild_id = transaction.last_insert_rowid() as u64;
+        let mut leader_rank_id = None;
+        for (rank_name, rank_level) in
+            [("the Leader", 3_i64), ("a Vice-Leader", 2), ("a Member", 1)]
+        {
+            transaction.execute(
+                "INSERT INTO guild_ranks (guild_id, name, level) VALUES (?1, ?2, ?3)",
+                params![guild_id as i64, rank_name, rank_level],
+            )?;
+            if rank_level == 3 {
+                leader_rank_id = Some(transaction.last_insert_rowid() as u64);
+            }
+        }
+        let leader_rank_id = leader_rank_id.expect("fixed guild rank provisioning includes leader");
+        transaction.execute(
+            "INSERT INTO guild_membership (player_id, guild_id, rank_id, nick) VALUES (?1, ?2, ?3, '')",
+            params![owner_player_id as i64, guild_id as i64, leader_rank_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(GuildRecord {
+            id: guild_id,
+            name: name.to_owned(),
+            owner_player_id,
+            motd: motd.to_owned(),
+        })
+    }
+
+    pub fn guild_ranks(&self, guild_id: u64) -> Result<Vec<GuildRankRecord>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, guild_id, name, level FROM guild_ranks WHERE guild_id = ?1 ORDER BY level DESC, id",
+        )?;
+        let ranks = statement
+            .query_map(params![guild_id as i64], |row| {
+                Ok(GuildRankRecord {
+                    id: row.get::<_, i64>(0)? as u64,
+                    guild_id: row.get::<_, i64>(1)? as u64,
+                    name: row.get(2)?,
+                    level: row.get::<_, i64>(3)? as u8,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if ranks.is_empty() {
+            let exists = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM guilds WHERE id = ?1)",
+                params![guild_id as i64],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            if !exists {
+                return Err(PersistenceError::UnknownGuild(guild_id));
+            }
+        }
+        Ok(ranks)
+    }
+
+    pub fn guild_membership(
+        &self,
+        player_id: u64,
+    ) -> Result<Option<GuildMembershipRecord>, PersistenceError> {
+        self.connection
+            .query_row(
+                "SELECT player_id, guild_id, rank_id, nick FROM guild_membership WHERE player_id = ?1",
+                params![player_id as i64],
+                |row| {
+                    Ok(GuildMembershipRecord {
+                        player_id: row.get::<_, i64>(0)? as u64,
+                        guild_id: row.get::<_, i64>(1)? as u64,
+                        rank_id: row.get::<_, i64>(2)? as u64,
+                        nick: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(PersistenceError::Sql)
     }
 
     pub fn save_player(&self, player: &Player) -> Result<(), PersistenceError> {
@@ -2084,6 +2217,17 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_ACCOUNT_VIP_ENTRIES, unix_seconds()],
             )?;
         }
+        if self.schema_version()? < SCHEMA_VERSION_GUILDS {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS guilds (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, owner_player_id INTEGER NOT NULL UNIQUE, created_at INTEGER NOT NULL, motd TEXT NOT NULL DEFAULT '');\
+                 CREATE TABLE IF NOT EXISTS guild_ranks (id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, name TEXT NOT NULL, level INTEGER NOT NULL, UNIQUE (guild_id, level), UNIQUE (guild_id, name));\
+                 CREATE TABLE IF NOT EXISTS guild_membership (player_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, rank_id INTEGER NOT NULL, nick TEXT NOT NULL DEFAULT '');",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_GUILDS, unix_seconds()],
+            )?;
+        }
         Ok(())
     }
 
@@ -2344,6 +2488,24 @@ fn validated_vip_description(value: &str) -> Result<&str, PersistenceError> {
     Ok(value)
 }
 
+fn validated_guild_name(value: &str) -> Result<&str, PersistenceError> {
+    if value.trim().is_empty() || value.len() > MAX_GUILD_NAME_BYTES {
+        return Err(PersistenceError::InvalidGuildRecord(format!(
+            "guild name must be nonempty and at most {MAX_GUILD_NAME_BYTES} bytes"
+        )));
+    }
+    Ok(value)
+}
+
+fn validated_guild_motd(value: &str) -> Result<&str, PersistenceError> {
+    if value.len() > MAX_GUILD_MOTD_BYTES {
+        return Err(PersistenceError::InvalidGuildRecord(format!(
+            "guild motd exceeds {MAX_GUILD_MOTD_BYTES} bytes"
+        )));
+    }
+    Ok(value)
+}
+
 fn sqlite_progression_attempt(value: u64) -> Result<i64, PersistenceError> {
     i64::try_from(value).map_err(|_| {
         PersistenceError::InvalidProgressionAttemptRecord(
@@ -2390,8 +2552,10 @@ pub enum PersistenceError {
     InvalidStaticCreatureRuntimeRecord(String),
     InvalidMapItemJournal(String),
     InvalidVipEntry(String),
+    InvalidGuildRecord(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
+    UnknownGuild(u64),
     UnknownVipTarget(String),
     DuplicateVipEntry {
         account_id: u32,
@@ -2401,6 +2565,7 @@ pub enum PersistenceError {
         account_id: u32,
         target_player_id: u64,
     },
+    GuildOwnerAlreadyMember(u64),
 }
 
 impl From<std::io::Error> for PersistenceError {
@@ -2439,6 +2604,61 @@ mod tests {
         let path = temporary_path("migration");
         let database = EngineDatabase::open(&path).unwrap();
         assert_eq!(database.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn atomically_provisions_bounded_guild_ranks_and_owner_membership() {
+        let path = temporary_path("guild-foundation");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("owner", "hash").unwrap();
+        database
+            .save_player(&Player {
+                id: 7,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let guild = database.create_guild(7, "Forgotten", "Welcome").unwrap();
+        assert_eq!(guild.name, "Forgotten");
+        assert_eq!(guild.owner_player_id, 7);
+        let ranks = database.guild_ranks(guild.id).unwrap();
+        assert_eq!(
+            ranks
+                .iter()
+                .map(|rank| (rank.name.as_str(), rank.level))
+                .collect::<Vec<_>>(),
+            vec![("the Leader", 3), ("a Vice-Leader", 2), ("a Member", 1)]
+        );
+        assert_eq!(
+            database.guild_membership(7).unwrap(),
+            Some(GuildMembershipRecord {
+                player_id: 7,
+                guild_id: guild.id,
+                rank_id: ranks[0].id,
+                nick: String::new(),
+            })
+        );
+        assert!(matches!(
+            database.create_guild(7, "Other", ""),
+            Err(PersistenceError::GuildOwnerAlreadyMember(7))
+        ));
+        assert!(matches!(
+            database.create_guild(7, "", ""),
+            Err(PersistenceError::InvalidGuildRecord(_))
+        ));
+        assert!(matches!(
+            database.guild_ranks(999),
+            Err(PersistenceError::UnknownGuild(999))
+        ));
         let _ = fs::remove_file(path);
     }
 
