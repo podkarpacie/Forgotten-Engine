@@ -8,7 +8,7 @@ This ledger measures **declared replacement scope**. It is not a schedule, marke
 
 ## Current weighted position
 
-The current conservative estimate remains **22% of the declared replacement scope**. This includes tested runtime progression, lifecycle, condition persistence, server-side condition death activation, static-world behavior, and bounded item transfer, including complete occupied equipment-slot reorganization. It does not credit unsupported client delivery, gameplay parity, Lua execution, or production operations.
+The current conservative estimate is **23% of the declared replacement scope**. This includes tested runtime progression, lifecycle, condition persistence, server-side condition death activation, static-world behavior, bounded item transfer, and a session-local party relationship foundation. It does not credit unsupported client delivery, gameplay parity, Lua execution, or production operations.
 
 | System category | Weight | Current credited scope | Why it is not higher |
 |---|---:|---:|---|
@@ -17,9 +17,9 @@ The current conservative estimate remains **22% of the declared replacement scop
 | Player progression, lifecycle, and combat | 13% | 3% | FE has persisted vitals, regeneration, configured experience/skill foundations, bounded conditions, exact condition restart progress, server-side death state, loss/respawn foundations, and selected-player fixed melee. Formula combat and client lifecycle delivery are incomplete. |
 | Items and world interaction | 17% | 1% | Runtime item instances, equipment, owned containers, bounded complete-item transfers between equipment and owned top-level containers, distinct occupied equipment-slot exchanges, and narrow map-source or owned-top-level-container-to-empty-equipment legacy slot-type guards exist with persistence, catalog validation, and mapped equipment deltas. Ground transfer, item actions, generic stacks, capacity, generic slot semantics, container deltas, and map interactions are not complete. |
 | Creatures, NPCs, spawns, loot, and corpses | 13% | 1% | FE has catalog parsing, static spawn materialization, occupancy, deterministic bounded movement, caller-triggered reset foundations, and per-spawn delayed reactivation with a fresh full-interval retry when the spawn tile is blocked. AI, generic targeting, full combat, timed respawn parity, loot, corpses, and NPC runtime are incomplete. |
-| Lua, social systems, economy, housing, and administration | 12% | 0% | Registry references are audited; VM-local bounded Lua table helpers and a deterministic pure math subset, a validated public `chatchannels.xml` catalog including a non-overwriting new-world skeleton, schema-v17 account-owned VIP persistence, and schema-v18 atomic guild owner/rank/membership persistence feed native channel-list, session-local channel open/leave, bounded classic mode-7 normal-channel delivery, exact live-session classic mode-5-to-mode-4 private delivery, and classic 740 VIP add/edit/remove plus login-time bounded list delivery. Lua execution, live VIP status, native guild delivery, and the main economy, housing, and moderation systems remain absent. |
+| Lua, social systems, economy, housing, and administration | 12% | 1% | Registry references are audited; VM-local bounded Lua table helpers and a deterministic pure math subset, a validated public `chatchannels.xml` catalog including a non-overwriting new-world skeleton, schema-v17 account-owned VIP persistence, schema-v18 atomic guild owner/rank/membership persistence, and one tested session-local party relationship core feed native channel-list, session-local channel open/leave, bounded classic mode-7 normal-channel delivery, exact live-session classic mode-5-to-mode-4 private delivery, and classic 740 VIP add/edit/remove plus login-time bounded list delivery. Lua execution, native party delivery, shared experience, live VIP status, native guild delivery, and the main economy, housing, and moderation systems remain absent. |
 | Production operations and compatibility evidence | 15% | 1% | Releases, checksums, validation scripts, and documented concurrency boundaries exist. Load, soak, security, migration, cross-platform, and independent real-client evidence are incomplete. |
-| **Total** | **100%** | **22%** | **Foundation and bounded-runtime stage; not production-ready.** |
+| **Total** | **100%** | **23%** | **Foundation and bounded-runtime stage; not production-ready.** |
 
 ## Full path to 100%
 
@@ -128,6 +128,7 @@ Each milestone below has an evidence target. Work may proceed in dependency orde
 - [ ] Add sandboxed Lua event execution with permission limits, typed TFS/FE API contracts, safe script loading, compatibility adapters, and explicit event-family semantics for supported event families. The bounded callback boundary is intentionally not automatic imported-script execution or a TFS API runner.
 - [ ] Add typed creature, player, item, movement, combat, and global event dispatch with compatibility adapters where evidence supports them.
 - [ ] Add parties, channels, private messages, moderation controls, and persistence.
+- [x] Add an authoritative session-local party relationship core with bounded invitations, one membership per active player, deterministic leadership transfer, and disconnect cleanup. No native party packet, party channel, shared experience, loot, Lua hook, or persistence behavior is claimed.
 - [ ] Add guild baseline, banking/trading baseline, houses, beds, rent, access lists, depots, and operator administration APIs.
 - [ ] Add audited migration adapters for supported TFS configuration and data surfaces, with explicit exclusions for unsafe or unimplemented scripting behavior.
 

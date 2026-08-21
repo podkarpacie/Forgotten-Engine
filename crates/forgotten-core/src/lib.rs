@@ -2516,6 +2516,12 @@ pub struct WorldState {
     player_combat_cooldowns: BTreeMap<u64, PlayerCombatCooldown>,
     player_spell_cooldowns: BTreeMap<u64, PlayerSpellCooldown>,
     player_interactions: BTreeMap<u64, PlayerInteractionIntent>,
+    // Party state is intentionally session-local. These indexes model the authoritative
+    // participant relationship only; client icons, private channels, shared experience, loot,
+    // Lua hooks, and durable persistence belong to later independently verified slices.
+    party_leaders: BTreeSet<u64>,
+    party_memberships: BTreeMap<u64, u64>,
+    party_invitations: BTreeMap<u64, BTreeSet<u64>>,
     static_creatures: BTreeMap<u32, StaticCreatureRuntime>,
     static_occupied_positions: BTreeSet<Position>,
     tick: u64,
@@ -2619,6 +2625,7 @@ impl WorldState {
             .players
             .remove(&id)
             .ok_or(CoreError::UnknownPlayer(id))?;
+        self.clear_player_party_state(id);
         self.player_vitals.remove(&id);
         self.player_progressions.remove(&id);
         self.player_progression_attempts.remove(&id);
@@ -2641,6 +2648,230 @@ impl WorldState {
         }
         self.mark_changed();
         Ok(player)
+    }
+
+    /// Creates one session-local party invitation. A player can lead one party or belong to one
+    /// party, while an unjoined player may hold invitations from several leaders. Party packets,
+    /// capacity limits, and policy hooks remain host concerns.
+    pub fn invite_to_party(&mut self, leader_id: u64, invitee_id: u64) -> Result<(), CoreError> {
+        self.ensure_party_player_exists(leader_id)?;
+        self.ensure_party_player_exists(invitee_id)?;
+        if leader_id == invitee_id {
+            return Err(CoreError::SelfInteractionNotAllowed(leader_id));
+        }
+        if self.party_memberships.contains_key(&leader_id) {
+            return Err(CoreError::PlayerAlreadyInParty(leader_id));
+        }
+        if self.party_leaders.contains(&invitee_id)
+            || self.party_memberships.contains_key(&invitee_id)
+        {
+            return Err(CoreError::PlayerAlreadyInParty(invitee_id));
+        }
+
+        let invitations = self.party_invitations.entry(invitee_id).or_default();
+        if !invitations.insert(leader_id) {
+            return Err(CoreError::DuplicatePartyInvitation {
+                leader_id,
+                invitee_id,
+            });
+        }
+        self.party_leaders.insert(leader_id);
+        self.mark_changed();
+        Ok(())
+    }
+
+    /// Accepts one pending invitation and clears every competing invitation held by the joining
+    /// player. The relationship remains memory-only and is removed when the live player leaves.
+    pub fn accept_party_invitation(
+        &mut self,
+        invitee_id: u64,
+        leader_id: u64,
+    ) -> Result<(), CoreError> {
+        self.ensure_party_player_exists(invitee_id)?;
+        self.ensure_party_player_exists(leader_id)?;
+        let invitation_exists = self
+            .party_invitations
+            .get(&invitee_id)
+            .is_some_and(|leaders| leaders.contains(&leader_id));
+        if !invitation_exists {
+            return Err(CoreError::PartyInvitationNotFound {
+                leader_id,
+                invitee_id,
+            });
+        }
+        if self.party_leaders.contains(&invitee_id)
+            || self.party_memberships.contains_key(&invitee_id)
+        {
+            return Err(CoreError::PlayerAlreadyInParty(invitee_id));
+        }
+        if !self.party_leaders.contains(&leader_id) {
+            return Err(CoreError::PlayerNotInParty(leader_id));
+        }
+
+        let inviting_leaders = self
+            .party_invitations
+            .remove(&invitee_id)
+            .unwrap_or_default();
+        self.party_memberships.insert(invitee_id, leader_id);
+        for invited_by in inviting_leaders {
+            if invited_by != leader_id {
+                self.disband_party_if_empty(invited_by);
+            }
+        }
+        self.mark_changed();
+        Ok(())
+    }
+
+    /// Removes one player from a live party. When a leader leaves, the lowest player ID among
+    /// the current members becomes the deterministic replacement leader. A leader without members
+    /// disbands its invitation-only party.
+    pub fn leave_party(&mut self, player_id: u64) -> Result<(), CoreError> {
+        self.ensure_party_player_exists(player_id)?;
+        if self.party_leaders.contains(&player_id) {
+            self.remove_party_leader(player_id);
+        } else if let Some(leader_id) = self.party_memberships.remove(&player_id) {
+            self.disband_party_if_empty(leader_id);
+        } else {
+            return Err(CoreError::PlayerNotInParty(player_id));
+        }
+        self.mark_changed();
+        Ok(())
+    }
+
+    /// Revokes exactly one invitation and removes an otherwise empty invitation-only party.
+    pub fn revoke_party_invitation(
+        &mut self,
+        leader_id: u64,
+        invitee_id: u64,
+    ) -> Result<(), CoreError> {
+        self.ensure_party_player_exists(leader_id)?;
+        self.ensure_party_player_exists(invitee_id)?;
+        if !self.party_leaders.contains(&leader_id) {
+            return Err(CoreError::PlayerNotInParty(leader_id));
+        }
+
+        let invitations_empty = {
+            let invitations = self.party_invitations.get_mut(&invitee_id).ok_or(
+                CoreError::PartyInvitationNotFound {
+                    leader_id,
+                    invitee_id,
+                },
+            )?;
+            if !invitations.remove(&leader_id) {
+                return Err(CoreError::PartyInvitationNotFound {
+                    leader_id,
+                    invitee_id,
+                });
+            }
+            invitations.is_empty()
+        };
+        if invitations_empty {
+            self.party_invitations.remove(&invitee_id);
+        }
+        self.disband_party_if_empty(leader_id);
+        self.mark_changed();
+        Ok(())
+    }
+
+    /// Returns the current live party leader for either a leader or member, or `None` when the
+    /// active player has no party. Invitation-only players intentionally remain outside a party
+    /// until they accept one invitation.
+    pub fn player_party_leader(&self, player_id: u64) -> Result<Option<u64>, CoreError> {
+        self.ensure_party_player_exists(player_id)?;
+        if self.party_leaders.contains(&player_id) {
+            return Ok(Some(player_id));
+        }
+        Ok(self.party_memberships.get(&player_id).copied())
+    }
+
+    /// Returns member IDs in deterministic ascending order for a known live party leader.
+    pub fn player_party_members(&self, leader_id: u64) -> Result<Vec<u64>, CoreError> {
+        self.ensure_party_player_exists(leader_id)?;
+        if !self.party_leaders.contains(&leader_id) {
+            return Err(CoreError::PlayerNotInParty(leader_id));
+        }
+        Ok(self.party_member_ids(leader_id))
+    }
+
+    fn ensure_party_player_exists(&self, player_id: u64) -> Result<(), CoreError> {
+        if self.players.contains_key(&player_id) {
+            Ok(())
+        } else {
+            Err(CoreError::UnknownPlayer(player_id))
+        }
+    }
+
+    fn party_member_ids(&self, leader_id: u64) -> Vec<u64> {
+        self.party_memberships
+            .iter()
+            .filter_map(|(&member_id, &member_leader_id)| {
+                (member_leader_id == leader_id).then_some(member_id)
+            })
+            .collect()
+    }
+
+    fn party_has_invitations(&self, leader_id: u64) -> bool {
+        self.party_invitations
+            .values()
+            .any(|leaders| leaders.contains(&leader_id))
+    }
+
+    fn remove_party_leader(&mut self, leader_id: u64) {
+        let member_ids = self.party_member_ids(leader_id);
+        let Some(new_leader_id) = member_ids.first().copied() else {
+            self.disband_party(leader_id);
+            return;
+        };
+
+        self.party_leaders.remove(&leader_id);
+        self.party_leaders.insert(new_leader_id);
+        self.party_memberships.remove(&new_leader_id);
+        for member_id in member_ids {
+            if member_id != new_leader_id {
+                self.party_memberships.insert(member_id, new_leader_id);
+            }
+        }
+        for leaders in self.party_invitations.values_mut() {
+            if leaders.remove(&leader_id) {
+                leaders.insert(new_leader_id);
+            }
+        }
+    }
+
+    fn disband_party_if_empty(&mut self, leader_id: u64) {
+        if self.party_leaders.contains(&leader_id)
+            && self.party_member_ids(leader_id).is_empty()
+            && !self.party_has_invitations(leader_id)
+        {
+            self.disband_party(leader_id);
+        }
+    }
+
+    fn disband_party(&mut self, leader_id: u64) {
+        self.party_leaders.remove(&leader_id);
+        self.party_memberships
+            .retain(|_, member_leader_id| *member_leader_id != leader_id);
+        self.party_invitations.values_mut().for_each(|leaders| {
+            leaders.remove(&leader_id);
+        });
+        self.party_invitations
+            .retain(|_, leaders| !leaders.is_empty());
+    }
+
+    fn clear_player_party_state(&mut self, player_id: u64) {
+        if self.party_leaders.contains(&player_id) {
+            self.remove_party_leader(player_id);
+        } else if let Some(leader_id) = self.party_memberships.remove(&player_id) {
+            self.disband_party_if_empty(leader_id);
+        }
+
+        let inviting_leaders = self
+            .party_invitations
+            .remove(&player_id)
+            .unwrap_or_default();
+        for leader_id in inviting_leaders {
+            self.disband_party_if_empty(leader_id);
+        }
     }
 
     /// Invalidates only target and follow references to a player that is no longer an active
@@ -5723,6 +5954,16 @@ pub enum CoreError {
         command: LifecycleCommand,
     },
     UnknownPlayer(u64),
+    PlayerNotInParty(u64),
+    PlayerAlreadyInParty(u64),
+    PartyInvitationNotFound {
+        leader_id: u64,
+        invitee_id: u64,
+    },
+    DuplicatePartyInvitation {
+        leader_id: u64,
+        invitee_id: u64,
+    },
     UnknownTown(u32),
     PlayerTownUnassigned(u64),
     InvalidPlayerRespawnState(u64),
@@ -5810,6 +6051,156 @@ mod tests {
             experience: 0,
             skill_points: 0,
         }
+    }
+
+    fn party_player(id: u64, name: &str, x: u16) -> Player {
+        Player {
+            id,
+            account_id: id,
+            name: name.to_owned(),
+            position: Position { x, y: 100, z: 7 },
+            level: 1,
+            experience: 0,
+            skill_points: 0,
+        }
+    }
+
+    #[test]
+    fn party_invitation_acceptance_forms_one_deterministic_live_party() {
+        let mut world = WorldState::default();
+        let leader = party_player(7, "Knight", 100);
+        let member = party_player(8, "Druid", 101);
+        world.add_player(leader.clone()).unwrap();
+        world.add_player(member.clone()).unwrap();
+
+        assert_eq!(world.invite_to_party(leader.id, member.id), Ok(()));
+        assert_eq!(world.player_party_leader(leader.id), Ok(Some(leader.id)));
+        assert_eq!(world.player_party_leader(member.id), Ok(None));
+        assert_eq!(
+            world.invite_to_party(leader.id, member.id),
+            Err(CoreError::DuplicatePartyInvitation {
+                leader_id: leader.id,
+                invitee_id: member.id,
+            })
+        );
+
+        assert_eq!(world.accept_party_invitation(member.id, leader.id), Ok(()));
+        assert_eq!(world.player_party_leader(member.id), Ok(Some(leader.id)));
+        assert_eq!(world.player_party_members(leader.id), Ok(vec![member.id]));
+    }
+
+    #[test]
+    fn party_member_leave_preserves_leader_and_disbands_an_empty_party() {
+        let mut world = WorldState::default();
+        let leader = party_player(7, "Knight", 100);
+        let member = party_player(8, "Druid", 101);
+        world.add_player(leader.clone()).unwrap();
+        world.add_player(member.clone()).unwrap();
+        world.invite_to_party(leader.id, member.id).unwrap();
+        world.accept_party_invitation(member.id, leader.id).unwrap();
+
+        assert_eq!(world.leave_party(member.id), Ok(()));
+        assert_eq!(world.player_party_leader(member.id), Ok(None));
+        assert_eq!(world.player_party_leader(leader.id), Ok(None));
+        assert_eq!(
+            world.player_party_members(leader.id),
+            Err(CoreError::PlayerNotInParty(leader.id))
+        );
+    }
+
+    #[test]
+    fn party_leader_leave_transfers_to_lowest_member_and_preserves_invitations() {
+        let mut world = WorldState::default();
+        let leader = party_player(7, "Knight", 100);
+        let first_member = party_player(8, "Druid", 101);
+        let second_member = party_player(9, "Paladin", 102);
+        let invitee = party_player(10, "Sorcerer", 103);
+        for player in [
+            leader.clone(),
+            first_member.clone(),
+            second_member.clone(),
+            invitee.clone(),
+        ] {
+            world.add_player(player).unwrap();
+        }
+        world.invite_to_party(leader.id, first_member.id).unwrap();
+        world
+            .accept_party_invitation(first_member.id, leader.id)
+            .unwrap();
+        world.invite_to_party(leader.id, second_member.id).unwrap();
+        world
+            .accept_party_invitation(second_member.id, leader.id)
+            .unwrap();
+        world.invite_to_party(leader.id, invitee.id).unwrap();
+
+        assert_eq!(world.leave_party(leader.id), Ok(()));
+        assert_eq!(
+            world.player_party_leader(first_member.id),
+            Ok(Some(first_member.id))
+        );
+        assert_eq!(
+            world.player_party_leader(second_member.id),
+            Ok(Some(first_member.id))
+        );
+        assert_eq!(
+            world.player_party_members(first_member.id),
+            Ok(vec![second_member.id])
+        );
+        assert_eq!(
+            world.accept_party_invitation(invitee.id, first_member.id),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn party_leader_without_members_disbands_and_revocation_cleans_empty_invitation_party() {
+        let mut world = WorldState::default();
+        let leader = party_player(7, "Knight", 100);
+        let invitee = party_player(8, "Druid", 101);
+        world.add_player(leader.clone()).unwrap();
+        world.add_player(invitee.clone()).unwrap();
+
+        world.invite_to_party(leader.id, invitee.id).unwrap();
+        assert_eq!(world.revoke_party_invitation(leader.id, invitee.id), Ok(()));
+        assert_eq!(world.player_party_leader(leader.id), Ok(None));
+        assert_eq!(
+            world.revoke_party_invitation(leader.id, invitee.id),
+            Err(CoreError::PlayerNotInParty(leader.id))
+        );
+
+        world.invite_to_party(leader.id, invitee.id).unwrap();
+        assert_eq!(world.leave_party(leader.id), Ok(()));
+        assert_eq!(world.player_party_leader(leader.id), Ok(None));
+        assert_eq!(
+            world.accept_party_invitation(invitee.id, leader.id),
+            Err(CoreError::PartyInvitationNotFound {
+                leader_id: leader.id,
+                invitee_id: invitee.id,
+            })
+        );
+    }
+
+    #[test]
+    fn player_removal_cleans_party_membership_and_pending_invitations() {
+        let mut world = WorldState::default();
+        let leader = party_player(7, "Knight", 100);
+        let member = party_player(8, "Druid", 101);
+        let invitee = party_player(9, "Paladin", 102);
+        for player in [leader.clone(), member.clone(), invitee.clone()] {
+            world.add_player(player).unwrap();
+        }
+        world.invite_to_party(leader.id, member.id).unwrap();
+        world.accept_party_invitation(member.id, leader.id).unwrap();
+        world.invite_to_party(leader.id, invitee.id).unwrap();
+
+        world.remove_player(member.id).unwrap();
+        assert_eq!(world.player_party_leader(leader.id), Ok(Some(leader.id)));
+        world.remove_player(invitee.id).unwrap();
+        assert_eq!(world.player_party_leader(leader.id), Ok(None));
+        assert_eq!(
+            world.remove_player(member.id),
+            Err(CoreError::UnknownPlayer(member.id))
+        );
     }
 
     #[test]
