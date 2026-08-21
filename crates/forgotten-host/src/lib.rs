@@ -1032,6 +1032,17 @@ pub struct SourceMapItemToEquipmentTransferOutcome {
     pub map_revision: u64,
 }
 
+/// Result of one persisted, revision-bound whole-item transfer from a map source into one owned
+/// top-level container. Native routing and client refresh delivery remain separate boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceMapItemToContainerTransferOutcome {
+    pub player_id: u64,
+    pub source_identity: WorldMapItemSourceIdentity,
+    pub item: ItemInstance,
+    pub container_id: u8,
+    pub map_revision: u64,
+}
+
 impl SharedNativeMap {
     pub fn new(map: WorldMap) -> Self {
         Self::recover_from_removal_journal(map, None)
@@ -1276,6 +1287,139 @@ impl SharedNativeMap {
             source_identity,
             item,
             equipment_slot,
+            map_revision,
+        })
+    }
+
+    /// Transfers one exact plain top-level source-bound map item into one existing, owned,
+    /// non-nested container. It appends only a complete item, never merges stacks, and follows
+    /// the established map, world, source-index, journal lock order.
+    pub fn move_source_item_to_top_level_container(
+        &self,
+        shared_world: &SharedNativeWorld,
+        database: &mut EngineDatabase,
+        player_id: u64,
+        position: Position,
+        runtime_item_index: usize,
+        container_id: u8,
+    ) -> Result<SourceMapItemToContainerTransferOutcome, HostError> {
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut world = shared_world.lock()?;
+        let mut source_item_indices = self
+            .source_item_indices
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut removed_source_items = self
+            .removed_source_items
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let runtime_item = map
+            .tile_items(position)
+            .and_then(|items| items.get(runtime_item_index))
+            .cloned()
+            .ok_or(HostError::Core(forgotten_core::CoreError::UnknownMapItem {
+                position,
+                stack_index: u8::try_from(runtime_item_index).unwrap_or(u8::MAX),
+                expected_server_id: 0,
+            }))?;
+        let source_item_index = source_item_indices
+            .get(&position)
+            .and_then(|indices| indices.get(runtime_item_index))
+            .copied()
+            .ok_or_else(|| {
+                HostError::InvalidConfiguration(
+                    "map item has no source-bound runtime identity".into(),
+                )
+            })?;
+        let source_identity = self
+            .source
+            .source_item_identity(position, usize::from(source_item_index))
+            .ok_or_else(|| {
+                HostError::InvalidConfiguration(
+                    "map source item identity no longer resolves".into(),
+                )
+            })?;
+        if self
+            .source
+            .tile_items(position)
+            .and_then(|items| items.get(usize::from(source_item_index)))
+            != Some(&runtime_item)
+        {
+            return Err(HostError::InvalidConfiguration(
+                "map runtime item no longer matches its immutable source item".into(),
+            ));
+        }
+        let item = plain_source_map_item_to_inventory_item(&runtime_item)?;
+        if removed_source_items.contains(&source_identity) {
+            return Err(HostError::InvalidConfiguration(
+                "map source item identity has already been removed".into(),
+            ));
+        }
+        let equipment = world
+            .player_equipment(player_id)
+            .cloned()
+            .map_err(HostError::Core)?;
+        let mut containers = world
+            .player_containers(player_id)
+            .cloned()
+            .map_err(HostError::Core)?;
+        let mut container = containers.remove(container_id).ok_or_else(|| {
+            HostError::InvalidConfiguration("map item destination container is not owned".into())
+        })?;
+        if container.has_parent {
+            return Err(HostError::InvalidConfiguration(
+                "map item destination container must be top-level".into(),
+            ));
+        }
+        container
+            .items
+            .insert(item.clone())
+            .map_err(HostError::Core)?;
+        containers.insert(container).map_err(HostError::Core)?;
+        let mut next_map = map.clone();
+        let mut next_items = next_map
+            .tile_items(position)
+            .map(ToOwned::to_owned)
+            .expect("validated runtime item list exists");
+        next_items.remove(runtime_item_index);
+        next_map
+            .set_tile_items(position, next_items)
+            .map_err(HostError::Core)?;
+        let mut next_removed_source_items = removed_source_items.clone();
+        next_removed_source_items.insert(source_identity);
+        let next_journal = MapItemRemovalJournal {
+            map_revision: self.source_revision(),
+            removed_items: next_removed_source_items.iter().copied().collect(),
+        };
+        database.replace_player_inventory_and_map_item_removal_journal(
+            player_id,
+            &equipment,
+            &containers,
+            &next_journal,
+        )?;
+        *map = next_map;
+        let changed = world
+            .replace_player_containers(player_id, containers)
+            .expect("validated player remains present while shared-world lock is held");
+        debug_assert!(changed);
+        let source_indices = source_item_indices
+            .get_mut(&position)
+            .expect("validated source index list exists");
+        source_indices.remove(runtime_item_index);
+        if source_indices.is_empty() {
+            source_item_indices.remove(&position);
+        }
+        *removed_source_items = next_removed_source_items;
+        let map_revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        shared_world.containers_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(SourceMapItemToContainerTransferOutcome {
+            player_id,
+            source_identity,
+            item,
+            container_id,
             map_revision,
         })
     }
@@ -4392,14 +4536,6 @@ fn handle_native_otclient_game(
                     continue;
                 }
                 if source_position.x != 0xffff {
-                    let Some(target_slot) = target_slot else {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=throw-item outcome=deferred-unsupported-map-source-target",
-                        );
-                        continue;
-                    };
                     let Some(intent) = native_map_item_use_intent(
                         Some(catalog),
                         character.id,
@@ -4440,6 +4576,91 @@ fn handle_native_otclient_game(
                         x: source_position.x,
                         y: source_position.y,
                         z: source_position.z,
+                    };
+                    if let Some(container_id) = target_container_id {
+                        if closed_container_ids.contains(&container_id) {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-closed-map-source-container-target",
+                            );
+                            continue;
+                        }
+                        let transfer = match map_owner.move_source_item_to_top_level_container(
+                            shared_world,
+                            &mut database,
+                            character.id,
+                            source_position,
+                            usize::from(source_stack_position),
+                            container_id,
+                        ) {
+                            Ok(transfer) => transfer,
+                            Err(HostError::Core(_) | HostError::InvalidConfiguration(_)) => {
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    "action=throw-item outcome=deferred-map-source-container-transfer-rejected",
+                                );
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        let containers = shared_world.player_containers(character.id)?;
+                        let Some(container) = containers.container(container_id) else {
+                            return Err(HostError::InvalidConfiguration(
+                                "published map-source container transfer lost its container".into(),
+                            ));
+                        };
+                        let Some(container_frame) = native_classic_container_frame(
+                            &config.client_profile,
+                            Some(catalog),
+                            container,
+                        )
+                        .map_err(HostError::Protocol)?
+                        else {
+                            return Err(HostError::InvalidConfiguration(
+                                "published map-source container transfer is not client-mapped"
+                                    .into(),
+                            ));
+                        };
+                        write_frame(stream, &container_frame)?;
+                        observed_containers_epoch = shared_world.containers_epoch();
+                        let mut refreshed_snapshot = snapshot.clone();
+                        refreshed_snapshot.player_position = native_position(player_position);
+                        refreshed_snapshot.player_direction = facing.protocol_direction();
+                        let map_snapshot = map_owner.render_snapshot()?;
+                        let refreshed_viewport = encode_shared_native_world_viewport(
+                            &config.client_profile,
+                            &refreshed_snapshot,
+                            map_snapshot.as_ref(),
+                            shared_world,
+                            character.id,
+                        )?;
+                        write_frame(stream, &refreshed_viewport)?;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "action=throw-item outcome=map-source-to-top-level-container source={:?} container-id={} client-thing-id={} count={} source-index={} map-revision={} container-refresh-bytes={} map-refresh-bytes={}",
+                                transfer.source_identity.position,
+                                container_id,
+                                source_client_thing_id,
+                                count,
+                                transfer.source_identity.item_index,
+                                transfer.map_revision,
+                                container_frame.0.len(),
+                                refreshed_viewport.0.len(),
+                            ),
+                        );
+                        continue;
+                    }
+                    let Some(target_slot) = target_slot else {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-unsupported-map-source-target",
+                        );
+                        continue;
                     };
                     let transfer = match map_owner.move_source_item_to_empty_equipment(
                         shared_world,
@@ -7737,6 +7958,116 @@ mod tests {
             database.map_item_removal_journal().unwrap().unwrap()
         );
 
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn source_map_item_transfer_to_top_level_container_persists_map_inventory_and_journal() {
+        let database_path = database_path("source-map-item-container-transfer");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        let player = Player {
+            id: 703,
+            account_id: account_id as u64,
+            name: "Knight".into(),
+            position: Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            level: 8,
+            experience: 4_900,
+            skill_points: 3,
+        };
+        database.save_player(&player).unwrap();
+        let position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let mut source_map = (*native_world_map()).clone();
+        source_map
+            .set_tile_items(
+                position,
+                vec![WorldMapItem {
+                    server_id: 2148,
+                    client_thing_id: Some(3031),
+                    count: 7,
+                    action_id: Some(12),
+                    unique_id: Some(34),
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
+        let shared_map = SharedNativeMap::new(source_map.clone());
+        let shared_world = SharedNativeWorld::from_static_spawns(None).unwrap();
+        shared_world
+            .register_player_at_available_position(player, &source_map)
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers
+            .insert(
+                forgotten_core::PlayerContainer::new(
+                    2,
+                    ItemInstance::new(1988, 1).unwrap(),
+                    "Bag",
+                    false,
+                    20,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        database
+            .replace_player_containers(703, &containers)
+            .unwrap();
+        shared_world
+            .replace_player_containers(703, containers)
+            .unwrap();
+
+        let outcome = shared_map
+            .move_source_item_to_top_level_container(
+                &shared_world,
+                &mut database,
+                703,
+                position,
+                0,
+                2,
+            )
+            .unwrap();
+
+        let containers = shared_world.player_containers(703).unwrap();
+        assert_eq!(outcome.player_id, 703);
+        assert_eq!(outcome.container_id, 2);
+        assert_eq!(outcome.item.server_id, 2148);
+        assert_eq!(outcome.item.count, 7);
+        assert_eq!(outcome.item.action_id, Some(12));
+        assert_eq!(outcome.item.unique_id, Some(34));
+        assert_eq!(
+            containers.container(2).unwrap().items.item(0),
+            Some(&outcome.item)
+        );
+        assert_eq!(database.player_containers(703).unwrap(), containers);
+        assert!(shared_map
+            .render_snapshot()
+            .unwrap()
+            .tile_items(position)
+            .unwrap()
+            .is_empty());
+        assert_eq!(shared_world.containers_epoch(), 2);
+        assert_eq!(
+            database.map_item_removal_journal().unwrap(),
+            Some(MapItemRemovalJournal {
+                map_revision: source_map.source_revision(),
+                removed_items: vec![outcome.source_identity],
+            })
+        );
         let _ = fs::remove_file(database_path);
     }
 
@@ -11661,6 +11992,160 @@ mod tests {
         let refreshed_viewport = read_frame(&mut client).unwrap().0;
         assert_eq!(
             refreshed_viewport.first().copied(),
+            Some(forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP)
+        );
+        drop(client);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_throw_moves_one_mapped_source_map_item_to_top_level_container() {
+        let database_path = database_path("native-map-source-to-container");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        let source_position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: source_position,
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers
+            .insert(
+                forgotten_core::PlayerContainer::new(
+                    2,
+                    ItemInstance::new(1988, 1).unwrap(),
+                    "Bag",
+                    false,
+                    20,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        database.replace_player_containers(1, &containers).unwrap();
+        let mut source_map = (*native_world_map()).clone();
+        source_map
+            .set_tile_items(
+                source_position,
+                vec![WorldMapItem {
+                    server_id: 4526,
+                    client_thing_id: Some(102),
+                    count: 1,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
+        let source_identity = source_map.source_item_identity(source_position, 0).unwrap();
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for (server_id, client_thing_id) in [(4526, 102), (1988, 1988)] {
+            catalog
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id,
+                        requires_classic_740_subtype: false,
+                    },
+                )
+                .unwrap();
+        }
+        let mut config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        config.world_map = Some(Arc::new(source_map));
+        config.item_presentation_catalog = Some(Arc::new(catalog));
+        let game = start_native_otclient_game(config, &database_path).unwrap();
+        let mut client = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut client,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut client).unwrap();
+        let _equipment = read_frame(&mut client).unwrap();
+        let _container = read_frame(&mut client).unwrap();
+        write_frame(
+            &mut client,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                100,
+                0,
+                100,
+                0,
+                7,
+                102,
+                0,
+                0,
+                255,
+                255,
+                0x40 | 2,
+                0,
+                0,
+                1,
+            ]),
+        )
+        .unwrap();
+        for _ in 0..20 {
+            if database
+                .player_containers(1)
+                .unwrap()
+                .container(2)
+                .unwrap()
+                .items
+                .item(0)
+                .is_some()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            database
+                .player_containers(1)
+                .unwrap()
+                .container(2)
+                .unwrap()
+                .items
+                .item(0),
+            Some(&ItemInstance::new(4526, 1).unwrap())
+        );
+        assert_eq!(
+            database.map_item_removal_journal().unwrap(),
+            Some(MapItemRemovalJournal {
+                map_revision: source_identity.map_revision,
+                removed_items: vec![source_identity],
+            })
+        );
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut client).unwrap().0.first().copied(),
+            Some(0x6e)
+        );
+        assert_eq!(
+            read_frame(&mut client).unwrap().0.first().copied(),
             Some(forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP)
         );
         drop(client);
