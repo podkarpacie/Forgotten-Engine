@@ -56,20 +56,20 @@ use forgotten_protocol::{
     encode_native_otclient_move_creature_at, encode_native_otclient_open_container,
     encode_native_otclient_open_public_channel, encode_native_otclient_player_modes,
     encode_native_otclient_player_skills, encode_native_otclient_player_stats,
-    encode_native_otclient_public_channel_say, encode_native_otclient_public_say,
-    encode_native_otclient_read_only_text_window, encode_native_otclient_set_inventory,
-    encode_native_otclient_status_message, encode_status_binary, encode_status_xml,
-    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
-    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
-    NativeOtClientCardinalDirection, NativeOtClientClassicChannel, NativeOtClientClassicItemRecord,
-    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
-    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
-    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
-    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
-    NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_PLAYER_ID_END,
-    NATIVE_OTCLIENT_PLAYER_ID_START,
+    encode_native_otclient_private_message_from, encode_native_otclient_public_channel_say,
+    encode_native_otclient_public_say, encode_native_otclient_read_only_text_window,
+    encode_native_otclient_set_inventory, encode_native_otclient_status_message,
+    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
+    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
+    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection, NativeOtClientClassicChannel,
+    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
+    NativeOtClientClassicOutfit, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
+    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerVitals,
+    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
+    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_MESSAGE_SAY,
+    NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
@@ -1093,7 +1093,7 @@ pub struct SharedNativeWorld {
     progression_epoch: Arc<AtomicU64>,
     equipment_epoch: Arc<AtomicU64>,
     containers_epoch: Arc<AtomicU64>,
-    chat_recipients: Arc<Mutex<BTreeMap<u64, mpsc::SyncSender<SharedPublicChatEvent>>>>,
+    chat_recipients: Arc<Mutex<BTreeMap<u64, SharedChatRecipient>>>,
 }
 
 /// Synchronized owner for a mutable native world map. The live listener and heartbeat obtain only
@@ -1537,7 +1537,14 @@ struct SharedPublicChatEvent {
     speaker_name: String,
     speaker_position: NativeOtClientPosition,
     channel_id: Option<u16>,
+    private: bool,
     text: String,
+}
+
+#[derive(Debug, Clone)]
+struct SharedChatRecipient {
+    player_name: String,
+    sender: mpsc::SyncSender<SharedPublicChatEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -2868,17 +2875,38 @@ impl SharedNativeWorld {
     fn register_public_chat_recipient(
         &self,
         player_id: u64,
+        player_name: &str,
     ) -> Result<mpsc::Receiver<SharedPublicChatEvent>, HostError> {
+        if player_name.is_empty() {
+            return Err(HostError::InvalidConfiguration(
+                "shared chat recipient name must not be empty".into(),
+            ));
+        }
         let (sender, receiver) = mpsc::sync_channel(NATIVE_OTCLIENT_SHARED_CHAT_QUEUE_CAPACITY);
         let mut recipients = self
             .chat_recipients
             .lock()
             .map_err(|_| HostError::SharedWorldUnavailable)?;
-        if recipients.insert(player_id, sender).is_some() {
+        if recipients
+            .values()
+            .any(|recipient| recipient.player_name == player_name)
+        {
+            return Err(HostError::InvalidConfiguration(
+                "shared chat recipient already registered for player name".into(),
+            ));
+        }
+        if recipients.contains_key(&player_id) {
             return Err(HostError::InvalidConfiguration(
                 "shared chat recipient already registered for player".into(),
             ));
         }
+        recipients.insert(
+            player_id,
+            SharedChatRecipient {
+                player_name: player_name.to_string(),
+                sender,
+            },
+        );
         Ok(receiver)
     }
 
@@ -2901,6 +2929,50 @@ impl SharedNativeWorld {
         self.broadcast_chat(sender_id, message, Some(channel_id))
     }
 
+    fn send_private_chat(
+        &self,
+        sender_id: u64,
+        recipient_name: &str,
+        message: &str,
+    ) -> Result<usize, HostError> {
+        let sender = self
+            .lock()?
+            .player(sender_id)
+            .cloned()
+            .ok_or(forgotten_core::CoreError::UnknownPlayer(sender_id))
+            .map_err(HostError::Core)?;
+        let body = message.split_whitespace().collect::<Vec<_>>().join(" ");
+        if body.is_empty() {
+            return Ok(0);
+        }
+        let event = SharedPublicChatEvent {
+            speaker_name: sender.name,
+            speaker_position: native_position(sender.position),
+            channel_id: None,
+            private: true,
+            text: truncate_native_chat_text(&body),
+        };
+        let mut recipients = self
+            .chat_recipients
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let Some((recipient_id, recipient)) = recipients
+            .iter()
+            .find(|(_, recipient)| recipient.player_name == recipient_name)
+            .map(|(player_id, recipient)| (*player_id, recipient.sender.clone()))
+        else {
+            return Ok(0);
+        };
+        match recipient.try_send(event) {
+            Ok(()) => Ok(1),
+            Err(mpsc::TrySendError::Full(_)) => Ok(0),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                recipients.remove(&recipient_id);
+                Ok(0)
+            }
+        }
+    }
+
     fn broadcast_chat(
         &self,
         sender_id: u64,
@@ -2921,6 +2993,7 @@ impl SharedNativeWorld {
             speaker_name: sender.name,
             speaker_position: native_position(sender.position),
             channel_id,
+            private: false,
             text: truncate_native_chat_text(&body),
         };
         let mut recipients = self
@@ -2928,14 +3001,16 @@ impl SharedNativeWorld {
             .lock()
             .map_err(|_| HostError::SharedWorldUnavailable)?;
         let mut delivered = 0;
-        recipients.retain(|_, recipient| match recipient.try_send(event.clone()) {
-            Ok(()) => {
-                delivered += 1;
-                true
-            }
-            Err(mpsc::TrySendError::Full(_)) => true,
-            Err(mpsc::TrySendError::Disconnected(_)) => false,
-        });
+        recipients.retain(
+            |_, recipient| match recipient.sender.try_send(event.clone()) {
+                Ok(()) => {
+                    delivered += 1;
+                    true
+                }
+                Err(mpsc::TrySendError::Full(_)) => true,
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            },
+        );
         Ok(delivered)
     }
 
@@ -4089,7 +4164,7 @@ fn handle_native_otclient_game(
             .physical_flat_reduction
         ),
     );
-    let chat_events = shared_world.register_public_chat_recipient(character.id)?;
+    let chat_events = shared_world.register_public_chat_recipient(character.id, &character.name)?;
     if initial_position != character.position {
         database.update_player_position(character.id, initial_position)?;
     }
@@ -6112,7 +6187,21 @@ fn handle_native_otclient_game(
                 );
             }
             NativeOtClientGameAction::Talk(request) => {
-                let recipient_count = if request.mode == 7 {
+                let recipient_count = if request.mode == 5 {
+                    let Some(recipient_name) = request.recipient.as_deref() else {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=talk outcome=deferred-missing-private-recipient",
+                        );
+                        continue;
+                    };
+                    shared_world.send_private_chat(
+                        character.id,
+                        recipient_name,
+                        &request.message,
+                    )?
+                } else if request.mode == 7 {
                     let Some(channel_id) = request.channel_id else {
                         native_diagnostic(
                             config.extended_diagnostics,
@@ -6140,19 +6229,27 @@ fn handle_native_otclient_game(
                         channel_id,
                         &request.message,
                     )?
-                } else if request.channel_id.is_some() {
+                } else if request.channel_id.is_some() || request.recipient.is_some() {
                     native_diagnostic(
                         config.extended_diagnostics,
                         peer,
                         "action=talk outcome=deferred-unsupported-channel-mode",
                     );
                     continue;
-                } else {
+                } else if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY {
                     shared_world.broadcast_public_chat(character.id, &request.message)?
+                } else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=talk outcome=deferred-unsupported-mode",
+                    );
+                    continue;
                 };
                 if config.extended_diagnostics {
                     eprintln!(
-                        "> Native OTCv8 public chat received bytes={} recipients={recipient_count}",
+                        "> Native OTCv8 chat received mode={} bytes={} recipients={recipient_count}",
+                        request.mode,
                         request.message.len()
                     );
                 }
@@ -6519,26 +6616,43 @@ fn drain_shared_public_chat(
     loop {
         match events.try_recv() {
             Ok(event) => {
-                let Some(record) = (match event.channel_id {
-                    Some(channel_id) if !open_public_channel_ids.contains(&channel_id) => None,
-                    Some(channel_id) => Some(
-                        encode_native_otclient_public_channel_say(
+                let Some((record, mode, event_kind)) = (if event.private {
+                    Some((
+                        encode_native_otclient_private_message_from(
                             profile,
                             &event.speaker_name,
-                            channel_id,
                             &event.text,
                         )
                         .map_err(HostError::Protocol)?,
-                    ),
-                    None => Some(
-                        encode_native_otclient_public_say(
-                            profile,
-                            &event.speaker_name,
-                            event.speaker_position,
-                            &event.text,
-                        )
-                        .map_err(HostError::Protocol)?,
-                    ),
+                        4,
+                        "private-chat",
+                    ))
+                } else {
+                    match event.channel_id {
+                        Some(channel_id) if !open_public_channel_ids.contains(&channel_id) => None,
+                        Some(channel_id) => Some((
+                            encode_native_otclient_public_channel_say(
+                                profile,
+                                &event.speaker_name,
+                                channel_id,
+                                &event.text,
+                            )
+                            .map_err(HostError::Protocol)?,
+                            7,
+                            "public-channel-chat",
+                        )),
+                        None => Some((
+                            encode_native_otclient_public_say(
+                                profile,
+                                &event.speaker_name,
+                                event.speaker_position,
+                                &event.text,
+                            )
+                            .map_err(HostError::Protocol)?,
+                            1,
+                            "public-chat",
+                        )),
+                    }
                 }) else {
                     continue;
                 };
@@ -6548,12 +6662,8 @@ fn drain_shared_public_chat(
                     peer,
                     &format!(
                         "outbound={} opcode=0xaa mode={} text-bytes={}",
-                        if event.channel_id.is_some() {
-                            "public-channel-chat"
-                        } else {
-                            "public-chat"
-                        },
-                        event.channel_id.map_or(1, |_| 5),
+                        event_kind,
+                        mode,
                         event.text.len(),
                     ),
                 );
@@ -14211,6 +14321,133 @@ mod tests {
     }
 
     #[test]
+    fn native_private_message_delivery_is_authenticated_and_exactly_session_local() {
+        let database_path = database_path("native-private-message");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        for (id, name, position) in [
+            (
+                1,
+                "Knight",
+                Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+            (
+                2,
+                "Druid",
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+        ] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: account_id as u64,
+                    name: name.into(),
+                    position,
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+
+        let mut knight = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut knight,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut knight).unwrap().0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+
+        let mut druid = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut druid,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Druid",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut druid).unwrap().0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+
+        write_frame(
+            &mut knight,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_TALK,
+                5,
+                5,
+                0,
+                b'D',
+                b'r',
+                b'u',
+                b'i',
+                b'd',
+                2,
+                0,
+                b'h',
+                b'i',
+            ]),
+        )
+        .unwrap();
+        druid
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let private_message = (0..4)
+            .map(|_| read_frame(&mut druid).unwrap())
+            .find(|frame| frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_TALK))
+            .expect("recipient session did not receive private message");
+        assert_eq!(
+            private_message.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_TALK,
+                6,
+                0,
+                b'K',
+                b'n',
+                b'i',
+                b'g',
+                b'h',
+                b't',
+                4,
+                2,
+                0,
+                b'h',
+                b'i',
+            ]
+        );
+
+        drop(knight);
+        drop(druid);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn native_configured_public_channel_lifecycle_is_authenticated_and_session_local() {
         let database_path = database_path("native-configured-public-channel");
         let database = EngineDatabase::open(&database_path).unwrap();
@@ -15180,8 +15417,10 @@ mod tests {
                 &map,
             )
             .unwrap();
-        let knight_events = shared.register_public_chat_recipient(101).unwrap();
-        let druid_events = shared.register_public_chat_recipient(102).unwrap();
+        let knight_events = shared
+            .register_public_chat_recipient(101, "Knight")
+            .unwrap();
+        let druid_events = shared.register_public_chat_recipient(102, "Druid").unwrap();
         assert_eq!(
             shared
                 .broadcast_public_chat(101, "  hello\n world  ")
@@ -15192,6 +15431,7 @@ mod tests {
             speaker_name: "Knight".into(),
             speaker_position: native_position(map.spawn()),
             channel_id: None,
+            private: false,
             text: "hello world".into(),
         };
         assert_eq!(knight_events.try_recv().unwrap(), expected);
@@ -15206,10 +15446,36 @@ mod tests {
             speaker_name: "Knight".into(),
             speaker_position: native_position(map.spawn()),
             channel_id: Some(7),
+            private: false,
             text: "trade offer".into(),
         };
         assert_eq!(knight_events.try_recv().unwrap(), channel_event);
         assert_eq!(druid_events.try_recv().unwrap(), channel_event);
+        assert_eq!(
+            shared
+                .send_private_chat(101, "Druid", "  private\n hello  ")
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            knight_events.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            druid_events.try_recv().unwrap(),
+            SharedPublicChatEvent {
+                speaker_name: "Knight".into(),
+                speaker_position: native_position(map.spawn()),
+                channel_id: None,
+                private: true,
+                text: "private hello".into(),
+            }
+        );
+        assert_eq!(shared.send_private_chat(101, "druid", "miss").unwrap(), 0);
+        assert!(matches!(
+            druid_events.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         assert_eq!(shared.broadcast_public_chat(101, "   ").unwrap(), 0);
         assert_eq!(
             shared
@@ -15252,7 +15518,9 @@ mod tests {
                 &map,
             )
             .unwrap();
-        let events = shared.register_public_chat_recipient(101).unwrap();
+        let events = shared
+            .register_public_chat_recipient(101, "Knight")
+            .unwrap();
         for index in 0..NATIVE_OTCLIENT_SHARED_CHAT_QUEUE_CAPACITY {
             assert_eq!(
                 shared
@@ -18113,6 +18381,7 @@ mod native_diagnostics_tests {
             forgotten_protocol::NativeOtClientTalkRequest {
                 mode: 1,
                 channel_id: None,
+                recipient: None,
                 message: secret_message,
             },
         ));

@@ -1290,13 +1290,14 @@ pub struct NativeOtClientClassicChannel {
     pub name: String,
 }
 
-/// Parsed bounded client talk input. Only the exact server-supported public-channel mode is
-/// eligible for the separate configured-channel route; private recipients remain outside this
-/// primitive boundary.
+/// Parsed bounded client talk input. Classic mode `5` retains its recipient string for a separate
+/// host-owned private-message route, while configured channels retain their classic channel ID.
+/// Authorization and delivery are deliberately outside this protocol boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeOtClientTalkRequest {
     pub mode: u8,
     pub channel_id: Option<u16>,
+    pub recipient: Option<String>,
     pub message: String,
 }
 
@@ -1507,6 +1508,37 @@ pub fn encode_native_otclient_public_channel_say(
     writer.string(speaker_name);
     writer.byte(7);
     writer.u16(channel_id);
+    writer.string(text);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes one classic 740 private message received from another player. The local OTCv8 parser
+/// maps server mode `4` to `MessagePrivateFrom` and reads no recipient or channel field before
+/// the text.
+pub fn encode_native_otclient_private_message_from(
+    profile: &NativeOtClientProfile,
+    speaker_name: &str,
+    text: &str,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    if speaker_name.is_empty()
+        || text.is_empty()
+        || text.len() > NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES
+    {
+        return Err(ProtocolError::StringTooLong(text.len()));
+    }
+    let fixed_bytes = 6usize;
+    if speaker_name.len() + text.len() + fixed_bytes > MAX_FRAME_SIZE {
+        return Err(ProtocolError::StringTooLong(
+            speaker_name.len().saturating_add(text.len()),
+        ));
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_TALK);
+    writer.string(speaker_name);
+    writer.byte(4);
     writer.string(text);
     Ok(Frame(writer.finish()))
 }
@@ -2273,20 +2305,29 @@ pub fn decode_native_otclient_game_action(
         }
         NATIVE_OTCLIENT_CLIENT_TALK => {
             let mode = reader.byte()?;
-            let (channel_id, message) = match mode {
+            let (channel_id, recipient, message) = match mode {
                 4 | 5 | 11 => {
-                    reader.string(MAX_LOGIN_STRING_BYTES)?;
-                    (None, reader.string(MAX_LOGIN_STRING_BYTES)?)
+                    let recipient = reader.string(MAX_LOGIN_STRING_BYTES)?;
+                    (
+                        None,
+                        Some(recipient),
+                        reader.string(MAX_LOGIN_STRING_BYTES)?,
+                    )
                 }
                 6 | 7 | 8 | 10 | 12 => {
                     let channel_id = reader.u16()?;
-                    (Some(channel_id), reader.string(MAX_LOGIN_STRING_BYTES)?)
+                    (
+                        Some(channel_id),
+                        None,
+                        reader.string(MAX_LOGIN_STRING_BYTES)?,
+                    )
                 }
-                _ => (None, reader.string(MAX_LOGIN_STRING_BYTES)?),
+                _ => (None, None, reader.string(MAX_LOGIN_STRING_BYTES)?),
             };
             NativeOtClientGameAction::Talk(NativeOtClientTalkRequest {
                 mode,
                 channel_id,
+                recipient,
                 message,
             })
         }
@@ -4305,6 +4346,7 @@ mod tests {
             NativeOtClientGameAction::Talk(NativeOtClientTalkRequest {
                 mode: 1,
                 channel_id: None,
+                recipient: None,
                 message: "hi".into(),
             })
         );
@@ -4317,6 +4359,7 @@ mod tests {
             NativeOtClientGameAction::Talk(NativeOtClientTalkRequest {
                 mode: 7,
                 channel_id: Some(7),
+                recipient: None,
                 message: "hi".into(),
             })
         );
@@ -4337,6 +4380,54 @@ mod tests {
                 7,
                 7,
                 0,
+                2,
+                0,
+                b'h',
+                b'i',
+            ]
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![
+                    NATIVE_OTCLIENT_CLIENT_TALK,
+                    5,
+                    5,
+                    0,
+                    b'D',
+                    b'r',
+                    b'u',
+                    b'i',
+                    b'd',
+                    2,
+                    0,
+                    b'h',
+                    b'i',
+                ]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::Talk(NativeOtClientTalkRequest {
+                mode: 5,
+                channel_id: None,
+                recipient: Some("Druid".into()),
+                message: "hi".into(),
+            })
+        );
+        assert_eq!(
+            encode_native_otclient_private_message_from(&profile, "Knight", "hi")
+                .unwrap()
+                .0,
+            vec![
+                NATIVE_OTCLIENT_GAME_TALK,
+                6,
+                0,
+                b'K',
+                b'n',
+                b'i',
+                b'g',
+                b'h',
+                b't',
+                4,
                 2,
                 0,
                 b'h',
