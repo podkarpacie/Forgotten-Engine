@@ -22,13 +22,15 @@ pub const MAX_SANDBOXED_LUA_CALLBACK_EVENT_KIND_BYTES: usize = 64;
 pub const MAX_SANDBOXED_LUA_TABLE_CREATE_ARRAY_CAPACITY: usize = 256;
 pub const MAX_SANDBOXED_LUA_TABLE_CREATE_RECORD_CAPACITY: usize = 256;
 pub const MAX_SANDBOXED_LUA_MATH_ARGUMENTS: usize = 256;
+pub const MAX_SANDBOXED_LUA_STRING_BYTES: usize = 1024;
 const INSTRUCTION_LIMIT_MARKER: &str = "forgotten-engine-sandbox-instruction-limit";
 
 /// Explicit limits for one side-effect-free Lua expression evaluation. The executor creates a
 /// fresh VM per call with no standard libraries. The installed compatibility surface is limited to
-/// VM-local, capacity-capped `table.create` and `table.pack`, plus deterministic `math.abs`,
-/// `math.ceil`, `math.floor`, `math.min`, and `math.max`; the sandbox offers no file, network,
-/// process, package, debug, random-state, time, or mutable host API surface.
+/// VM-local, capacity-capped `table.create` and `table.pack`, deterministic `math.abs`,
+/// `math.ceil`, `math.floor`, `math.min`, and `math.max`, and ASCII-only bounded `string.len`,
+/// `string.lower`, `string.upper`, `string.reverse`, and `string.sub`; the sandbox offers no
+/// file, network, process, package, debug, random-state, time, or mutable host API surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SandboxedLuaLimits {
     pub max_source_bytes: usize,
@@ -521,7 +523,64 @@ fn install_sandboxed_tfs_compatibility_globals(lua: &Lua) -> Result<(), mlua::Er
     math.set("floor", math_floor)?;
     math.set("min", math_min)?;
     math.set("max", math_max)?;
-    lua.globals().set("math", math)
+    lua.globals().set("math", math)?;
+
+    let string_len = lua.create_function(|_, value: String| {
+        let value = bounded_sandboxed_ascii_string(value)?;
+        Ok(i64::try_from(value.len()).unwrap_or(i64::MAX))
+    })?;
+    let string_lower = lua.create_function(|_, value: String| {
+        let value = bounded_sandboxed_ascii_string(value)?;
+        Ok(value.to_ascii_lowercase())
+    })?;
+    let string_upper = lua.create_function(|_, value: String| {
+        let value = bounded_sandboxed_ascii_string(value)?;
+        Ok(value.to_ascii_uppercase())
+    })?;
+    let string_reverse = lua.create_function(|_, value: String| {
+        let value = bounded_sandboxed_ascii_string(value)?;
+        Ok(value.chars().rev().collect::<String>())
+    })?;
+    let string_sub =
+        lua.create_function(|_, (value, start, end): (String, i64, Option<i64>)| {
+            let value = bounded_sandboxed_ascii_string(value)?;
+            let length = i64::try_from(value.len()).unwrap_or(i64::MAX);
+            let start = normalized_sandboxed_lua_string_index(start, length).max(1);
+            let end = normalized_sandboxed_lua_string_index(end.unwrap_or(-1), length).min(length);
+            if start > end || start > length || end < 1 {
+                return Ok(String::new());
+            }
+            Ok(value[(start - 1) as usize..end as usize].to_owned())
+        })?;
+    let string = lua.create_table()?;
+    string.set("len", string_len)?;
+    string.set("lower", string_lower)?;
+    string.set("upper", string_upper)?;
+    string.set("reverse", string_reverse)?;
+    string.set("sub", string_sub)?;
+    lua.globals().set("string", string)
+}
+
+fn bounded_sandboxed_ascii_string(value: String) -> Result<String, mlua::Error> {
+    if value.len() > MAX_SANDBOXED_LUA_STRING_BYTES {
+        return Err(mlua::Error::RuntimeError(
+            "sandbox string exceeds the configured byte limit".into(),
+        ));
+    }
+    if !value.is_ascii() {
+        return Err(mlua::Error::RuntimeError(
+            "sandbox string helpers accept ASCII only".into(),
+        ));
+    }
+    Ok(value)
+}
+
+fn normalized_sandboxed_lua_string_index(index: i64, length: i64) -> i64 {
+    if index >= 0 {
+        index
+    } else {
+        length.saturating_add(index).saturating_add(1)
+    }
 }
 
 fn sandboxed_lua_value(value: Value) -> Option<SandboxedLuaValue> {
@@ -746,7 +805,13 @@ mod tests {
                 "return function(_, _, value) local t = table.create(1, 1) t[1] = value return t[1] end",
             )
             .unwrap();
-        assert_eq!(dispatcher.len(), 3);
+        dispatcher
+            .register_callback(
+                "string-helpers",
+                "return function(_, _, value) if string.upper(string.reverse('fe')) == 'EF' and string.sub('abcd', 2, -2) == 'bc' then return value end return 0 end",
+            )
+            .unwrap();
+        assert_eq!(dispatcher.len(), 4);
         assert!(!dispatcher.is_empty());
 
         let input = SandboxedLuaCallbackInput {
@@ -767,6 +832,12 @@ mod tests {
         let table_create = dispatcher.dispatch("table-create", &input);
         assert_eq!(
             table_create.value,
+            Some(SandboxedLuaValue::Integer(input.value))
+        );
+
+        let string_helpers = dispatcher.dispatch("string-helpers", &input);
+        assert_eq!(
+            string_helpers.value,
             Some(SandboxedLuaValue::Integer(input.value))
         );
 
@@ -951,6 +1022,12 @@ mod tests {
         assert_eq!(math.state, SandboxedLuaExecutionState::Completed);
         assert_eq!(math.value, Some(SandboxedLuaValue::Boolean(true)));
 
+        let string = executor.execute_expression(
+            "string.len('Abc1') == 4 and string.lower('Abc1') == 'abc1' and string.upper('Abc1') == 'ABC1' and string.reverse('Abc1') == '1cbA' and string.sub('Abc1', 2, -2) == 'bc' and string.sub('Abc1', -2) == 'c1' and string.sub('Abc1', 8) == ''",
+        );
+        assert_eq!(string.state, SandboxedLuaExecutionState::Completed);
+        assert_eq!(string.value, Some(SandboxedLuaValue::Boolean(true)));
+
         assert_eq!(
             executor.execute_expression("math.min()").state,
             SandboxedLuaExecutionState::RuntimeRejected
@@ -966,6 +1043,23 @@ mod tests {
         );
         assert_eq!(
             executor.execute_expression("math.random").value,
+            Some(SandboxedLuaValue::Nil)
+        );
+        assert_eq!(
+            executor
+                .execute_expression(&format!(
+                    "string.lower('{}')",
+                    "a".repeat(MAX_SANDBOXED_LUA_STRING_BYTES + 1)
+                ))
+                .state,
+            SandboxedLuaExecutionState::RuntimeRejected
+        );
+        assert_eq!(
+            executor.execute_expression("string.upper('ą')").state,
+            SandboxedLuaExecutionState::RuntimeRejected
+        );
+        assert_eq!(
+            executor.execute_expression("string.match").value,
             Some(SandboxedLuaValue::Nil)
         );
 
