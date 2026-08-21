@@ -49,12 +49,35 @@ world-mutation capability.
 > This worker is a tested preparation primitive. It is not yet attached to the production listener,
 > does not execute gameplay, and carries **no performance or scalability claim**.
 
+## Implemented ordered publication pool
+
+`forgotten-host` additionally provides a `NativeRenderPreparationPool` for one bounded ordered
+batch of detached native viewport publications. It starts from one to eight existing preparation
+workers. Each worker retains its fixed 32-request queue, so a publication batch has a strict 256
+request ceiling. The pool accepts a caller-provided publication sequence, sorts before scheduling,
+rejects duplicate sequences, and collects frames in that sorted sequence even when workers finish
+in another order.
+
+| Guarantee | Implemented boundary | Still deferred |
+| --- | --- | --- |
+| Immutable publication input | Each publication owns its profile, session snapshot, world-map `Arc`, and captured render snapshot. | Publishing every live refresh path from an authoritative tick. |
+| Bounded fan-out | One to eight workers; 32 queued requests per worker; 256 publications per ordered batch. | Admission telemetry, queue-depth reporting, retry policy, and overload handling. |
+| Reproducible delivery order | Caller sequence is sorted and duplicate values are rejected before any request is scheduled. | Cross-session socket scheduling and full packet-pipeline ordering. |
+| Mutation isolation | The pool has no `SharedNativeWorld`, database, socket, action queue, or mutation callback. | Applying validated gameplay commands on worker threads. |
+
+The pool regression proves byte-identical ordered results against direct encoding from the same
+detached snapshots, preserves captured peer data after later world mutation, and rejects invalid
+worker counts, duplicate sequences, and oversized batches. The pool is intentionally **not wired
+to the production listener** because its measured fixed-batch cost remains slower than direct
+preparation.
+
 ## Required deterministic simulation design
 
-Before parallel worker pools execute gameplay simulation, FE will introduce a command queue with an
-explicit tick number and stable tie-breaker `(tick, player_id, session_sequence)`. The authoritative
-world will apply a sorted batch at each tick, publish an immutable snapshot, and release the lock
-before packet encoding or network writes. This preserves reproducible outcomes while allowing
+Before parallel worker pools execute gameplay simulation, FE will connect its existing command queue
+to an explicit tick number and stable tie-breaker `(tick, player_id, session_sequence)`. The
+authoritative world must apply a sorted batch at each tick, publish an immutable snapshot, and
+release the lock before packet encoding or network writes. The current publication pool handles
+only the final immutable encoding stage. This preserves reproducible outcomes while allowing
 decoding, encoding, and disconnected-content work to use available CPU cores.
 
 ## Implemented command-batch foundation
@@ -103,3 +126,20 @@ cost for this isolated one-frame scenario.
 A follow-up with three concurrent immutable request streams and three workers also remained slower:
 the direct median was 17.008 µs per frame, while the worker median was 21.625 µs per frame. This
 removes any basis for a current live-listener integration or multithreaded throughput claim.
+
+## Measured ordered publication-pool baseline
+
+A third local release-mode experiment exercised the ordered pool directly. Each of nine samples
+prepared 500 batches of three pre-captured, byte-distinct native 740 viewport publications. The
+direct path encoded the three publications in established sequence. The pool path sorted the same
+three sequence numbers, fanned them out to three workers, and collected exactly that sequence.
+Every output batch was byte-identical to its direct reference.
+
+| Path | Median sample | Median per batch | Median per frame | Result |
+| --- | ---: | ---: | ---: | --- |
+| Direct ordered encoding | 43.796 ms | 87.592 µs | 29.197 µs | Reference |
+| Three-worker ordered publication pool | 47.577 ms | 95.154 µs | 31.718 µs | 8.633% slower |
+
+This validates bounded immutable fan-out and reproducible publication order, but it does **not**
+justify listener integration or a server-speed claim. The full method and raw samples are recorded
+in `docs/benchmarks/native-render-preparation-v7.4.44.md`.

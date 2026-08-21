@@ -1463,6 +1463,11 @@ struct NativeWorldRenderSnapshot {
 // Staged foundation: production listener integration is deferred until lifecycle and benchmark gates pass.
 #[allow(dead_code)]
 const NATIVE_RENDER_PREPARATION_QUEUE_CAPACITY: usize = 32;
+#[allow(dead_code)]
+const MAX_NATIVE_RENDER_PREPARATION_WORKERS: usize = 8;
+#[allow(dead_code)]
+const MAX_NATIVE_RENDER_PUBLICATION_BATCH: usize =
+    NATIVE_RENDER_PREPARATION_QUEUE_CAPACITY * MAX_NATIVE_RENDER_PREPARATION_WORKERS;
 
 #[allow(dead_code)]
 struct NativeRenderPreparationRequest {
@@ -1514,6 +1519,19 @@ impl NativeRenderPreparationWorker {
         world_map: Arc<WorldMap>,
         render_snapshot: NativeWorldRenderSnapshot,
     ) -> Result<Frame, HostError> {
+        self.schedule(profile, snapshot, world_map, render_snapshot)?
+            .recv_timeout(self.response_timeout)
+            .map_err(|_| HostError::RenderPreparationUnavailable)?
+            .map_err(HostError::Protocol)
+    }
+
+    fn schedule(
+        &self,
+        profile: NativeOtClientProfile,
+        snapshot: NativeOtClientEmptyWorldSnapshot,
+        world_map: Arc<WorldMap>,
+        render_snapshot: NativeWorldRenderSnapshot,
+    ) -> Result<mpsc::Receiver<Result<Frame, ProtocolError>>, HostError> {
         let (response, receiver) = mpsc::sync_channel(1);
         self.requests
             .try_send(NativeRenderPreparationRequest {
@@ -1524,10 +1542,103 @@ impl NativeRenderPreparationWorker {
                 response,
             })
             .map_err(|_| HostError::RenderPreparationUnavailable)?;
-        receiver
-            .recv_timeout(self.response_timeout)
-            .map_err(|_| HostError::RenderPreparationUnavailable)?
-            .map_err(HostError::Protocol)
+        Ok(receiver)
+    }
+}
+
+/// One ordered immutable viewport-publication request. The sequence belongs to the caller's
+/// established publication order; workers only encode its detached inputs.
+#[allow(dead_code)]
+#[derive(Clone)]
+struct NativeRenderPublication {
+    sequence: u64,
+    profile: NativeOtClientProfile,
+    snapshot: NativeOtClientEmptyWorldSnapshot,
+    world_map: Arc<WorldMap>,
+    render_snapshot: NativeWorldRenderSnapshot,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeRenderPublicationError {
+    InvalidWorkerCount(usize),
+    PublicationLimitExceeded { limit: usize },
+    DuplicateSequence(u64),
+    PreparationUnavailable,
+    Protocol,
+}
+
+/// Bounded worker fan-out for detached native viewport snapshots. It deliberately has no shared
+/// world, database, socket, action queue, or mutation callback. `prepare_batch` sorts by the
+/// caller-provided publication sequence before scheduling and returns frames in that same order,
+/// independently of which worker completes first.
+#[allow(dead_code)]
+#[derive(Clone)]
+struct NativeRenderPreparationPool {
+    workers: Vec<NativeRenderPreparationWorker>,
+}
+
+#[allow(dead_code)]
+impl NativeRenderPreparationPool {
+    fn start(
+        worker_count: usize,
+        response_timeout: Duration,
+    ) -> Result<(Self, Vec<JoinHandle<()>>), NativeRenderPublicationError> {
+        if worker_count == 0 || worker_count > MAX_NATIVE_RENDER_PREPARATION_WORKERS {
+            return Err(NativeRenderPublicationError::InvalidWorkerCount(
+                worker_count,
+            ));
+        }
+        let mut workers = Vec::with_capacity(worker_count);
+        let mut worker_threads = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let (worker, worker_thread) = NativeRenderPreparationWorker::start(response_timeout);
+            workers.push(worker);
+            worker_threads.push(worker_thread);
+        }
+        Ok((Self { workers }, worker_threads))
+    }
+
+    fn prepare_batch(
+        &self,
+        mut publications: Vec<NativeRenderPublication>,
+    ) -> Result<Vec<Frame>, NativeRenderPublicationError> {
+        if publications.len() > MAX_NATIVE_RENDER_PUBLICATION_BATCH {
+            return Err(NativeRenderPublicationError::PublicationLimitExceeded {
+                limit: MAX_NATIVE_RENDER_PUBLICATION_BATCH,
+            });
+        }
+        publications.sort_by_key(|publication| publication.sequence);
+        let mut seen_sequences = BTreeSet::new();
+        for publication in &publications {
+            if !seen_sequences.insert(publication.sequence) {
+                return Err(NativeRenderPublicationError::DuplicateSequence(
+                    publication.sequence,
+                ));
+            }
+        }
+        let mut responses = Vec::with_capacity(publications.len());
+        for (index, publication) in publications.into_iter().enumerate() {
+            let worker = &self.workers[index % self.workers.len()];
+            let response = worker
+                .schedule(
+                    publication.profile,
+                    publication.snapshot,
+                    publication.world_map,
+                    publication.render_snapshot,
+                )
+                .map_err(|_| NativeRenderPublicationError::PreparationUnavailable)?;
+            responses.push((response, worker.response_timeout));
+        }
+        responses
+            .into_iter()
+            .map(|(response, timeout)| {
+                response
+                    .recv_timeout(timeout)
+                    .map_err(|_| NativeRenderPublicationError::PreparationUnavailable)?
+                    .map_err(|_| NativeRenderPublicationError::Protocol)
+            })
+            .collect()
     }
 }
 
@@ -13771,6 +13882,127 @@ mod tests {
     }
 
     #[test]
+    fn native_render_preparation_pool_orders_detached_publications_and_rejects_invalid_batches() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 102,
+                    account_id: 2,
+                    name: "Druid".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+        let snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_id: native_player_id(101).unwrap(),
+            player_name: "Knight".into(),
+            player_position: native_position(map.spawn()),
+            player_level: 8,
+            player_experience: 0,
+            player_vitals: NativeOtClientPlayerVitals::default(),
+            player_skills: forgotten_core::PlayerSkills::default(),
+            ground_thing_id: 102,
+            player_look_type: 128,
+            player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
+            player_speed: 220,
+            server_beat: 50,
+        };
+        let render_snapshot = shared.native_render_snapshot(101, 128, 220).unwrap();
+        let publication = |sequence, x| {
+            let mut snapshot = snapshot.clone();
+            snapshot.player_position.x = x;
+            NativeRenderPublication {
+                sequence,
+                profile: profile.clone(),
+                snapshot,
+                world_map: Arc::clone(&map),
+                render_snapshot: render_snapshot.clone(),
+            }
+        };
+        let ordered_publications = [
+            publication(10, 100),
+            publication(20, 101),
+            publication(30, 102),
+        ];
+        let expected = ordered_publications
+            .iter()
+            .map(|publication| {
+                encode_native_otclient_map_viewport_with_static_spawns_and_players(
+                    &publication.profile,
+                    &publication.snapshot,
+                    publication.world_map.as_ref(),
+                    Some(&publication.render_snapshot.static_spawns),
+                    Some(&publication.render_snapshot.visible_players),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (pool, worker_threads) =
+            NativeRenderPreparationPool::start(3, Duration::from_secs(1)).unwrap();
+        let prepared = pool
+            .prepare_batch(vec![
+                publication(30, 102),
+                publication(10, 100),
+                publication(20, 101),
+            ])
+            .unwrap();
+        shared.remove_player(102).unwrap();
+        assert_eq!(prepared, expected);
+        assert!(prepared
+            .iter()
+            .all(|frame| frame.0.windows(5).any(|window| window == b"Druid")));
+
+        assert!(matches!(
+            NativeRenderPreparationPool::start(0, Duration::from_secs(1)),
+            Err(NativeRenderPublicationError::InvalidWorkerCount(0))
+        ));
+        assert_eq!(
+            pool.prepare_batch(vec![publication(1, 100), publication(1, 101)]),
+            Err(NativeRenderPublicationError::DuplicateSequence(1))
+        );
+        let over_limit = (0..=MAX_NATIVE_RENDER_PUBLICATION_BATCH as u64)
+            .map(|sequence| publication(sequence, 100))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pool.prepare_batch(over_limit),
+            Err(NativeRenderPublicationError::PublicationLimitExceeded {
+                limit: MAX_NATIVE_RENDER_PUBLICATION_BATCH,
+            })
+        );
+
+        drop(pool);
+        for worker_thread in worker_threads {
+            worker_thread.join().unwrap();
+        }
+        assert!(shared.visible_players(101, 0, 220).unwrap().is_empty());
+    }
+
+    #[test]
     #[ignore = "run explicitly in release mode to collect local native-render benchmark samples"]
     fn benchmark_native_render_preparation_direct_and_worker() {
         use std::time::Instant;
@@ -14053,6 +14285,146 @@ mod tests {
             "native-render-concurrent-benchmark scenario=three-immutable-session-streams samples={SAMPLE_COUNT} sessions={SESSION_COUNT} iterations_per_session={ITERATIONS_PER_SESSION} direct_total_us={:?} worker_total_us={:?}",
             micros(&direct_samples),
             micros(&worker_samples),
+        );
+    }
+
+    #[test]
+    #[ignore = "run explicitly in release mode to collect deterministic publication-pool benchmark samples"]
+    fn benchmark_native_render_preparation_ordered_publication_pool() {
+        use std::time::Instant;
+
+        const SAMPLE_COUNT: usize = 9;
+        const BATCHES_PER_SAMPLE: usize = 500;
+        const PUBLICATIONS_PER_BATCH: usize = 3;
+
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 102,
+                    account_id: 2,
+                    name: "Druid".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+        let snapshot = NativeOtClientEmptyWorldSnapshot {
+            player_id: native_player_id(101).unwrap(),
+            player_name: "Knight".into(),
+            player_position: native_position(map.spawn()),
+            player_level: 8,
+            player_experience: 0,
+            player_vitals: NativeOtClientPlayerVitals::default(),
+            player_skills: forgotten_core::PlayerSkills::default(),
+            ground_thing_id: 102,
+            player_look_type: 128,
+            player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
+            player_speed: 220,
+            server_beat: 50,
+        };
+        let render_snapshot = shared.native_render_snapshot(101, 128, 220).unwrap();
+        let publication = |sequence, x| {
+            let mut snapshot = snapshot.clone();
+            snapshot.player_position.x = x;
+            NativeRenderPublication {
+                sequence,
+                profile: profile.clone(),
+                snapshot,
+                world_map: Arc::clone(&map),
+                render_snapshot: render_snapshot.clone(),
+            }
+        };
+        let publications = [
+            publication(10, 100),
+            publication(20, 101),
+            publication(30, 102),
+        ];
+        let expected = publications
+            .iter()
+            .map(|publication| {
+                encode_native_otclient_map_viewport_with_static_spawns_and_players(
+                    &publication.profile,
+                    &publication.snapshot,
+                    publication.world_map.as_ref(),
+                    Some(&publication.render_snapshot.static_spawns),
+                    Some(&publication.render_snapshot.visible_players),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let mut direct_samples = Vec::with_capacity(SAMPLE_COUNT);
+        for _ in 0..SAMPLE_COUNT {
+            let started = Instant::now();
+            for _ in 0..BATCHES_PER_SAMPLE {
+                let direct = publications
+                    .iter()
+                    .map(|publication| {
+                        encode_native_otclient_map_viewport_with_static_spawns_and_players(
+                            &publication.profile,
+                            &publication.snapshot,
+                            publication.world_map.as_ref(),
+                            Some(&publication.render_snapshot.static_spawns),
+                            Some(&publication.render_snapshot.visible_players),
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(direct, expected);
+            }
+            direct_samples.push(started.elapsed());
+        }
+
+        let (pool, worker_threads) =
+            NativeRenderPreparationPool::start(PUBLICATIONS_PER_BATCH, Duration::from_secs(1))
+                .unwrap();
+        let mut pool_samples = Vec::with_capacity(SAMPLE_COUNT);
+        for _ in 0..SAMPLE_COUNT {
+            let started = Instant::now();
+            for _ in 0..BATCHES_PER_SAMPLE {
+                assert_eq!(pool.prepare_batch(publications.to_vec()).unwrap(), expected);
+            }
+            pool_samples.push(started.elapsed());
+        }
+        drop(pool);
+        for worker_thread in worker_threads {
+            worker_thread.join().unwrap();
+        }
+
+        let micros = |samples: &[Duration]| {
+            samples
+                .iter()
+                .map(|sample| sample.as_micros())
+                .collect::<Vec<_>>()
+        };
+        println!(
+            "native-render-publication-pool-benchmark scenario=ordered-three-publication-batches samples={SAMPLE_COUNT} batches_per_sample={BATCHES_PER_SAMPLE} publications_per_batch={PUBLICATIONS_PER_BATCH} direct_total_us={:?} pool_total_us={:?}",
+            micros(&direct_samples),
+            micros(&pool_samples),
         );
     }
 

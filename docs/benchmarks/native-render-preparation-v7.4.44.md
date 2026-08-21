@@ -110,3 +110,49 @@ foundation, not a demonstrated throughput improvement. It remains disconnected f
 listener. A future benchmark must include a bounded shared queue, realistic heterogeneous snapshots,
 queue-depth/saturation telemetry, and end-to-end post-publication work before any listener
 integration is considered.
+
+## Ordered publication-pool follow-up
+
+The next local release-mode experiment measured the bounded `NativeRenderPreparationPool`. The
+pool owns no authoritative-world, database, socket, action queue, or mutation capability. It sorts
+caller-owned publication sequence numbers before scheduling, rejects duplicates, uses three workers
+for the run, and returns frames in that sorted order after each detached snapshot has been encoded.
+
+```text
+cargo +stable test --release -p forgotten-host \
+  benchmark_native_render_preparation_ordered_publication_pool -- --ignored --nocapture
+```
+
+| Parameter | Value |
+|---|---:|
+| Build mode | `--release` |
+| Samples per path | 9 |
+| Batches per sample | 500 |
+| Publications per batch | 3 |
+| Frames per sample | 1,500 |
+| Total frames per path | 13,500 |
+| Direct path | Three direct encodes in established publication sequence |
+| Pool path | Three workers, ordered batch fan-out and ordered collection |
+| Mutation during benchmark | None; every output batch is byte-identical to direct encoding |
+
+All timing values are microseconds for one 500-batch sample. Per-frame medians divide the sample
+median by 1,500 frames.
+
+| Path | Median sample | p95 sample | Min–max sample | Median per frame |
+|---|---:|---:|---:|---:|
+| Direct ordered encoding | 43,796 µs | 46,562 µs | 43,133–46,562 µs | 29.197 µs |
+| Three-worker ordered publication pool | 47,577 µs | 54,422 µs | 44,892–54,422 µs | 31.718 µs |
+
+| Comparison | Result |
+|---|---:|
+| Pool/direct median ratio | 1.086× |
+| Pool median overhead | 8.633% |
+| Correctness result | 13,500 byte-identical frames per path, returned in publication-sequence order |
+
+Raw sample durations were direct: `43796, 44030, 43133, 43202, 43389, 43303, 46454, 46562,
+46182`; pool: `44892, 46879, 53379, 54422, 49094, 47861, 47317, 45515, 47577`.
+
+The ordered pool is a validated bounded snapshot-publication boundary, **not** a demonstrated
+server-speed improvement. It remains disconnected from the listener. Future work must still measure
+real queue saturation, lock holds, action latency, memory, socket writes, and authoritative command
+application under a production-like workload.
