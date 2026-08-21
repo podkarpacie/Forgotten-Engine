@@ -89,6 +89,7 @@ pub const PROBE_VERSION: u8 = 1;
 const MAX_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
 const NATIVE_OTCLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const NATIVE_OTCLIENT_HEARTBEAT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MAX_NATIVE_OTCLIENT_LOGIN_VIP_ENTRIES: usize = 128;
 const NATIVE_OTCLIENT_DEFAULT_GROUND_SPEED: u64 = 150;
 const NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY: Duration = Duration::from_secs(2);
 const DEFAULT_NATIVE_ARMOR_MULTIPLIER_MILLI: u32 = 1_000;
@@ -4303,10 +4304,42 @@ fn handle_native_otclient_game(
     for frame in &static_health_frames {
         write_frame(stream, frame)?;
     }
+    let persisted_vip_entries = database
+        .account_vip_entries(request.account_id)
+        .map_err(HostError::Persistence)?;
+    let mut delivered_vip_entries = 0usize;
+    let mut skipped_vip_entries = 0usize;
+    for entry in persisted_vip_entries
+        .iter()
+        .take(MAX_NATIVE_OTCLIENT_LOGIN_VIP_ENTRIES)
+    {
+        let Ok(target_player_id) = u32::try_from(entry.target_player_id) else {
+            skipped_vip_entries = skipped_vip_entries.saturating_add(1);
+            continue;
+        };
+        if target_player_id == 0 {
+            skipped_vip_entries = skipped_vip_entries.saturating_add(1);
+            continue;
+        }
+        let frame = encode_native_otclient_classic_vip_entry(
+            &config.client_profile,
+            target_player_id,
+            &entry.target_player_name,
+            false,
+        )
+        .map_err(HostError::Protocol)?;
+        write_frame(stream, &frame)?;
+        delivered_vip_entries = delivered_vip_entries.saturating_add(1);
+    }
+    skipped_vip_entries = skipped_vip_entries.saturating_add(
+        persisted_vip_entries
+            .len()
+            .saturating_sub(MAX_NATIVE_OTCLIENT_LOGIN_VIP_ENTRIES),
+    );
     stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
     if config.extended_diagnostics {
         eprintln!(
-            "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} equipment-records={}/{} skipped-unmapped={} container-records={}/{} skipped-unmapped-or-nested={} static-health-records={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
+            "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} equipment-records={}/{} skipped-unmapped={} container-records={}/{} skipped-unmapped-or-nested={} static-health-records={} vip-records={} skipped-vip-records={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
             character.name,
             initialization.0.len(),
             equipment_frames.len(),
@@ -4316,6 +4349,8 @@ fn handle_native_otclient_game(
             bootstrap_containers.len(),
             bootstrap_containers.len().saturating_sub(container_frames.len()),
             static_health_frames.len(),
+            delivered_vip_entries,
+            skipped_vip_entries,
             world_map.identifier(),
             world_map.tile_count(),
             active_static_spawns.entities.len(),
@@ -14686,6 +14721,91 @@ mod tests {
             .account_vip_entries(account_id.try_into().unwrap())
             .unwrap()
             .is_empty());
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_classic_login_delivers_persisted_vip_entries_after_initialization() {
+        let database_path = database_path("native-classic-login-vip");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        for (id, name) in [(1, "Knight"), (2, "Druid")] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: account_id as u64,
+                    name: name.into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        database
+            .add_account_vip_entry(
+                account_id.try_into().unwrap(),
+                "Druid",
+                "persisted metadata",
+                4,
+                true,
+            )
+            .unwrap();
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let initialization = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            initialization.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let vip_entry = (0..4)
+            .map(|_| read_frame(&mut stream).unwrap())
+            .find(|frame| {
+                frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_VIP_ADD)
+            })
+            .expect("persisted VIP entry was not delivered after native initialization");
+        assert_eq!(
+            vip_entry.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_VIP_ADD,
+                2,
+                0,
+                0,
+                0,
+                5,
+                0,
+                b'D',
+                b'r',
+                b'u',
+                b'i',
+                b'd',
+                0,
+            ]
+        );
+        drop(stream);
+        game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }
 
