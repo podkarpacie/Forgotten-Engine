@@ -446,6 +446,9 @@ fn run_host(
     let item_armor_by_server_id = item_catalog
         .as_ref()
         .map(|catalog| catalog.native_xml_armor_by_server_id());
+    let item_slot_types_by_server_id = item_catalog
+        .as_ref()
+        .map(|catalog| catalog.xml_slot_types_by_server_id());
     let item_weight_by_server_id = item_catalog
         .as_ref()
         .map(|catalog| catalog.xml_weight_by_server_id());
@@ -672,6 +675,7 @@ fn run_host(
             world_map: Some(Arc::clone(&world_map)),
             item_presentation_catalog: item_presentation_catalog.map(Arc::new),
             item_armor_by_server_id: item_armor_by_server_id.map(Arc::new),
+            item_slot_types_by_server_id: item_slot_types_by_server_id.map(Arc::new),
             item_weight_by_server_id: item_weight_by_server_id.map(Arc::new),
             item_name_by_server_id: item_name_by_server_id.map(Arc::new),
             stackable_item_server_ids: stackable_item_server_ids.map(Arc::new),

@@ -25,7 +25,7 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-pub use items::{LegacyItemCatalog, LegacyItemDefinition};
+pub use items::{LegacyItemCatalog, LegacyItemDefinition, LegacyItemSlotType};
 pub use legacy_xml::{
     LegacyHouse, LegacySpawnArea, LegacySpawnCreature, LegacySpawnKind, LegacyWorldCompanionData,
 };

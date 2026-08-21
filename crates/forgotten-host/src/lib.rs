@@ -2,7 +2,7 @@
 //!
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
-use forgotten_config::{DeclarativeSpellCatalog, DeclarativeWeaponCatalog};
+use forgotten_config::{DeclarativeSpellCatalog, DeclarativeWeaponCatalog, LegacyItemSlotType};
 use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
     EquipmentSlot, ExperienceAwardPolicy, FeTfsStaticSpawnCollection, ItemInstance,
@@ -296,6 +296,40 @@ fn native_classic_item_record(
         subtype: presentation
             .requires_classic_740_subtype
             .then_some(item.count.min(u16::from(u8::MAX)) as u8),
+    })
+}
+
+/// Applies only one bounded compatibility rule. Missing legacy metadata preserves the existing
+/// transfer behavior, while a known nonempty `slotType` set must explicitly admit the requested
+/// fixed equipment slot. `two-handed` remains unsupported because FE has no atomic dual-slot
+/// occupancy contract yet.
+fn native_legacy_slot_types_allow_equipment_slot(
+    slot_types_by_server_id: Option<&BTreeMap<u16, BTreeSet<LegacyItemSlotType>>>,
+    server_id: u16,
+    target_slot: EquipmentSlot,
+) -> bool {
+    let Some(slot_types) = slot_types_by_server_id.and_then(|entries| entries.get(&server_id))
+    else {
+        return true;
+    };
+    slot_types.iter().any(|slot_type| {
+        matches!(
+            (slot_type, target_slot),
+            (LegacyItemSlotType::Head, EquipmentSlot::Head)
+                | (LegacyItemSlotType::Necklace, EquipmentSlot::Neck)
+                | (LegacyItemSlotType::Backpack, EquipmentSlot::Backpack)
+                | (LegacyItemSlotType::Body, EquipmentSlot::Armor)
+                | (LegacyItemSlotType::RightHand, EquipmentSlot::RightHand)
+                | (LegacyItemSlotType::LeftHand, EquipmentSlot::LeftHand)
+                | (
+                    LegacyItemSlotType::Hand,
+                    EquipmentSlot::RightHand | EquipmentSlot::LeftHand
+                )
+                | (LegacyItemSlotType::Legs, EquipmentSlot::Legs)
+                | (LegacyItemSlotType::Feet, EquipmentSlot::Feet)
+                | (LegacyItemSlotType::Ring, EquipmentSlot::Ring)
+                | (LegacyItemSlotType::Ammo, EquipmentSlot::Ammo)
+        )
     })
 }
 
@@ -916,6 +950,10 @@ pub struct NativeOtClientHostConfig {
     /// Shielding, weapon defense, vocation multipliers, random armor, and TFS formula parity are
     /// deliberately excluded.
     pub item_armor_by_server_id: Option<Arc<BTreeMap<u16, u16>>>,
+    /// Immutable validated legacy `items.xml` slot types. They are used only by the bounded
+    /// native map-source-to-empty-equipment route; generic inventories, stacks, swaps, and
+    /// two-handed placement remain outside this policy.
+    pub item_slot_types_by_server_id: Option<Arc<BTreeMap<u16, BTreeSet<LegacyItemSlotType>>>>,
     /// Immutable validated legacy `items.xml` source weights used only to append one bounded
     /// classic weight sentence to an exact native map LookMap response. They do not enforce
     /// capacity or change item-transfer behavior.
@@ -4825,6 +4863,18 @@ fn handle_native_otclient_game(
                         );
                         continue;
                     };
+                    if !native_legacy_slot_types_allow_equipment_slot(
+                        config.item_slot_types_by_server_id.as_deref(),
+                        source.server_id,
+                        target_slot,
+                    ) {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-map-source-slot-type-mismatch",
+                        );
+                        continue;
+                    }
                     let transfer = match map_owner.move_source_item_to_empty_equipment(
                         shared_world,
                         &mut database,
@@ -7817,6 +7867,7 @@ mod tests {
             world_map: None,
             item_presentation_catalog: None,
             item_armor_by_server_id: None,
+            item_slot_types_by_server_id: None,
             item_weight_by_server_id: None,
             item_name_by_server_id: None,
             stackable_item_server_ids: None,
@@ -7833,6 +7884,50 @@ mod tests {
             declarative_weapon_catalog: None,
             declarative_spell_catalog: None,
         }
+    }
+
+    #[test]
+    fn native_legacy_slot_types_allow_only_exact_representable_equipment_slots() {
+        let slot_types = BTreeMap::from([
+            (4526, BTreeSet::from([LegacyItemSlotType::LeftHand])),
+            (4527, BTreeSet::from([LegacyItemSlotType::Hand])),
+            (4528, BTreeSet::from([LegacyItemSlotType::TwoHanded])),
+        ]);
+        assert!(native_legacy_slot_types_allow_equipment_slot(
+            Some(&slot_types),
+            4526,
+            EquipmentSlot::LeftHand,
+        ));
+        assert!(!native_legacy_slot_types_allow_equipment_slot(
+            Some(&slot_types),
+            4526,
+            EquipmentSlot::Head,
+        ));
+        assert!(native_legacy_slot_types_allow_equipment_slot(
+            Some(&slot_types),
+            4527,
+            EquipmentSlot::RightHand,
+        ));
+        assert!(native_legacy_slot_types_allow_equipment_slot(
+            Some(&slot_types),
+            4527,
+            EquipmentSlot::LeftHand,
+        ));
+        assert!(!native_legacy_slot_types_allow_equipment_slot(
+            Some(&slot_types),
+            4528,
+            EquipmentSlot::RightHand,
+        ));
+        assert!(native_legacy_slot_types_allow_equipment_slot(
+            Some(&slot_types),
+            4999,
+            EquipmentSlot::Head,
+        ));
+        assert!(native_legacy_slot_types_allow_equipment_slot(
+            None,
+            4526,
+            EquipmentSlot::Head,
+        ));
     }
 
     fn native_world_map() -> Arc<WorldMap> {
