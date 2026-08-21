@@ -42,8 +42,8 @@ use forgotten_protocol::{
     encode_native_otclient_choose_outfit, encode_native_otclient_clear_target,
     encode_native_otclient_close_container, encode_native_otclient_creature_health,
     encode_native_otclient_creature_outfit, encode_native_otclient_delete_inventory,
-    encode_native_otclient_empty_quest_log, encode_native_otclient_game_cancel_walk_facing,
-    encode_native_otclient_game_death,
+    encode_native_otclient_empty_channel_list, encode_native_otclient_empty_quest_log,
+    encode_native_otclient_game_cancel_walk_facing, encode_native_otclient_game_death,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
@@ -873,6 +873,7 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         }
         NativeOtClientGameAction::RequestOutfit => "action=request-outfit".into(),
         NativeOtClientGameAction::RequestQuestLog => "action=request-quest-log".into(),
+        NativeOtClientGameAction::RequestChannels => "action=request-channels".into(),
         NativeOtClientGameAction::ChangeOutfit(outfit) => format!(
             "action=change-outfit look-type={} colors={},{},{},{}",
             outfit.look_type, outfit.head, outfit.body, outfit.legs, outfit.feet
@@ -5740,6 +5741,19 @@ fn handle_native_otclient_game(
                         "outbound=choose-outfit opcode=0xc8 bytes={} look-type={}",
                         outfit_window.0.len(),
                         player_outfit.look_type
+                    ),
+                );
+            }
+            NativeOtClientGameAction::RequestChannels => {
+                let channels = encode_native_otclient_empty_channel_list(&config.client_profile)
+                    .map_err(HostError::Protocol)?;
+                write_frame(stream, &channels)?;
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "outbound=channel-list-empty opcode=0xab bytes={}",
+                        channels.0.len()
                     ),
                 );
             }
@@ -13900,7 +13914,7 @@ mod tests {
     }
 
     #[test]
-    fn native_empty_quest_log_response_keeps_session_usable() {
+    fn native_empty_quest_log_and_channel_list_responses_keep_session_usable() {
         let database_path = database_path("native-empty-quest-log");
         let database = EngineDatabase::open(&database_path).unwrap();
         let account_id = database
@@ -13972,6 +13986,18 @@ mod tests {
                 128,
                 128,
             ]
+        );
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_REQUEST_CHANNELS,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame(&mut stream).unwrap().0,
+            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CHANNELS, 0]
         );
 
         drop(stream);
