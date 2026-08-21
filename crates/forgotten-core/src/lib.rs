@@ -3794,8 +3794,10 @@ impl WorldState {
     }
 
     /// Reactivates only inactive static creatures whose nonzero per-spawn interval has elapsed
-    /// on the deterministic world clock. The caller owns clock advancement and invocation; this
-    /// method does not create an autonomous scheduler, AI loop, combat path, or script behavior.
+    /// on the deterministic world clock. A due attempt blocked by player or static occupancy
+    /// re-arms one full configured interval before the next attempt. The caller owns clock
+    /// advancement and invocation; this method does not create an autonomous scheduler, AI loop,
+    /// combat path, or script behavior.
     pub fn reactivate_due_static_creatures(&mut self) -> StaticCreatureResetSummary {
         let player_positions: BTreeSet<Position> = self
             .players
@@ -3820,10 +3822,18 @@ impl WorldState {
             }
             if player_positions.contains(&runtime.spawn_position) {
                 summary.deferred_by_player_occupancy += 1;
+                runtime.reactivation_due_tick = Some(
+                    self.tick
+                        .saturating_add(u64::from(runtime.respawn_interval_seconds)),
+                );
                 continue;
             }
             if active_positions.contains(&runtime.spawn_position) {
                 summary.deferred_by_static_creature_occupancy += 1;
+                runtime.reactivation_due_tick = Some(
+                    self.tick
+                        .saturating_add(u64::from(runtime.respawn_interval_seconds)),
+                );
                 continue;
             }
             runtime.entity.position = runtime.spawn_position;
@@ -8228,9 +8238,34 @@ mod tests {
                 deferred_by_static_creature_occupancy: 0,
             }
         );
+        assert_eq!(
+            world
+                .static_creature_lifecycle(creature_id)
+                .unwrap()
+                .reactivation_due_tick,
+            Some(9)
+        );
         world
             .move_player_cardinal(7, CardinalDirection::West)
             .unwrap();
+        assert_eq!(
+            world.reactivate_due_static_creatures(),
+            StaticCreatureResetSummary {
+                reactivated: 0,
+                deferred_by_player_occupancy: 0,
+                deferred_by_static_creature_occupancy: 0,
+            }
+        );
+        world.advance_ticks(2);
+        assert_eq!(
+            world.reactivate_due_static_creatures(),
+            StaticCreatureResetSummary {
+                reactivated: 0,
+                deferred_by_player_occupancy: 0,
+                deferred_by_static_creature_occupancy: 0,
+            }
+        );
+        world.advance_tick();
         assert_eq!(
             world.reactivate_due_static_creatures(),
             StaticCreatureResetSummary {
