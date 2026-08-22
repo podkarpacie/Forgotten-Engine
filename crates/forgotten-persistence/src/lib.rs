@@ -36,7 +36,8 @@ const SCHEMA_VERSION_GUILDS: i64 = 18;
 const SCHEMA_VERSION_GUILD_INVITATIONS: i64 = 19;
 const SCHEMA_VERSION_PLAYER_BANK_BALANCE: i64 = 20;
 const SCHEMA_VERSION_PLAYER_DEPOTS: i64 = 21;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_DEPOTS;
+const SCHEMA_VERSION_PLAYER_INBOX: i64 = 22;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_INBOX;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 pub const MAX_VIP_DESCRIPTION_BYTES: usize = 128;
@@ -51,6 +52,7 @@ pub const MAX_PLAYER_BANK_BALANCE: u64 = i64::MAX as u64;
 pub const MAX_PLAYER_DEPOT_ID: u8 = 19;
 pub const MAX_PLAYER_DEPOTS_PER_PLAYER: usize = 20;
 pub const MAX_PLAYER_DEPOT_TOP_LEVEL_ITEMS: usize = 1_000;
+pub const MAX_PLAYER_INBOX_TOP_LEVEL_ITEMS: usize = 30;
 
 pub struct EngineDatabase {
     connection: Connection,
@@ -2719,6 +2721,89 @@ impl EngineDatabase {
         Ok(records)
     }
 
+    /// Replaces a player's complete bounded inbox contents in one transaction. This TFS-shaped
+    /// storage boundary retains only ordered top-level items; nesting, attributes beyond the
+    /// bounded IDs, client windows, capacity policy, and inbox routing remain outside it.
+    pub fn replace_player_inbox(
+        &mut self,
+        player_id: u64,
+        items: &[ItemInstance],
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        validate_player_inbox_items(items)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM player_inbox_items WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        for (slot, item) in items.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO player_inbox_items (player_id, slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    player_id as i64,
+                    slot as i64,
+                    i64::from(item.server_id),
+                    i64::from(item.count),
+                    item.action_id.map(i64::from),
+                    item.unique_id.map(i64::from),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Loads a player's bounded inbox in deterministic top-level item order and rejects malformed
+    /// raw SQLite fields before they reach the authoritative item representation.
+    pub fn player_inbox(&self, player_id: u64) -> Result<Vec<ItemInstance>, PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT slot, server_id, count, action_id, unique_id FROM player_inbox_items WHERE player_id = ?1 ORDER BY slot",
+        )?;
+        let records = statement
+            .query_map(params![player_id as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if records.len() > MAX_PLAYER_INBOX_TOP_LEVEL_ITEMS {
+            return Err(PersistenceError::InvalidInboxRecord(format!(
+                "inbox exceeds {MAX_PLAYER_INBOX_TOP_LEVEL_ITEMS} top-level items"
+            )));
+        }
+        let mut items = Vec::with_capacity(records.len());
+        for (expected_slot, (slot, server_id, count, action_id, unique_id)) in
+            records.into_iter().enumerate()
+        {
+            let expected_slot = i64::try_from(expected_slot).map_err(|_| {
+                PersistenceError::InvalidInboxRecord("inbox item slot does not fit i64".into())
+            })?;
+            if slot != expected_slot {
+                return Err(PersistenceError::InvalidInboxRecord(
+                    "inbox item slots must be contiguous from zero".into(),
+                ));
+            }
+            let server_id = u16::try_from(server_id).map_err(|_| {
+                PersistenceError::InvalidInboxRecord("server item ID does not fit u16".into())
+            })?;
+            let count = u16::try_from(count).map_err(|_| {
+                PersistenceError::InvalidInboxRecord("item count does not fit u16".into())
+            })?;
+            let mut item = ItemInstance::new(server_id, count)
+                .map_err(|error| PersistenceError::InvalidInboxRecord(error.to_string()))?;
+            item.action_id = optional_u16_inbox_attribute(action_id, "action ID")?;
+            item.unique_id = optional_u16_inbox_attribute(unique_id, "unique ID")?;
+            items.push(item);
+        }
+        validate_player_inbox_items(&items)?;
+        Ok(items)
+    }
+
     pub fn record_event(&self, level: &str, message: &str) -> Result<(), PersistenceError> {
         self.connection.execute(
             "INSERT INTO engine_events (level, message, created_at) VALUES (?1, ?2, ?3)",
@@ -3230,6 +3315,15 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_PLAYER_DEPOTS, unix_seconds()],
             )?;
         }
+        if self.schema_version()? < SCHEMA_VERSION_PLAYER_INBOX {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS player_inbox_items (player_id INTEGER NOT NULL, slot INTEGER NOT NULL, server_id INTEGER NOT NULL, count INTEGER NOT NULL, action_id INTEGER, unique_id INTEGER, PRIMARY KEY (player_id, slot));",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_PLAYER_INBOX, unix_seconds()],
+            )?;
+        }
         Ok(())
     }
 
@@ -3462,6 +3556,19 @@ fn optional_u16_depot_attribute(
         .transpose()
 }
 
+fn optional_u16_inbox_attribute(
+    value: Option<i64>,
+    label: &str,
+) -> Result<Option<u16>, PersistenceError> {
+    value
+        .map(|value| {
+            u16::try_from(value).map_err(|_| {
+                PersistenceError::InvalidInboxRecord(format!("{label} does not fit u16"))
+            })
+        })
+        .transpose()
+}
+
 fn validate_player_depot_records(records: &[PlayerDepotRecord]) -> Result<(), PersistenceError> {
     if records.len() > MAX_PLAYER_DEPOTS_PER_PLAYER {
         return Err(PersistenceError::InvalidDepotRecord(format!(
@@ -3490,6 +3597,15 @@ fn validate_player_depot_records(records: &[PlayerDepotRecord]) -> Result<(), Pe
                 "depot exceeds {MAX_PLAYER_DEPOT_TOP_LEVEL_ITEMS} top-level items"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_player_inbox_items(items: &[ItemInstance]) -> Result<(), PersistenceError> {
+    if items.len() > MAX_PLAYER_INBOX_TOP_LEVEL_ITEMS {
+        return Err(PersistenceError::InvalidInboxRecord(format!(
+            "inbox exceeds {MAX_PLAYER_INBOX_TOP_LEVEL_ITEMS} top-level items"
+        )));
     }
     Ok(())
 }
@@ -3636,6 +3752,7 @@ pub enum PersistenceError {
     InvalidGuildRecord(String),
     InvalidBankBalanceRecord(String),
     InvalidDepotRecord(String),
+    InvalidInboxRecord(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
     UnknownGuild(u64),
@@ -5505,6 +5622,64 @@ mod tests {
         ));
         assert!(matches!(
             database.player_depots(999),
+            Err(PersistenceError::UnknownPlayer(999))
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_bounded_player_inbox_with_strict_item_ordering() {
+        let path = temporary_path("inbox");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        assert_eq!(database.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        let account_id = database.create_account("admin", "hash").unwrap();
+        database
+            .save_player(&Player {
+                id: 7,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let mut letter = ItemInstance::new(2597, 1).unwrap();
+        letter.action_id = Some(4_242);
+        let mut coins = ItemInstance::new(3031, 50).unwrap();
+        coins.unique_id = Some(7_000);
+        let inbox = vec![letter, coins];
+        database.replace_player_inbox(7, &inbox).unwrap();
+        assert_eq!(database.player_inbox(7).unwrap(), inbox);
+
+        let overfull =
+            vec![ItemInstance::new(3031, 1).unwrap(); MAX_PLAYER_INBOX_TOP_LEVEL_ITEMS + 1];
+        assert!(matches!(
+            database.replace_player_inbox(7, &overfull),
+            Err(PersistenceError::InvalidInboxRecord(_))
+        ));
+        assert_eq!(database.player_inbox(7).unwrap(), inbox);
+
+        database.replace_player_inbox(7, &[]).unwrap();
+        assert!(database.player_inbox(7).unwrap().is_empty());
+        database
+            .connection
+            .execute(
+                "INSERT INTO player_inbox_items (player_id, slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![7_i64, 1_i64, 2597_i64, 1_i64, Option::<i64>::None, Option::<i64>::None],
+            )
+            .unwrap();
+        assert!(matches!(
+            database.player_inbox(7),
+            Err(PersistenceError::InvalidInboxRecord(_))
+        ));
+        assert!(matches!(
+            database.player_inbox(999),
             Err(PersistenceError::UnknownPlayer(999))
         ));
         let _ = fs::remove_file(path);
