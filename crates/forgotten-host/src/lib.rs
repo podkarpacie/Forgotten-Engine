@@ -147,6 +147,34 @@ pub enum StaticTargetAttackPolicy {
     SelectedAdjacentFixedDamage { damage: u16 },
 }
 
+/// Derives the acquisition range required by every enabled static-creature policy. Pursuit must
+/// not depend on direct damage to discover a target; when both policies are enabled, the widest
+/// bounded range permits pursuit while the existing attack primitive still validates adjacency.
+fn static_target_acquisition_policy(
+    pursuit_policy: StaticTargetPursuitPolicy,
+    attack_policy: StaticTargetAttackPolicy,
+) -> StaticTargetAcquisitionPolicy {
+    let pursuit_range = match pursuit_policy {
+        StaticTargetPursuitPolicy::Disabled => None,
+        StaticTargetPursuitPolicy::NearestLivingPlayerOneStep { max_range } => Some(max_range),
+    };
+    let attack_range = match attack_policy {
+        StaticTargetAttackPolicy::Disabled => None,
+        StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { .. } => Some(1),
+    };
+    match (pursuit_range, attack_range) {
+        (Some(pursuit_range), Some(attack_range)) => {
+            StaticTargetAcquisitionPolicy::NearestLivingPlayer {
+                max_range: pursuit_range.max(attack_range),
+            }
+        }
+        (Some(max_range), None) | (None, Some(max_range)) => {
+            StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range }
+        }
+        (None, None) => StaticTargetAcquisitionPolicy::Disabled,
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StaticTargetAttackSummary {
     pub examined_static_creatures: usize,
@@ -253,12 +281,8 @@ fn run_native_shared_world_heartbeat(
             continue;
         }
         last_tick += Duration::from_secs(u64::from(elapsed_seconds));
-        let target_policy = match config.attack_policy {
-            StaticTargetAttackPolicy::Disabled => StaticTargetAcquisitionPolicy::Disabled,
-            StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { .. } => {
-                StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 }
-            }
-        };
+        let target_policy =
+            static_target_acquisition_policy(config.pursuit_policy, config.attack_policy);
         let world_map = config
             .map_owner
             .as_ref()
@@ -9344,6 +9368,38 @@ mod tests {
             declarative_weapon_catalog: None,
             declarative_spell_catalog: None,
         }
+    }
+
+    #[test]
+    fn static_target_acquisition_includes_enabled_pursuit_without_direct_attack() {
+        assert_eq!(
+            static_target_acquisition_policy(
+                StaticTargetPursuitPolicy::Disabled,
+                StaticTargetAttackPolicy::Disabled,
+            ),
+            StaticTargetAcquisitionPolicy::Disabled
+        );
+        assert_eq!(
+            static_target_acquisition_policy(
+                StaticTargetPursuitPolicy::NearestLivingPlayerOneStep { max_range: 6 },
+                StaticTargetAttackPolicy::Disabled,
+            ),
+            StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 6 }
+        );
+        assert_eq!(
+            static_target_acquisition_policy(
+                StaticTargetPursuitPolicy::NearestLivingPlayerOneStep { max_range: 4 },
+                StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage: 2 },
+            ),
+            StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 4 }
+        );
+        assert_eq!(
+            static_target_acquisition_policy(
+                StaticTargetPursuitPolicy::Disabled,
+                StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage: 2 },
+            ),
+            StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 }
+        );
     }
 
     #[test]
