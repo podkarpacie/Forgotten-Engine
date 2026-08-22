@@ -34,7 +34,8 @@ const SCHEMA_VERSION_STATIC_CREATURE_MELEE_COOLDOWN: i64 = 16;
 const SCHEMA_VERSION_ACCOUNT_VIP_ENTRIES: i64 = 17;
 const SCHEMA_VERSION_GUILDS: i64 = 18;
 const SCHEMA_VERSION_GUILD_INVITATIONS: i64 = 19;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_GUILD_INVITATIONS;
+const SCHEMA_VERSION_PLAYER_BANK_BALANCE: i64 = 20;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_BANK_BALANCE;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 pub const MAX_VIP_DESCRIPTION_BYTES: usize = 128;
@@ -44,6 +45,7 @@ pub const MAX_GUILD_NICK_BYTES: usize = 15;
 pub const MAX_GUILD_RANK_NAME_BYTES: usize = 64;
 pub const MAX_GUILD_RANKS_PER_GUILD: usize = 20;
 pub const MAX_GUILD_INVITATIONS_PER_GUILD: usize = 20;
+pub const MAX_PLAYER_BANK_BALANCE: u64 = i64::MAX as u64;
 
 pub struct EngineDatabase {
     connection: Connection,
@@ -317,6 +319,101 @@ impl EngineDatabase {
             .into_iter()
             .find(|character| character.id == player_id)
             .ok_or(PersistenceError::UnknownPlayer(player_id))
+    }
+
+    /// Returns the exact durable player bank balance. FE retains the TFS-style nonnegative balance
+    /// concept but bounds it to SQLite's signed integer range; money items and client bank packets
+    /// remain outside this persistence query.
+    pub fn player_bank_balance(&self, player_id: u64) -> Result<u64, PersistenceError> {
+        let balance = self
+            .connection
+            .query_row(
+                "SELECT bank_balance FROM players WHERE id = ?1",
+                params![player_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(PersistenceError::UnknownPlayer(player_id))?;
+        sqlite_bank_balance(balance)
+    }
+
+    /// Replaces one player's durable balance within the SQLite-safe FE bound. This is a storage
+    /// primitive only; command authorization, money conversion, client delivery, and economy
+    /// policy remain separate.
+    pub fn set_player_bank_balance(
+        &self,
+        player_id: u64,
+        balance: u64,
+    ) -> Result<(), PersistenceError> {
+        let balance = sqlite_bank_balance_value(balance)?;
+        let affected = self.connection.execute(
+            "UPDATE players SET bank_balance = ?1 WHERE id = ?2",
+            params![balance, player_id as i64],
+        )?;
+        if affected == 0 {
+            return Err(PersistenceError::UnknownPlayer(player_id));
+        }
+        Ok(())
+    }
+
+    /// Credits one exact nonnegative amount without allowing an SQLite-range overflow.
+    pub fn credit_player_bank_balance(
+        &mut self,
+        player_id: u64,
+        amount: u64,
+    ) -> Result<u64, PersistenceError> {
+        let transaction = self.connection.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT bank_balance FROM players WHERE id = ?1",
+                params![player_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(PersistenceError::UnknownPlayer(player_id))?;
+        let updated = sqlite_bank_balance(current)?
+            .checked_add(amount)
+            .filter(|balance| *balance <= MAX_PLAYER_BANK_BALANCE)
+            .ok_or(PersistenceError::BankBalanceOverflow { player_id })?;
+        transaction.execute(
+            "UPDATE players SET bank_balance = ?1 WHERE id = ?2",
+            params![sqlite_bank_balance_value(updated)?, player_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    /// Debits one exact amount only when the durable balance covers it. Negative balances are never
+    /// persisted and a rejected debit leaves durable state unchanged.
+    pub fn debit_player_bank_balance(
+        &mut self,
+        player_id: u64,
+        amount: u64,
+    ) -> Result<u64, PersistenceError> {
+        let transaction = self.connection.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT bank_balance FROM players WHERE id = ?1",
+                params![player_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(PersistenceError::UnknownPlayer(player_id))?;
+        let current = sqlite_bank_balance(current)?;
+        let updated =
+            current
+                .checked_sub(amount)
+                .ok_or(PersistenceError::InsufficientBankBalance {
+                    player_id,
+                    balance: current,
+                    requested: amount,
+                })?;
+        transaction.execute(
+            "UPDATE players SET bank_balance = ?1 WHERE id = ?2",
+            params![sqlite_bank_balance_value(updated)?, player_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(updated)
     }
 
     /// Adds one exact persisted character to an account-owned VIP list. The target name is matched
@@ -2998,6 +3095,17 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_GUILD_INVITATIONS, unix_seconds()],
             )?;
         }
+        if self.schema_version()? < SCHEMA_VERSION_PLAYER_BANK_BALANCE {
+            if !self.player_column_exists("bank_balance")? {
+                self.connection.execute_batch(
+                    "ALTER TABLE players ADD COLUMN bank_balance INTEGER NOT NULL DEFAULT 0",
+                )?;
+            }
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_PLAYER_BANK_BALANCE, unix_seconds()],
+            )?;
+        }
         Ok(())
     }
 
@@ -3294,6 +3402,22 @@ fn validated_guild_rank_name(value: &str) -> Result<&str, PersistenceError> {
     Ok(value)
 }
 
+fn sqlite_bank_balance(value: i64) -> Result<u64, PersistenceError> {
+    u64::try_from(value).map_err(|_| {
+        PersistenceError::InvalidBankBalanceRecord(
+            "bank balance must be nonnegative and fit SQLite signed range".into(),
+        )
+    })
+}
+
+fn sqlite_bank_balance_value(value: u64) -> Result<i64, PersistenceError> {
+    i64::try_from(value).map_err(|_| {
+        PersistenceError::InvalidBankBalanceRecord(format!(
+            "bank balance exceeds SQLite signed range of {MAX_PLAYER_BANK_BALANCE}"
+        ))
+    })
+}
+
 fn sqlite_progression_attempt(value: u64) -> Result<i64, PersistenceError> {
     i64::try_from(value).map_err(|_| {
         PersistenceError::InvalidProgressionAttemptRecord(
@@ -3341,6 +3465,7 @@ pub enum PersistenceError {
     InvalidMapItemJournal(String),
     InvalidVipEntry(String),
     InvalidGuildRecord(String),
+    InvalidBankBalanceRecord(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
     UnknownGuild(u64),
@@ -3381,6 +3506,14 @@ pub enum PersistenceError {
     },
     GuildInvitationCapExceeded {
         guild_id: u64,
+    },
+    BankBalanceOverflow {
+        player_id: u64,
+    },
+    InsufficientBankBalance {
+        player_id: u64,
+        balance: u64,
+        requested: u64,
     },
     GuildRankOutsideGuild {
         guild_id: u64,
@@ -4111,6 +4244,57 @@ mod tests {
                 motd: "Welcome again".into(),
             }
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_bounded_player_bank_balance_operations() {
+        let path = temporary_path("player-bank-balance");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("owner", "hash").unwrap() as u32;
+        let player = database
+            .create_player_for_account(account_id, "Knight")
+            .unwrap();
+
+        assert_eq!(database.player_bank_balance(player.id).unwrap(), 0);
+        database.set_player_bank_balance(player.id, 100).unwrap();
+        assert_eq!(
+            database.credit_player_bank_balance(player.id, 50).unwrap(),
+            150
+        );
+        assert_eq!(
+            database.debit_player_bank_balance(player.id, 75).unwrap(),
+            75
+        );
+        assert!(matches!(
+            database.debit_player_bank_balance(player.id, 76),
+            Err(PersistenceError::InsufficientBankBalance {
+                player_id,
+                balance: 75,
+                requested: 76,
+            }) if player_id == player.id
+        ));
+        assert_eq!(database.player_bank_balance(player.id).unwrap(), 75);
+
+        database
+            .set_player_bank_balance(player.id, MAX_PLAYER_BANK_BALANCE)
+            .unwrap();
+        assert!(matches!(
+            database.credit_player_bank_balance(player.id, 1),
+            Err(PersistenceError::BankBalanceOverflow { player_id }) if player_id == player.id
+        ));
+        assert!(matches!(
+            database.set_player_bank_balance(player.id, MAX_PLAYER_BANK_BALANCE + 1),
+            Err(PersistenceError::InvalidBankBalanceRecord(_))
+        ));
+        assert!(matches!(
+            database.player_bank_balance(999),
+            Err(PersistenceError::UnknownPlayer(999))
+        ));
+        assert!(matches!(
+            database.credit_player_bank_balance(999, 1),
+            Err(PersistenceError::UnknownPlayer(999))
+        ));
         let _ = fs::remove_file(path);
     }
 
