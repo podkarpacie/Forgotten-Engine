@@ -789,6 +789,43 @@ impl EngineDatabase {
         })
     }
 
+    /// Deletes one durable guild and all FE-owned dependent invitation, membership, and rank
+    /// records in a single transaction. Authorization, client state, wars, banking, houses, and
+    /// broader gameplay cleanup remain outside this storage operation.
+    pub fn delete_guild(&mut self, guild_id: u64) -> Result<GuildRecord, PersistenceError> {
+        let transaction = self.connection.transaction()?;
+        let guild = transaction
+            .query_row(
+                "SELECT name, owner_player_id, motd FROM guilds WHERE id = ?1",
+                params![guild_id as i64],
+                |row| {
+                    Ok(GuildRecord {
+                        id: guild_id,
+                        name: row.get(0)?,
+                        owner_player_id: row.get::<_, i64>(1)? as u64,
+                        motd: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(PersistenceError::UnknownGuild(guild_id))?;
+        transaction.execute(
+            "DELETE FROM guild_invitations WHERE guild_id = ?1",
+            params![guild_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM guild_membership WHERE guild_id = ?1",
+            params![guild_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM guild_ranks WHERE guild_id = ?1",
+            params![guild_id as i64],
+        )?;
+        transaction.execute("DELETE FROM guilds WHERE id = ?1", params![guild_id as i64])?;
+        transaction.commit()?;
+        Ok(guild)
+    }
+
     /// Transfers durable guild ownership to an existing guild member. The new owner receives the
     /// required leader rank and the former owner receives the required vice-leader rank, preserving
     /// one durable owner and rank consistency without adding authorization or client behavior.
@@ -4015,6 +4052,65 @@ mod tests {
             database.accept_guild_invitation(first.id, 999),
             Err(PersistenceError::UnknownPlayer(999))
         ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn deletes_guild_and_all_fe_owned_dependent_records_transactionally() {
+        let path = temporary_path("guild-deletion");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        for (id, name) in [(7, "Knight"), (8, "Druid"), (9, "Sorcerer")] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: 1,
+                    name: name.into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let guild = database.create_guild(7, "Forgotten", "Welcome").unwrap();
+        database.add_guild_member(guild.id, 9).unwrap();
+        database.add_guild_rank(guild.id, "Officer", 4).unwrap();
+        database.invite_player_to_guild(guild.id, 8).unwrap();
+
+        assert_eq!(database.delete_guild(guild.id).unwrap(), guild);
+        assert_eq!(database.guild_membership(7).unwrap(), None);
+        assert_eq!(database.guild_membership(9).unwrap(), None);
+        assert_eq!(
+            database.guild_invitations_for_player(8).unwrap(),
+            Vec::new()
+        );
+        assert!(matches!(
+            database.guild_ranks(guild.id),
+            Err(PersistenceError::UnknownGuild(id)) if id == guild.id
+        ));
+        assert!(matches!(
+            database.guild_invitations_for_guild(guild.id),
+            Err(PersistenceError::UnknownGuild(id)) if id == guild.id
+        ));
+        assert!(matches!(
+            database.delete_guild(guild.id),
+            Err(PersistenceError::UnknownGuild(id)) if id == guild.id
+        ));
+        assert_eq!(
+            database
+                .create_guild(7, "Forgotten", "Welcome again")
+                .unwrap(),
+            GuildRecord {
+                id: guild.id,
+                name: "Forgotten".into(),
+                owner_player_id: 7,
+                motd: "Welcome again".into(),
+            }
+        );
         let _ = fs::remove_file(path);
     }
 
