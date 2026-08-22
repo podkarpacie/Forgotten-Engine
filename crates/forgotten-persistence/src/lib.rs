@@ -33,7 +33,8 @@ const SCHEMA_VERSION_STATIC_CREATURE_DAMAGE_SEQUENCE: i64 = 15;
 const SCHEMA_VERSION_STATIC_CREATURE_MELEE_COOLDOWN: i64 = 16;
 const SCHEMA_VERSION_ACCOUNT_VIP_ENTRIES: i64 = 17;
 const SCHEMA_VERSION_GUILDS: i64 = 18;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_GUILDS;
+const SCHEMA_VERSION_GUILD_INVITATIONS: i64 = 19;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_GUILD_INVITATIONS;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 pub const MAX_VIP_DESCRIPTION_BYTES: usize = 128;
@@ -42,6 +43,7 @@ pub const MAX_GUILD_MOTD_BYTES: usize = 255;
 pub const MAX_GUILD_NICK_BYTES: usize = 15;
 pub const MAX_GUILD_RANK_NAME_BYTES: usize = 64;
 pub const MAX_GUILD_RANKS_PER_GUILD: usize = 20;
+pub const MAX_GUILD_INVITATIONS_PER_GUILD: usize = 20;
 
 pub struct EngineDatabase {
     connection: Connection,
@@ -110,6 +112,14 @@ pub struct GuildMembershipRecord {
     pub guild_id: u64,
     pub rank_id: u64,
     pub nick: String,
+}
+
+/// One durable guild invitation. Acceptance, authorization, client delivery, and expiry policy
+/// remain outside this storage relationship.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuildInvitationRecord {
+    pub player_id: u64,
+    pub guild_id: u64,
 }
 
 /// The complete accepted authoritative state that must be persisted together after a bounded
@@ -563,6 +573,10 @@ impl EngineDatabase {
             "INSERT INTO guild_membership (player_id, guild_id, rank_id, nick) VALUES (?1, ?2, ?3, '')",
             params![player_id as i64, guild_id as i64, member_rank_id as i64],
         )?;
+        transaction.execute(
+            "DELETE FROM guild_invitations WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
         transaction.commit()?;
         Ok(GuildMembershipRecord {
             player_id,
@@ -570,6 +584,142 @@ impl EngineDatabase {
             rank_id: member_rank_id,
             nick: String::new(),
         })
+    }
+
+    /// Creates one durable pending invite for an existing player who is not currently a guild
+    /// member. The schema prevents duplicate player/guild pairs and the FE cap bounds each guild's
+    /// pending invite set; authorization and client-facing delivery remain outside this operation.
+    pub fn invite_player_to_guild(
+        &mut self,
+        guild_id: u64,
+        player_id: u64,
+    ) -> Result<GuildInvitationRecord, PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let transaction = self.connection.transaction()?;
+        let guild_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guilds WHERE id = ?1)",
+            params![guild_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !guild_exists {
+            return Err(PersistenceError::UnknownGuild(guild_id));
+        }
+        let has_membership = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guild_membership WHERE player_id = ?1)",
+            params![player_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if has_membership {
+            return Err(PersistenceError::GuildInviteeAlreadyMember {
+                guild_id,
+                player_id,
+            });
+        }
+        let duplicate = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guild_invitations WHERE guild_id = ?1 AND player_id = ?2)",
+            params![guild_id as i64, player_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if duplicate {
+            return Err(PersistenceError::DuplicateGuildInvitation {
+                guild_id,
+                player_id,
+            });
+        }
+        let pending_count = transaction.query_row(
+            "SELECT COUNT(*) FROM guild_invitations WHERE guild_id = ?1",
+            params![guild_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        if pending_count >= MAX_GUILD_INVITATIONS_PER_GUILD {
+            return Err(PersistenceError::GuildInvitationCapExceeded { guild_id });
+        }
+        transaction.execute(
+            "INSERT INTO guild_invitations (player_id, guild_id) VALUES (?1, ?2)",
+            params![player_id as i64, guild_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(GuildInvitationRecord {
+            player_id,
+            guild_id,
+        })
+    }
+
+    /// Lists pending invitations for one existing player in deterministic guild-ID order.
+    pub fn guild_invitations_for_player(
+        &self,
+        player_id: u64,
+    ) -> Result<Vec<GuildInvitationRecord>, PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT player_id, guild_id FROM guild_invitations WHERE player_id = ?1 ORDER BY guild_id",
+        )?;
+        let invitations = statement
+            .query_map(params![player_id as i64], |row| {
+                Ok(GuildInvitationRecord {
+                    player_id: row.get::<_, i64>(0)? as u64,
+                    guild_id: row.get::<_, i64>(1)? as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(invitations)
+    }
+
+    /// Lists pending invitations issued by one existing guild in deterministic player-ID order.
+    pub fn guild_invitations_for_guild(
+        &self,
+        guild_id: u64,
+    ) -> Result<Vec<GuildInvitationRecord>, PersistenceError> {
+        let guild_exists = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guilds WHERE id = ?1)",
+            params![guild_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !guild_exists {
+            return Err(PersistenceError::UnknownGuild(guild_id));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT player_id, guild_id FROM guild_invitations WHERE guild_id = ?1 ORDER BY player_id",
+        )?;
+        let invitations = statement
+            .query_map(params![guild_id as i64], |row| {
+                Ok(GuildInvitationRecord {
+                    player_id: row.get::<_, i64>(0)? as u64,
+                    guild_id: row.get::<_, i64>(1)? as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(invitations)
+    }
+
+    /// Revokes one existing pending player/guild invite without changing memberships.
+    pub fn revoke_guild_invitation(
+        &mut self,
+        guild_id: u64,
+        player_id: u64,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let transaction = self.connection.transaction()?;
+        let guild_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guilds WHERE id = ?1)",
+            params![guild_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !guild_exists {
+            return Err(PersistenceError::UnknownGuild(guild_id));
+        }
+        let affected = transaction.execute(
+            "DELETE FROM guild_invitations WHERE guild_id = ?1 AND player_id = ?2",
+            params![guild_id as i64, player_id as i64],
+        )?;
+        if affected == 0 {
+            return Err(PersistenceError::UnknownGuildInvitation {
+                guild_id,
+                player_id,
+            });
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Transfers durable guild ownership to an existing guild member. The new owner receives the
@@ -2735,6 +2885,15 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_GUILDS, unix_seconds()],
             )?;
         }
+        if self.schema_version()? < SCHEMA_VERSION_GUILD_INVITATIONS {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS guild_invitations (player_id INTEGER NOT NULL, guild_id INTEGER NOT NULL, PRIMARY KEY (player_id, guild_id));",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_GUILD_INVITATIONS, unix_seconds()],
+            )?;
+        }
         Ok(())
     }
 
@@ -3103,6 +3262,21 @@ pub enum PersistenceError {
     GuildOwnershipTargetNotMember {
         guild_id: u64,
         player_id: u64,
+    },
+    GuildInviteeAlreadyMember {
+        guild_id: u64,
+        player_id: u64,
+    },
+    DuplicateGuildInvitation {
+        guild_id: u64,
+        player_id: u64,
+    },
+    UnknownGuildInvitation {
+        guild_id: u64,
+        player_id: u64,
+    },
+    GuildInvitationCapExceeded {
+        guild_id: u64,
     },
     GuildRankOutsideGuild {
         guild_id: u64,
@@ -3599,6 +3773,105 @@ mod tests {
             Err(PersistenceError::UnknownGuild(999))
         ));
         assert_eq!(other.owner_player_id, 9);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_bounded_guild_invitations_and_membership_cleanup() {
+        let path = temporary_path("guild-invitations");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        for id in 7..=31 {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: 1,
+                    name: format!("Player {id}"),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let guild = database.create_guild(7, "Forgotten", "Welcome").unwrap();
+        let initial = database.invite_player_to_guild(guild.id, 8).unwrap();
+        assert_eq!(
+            initial,
+            GuildInvitationRecord {
+                player_id: 8,
+                guild_id: guild.id,
+            }
+        );
+        assert_eq!(
+            database.guild_invitations_for_player(8).unwrap(),
+            vec![initial]
+        );
+        assert_eq!(
+            database.guild_invitations_for_guild(guild.id).unwrap(),
+            vec![initial]
+        );
+        assert!(matches!(
+            database.invite_player_to_guild(guild.id, 8),
+            Err(PersistenceError::DuplicateGuildInvitation { guild_id, player_id })
+                if guild_id == guild.id && player_id == 8
+        ));
+        assert!(matches!(
+            database.invite_player_to_guild(guild.id, 7),
+            Err(PersistenceError::GuildInviteeAlreadyMember { guild_id, player_id })
+                if guild_id == guild.id && player_id == 7
+        ));
+        assert!(matches!(
+            database.invite_player_to_guild(999, 8),
+            Err(PersistenceError::UnknownGuild(999))
+        ));
+
+        database.add_guild_member(guild.id, 8).unwrap();
+        assert_eq!(
+            database.guild_invitations_for_player(8).unwrap(),
+            Vec::new()
+        );
+        assert!(matches!(
+            database.invite_player_to_guild(guild.id, 8),
+            Err(PersistenceError::GuildInviteeAlreadyMember { guild_id, player_id })
+                if guild_id == guild.id && player_id == 8
+        ));
+
+        database.invite_player_to_guild(guild.id, 9).unwrap();
+        database.revoke_guild_invitation(guild.id, 9).unwrap();
+        assert!(matches!(
+            database.revoke_guild_invitation(guild.id, 9),
+            Err(PersistenceError::UnknownGuildInvitation { guild_id, player_id })
+                if guild_id == guild.id && player_id == 9
+        ));
+        assert!(matches!(
+            database.guild_invitations_for_guild(999),
+            Err(PersistenceError::UnknownGuild(999))
+        ));
+        assert!(matches!(
+            database.guild_invitations_for_player(999),
+            Err(PersistenceError::UnknownPlayer(999))
+        ));
+
+        for player_id in 10..30 {
+            database
+                .invite_player_to_guild(guild.id, player_id)
+                .unwrap();
+        }
+        assert_eq!(
+            database
+                .guild_invitations_for_guild(guild.id)
+                .unwrap()
+                .len(),
+            MAX_GUILD_INVITATIONS_PER_GUILD
+        );
+        assert!(matches!(
+            database.invite_player_to_guild(guild.id, 30),
+            Err(PersistenceError::GuildInvitationCapExceeded { guild_id }) if guild_id == guild.id
+        ));
         let _ = fs::remove_file(path);
     }
 
