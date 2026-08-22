@@ -1507,6 +1507,186 @@ impl SharedNativeMap {
         })
     }
 
+    /// Transfers one exact plain source-bound map stack count into one equipment slot. The slot is
+    /// empty or contains an exact compatible bounded stack. A whole-count request completes the
+    /// source removal, while a smaller request reduces the runtime source stack and persists its
+    /// remaining count in the same SQLite transaction as the equipment change.
+    #[allow(clippy::too_many_arguments)] // Explicit map identity and destination fields preserve the authoritative transfer contract.
+    pub fn move_source_item_stack_to_equipment(
+        &self,
+        shared_world: &SharedNativeWorld,
+        database: &mut EngineDatabase,
+        player_id: u64,
+        position: Position,
+        runtime_item_index: usize,
+        requested_count: u16,
+        equipment_slot: EquipmentSlot,
+    ) -> Result<SourceMapItemToEquipmentTransferOutcome, HostError> {
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut world = shared_world.lock()?;
+        let mut source_item_indices = self
+            .source_item_indices
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut removed_source_items = self
+            .removed_source_items
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut source_item_count_overrides = self
+            .source_item_count_overrides
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let runtime_item = map
+            .tile_items(position)
+            .and_then(|items| items.get(runtime_item_index))
+            .cloned()
+            .ok_or(HostError::Core(forgotten_core::CoreError::UnknownMapItem {
+                position,
+                stack_index: u8::try_from(runtime_item_index).unwrap_or(u8::MAX),
+                expected_server_id: 0,
+            }))?;
+        let source_item_index = source_item_indices
+            .get(&position)
+            .and_then(|indices| indices.get(runtime_item_index))
+            .copied()
+            .ok_or_else(|| {
+                HostError::InvalidConfiguration(
+                    "map item has no source-bound runtime identity".into(),
+                )
+            })?;
+        let source_identity = self
+            .source
+            .source_item_identity(position, usize::from(source_item_index))
+            .ok_or_else(|| {
+                HostError::InvalidConfiguration(
+                    "map source item identity no longer resolves".into(),
+                )
+            })?;
+        let source_item = self
+            .source
+            .tile_items(position)
+            .and_then(|items| items.get(usize::from(source_item_index)))
+            .ok_or_else(|| {
+                HostError::InvalidConfiguration("map source item no longer resolves".into())
+            })?;
+        if runtime_item.server_id != source_item.server_id
+            || runtime_item.action_id != source_item.action_id
+            || runtime_item.unique_id != source_item.unique_id
+            || runtime_item.children != source_item.children
+            || runtime_item.text != source_item.text
+            || runtime_item.description != source_item.description
+            || runtime_item.teleport_destination != source_item.teleport_destination
+            || runtime_item.duration != source_item.duration
+            || runtime_item.charges != source_item.charges
+        {
+            return Err(HostError::InvalidConfiguration(
+                "map runtime item no longer matches its immutable source item identity".into(),
+            ));
+        }
+        if removed_source_items.contains(&source_identity) {
+            return Err(HostError::InvalidConfiguration(
+                "map source item identity has already been removed".into(),
+            ));
+        }
+        let available_count = u16::from(runtime_item.count);
+        if requested_count == 0 || requested_count > available_count {
+            return Err(HostError::Core(
+                forgotten_core::CoreError::InvalidItemTransferCount {
+                    requested: requested_count,
+                    available: available_count,
+                },
+            ));
+        }
+        let mut item = plain_source_map_item_to_inventory_item(&runtime_item)?;
+        item.count = requested_count;
+        let mut equipment = world
+            .player_equipment(player_id)
+            .cloned()
+            .map_err(HostError::Core)?;
+        match equipment.item(equipment_slot).cloned() {
+            None => {
+                equipment.equip(equipment_slot, item.clone());
+            }
+            Some(mut existing) => {
+                existing.merge_stack(&item).map_err(HostError::Core)?;
+                equipment.equip(equipment_slot, existing);
+            }
+        }
+        let containers = world
+            .player_containers(player_id)
+            .cloned()
+            .map_err(HostError::Core)?;
+        let mut next_map = map.clone();
+        let mut next_items = next_map
+            .tile_items(position)
+            .map(ToOwned::to_owned)
+            .expect("validated runtime item list exists");
+        let mut next_removed_source_items = removed_source_items.clone();
+        let mut next_source_item_count_overrides = source_item_count_overrides.clone();
+        let whole_source = requested_count == available_count;
+        if whole_source {
+            next_items.remove(runtime_item_index);
+            next_removed_source_items.insert(source_identity);
+            next_source_item_count_overrides.remove(&source_identity);
+        } else {
+            let remaining_count = available_count - requested_count;
+            next_items[runtime_item_index].count =
+                u8::try_from(remaining_count).expect("bounded item-stack count fits map u8");
+            next_source_item_count_overrides.insert(source_identity, remaining_count);
+        }
+        next_map
+            .set_tile_items(position, next_items)
+            .map_err(HostError::Core)?;
+        let next_journal = MapItemRemovalJournal {
+            map_revision: self.source_revision(),
+            removed_items: next_removed_source_items.iter().copied().collect(),
+        };
+        let next_override_records = next_source_item_count_overrides
+            .iter()
+            .map(
+                |(source_identity, remaining_count)| MapItemCountOverrideRecord {
+                    source_identity: *source_identity,
+                    remaining_count: *remaining_count,
+                },
+            )
+            .collect::<Vec<_>>();
+        database.replace_player_inventory_and_map_item_state(
+            player_id,
+            &equipment,
+            &containers,
+            &next_journal,
+            &next_override_records,
+        )?;
+        *map = next_map;
+        let changed = world
+            .replace_player_equipment(player_id, equipment)
+            .expect("validated player remains present while shared-world lock is held");
+        debug_assert!(changed);
+        if whole_source {
+            let source_indices = source_item_indices
+                .get_mut(&position)
+                .expect("validated source index list exists");
+            source_indices.remove(runtime_item_index);
+            if source_indices.is_empty() {
+                source_item_indices.remove(&position);
+            }
+        }
+        *removed_source_items = next_removed_source_items;
+        *source_item_count_overrides = next_source_item_count_overrides;
+        let map_revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        shared_world.equipment_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(SourceMapItemToEquipmentTransferOutcome {
+            player_id,
+            source_identity,
+            item,
+            equipment_slot,
+            map_revision,
+        })
+    }
+
     /// Transfers one exact complete plain top-level source-bound map stack into one existing,
     /// owned, non-nested container. It merges only an exact compatible stack or appends one
     /// bounded stack, then follows the established map, world, source-index, journal lock order.
@@ -5666,12 +5846,13 @@ fn handle_native_otclient_game(
                         );
                         continue;
                     }
-                    let transfer = match map_owner.move_source_item_to_empty_equipment(
+                    let transfer = match map_owner.move_source_item_stack_to_equipment(
                         shared_world,
                         &mut database,
                         character.id,
                         source_position,
                         usize::from(source_stack_position),
+                        u16::from(count),
                         target_slot,
                     ) {
                         Ok(transfer) => transfer,
@@ -9668,6 +9849,166 @@ mod tests {
                 .count,
             4
         );
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn source_map_partial_stack_transfer_to_equipment_persists_count_override_and_full_removal() {
+        let database_path = database_path("source-map-item-equipment-transfer");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        let player = Player {
+            id: 705,
+            account_id: account_id as u64,
+            name: "Knight".into(),
+            position: Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            level: 8,
+            experience: 4_900,
+            skill_points: 3,
+        };
+        database.save_player(&player).unwrap();
+        let position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let mut source_map = (*native_world_map()).clone();
+        source_map
+            .set_tile_items(
+                position,
+                vec![WorldMapItem {
+                    server_id: 2148,
+                    client_thing_id: Some(3031),
+                    count: 7,
+                    action_id: Some(12),
+                    unique_id: Some(34),
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
+        let shared_map = SharedNativeMap::new(source_map.clone());
+        let shared_world = SharedNativeWorld::from_static_spawns(None).unwrap();
+        shared_world
+            .register_player_at_available_position(player, &source_map)
+            .unwrap();
+
+        let partial = shared_map
+            .move_source_item_stack_to_equipment(
+                &shared_world,
+                &mut database,
+                705,
+                position,
+                0,
+                3,
+                EquipmentSlot::RightHand,
+            )
+            .unwrap();
+
+        assert_eq!(partial.player_id, 705);
+        assert_eq!(partial.item.count, 3);
+        assert_eq!(partial.equipment_slot, EquipmentSlot::RightHand);
+        assert_eq!(
+            shared_world
+                .player_equipment(705)
+                .unwrap()
+                .item(EquipmentSlot::RightHand)
+                .unwrap()
+                .count,
+            3
+        );
+        assert_eq!(
+            shared_map
+                .render_snapshot()
+                .unwrap()
+                .tile_items(position)
+                .unwrap()[0]
+                .count,
+            4
+        );
+        assert_eq!(database.map_item_removal_journal().unwrap(), None);
+        let expected_overrides = Some((
+            source_map.source_revision(),
+            vec![MapItemCountOverrideRecord {
+                source_identity: partial.source_identity,
+                remaining_count: 4,
+            }],
+        ));
+        assert_eq!(
+            database.map_item_count_overrides().unwrap(),
+            expected_overrides
+        );
+        assert_eq!(
+            shared_map.count_overrides().unwrap(),
+            expected_overrides.as_ref().unwrap().1
+        );
+        let recovered = SharedNativeMap::recover_from_map_item_state(
+            source_map.clone(),
+            None,
+            expected_overrides.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered
+                .render_snapshot()
+                .unwrap()
+                .tile_items(position)
+                .unwrap()[0]
+                .count,
+            4
+        );
+
+        let complete = shared_map
+            .move_source_item_stack_to_equipment(
+                &shared_world,
+                &mut database,
+                705,
+                position,
+                0,
+                4,
+                EquipmentSlot::RightHand,
+            )
+            .unwrap();
+
+        assert_eq!(complete.source_identity, partial.source_identity);
+        assert_eq!(complete.item.count, 4);
+        assert!(shared_map
+            .render_snapshot()
+            .unwrap()
+            .tile_items(position)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            shared_world
+                .player_equipment(705)
+                .unwrap()
+                .item(EquipmentSlot::RightHand)
+                .unwrap()
+                .count,
+            7
+        );
+        assert_eq!(database.map_item_count_overrides().unwrap(), None);
+        assert_eq!(shared_map.count_overrides().unwrap(), Vec::new());
+        assert_eq!(
+            database.map_item_removal_journal().unwrap(),
+            Some(MapItemRemovalJournal {
+                map_revision: source_map.source_revision(),
+                removed_items: vec![partial.source_identity],
+            })
+        );
+        assert_eq!(shared_world.equipment_epoch(), 2);
+        assert_eq!(shared_map.revision(), 2);
+
         let _ = fs::remove_file(database_path);
     }
 
