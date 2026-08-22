@@ -30,8 +30,8 @@ use forgotten_core::{
 };
 use forgotten_persistence::{
     EngineDatabase, MapItemCountOverrideRecord, MapItemRemovalJournal,
-    PlayerFixedDeathLossSnapshot, PlayerOutfit, PlayerVitals as PersistedPlayerVitals,
-    StaticCreatureRuntimeRecord,
+    PlayerExperienceVitalsUpdate, PlayerFixedDeathLossSnapshot, PlayerOutfit,
+    PlayerVitals as PersistedPlayerVitals, StaticCreatureRuntimeRecord,
 };
 use forgotten_protocol::{
     decode, decode_fe_otclient_capability_ack, decode_fe_otclient_move_request,
@@ -5400,6 +5400,7 @@ fn handle_native_otclient_game(
                                 outcome.target_id,
                                 config.experience_award_policy.as_deref(),
                                 config.vocation_level_up_gains.as_deref(),
+                                config.party_shared_experience_rules,
                             )?;
                             for frame in native_static_target_deactivation_frames(
                                 &config.client_profile,
@@ -8897,6 +8898,7 @@ fn apply_and_persist_native_static_defeat_experience(
     creature_id: u32,
     policy: Option<&ExperienceAwardPolicy>,
     vocation_level_up_gains: Option<&BTreeMap<VocationId, VocationLevelUpGains>>,
+    party_shared_experience_rules: Option<PartySharedExperienceRules>,
 ) -> Result<Option<forgotten_core::PlayerExperienceAwardOutcome>, HostError> {
     let Some(policy) = policy else {
         return Ok(None);
@@ -8905,36 +8907,67 @@ fn apply_and_persist_native_static_defeat_experience(
     if raw_experience == 0 {
         return Ok(None);
     }
-    let vocation = shared_world.player_progression(player_id)?.vocation;
-    let gains = vocation_level_up_gains
-        .and_then(|entries| entries.get(&vocation).copied())
-        .unwrap_or_default();
-    let outcome = shared_world.award_player_experience_with_vocation_gains(
-        player_id,
-        raw_experience,
-        policy,
-        gains,
-    )?;
+    let mut world = shared_world.lock()?;
+    let recipient_ids = party_shared_experience_rules
+        .map(|rules| world.party_shared_experience_recipients(player_id, rules))
+        .transpose()
+        .map_err(HostError::Core)?
+        .flatten()
+        .unwrap_or_else(|| vec![player_id]);
+    let mut staged_world = world.clone();
+    let mut outcomes = Vec::with_capacity(recipient_ids.len());
+    for recipient_id in recipient_ids {
+        let vocation = staged_world
+            .player_progression(recipient_id)
+            .map_err(HostError::Core)?
+            .vocation;
+        let gains = vocation_level_up_gains
+            .and_then(|entries| entries.get(&vocation).copied())
+            .unwrap_or_default();
+        outcomes.push(
+            staged_world
+                .award_player_experience_with_vocation_gains(
+                    recipient_id,
+                    raw_experience,
+                    policy,
+                    gains,
+                )
+                .map_err(HostError::Core)?,
+        );
+    }
+    let outcome = outcomes
+        .iter()
+        .copied()
+        .find(|outcome| outcome.player_id == player_id)
+        .ok_or_else(|| {
+            HostError::InvalidConfiguration(
+                "shared experience recipient selection omitted the defeating player".into(),
+            )
+        })?;
     if outcome.awarded_experience == 0 {
         return Ok(None);
     }
-    let (player, vitals) = shared_world.player_and_vitals(player_id)?;
-    if outcome.gained_levels > 0 {
-        database.update_player_experience_and_vitals(
-            player_id,
-            player.level,
-            player.experience,
-            PersistedPlayerVitals {
-                health: vitals.health,
-                max_health: vitals.max_health,
-                mana: vitals.mana,
-                max_mana: vitals.max_mana,
-                capacity: vitals.capacity,
-                magic_level: vitals.magic_level,
+    let updates = outcomes
+        .iter()
+        .map(|outcome| PlayerExperienceVitalsUpdate {
+            player_id: outcome.player_id,
+            level: outcome.level,
+            experience: outcome.experience,
+            vitals: PersistedPlayerVitals {
+                health: outcome.vitals.health,
+                max_health: outcome.vitals.max_health,
+                mana: outcome.vitals.mana,
+                max_mana: outcome.vitals.max_mana,
+                capacity: outcome.vitals.capacity,
+                magic_level: outcome.vitals.magic_level,
             },
-        )?;
-    } else {
-        database.update_player_experience(player_id, player.level, player.experience)?;
+        })
+        .collect::<Vec<_>>();
+    database.update_player_experience_and_vitals_batch(&updates)?;
+    *world = staged_world;
+    drop(world);
+    if outcomes.iter().any(|outcome| outcome.gained_levels > 0) {
+        shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
     }
     Ok(Some(outcome))
 }
@@ -13350,6 +13383,7 @@ mod tests {
                 VocationId::new(0),
                 VocationLevelUpGains::new(15, 5, 25),
             )])),
+            None,
         )
         .unwrap()
         .unwrap();

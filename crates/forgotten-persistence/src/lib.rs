@@ -185,6 +185,17 @@ pub struct PlayerFixedDeathLossSnapshot {
     pub state: PlayerRespawnState,
 }
 
+/// One complete durable level, experience, and vitality result for a staged multi-player award.
+/// Callers calculate it before entering the transaction; this storage boundary only validates and
+/// commits all supplied rows together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerExperienceVitalsUpdate {
+    pub player_id: u64,
+    pub level: u32,
+    pub experience: u64,
+    pub vitals: PlayerVitals,
+}
+
 impl EngineDatabase {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, PersistenceError> {
         let path = path.as_ref().to_path_buf();
@@ -1809,6 +1820,48 @@ impl EngineDatabase {
                 player_id as i64,
             ],
         )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Commits every complete staged experience/vitality result in one SQLite transaction. Any
+    /// invalid, duplicate, or unknown player rolls back the entire batch before a partial durable
+    /// result can become visible.
+    pub fn update_player_experience_and_vitals_batch(
+        &mut self,
+        updates: &[PlayerExperienceVitalsUpdate],
+    ) -> Result<(), PersistenceError> {
+        let mut seen_player_ids = BTreeMap::new();
+        for update in updates {
+            if !update.vitals.is_valid() {
+                return Err(PersistenceError::InvalidPlayerVitals);
+            }
+            if seen_player_ids.insert(update.player_id, ()).is_some() {
+                return Err(PersistenceError::DuplicatePlayerExperienceUpdate(
+                    update.player_id,
+                ));
+            }
+        }
+        let transaction = self.connection.transaction()?;
+        for update in updates {
+            let affected = transaction.execute(
+                "UPDATE players SET level = ?1, experience = ?2, health = ?3, max_health = ?4, mana = ?5, max_mana = ?6, capacity = ?7, magic_level = ?8 WHERE id = ?9",
+                params![
+                    i64::from(update.level),
+                    update.experience as i64,
+                    i64::from(update.vitals.health),
+                    i64::from(update.vitals.max_health),
+                    i64::from(update.vitals.mana),
+                    i64::from(update.vitals.max_mana),
+                    i64::from(update.vitals.capacity),
+                    i64::from(update.vitals.magic_level),
+                    update.player_id as i64,
+                ],
+            )?;
+            if affected == 0 {
+                return Err(PersistenceError::UnknownPlayer(update.player_id));
+            }
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -4226,6 +4279,7 @@ pub enum PersistenceError {
     PasswordHash(String),
     InvalidPlayerName,
     InvalidPlayerVitals,
+    DuplicatePlayerExperienceUpdate(u64),
     InvalidPlayerOutfit,
     InvalidEquipmentRecord(String),
     InvalidContainerRecord(String),
@@ -5783,6 +5837,66 @@ mod tests {
         assert_eq!(advanced.experience, 16_900);
         assert_eq!(advanced.vitals, advanced_vitals);
         assert_eq!(database.player_by_id(1).unwrap().name, "Knight");
+
+        database
+            .save_player(&Player {
+                id: 2,
+                account_id: account_id as u64,
+                name: "Druid".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let second_vitals = PlayerVitals {
+            health: 160,
+            max_health: 160,
+            mana: 60,
+            max_mana: 60,
+            capacity: 40_050,
+            magic_level: 1,
+        };
+        database
+            .update_player_experience_and_vitals_batch(&[
+                PlayerExperienceVitalsUpdate {
+                    player_id: 1,
+                    level: 14,
+                    experience: 19_600,
+                    vitals: advanced_vitals,
+                },
+                PlayerExperienceVitalsUpdate {
+                    player_id: 2,
+                    level: 9,
+                    experience: 6_400,
+                    vitals: second_vitals,
+                },
+            ])
+            .unwrap();
+        assert_eq!(database.player_by_id(1).unwrap().level, 14);
+        assert_eq!(database.player_by_id(2).unwrap().vitals, second_vitals);
+        assert!(matches!(
+            database.update_player_experience_and_vitals_batch(&[
+                PlayerExperienceVitalsUpdate {
+                    player_id: 1,
+                    level: 15,
+                    experience: 22_500,
+                    vitals: advanced_vitals,
+                },
+                PlayerExperienceVitalsUpdate {
+                    player_id: 99,
+                    level: 1,
+                    experience: 0,
+                    vitals: PlayerVitals::default(),
+                },
+            ]),
+            Err(PersistenceError::UnknownPlayer(99))
+        ));
+        assert_eq!(database.player_by_id(1).unwrap().level, 14);
         assert!(matches!(
             database.update_player_experience(99, 1, 0),
             Err(PersistenceError::UnknownPlayer(99))
