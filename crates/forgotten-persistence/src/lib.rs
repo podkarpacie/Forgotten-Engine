@@ -38,7 +38,8 @@ const SCHEMA_VERSION_PLAYER_BANK_BALANCE: i64 = 20;
 const SCHEMA_VERSION_PLAYER_DEPOTS: i64 = 21;
 const SCHEMA_VERSION_PLAYER_INBOX: i64 = 22;
 const SCHEMA_VERSION_HOUSE_OWNERSHIP: i64 = 23;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_HOUSE_OWNERSHIP;
+const SCHEMA_VERSION_HOUSE_ACCESS_LISTS: i64 = 24;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_HOUSE_ACCESS_LISTS;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 pub const MAX_VIP_DESCRIPTION_BYTES: usize = 128;
@@ -54,6 +55,8 @@ pub const MAX_PLAYER_DEPOT_ID: u8 = 19;
 pub const MAX_PLAYER_DEPOTS_PER_PLAYER: usize = 20;
 pub const MAX_PLAYER_DEPOT_TOP_LEVEL_ITEMS: usize = 1_000;
 pub const MAX_PLAYER_INBOX_TOP_LEVEL_ITEMS: usize = 30;
+pub const MAX_HOUSE_ACCESS_LISTS_PER_HOUSE: usize = 64;
+pub const MAX_HOUSE_ACCESS_LIST_TEXT_BYTES: usize = 8_192;
 
 pub struct EngineDatabase {
     connection: Connection,
@@ -147,6 +150,15 @@ pub struct PlayerDepotRecord {
 pub struct HouseOwnershipRecord {
     pub house_id: u32,
     pub owner_player_id: u64,
+}
+
+/// One bounded raw house access-list text assignment. FE retains the durable TFS-shaped relation
+/// but deliberately does not parse names, expressions, or door permission semantics yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HouseAccessListRecord {
+    pub house_id: u32,
+    pub list_id: u32,
+    pub text: String,
 }
 
 /// The complete accepted authoritative state that must be persisted together after a bounded
@@ -2866,6 +2878,63 @@ impl EngineDatabase {
         }))
     }
 
+    /// Replaces every raw bounded access-list text record for one nonzero house identity in a
+    /// single transaction. Text interpretation and permission effects remain caller concerns.
+    pub fn replace_house_access_lists(
+        &mut self,
+        house_id: u32,
+        records: &[HouseAccessListRecord],
+    ) -> Result<(), PersistenceError> {
+        validate_house_access_list_records(house_id, records)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM house_access_lists WHERE house_id = ?1",
+            params![i64::from(house_id)],
+        )?;
+        for record in records {
+            transaction.execute(
+                "INSERT INTO house_access_lists (house_id, list_id, text) VALUES (?1, ?2, ?3)",
+                params![i64::from(house_id), i64::from(record.list_id), record.text,],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Loads raw bounded access-list records in deterministic list-ID order. Malformed raw rows
+    /// are rejected rather than silently changing future authorization behavior.
+    pub fn house_access_lists(
+        &self,
+        house_id: u32,
+    ) -> Result<Vec<HouseAccessListRecord>, PersistenceError> {
+        validated_house_id(house_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT list_id, text FROM house_access_lists WHERE house_id = ?1 ORDER BY list_id",
+        )?;
+        let records = statement
+            .query_map(params![i64::from(house_id)], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let records = records
+            .into_iter()
+            .map(|(list_id, text)| {
+                let list_id = u32::try_from(list_id).map_err(|_| {
+                    PersistenceError::InvalidHouseAccessListRecord(
+                        "list ID does not fit u32".into(),
+                    )
+                })?;
+                Ok(HouseAccessListRecord {
+                    house_id,
+                    list_id,
+                    text,
+                })
+            })
+            .collect::<Result<Vec<_>, PersistenceError>>()?;
+        validate_house_access_list_records(house_id, &records)?;
+        Ok(records)
+    }
+
     pub fn record_event(&self, level: &str, message: &str) -> Result<(), PersistenceError> {
         self.connection.execute(
             "INSERT INTO engine_events (level, message, created_at) VALUES (?1, ?2, ?3)",
@@ -3395,6 +3464,15 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_HOUSE_OWNERSHIP, unix_seconds()],
             )?;
         }
+        if self.schema_version()? < SCHEMA_VERSION_HOUSE_ACCESS_LISTS {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS house_access_lists (house_id INTEGER NOT NULL, list_id INTEGER NOT NULL, text TEXT NOT NULL, PRIMARY KEY (house_id, list_id));",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_HOUSE_ACCESS_LISTS, unix_seconds()],
+            )?;
+        }
         Ok(())
     }
 
@@ -3690,6 +3768,37 @@ fn validated_house_id(house_id: u32) -> Result<(), PersistenceError> {
     Ok(())
 }
 
+fn validate_house_access_list_records(
+    house_id: u32,
+    records: &[HouseAccessListRecord],
+) -> Result<(), PersistenceError> {
+    validated_house_id(house_id)?;
+    if records.len() > MAX_HOUSE_ACCESS_LISTS_PER_HOUSE {
+        return Err(PersistenceError::InvalidHouseAccessListRecord(format!(
+            "house exceeds {MAX_HOUSE_ACCESS_LISTS_PER_HOUSE} access lists"
+        )));
+    }
+    let mut seen = BTreeMap::new();
+    for record in records {
+        if record.house_id != house_id {
+            return Err(PersistenceError::InvalidHouseAccessListRecord(
+                "access-list house ID does not match replacement house".into(),
+            ));
+        }
+        if seen.insert(record.list_id, ()).is_some() {
+            return Err(PersistenceError::InvalidHouseAccessListRecord(
+                "duplicate access-list ID".into(),
+            ));
+        }
+        if record.text.len() > MAX_HOUSE_ACCESS_LIST_TEXT_BYTES {
+            return Err(PersistenceError::InvalidHouseAccessListRecord(format!(
+                "access-list text exceeds {MAX_HOUSE_ACCESS_LIST_TEXT_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn player_skills_from_record(record: [i64; 14]) -> Result<PlayerSkills, PersistenceError> {
     let mut skills = PlayerSkills::default();
     for skill in PlayerSkill::ALL {
@@ -3834,6 +3943,7 @@ pub enum PersistenceError {
     InvalidDepotRecord(String),
     InvalidInboxRecord(String),
     InvalidHouseOwnershipRecord(String),
+    InvalidHouseAccessListRecord(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
     UnknownGuild(u64),
@@ -5827,6 +5937,103 @@ mod tests {
             .unwrap();
         assert!(matches!(
             database.house_owner(0),
+            Err(PersistenceError::InvalidHouseOwnershipRecord(_))
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_bounded_house_access_lists_without_interpreting_text() {
+        let path = temporary_path("house-access-lists");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        assert_eq!(database.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        assert!(database.house_access_lists(42).unwrap().is_empty());
+        let lists = vec![
+            HouseAccessListRecord {
+                house_id: 42,
+                list_id: 0x101,
+                text: "Subowner\nKnight".into(),
+            },
+            HouseAccessListRecord {
+                house_id: 42,
+                list_id: 0x100,
+                text: "Guest\nDruid".into(),
+            },
+        ];
+        database.replace_house_access_lists(42, &lists).unwrap();
+        assert_eq!(
+            database.house_access_lists(42).unwrap(),
+            vec![
+                HouseAccessListRecord {
+                    house_id: 42,
+                    list_id: 0x100,
+                    text: "Guest\nDruid".into(),
+                },
+                HouseAccessListRecord {
+                    house_id: 42,
+                    list_id: 0x101,
+                    text: "Subowner\nKnight".into(),
+                },
+            ]
+        );
+
+        assert!(matches!(
+            database.replace_house_access_lists(
+                42,
+                &[HouseAccessListRecord {
+                    house_id: 43,
+                    list_id: 0,
+                    text: String::new(),
+                }],
+            ),
+            Err(PersistenceError::InvalidHouseAccessListRecord(_))
+        ));
+        assert!(matches!(
+            database.replace_house_access_lists(
+                42,
+                &[
+                    HouseAccessListRecord {
+                        house_id: 42,
+                        list_id: 0,
+                        text: String::new(),
+                    },
+                    HouseAccessListRecord {
+                        house_id: 42,
+                        list_id: 0,
+                        text: String::new(),
+                    },
+                ],
+            ),
+            Err(PersistenceError::InvalidHouseAccessListRecord(_))
+        ));
+        assert!(matches!(
+            database.replace_house_access_lists(
+                42,
+                &[HouseAccessListRecord {
+                    house_id: 42,
+                    list_id: 0,
+                    text: "x".repeat(MAX_HOUSE_ACCESS_LIST_TEXT_BYTES + 1),
+                }],
+            ),
+            Err(PersistenceError::InvalidHouseAccessListRecord(_))
+        ));
+        assert_eq!(database.house_access_lists(42).unwrap().len(), 2);
+
+        database.replace_house_access_lists(42, &[]).unwrap();
+        assert!(database.house_access_lists(42).unwrap().is_empty());
+        database
+            .connection
+            .execute(
+                "INSERT INTO house_access_lists (house_id, list_id, text) VALUES (?1, ?2, ?3)",
+                params![42_i64, -1_i64, "broken"],
+            )
+            .unwrap();
+        assert!(matches!(
+            database.house_access_lists(42),
+            Err(PersistenceError::InvalidHouseAccessListRecord(_))
+        ));
+        assert!(matches!(
+            database.house_access_lists(0),
             Err(PersistenceError::InvalidHouseOwnershipRecord(_))
         ));
         let _ = fs::remove_file(path);
