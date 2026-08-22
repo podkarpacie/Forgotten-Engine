@@ -13977,6 +13977,154 @@ mod tests {
     }
 
     #[test]
+    fn selected_player_melee_awards_and_persists_each_declared_adjacent_weapon_skill_try() {
+        let path = database_path("selected-player-melee-adjacent-weapon-skill-tries");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("operator", "hash").unwrap();
+        let map = native_world_map();
+        let scenarios = [
+            (401_u64, 402_u64, 2376_u16, PlayerSkill::Sword, 100_u16),
+            (403_u64, 404_u64, 2383_u16, PlayerSkill::Axe, 103_u16),
+            (405_u64, 406_u64, 2398_u16, PlayerSkill::Club, 106_u16),
+        ];
+        for (attacker_id, target_id, _weapon_id, _skill, x) in scenarios {
+            for (id, name, position) in [
+                (
+                    attacker_id,
+                    format!("Attacker-{attacker_id}"),
+                    Position { x, y: 100, z: 7 },
+                ),
+                (
+                    target_id,
+                    format!("Target-{target_id}"),
+                    Position {
+                        x: x.saturating_add(1),
+                        y: 100,
+                        z: 7,
+                    },
+                ),
+            ] {
+                database
+                    .save_player(&Player {
+                        id,
+                        account_id: account_id as u64,
+                        name,
+                        position,
+                        level: 8,
+                        experience: 4_900,
+                        skill_points: 3,
+                    })
+                    .unwrap();
+            }
+        }
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let vocation = VocationId::new(4);
+        let progression = PlayerProgression {
+            vocation,
+            skills: forgotten_core::PlayerSkills::default(),
+        };
+        for (attacker_id, target_id, _weapon_id, _skill, x) in scenarios {
+            shared
+                .register_player_at_available_position_with_vitals_equipment_containers_and_progression(
+                    Player {
+                        id: attacker_id,
+                        account_id: account_id as u64,
+                        name: format!("Attacker-{attacker_id}"),
+                        position: Position { x, y: 100, z: 7 },
+                        level: 8,
+                        experience: 4_900,
+                        skill_points: 3,
+                    },
+                    PlayerVitals::default(),
+                    progression,
+                    PlayerEquipment::default(),
+                    PlayerContainers::default(),
+                    &map,
+                )
+                .unwrap();
+            shared
+                .register_player_at_available_position(
+                    Player {
+                        id: target_id,
+                        account_id: account_id as u64,
+                        name: format!("Target-{target_id}"),
+                        position: Position {
+                            x: x.saturating_add(1),
+                            y: 100,
+                            z: 7,
+                        },
+                        level: 8,
+                        experience: 4_900,
+                        skill_points: 3,
+                    },
+                    &map,
+                )
+                .unwrap();
+        }
+        let catalog = parse_declarative_weapons_xml(
+            br#"<fe-weapons><weapon itemid="2376" damage="1" intervalticks="1"/><weapon itemid="2383" damage="1" intervalticks="1"/><weapon itemid="2398" damage="1" intervalticks="1"/></fe-weapons>"#,
+        )
+        .unwrap()
+        .with_adjacent_melee_skills(Some(&BTreeMap::from([
+            (2376, PlayerSkill::Sword),
+            (2383, PlayerSkill::Axe),
+            (2398, PlayerSkill::Club),
+        ])));
+        let multiplier = forgotten_core::ProgressionMultiplier::new(1_000).unwrap();
+        let rules_by_vocation = BTreeMap::from([(
+            vocation,
+            PlayerProgressionRules {
+                magic_level_multiplier: multiplier,
+                skill_multipliers: [multiplier; 7],
+            },
+        )]);
+        for (attacker_id, target_id, weapon_id, skill, _x) in scenarios {
+            let mut equipment = PlayerEquipment::default();
+            equipment.equip(
+                EquipmentSlot::RightHand,
+                ItemInstance::new(weapon_id, 1).unwrap(),
+            );
+            shared
+                .replace_player_equipment(attacker_id, equipment)
+                .unwrap();
+            shared
+                .set_player_target(attacker_id, Some(target_id))
+                .unwrap();
+            assert!(apply_native_selected_player_melee(
+                &mut database,
+                &shared,
+                attacker_id,
+                &map,
+                NativeSelectedPlayerMeleePolicy {
+                    progression_rules: Some(&rules_by_vocation),
+                    skill_rate: 3,
+                    death_loss_policy: DeathLossPolicy::DefaultFormula,
+                    armor_by_server_id: None,
+                    armor_multiplier_by_vocation: None,
+                    declarative_weapon_catalog: Some(&catalog),
+                },
+            )
+            .unwrap()
+            .is_some());
+            assert_eq!(
+                shared
+                    .player_progression_attempts(attacker_id)
+                    .unwrap()
+                    .skill_tries(skill),
+                3
+            );
+            assert_eq!(
+                database
+                    .player_progression_attempts(attacker_id)
+                    .unwrap()
+                    .skill_tries(skill),
+                3
+            );
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn selected_player_melee_awards_and_persists_rate_scaled_configured_fist_tries() {
         let path = database_path("selected-player-melee-skill-try");
         let mut database = EngineDatabase::open(&path).unwrap();

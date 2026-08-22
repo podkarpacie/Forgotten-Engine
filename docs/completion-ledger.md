@@ -21,7 +21,7 @@ The current conservative estimate is **24% of the declared replacement scope**. 
 | Production operations and compatibility evidence | 15% | 1% | Releases, checksums, validation scripts, and documented concurrency boundaries exist. Load, soak, security, migration, cross-platform, and independent real-client evidence are incomplete. |
 | **Total** | **100%** | **24%** | **Foundation and bounded-runtime stage; not production-ready.** |
 
-The declared progression credit now also includes a narrowly bounded persisted weapon-skill source: a successful selected declarative right-hand sword, club, or axe hit can award the configured skill-rate tries through existing vocation rules. This does not credit ranged weapons, shields, spell mana, offline training, generic weapon behavior, or TFS combat parity.
+The declared progression credit now also includes a narrowly bounded persisted weapon-skill source: a successful selected declarative right-hand sword, club, or axe hit can award the configured skill-rate tries through existing vocation rules. One host regression now exercises all three classes with exact rate-scaled attempt counters in both authoritative memory and SQLite. This does not credit ranged weapons, shields, spell mana, offline training, generic weapon behavior, or TFS combat parity.
 
 The declared progression credit now also includes one authenticated bounded declarative spell command. It consumes a catalog-defined mana cost, applies only the configured `rateMagic` multiplier to magic-level progress, and commits mana plus exact progression attempts together. It does not credit TFS spell words, parameters, targets, effects, runes, potions, Lua, or full spell behavior.
 
