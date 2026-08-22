@@ -23,6 +23,8 @@ The current conservative estimate is **24% of the declared replacement scope**. 
 
 The declared progression credit now also includes a narrowly bounded persisted weapon-skill source: a successful selected declarative right-hand sword, club, or axe hit can award the configured skill-rate tries through existing vocation rules. This does not credit ranged weapons, shields, spell mana, offline training, generic weapon behavior, or TFS combat parity.
 
+The declared progression credit now also includes one authenticated bounded declarative spell command. It consumes a catalog-defined mana cost, applies only the configured `rateMagic` multiplier to magic-level progress, and commits mana plus exact progression attempts together. It does not credit TFS spell words, parameters, targets, effects, runes, potions, Lua, or full spell behavior.
+
 The declared item credit now also includes one complete source-map compatible-stack merge into an owned top-level container. It remains a single exact source identity removal with durable journal recovery, not a partial stack or generic ground-transfer system.
 
 The same declared item credit now includes an equivalent complete compatible-stack merge into a requested equipment slot. It accepts only an empty slot or one matching bounded destination stack, and keeps incompatible or overflowing occupied slots unchanged.

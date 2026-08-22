@@ -1078,6 +1078,10 @@ pub struct NativeOtClientHostConfig {
     /// melee fist-try award. Other combat, weapon, spell, training, and Lua sources remain
     /// separate and deferred.
     pub skill_rate: u32,
+    /// Validated TFS-style global magic rate used only by the bounded scriptless declarative
+    /// native spell command. Generic speech, spell words, targets, effects, runes, Lua, and
+    /// complete TFS spell behavior remain separate and deferred.
+    pub magic_rate: u32,
     /// Validated configured flat experience rate and optional level-stage policy. Concrete
     /// gameplay reward sources remain separate from this immutable host input.
     pub experience_award_policy: Option<Arc<ExperienceAwardPolicy>>,
@@ -7106,6 +7110,64 @@ fn handle_native_otclient_game(
                 );
             }
             NativeOtClientGameAction::Talk(request) => {
+                if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
+                    && request.channel_id.is_none()
+                    && request.recipient.is_none()
+                {
+                    if let Some(spell_id) = native_declarative_spell_command_id(&request.message) {
+                        let (Some(catalog), Some(rules_by_vocation)) = (
+                            config.declarative_spell_catalog.as_deref(),
+                            config.progression_rules.as_deref(),
+                        ) else {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=declarative-spell outcome=deferred-missing-catalog-or-progression-rules",
+                            );
+                            continue;
+                        };
+                        match apply_and_persist_native_declarative_spell_cast(
+                            &mut database,
+                            shared_world,
+                            character.id,
+                            spell_id,
+                            catalog,
+                            rules_by_vocation,
+                            config.magic_rate,
+                        ) {
+                            Ok((cast, magic)) => {
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    &format!(
+                                        "action=declarative-spell outcome=accepted spell-id={} mana-spent={} remaining-mana={} awarded-magic-mana={} magic-level={} gained-levels={}",
+                                        cast.spell_id,
+                                        cast.mana_spent,
+                                        cast.remaining_mana,
+                                        u64::from(cast.mana_spent)
+                                            .saturating_mul(u64::from(config.magic_rate)),
+                                        magic.magic_level,
+                                        magic.gained_levels,
+                                    ),
+                                );
+                            }
+                            Err(HostError::Core(
+                                forgotten_core::CoreError::InsufficientMana { .. }
+                                | forgotten_core::CoreError::SpellCooldownActive { .. }
+                                | forgotten_core::CoreError::PlayerIsDead(_),
+                            ))
+                            | Err(HostError::InvalidConfiguration(_)) => {
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    "action=declarative-spell outcome=rejected-authoritative-state-or-catalog",
+                                );
+                            }
+                            Err(error) => return Err(error),
+                        }
+                        continue;
+                    }
+                }
                 let recipient_count = if request.mode == 5 {
                     let Some(recipient_name) = request.recipient.as_deref() else {
                         native_diagnostic(
@@ -8303,6 +8365,79 @@ fn cancel_native_player_attack_and_follow(
     Ok(())
 }
 
+/// Parses only FE's explicit numeric declarative-spell command. This intentionally does not
+/// interpret arbitrary player speech, TFS spell words, parameters, rune use, or target text.
+fn native_declarative_spell_command_id(message: &str) -> Option<u16> {
+    const PREFIX: &str = "!fe cast ";
+    let spell_id = message.strip_prefix(PREFIX)?.parse::<u16>().ok()?;
+    (spell_id != 0).then_some(spell_id)
+}
+
+/// Applies a catalog-backed spell cast and rate-scaled magic progression under the same shared
+/// world lock, then durably persists the resulting mana, magic level, and exact progression
+/// attempts in one SQLite transaction before publishing the vital refresh epoch.
+fn apply_and_persist_native_declarative_spell_cast(
+    database: &mut EngineDatabase,
+    shared_world: &SharedNativeWorld,
+    caster_id: u64,
+    spell_id: u16,
+    catalog: &DeclarativeSpellCatalog,
+    rules_by_vocation: &BTreeMap<VocationId, PlayerProgressionRules>,
+    magic_rate: u32,
+) -> Result<
+    (
+        PlayerSpellCastOutcome,
+        forgotten_core::PlayerMagicAdvanceOutcome,
+    ),
+    HostError,
+> {
+    let definition = catalog.get(spell_id).ok_or_else(|| {
+        HostError::InvalidConfiguration("declared spell ID is not present in host catalog".into())
+    })?;
+    let event = definition.cast_event(caster_id).map_err(|_| {
+        HostError::InvalidConfiguration(
+            "validated declarative spell did not build a cast event".into(),
+        )
+    })?;
+    let mut world = shared_world.lock()?;
+    let vocation = world
+        .player_progression(caster_id)
+        .map_err(HostError::Core)?
+        .vocation;
+    let rules = rules_by_vocation.get(&vocation).copied().ok_or_else(|| {
+        HostError::InvalidConfiguration(format!(
+            "declarative spell caster vocation {} has no validated progression rules",
+            vocation.value()
+        ))
+    })?;
+    let cast = world
+        .apply_player_spell_cast_event(event)
+        .map_err(HostError::Core)?;
+    let awarded_mana = u64::from(cast.mana_spent).saturating_mul(u64::from(magic_rate));
+    let magic = world
+        .apply_player_magic_mana(caster_id, awarded_mana, rules)
+        .map_err(HostError::Core)?;
+    let vitals = world.player_vitals(caster_id).map_err(HostError::Core)?;
+    let attempts = world
+        .player_progression_attempts(caster_id)
+        .map_err(HostError::Core)?;
+    database.update_player_vitals_and_progression_attempts(
+        caster_id,
+        PersistedPlayerVitals {
+            health: vitals.health,
+            max_health: vitals.max_health,
+            mana: vitals.mana,
+            max_mana: vitals.max_mana,
+            capacity: vitals.capacity,
+            magic_level: vitals.magic_level,
+        },
+        attempts,
+    )?;
+    drop(world);
+    shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+    Ok((cast, magic))
+}
+
 struct NativeSelectedPlayerMeleePolicy<'a> {
     progression_rules: Option<&'a BTreeMap<VocationId, PlayerProgressionRules>>,
     skill_rate: u32,
@@ -9203,6 +9338,7 @@ mod tests {
             progression_rules: None,
             vocation_level_up_gains: None,
             skill_rate: 1,
+            magic_rate: 1,
             experience_award_policy: None,
             death_loss_policy: DeathLossPolicy::DefaultFormula,
             declarative_weapon_catalog: None,
@@ -11845,6 +11981,115 @@ mod tests {
             shared.apply_declarative_spell_cast(107, 999, &catalog),
             Err(HostError::InvalidConfiguration(_))
         ));
+    }
+
+    #[test]
+    fn native_declarative_spell_cast_persists_rate_scaled_magic_progression() {
+        let path = database_path("native-declarative-spell-magic-progression");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("operator", "hash").unwrap();
+        let map = native_world_map();
+        let player = Player {
+            id: 108,
+            account_id: account_id as u64,
+            name: "Sorcerer".into(),
+            position: map.spawn(),
+            level: 8,
+            experience: 4_900,
+            skill_points: 3,
+        };
+        database.save_player(&player).unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        shared
+            .register_player_at_available_position_with_vitals(
+                player,
+                PlayerVitals {
+                    mana: 50,
+                    max_mana: 50,
+                    ..PlayerVitals::default()
+                },
+                &map,
+            )
+            .unwrap();
+        let catalog = parse_declarative_spells_xml(
+            br#"<fe-spells><fe-spell id="100" manacost="20" intervalticks="2"/></fe-spells>"#,
+        )
+        .unwrap();
+        let multiplier = forgotten_core::ProgressionMultiplier::new(1_000).unwrap();
+        let rules_by_vocation = BTreeMap::from([(
+            VocationId::new(0),
+            PlayerProgressionRules {
+                magic_level_multiplier: multiplier,
+                skill_multipliers: [multiplier; 7],
+            },
+        )]);
+
+        assert_eq!(
+            native_declarative_spell_command_id("!fe cast 100"),
+            Some(100)
+        );
+        assert_eq!(native_declarative_spell_command_id("!fe cast 0"), None);
+        assert_eq!(
+            native_declarative_spell_command_id("!fe cast 100 extra"),
+            None
+        );
+        assert_eq!(native_declarative_spell_command_id("exura"), None);
+        let (cast, magic) = apply_and_persist_native_declarative_spell_cast(
+            &mut database,
+            &shared,
+            108,
+            100,
+            &catalog,
+            &rules_by_vocation,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(cast.mana_spent, 20);
+        assert_eq!(cast.remaining_mana, 30);
+        assert_eq!(magic.magic_level, 0);
+        assert_eq!(magic.stored_mana, 40);
+        assert_eq!(shared.player_vitals(108).unwrap().mana, 30);
+        assert_eq!(
+            shared
+                .player_progression_attempts(108)
+                .unwrap()
+                .magic_mana(),
+            40
+        );
+        assert_eq!(shared.vitals_epoch(), 1);
+        let persisted = database
+            .characters_for_account(account_id)
+            .unwrap()
+            .into_iter()
+            .find(|character| character.id == 108)
+            .unwrap();
+        assert_eq!(persisted.vitals.mana, 30);
+        assert_eq!(persisted.vitals.magic_level, 0);
+        assert_eq!(persisted.progression_attempts.magic_mana(), 40);
+        assert!(matches!(
+            apply_and_persist_native_declarative_spell_cast(
+                &mut database,
+                &shared,
+                108,
+                100,
+                &catalog,
+                &rules_by_vocation,
+                2,
+            ),
+            Err(HostError::Core(
+                forgotten_core::CoreError::SpellCooldownActive { .. }
+            ))
+        ));
+        assert_eq!(shared.player_vitals(108).unwrap().mana, 30);
+        assert_eq!(
+            shared
+                .player_progression_attempts(108)
+                .unwrap()
+                .magic_mana(),
+            40
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]

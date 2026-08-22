@@ -716,6 +716,7 @@ fn run_host(
             progression_rules,
             vocation_level_up_gains,
             skill_rate: config.skill_rate,
+            magic_rate: config.magic_rate,
             experience_award_policy: Some(experience_award_policy),
             death_loss_policy,
             declarative_weapon_catalog,
