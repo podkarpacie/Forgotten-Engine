@@ -86,6 +86,7 @@ pub(crate) fn load_legacy_world_companions(
     } else {
         Vec::new()
     };
+    validate_legacy_spawns_against_map(&spawns, world_map)?;
     validate_legacy_houses_against_map(&houses, world_map)?;
     Ok(LegacyWorldCompanionData {
         spawn_file: spawn_path.is_file().then_some(spawn_path),
@@ -233,6 +234,24 @@ fn add_spawn(spawns: &mut Vec<LegacySpawnArea>, spawn: LegacySpawnArea) -> Resul
         return Err(invalid("spawn count exceeds the configured limit"));
     }
     spawns.push(spawn);
+    Ok(())
+}
+
+/// Ensures every declared legacy spawn creature is placed on a walkable imported map tile.
+/// Spawn-area enforcement, timing, AI, combat, and runtime respawning remain separate boundaries.
+fn validate_legacy_spawns_against_map(
+    spawns: &[LegacySpawnArea],
+    world_map: &WorldMap,
+) -> Result<(), ConfigError> {
+    for spawn in spawns {
+        for creature in &spawn.creatures {
+            if !world_map.is_walkable(creature.position) {
+                return Err(invalid(
+                    "legacy spawn creature position is not a walkable imported map tile",
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -560,5 +579,62 @@ mod tests {
         )
         .unwrap();
         assert!(validate_legacy_houses_against_map(&[house], &map).is_err());
+    }
+
+    #[test]
+    fn validates_legacy_spawn_creatures_against_imported_walkable_tiles() {
+        let position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let mut map = WorldMap::new("spawns", position);
+        map.set_tile(
+            position,
+            WorldMapTile {
+                ground_thing_id: 102,
+                walkable: true,
+            },
+        )
+        .unwrap();
+        let creature = LegacySpawnCreature {
+            kind: LegacySpawnKind::Monster,
+            name: "Rat".into(),
+            position,
+            spawn_interval_seconds: 60,
+            direction: 2,
+            chance: 100,
+        };
+        let spawn = LegacySpawnArea {
+            center: position,
+            radius: 3,
+            creatures: vec![creature.clone()],
+        };
+
+        validate_legacy_spawns_against_map(std::slice::from_ref(&spawn), &map).unwrap();
+
+        map.set_tile(
+            position,
+            WorldMapTile {
+                ground_thing_id: 102,
+                walkable: false,
+            },
+        )
+        .unwrap();
+        assert!(validate_legacy_spawns_against_map(std::slice::from_ref(&spawn), &map).is_err());
+
+        let off_map_spawn = LegacySpawnArea {
+            center: position,
+            radius: 3,
+            creatures: vec![LegacySpawnCreature {
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                ..creature
+            }],
+        };
+        assert!(validate_legacy_spawns_against_map(&[off_map_spawn], &map).is_err());
     }
 }
