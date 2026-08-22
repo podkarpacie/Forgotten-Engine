@@ -1640,7 +1640,9 @@ impl ItemInstance {
         Ok(split)
     }
 
-    fn merge_stack(&mut self, incoming: &Self) -> Result<(), CoreError> {
+    /// Merges one exact compatible complete stack while enforcing the bounded stack count.
+    /// Ownership and source-transfer policy remain the responsibility of the caller.
+    pub fn merge_stack(&mut self, incoming: &Self) -> Result<(), CoreError> {
         if !self.is_stack_compatible_with(incoming) {
             return Err(CoreError::IncompatibleItemStacks);
         }

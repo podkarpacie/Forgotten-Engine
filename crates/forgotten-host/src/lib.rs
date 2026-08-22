@@ -1280,8 +1280,10 @@ impl SharedNativeMap {
         Ok(self.revision.fetch_add(1, Ordering::SeqCst) + 1)
     }
 
-    /// Transfers one exact top-level imported source item into one empty equipment slot. The lock
-    /// order is always map, authoritative player world, source-index map, then removal journal.
+    /// Transfers one exact complete top-level imported source stack into one equipment slot. The
+    /// slot is either empty or contains one exact compatible stack with bounded remaining room.
+    /// The lock order is always map, authoritative player world, source-index map, then removal
+    /// journal.
     /// It creates candidate map/inventory/journal state first, commits the candidate inventory and
     /// journal through one SQLite transaction, then publishes the already validated in-memory
     /// state and advances both affected epochs. Native ThrowItem decoding and map refresh packets
@@ -1352,13 +1354,14 @@ impl SharedNativeMap {
             .player_equipment(player_id)
             .cloned()
             .map_err(HostError::Core)?;
-        if equipment.item(equipment_slot).is_some() {
-            return Err(HostError::Core(
-                forgotten_core::CoreError::OccupiedEquipmentSlot {
-                    player_id,
-                    slot: equipment_slot,
-                },
-            ));
+        match equipment.item(equipment_slot).cloned() {
+            None => {
+                equipment.equip(equipment_slot, item.clone());
+            }
+            Some(mut existing) => {
+                existing.merge_stack(&item).map_err(HostError::Core)?;
+                equipment.equip(equipment_slot, existing);
+            }
         }
         let containers = world
             .player_containers(player_id)
@@ -1378,7 +1381,6 @@ impl SharedNativeMap {
         next_map
             .set_tile_items(position, next_items)
             .map_err(HostError::Core)?;
-        equipment.equip(equipment_slot, item.clone());
         let mut next_removed_source_items = removed_source_items.clone();
         next_removed_source_items.insert(source_identity);
         let next_journal = MapItemRemovalJournal {
@@ -9083,7 +9085,7 @@ mod tests {
     }
 
     #[test]
-    fn source_map_item_pickup_persists_map_inventory_and_journal_together() {
+    fn source_map_complete_stack_merges_into_matching_equipment_stack() {
         let database_path = database_path("source-map-item-pickup");
         let mut database = EngineDatabase::open(&database_path).unwrap();
         let account_id = database
@@ -9132,6 +9134,15 @@ mod tests {
         shared_world
             .register_player_at_available_position(player, &source_map)
             .unwrap();
+        let mut equipment = PlayerEquipment::default();
+        let mut existing_stack = ItemInstance::new(2148, 5).unwrap();
+        existing_stack.action_id = Some(12);
+        existing_stack.unique_id = Some(34);
+        equipment.equip(EquipmentSlot::RightHand, existing_stack);
+        database.replace_player_equipment(701, &equipment).unwrap();
+        shared_world
+            .replace_player_equipment(701, equipment)
+            .unwrap();
 
         let outcome = shared_map
             .move_source_item_to_empty_equipment(
@@ -9158,7 +9169,7 @@ mod tests {
         assert_eq!(outcome.equipment_slot, EquipmentSlot::RightHand);
         assert_eq!(outcome.map_revision, 1);
         assert_eq!(shared_map.revision(), 1);
-        assert_eq!(shared_world.equipment_epoch(), 1);
+        assert_eq!(shared_world.equipment_epoch(), 2);
         assert!(shared_map
             .render_snapshot()
             .unwrap()
@@ -9166,9 +9177,12 @@ mod tests {
             .unwrap()
             .is_empty());
         let equipment = shared_world.player_equipment(701).unwrap();
+        let mut merged_stack = ItemInstance::new(2148, 12).unwrap();
+        merged_stack.action_id = Some(12);
+        merged_stack.unique_id = Some(34);
         assert_eq!(
             equipment.item(EquipmentSlot::RightHand),
-            Some(&outcome.item)
+            Some(&merged_stack)
         );
         assert_eq!(database.player_equipment(701).unwrap(), equipment);
         assert_eq!(
@@ -9405,7 +9419,7 @@ mod tests {
     }
 
     #[test]
-    fn source_map_item_pickup_rejects_occupied_slot_without_mutating_map_or_persistence() {
+    fn source_map_item_pickup_rejects_incompatible_occupied_slot_without_mutation() {
         let database_path = database_path("source-map-item-pickup-occupied-slot");
         let mut database = EngineDatabase::open(&database_path).unwrap();
         let account_id = database
@@ -9479,10 +9493,7 @@ mod tests {
                 EquipmentSlot::RightHand,
             ),
             Err(HostError::Core(
-                forgotten_core::CoreError::OccupiedEquipmentSlot {
-                    player_id: 702,
-                    slot: EquipmentSlot::RightHand,
-                }
+                forgotten_core::CoreError::IncompatibleItemStacks
             ))
         ));
 

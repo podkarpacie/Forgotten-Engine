@@ -25,6 +25,8 @@ The declared progression credit now also includes a narrowly bounded persisted w
 
 The declared item credit now also includes one complete source-map compatible-stack merge into an owned top-level container. It remains a single exact source identity removal with durable journal recovery, not a partial stack or generic ground-transfer system.
 
+The same declared item credit now includes an equivalent complete compatible-stack merge into a requested equipment slot. It accepts only an empty slot or one matching bounded destination stack, and keeps incompatible or overflowing occupied slots unchanged.
+
 ## Full path to 100%
 
 Each milestone below has an evidence target. Work may proceed in dependency order, but a milestone is not complete merely because an API or parser exists. Existing completed items are retained to show the verified base for the next work.
