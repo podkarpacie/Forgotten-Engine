@@ -2627,7 +2627,7 @@ pub struct PartySharedExperienceState {
     pub eligibility: PartySharedExperienceEligibility,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct WorldState {
     players: BTreeMap<u64, Player>,
     player_vitals: BTreeMap<u64, PlayerVitals>,
@@ -3089,6 +3089,30 @@ impl WorldState {
             requested,
             eligibility: PartySharedExperienceEligibility::Eligible,
         })
+    }
+
+    /// Returns deterministic ascending recipient IDs only when the current player belongs to a
+    /// requested and eligible live party. `None` means callers must retain their non-shared reward
+    /// behavior. This selector does not award experience or mutate party state.
+    pub fn party_shared_experience_recipients(
+        &self,
+        player_id: u64,
+        rules: PartySharedExperienceRules,
+    ) -> Result<Option<Vec<u64>>, CoreError> {
+        let Some(leader_id) = self.player_party_leader(player_id)? else {
+            return Ok(None);
+        };
+        if self
+            .party_shared_experience_state(leader_id, rules)?
+            .eligibility
+            != PartySharedExperienceEligibility::Eligible
+        {
+            return Ok(None);
+        }
+        let mut recipients = self.party_member_ids(leader_id);
+        recipients.push(leader_id);
+        recipients.sort_unstable();
+        Ok(Some(recipients))
     }
 
     /// Captures the basic party display relation for every current active player in deterministic
@@ -6544,6 +6568,12 @@ mod tests {
                 requested: true,
                 eligibility: PartySharedExperienceEligibility::Eligible,
             }
+        );
+        assert_eq!(
+            world
+                .party_shared_experience_recipients(member.id, rules)
+                .unwrap(),
+            Some(vec![leader.id, member.id])
         );
         world
             .transfer_party_leadership(leader.id, member.id)
