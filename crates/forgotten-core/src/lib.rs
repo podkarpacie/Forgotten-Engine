@@ -1942,7 +1942,9 @@ impl ItemContainer {
     /// Merges into the first compatible bounded stack that has room, or inserts a new stack.
     /// If compatible stacks exist but all would overflow, no new stack is created because that
     /// would hide an invalid merge behind arbitrary stack fragmentation.
-    fn merge_or_insert_stack(&mut self, item: ItemInstance) -> Result<(usize, u16), CoreError> {
+    /// Merges one compatible complete stack or inserts it as a new bounded entry. Callers must
+    /// separately validate ownership, source identity, and persistence boundaries.
+    pub fn merge_or_insert_stack(&mut self, item: ItemInstance) -> Result<(usize, u16), CoreError> {
         if let Some((index, existing)) = self.items.iter_mut().enumerate().find(|(_, existing)| {
             existing.is_stack_compatible_with(&item)
                 && existing.count.saturating_add(item.count) <= MAX_ITEM_STACK_COUNT

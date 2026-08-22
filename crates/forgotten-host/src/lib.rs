@@ -1417,9 +1417,9 @@ impl SharedNativeMap {
         })
     }
 
-    /// Transfers one exact plain top-level source-bound map item into one existing, owned,
-    /// non-nested container. It appends only a complete item, never merges stacks, and follows
-    /// the established map, world, source-index, journal lock order.
+    /// Transfers one exact complete plain top-level source-bound map stack into one existing,
+    /// owned, non-nested container. It merges only an exact compatible stack or appends one
+    /// bounded stack, then follows the established map, world, source-index, journal lock order.
     pub fn move_source_item_to_top_level_container(
         &self,
         shared_world: &SharedNativeWorld,
@@ -1502,7 +1502,7 @@ impl SharedNativeMap {
         }
         container
             .items
-            .insert(item.clone())
+            .merge_or_insert_stack(item.clone())
             .map_err(HostError::Core)?;
         containers.insert(container).map_err(HostError::Core)?;
         let mut next_map = map.clone();
@@ -9286,6 +9286,114 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(shared_world.containers_epoch(), 2);
+        assert_eq!(
+            database.map_item_removal_journal().unwrap(),
+            Some(MapItemRemovalJournal {
+                map_revision: source_map.source_revision(),
+                removed_items: vec![outcome.source_identity],
+            })
+        );
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn source_map_complete_stack_merges_into_matching_top_level_container_stack() {
+        let database_path = database_path("source-map-item-container-stack-merge");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        let player = Player {
+            id: 704,
+            account_id: account_id as u64,
+            name: "Knight".into(),
+            position: Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            level: 8,
+            experience: 4_900,
+            skill_points: 3,
+        };
+        database.save_player(&player).unwrap();
+        let position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let mut source_map = (*native_world_map()).clone();
+        source_map
+            .set_tile_items(
+                position,
+                vec![WorldMapItem {
+                    server_id: 2148,
+                    client_thing_id: Some(3031),
+                    count: 7,
+                    action_id: Some(12),
+                    unique_id: Some(34),
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
+        let shared_map = SharedNativeMap::new(source_map.clone());
+        let shared_world = SharedNativeWorld::from_static_spawns(None).unwrap();
+        shared_world
+            .register_player_at_available_position(player, &source_map)
+            .unwrap();
+        let mut bag = forgotten_core::PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Bag",
+            false,
+            20,
+        )
+        .unwrap();
+        let mut existing_stack = ItemInstance::new(2148, 5).unwrap();
+        existing_stack.action_id = Some(12);
+        existing_stack.unique_id = Some(34);
+        bag.items.insert(existing_stack).unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(bag).unwrap();
+        database
+            .replace_player_containers(704, &containers)
+            .unwrap();
+        shared_world
+            .replace_player_containers(704, containers)
+            .unwrap();
+
+        let outcome = shared_map
+            .move_source_item_to_top_level_container(
+                &shared_world,
+                &mut database,
+                704,
+                position,
+                0,
+                2,
+            )
+            .unwrap();
+
+        let mut merged_stack = ItemInstance::new(2148, 12).unwrap();
+        merged_stack.action_id = Some(12);
+        merged_stack.unique_id = Some(34);
+        let containers = shared_world.player_containers(704).unwrap();
+        assert_eq!(containers.container(2).unwrap().items.len(), 1);
+        assert_eq!(
+            containers.container(2).unwrap().items.item(0),
+            Some(&merged_stack)
+        );
+        assert_eq!(database.player_containers(704).unwrap(), containers);
+        assert!(shared_map
+            .render_snapshot()
+            .unwrap()
+            .tile_items(position)
+            .unwrap()
+            .is_empty());
         assert_eq!(
             database.map_item_removal_journal().unwrap(),
             Some(MapItemRemovalJournal {
