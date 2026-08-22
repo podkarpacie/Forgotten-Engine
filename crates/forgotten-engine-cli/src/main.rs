@@ -453,6 +453,9 @@ fn run_host(
     let item_armor_by_server_id = item_catalog
         .as_ref()
         .map(|catalog| catalog.native_xml_armor_by_server_id());
+    let item_adjacent_melee_skill_by_server_id = item_catalog
+        .as_ref()
+        .map(|catalog| catalog.adjacent_melee_skill_by_server_id());
     let item_slot_types_by_server_id = item_catalog
         .as_ref()
         .map(|catalog| catalog.xml_slot_types_by_server_id());
@@ -647,7 +650,11 @@ fn run_host(
         });
         let experience_award_policy = Arc::new(config.experience_award_policy()?);
         let death_loss_policy = DeathLossPolicy::from_config(config.death_loss_percent)?;
-        let declarative_weapon_catalog = declarative_weapon_catalog.map(Arc::new);
+        let declarative_weapon_catalog = declarative_weapon_catalog
+            .map(|catalog| {
+                catalog.with_adjacent_melee_skills(item_adjacent_melee_skill_by_server_id.as_ref())
+            })
+            .map(Arc::new);
         if let Some(catalog) = &declarative_weapon_catalog {
             println!(
                 "> Loaded {} scriptless declarative weapon definitions; equipped-item binding remains limited to the native selected-melee foundation.",

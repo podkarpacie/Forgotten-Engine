@@ -1,5 +1,5 @@
 use crate::ConfigError;
-use forgotten_core::{NativeItemPresentation, NativeItemPresentationCatalog};
+use forgotten_core::{NativeItemPresentation, NativeItemPresentationCatalog, PlayerSkill};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 use std::collections::{BTreeMap, BTreeSet};
@@ -114,6 +114,18 @@ impl LegacyItemSlotType {
 }
 
 impl LegacyWeaponType {
+    /// Returns a typed skill only for legacy weapon classes that FE currently routes through the
+    /// bounded adjacent declarative melee action. Shielding, distance, wand, ammunition, and
+    /// quiver behavior need distinct verified combat paths and remain outside this projection.
+    pub const fn adjacent_melee_skill(self) -> Option<PlayerSkill> {
+        match self {
+            Self::Sword => Some(PlayerSkill::Sword),
+            Self::Club => Some(PlayerSkill::Club),
+            Self::Axe => Some(PlayerSkill::Axe),
+            Self::Shield | Self::Distance | Self::Wand | Self::Ammunition | Self::Quiver => None,
+        }
+    }
+
     fn parse(value: &str) -> Result<Self, ConfigError> {
         match value {
             "sword" => Ok(Self::Sword),
@@ -205,6 +217,21 @@ impl LegacyItemCatalog {
                     .xml_armor
                     .filter(|armor| *armor > 0)
                     .map(|armor| (server_id, armor))
+            })
+            .collect()
+    }
+
+    /// Returns only sword, club, and axe legacy weapon classifications that FE's existing
+    /// adjacent declarative melee route can map to a typed skill-try award. This does not enable
+    /// ranged, shielding, wand, ammunition, quiver, or generic TFS weapon behavior.
+    pub fn adjacent_melee_skill_by_server_id(&self) -> BTreeMap<u16, PlayerSkill> {
+        self.definitions
+            .iter()
+            .filter_map(|(&server_id, definition)| {
+                definition
+                    .xml_weapon_type
+                    .and_then(LegacyWeaponType::adjacent_melee_skill)
+                    .map(|skill| (server_id, skill))
             })
             .collect()
     }
@@ -984,6 +1011,10 @@ mod tests {
         assert_eq!(definition.xml_extra_defense, Some(4));
         assert_eq!(definition.xml_attack_speed_millis, Some(1_600));
         assert_eq!(definition.xml_weapon_type, Some(LegacyWeaponType::Sword));
+        assert_eq!(
+            catalog.adjacent_melee_skill_by_server_id(),
+            BTreeMap::from([(100, PlayerSkill::Sword)])
+        );
         assert_eq!(catalog.definition(101), None);
     }
 

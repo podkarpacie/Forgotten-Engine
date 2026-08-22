@@ -1,6 +1,6 @@
 use super::{ConfigError, EngineConfig};
 use forgotten_core::{
-    CombatAttackTiming, CombatDamageType, PlayerCombatEvent, MAX_COMBAT_EVENT_DAMAGE,
+    CombatAttackTiming, CombatDamageType, PlayerCombatEvent, PlayerSkill, MAX_COMBAT_EVENT_DAMAGE,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
@@ -42,6 +42,7 @@ impl DeclarativeWeaponDefinition {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeclarativeWeaponCatalog {
     entries: BTreeMap<u16, DeclarativeWeaponDefinition>,
+    adjacent_melee_skills: BTreeMap<u16, PlayerSkill>,
 }
 
 impl DeclarativeWeaponCatalog {
@@ -61,6 +62,31 @@ impl DeclarativeWeaponCatalog {
         self.entries
             .iter()
             .map(|(item_id, definition)| (*item_id, *definition))
+    }
+
+    /// Attaches only prevalidated sword, club, and axe classifications for declarations that
+    /// already exist in this catalog. The source map is bounded `items.xml` metadata; missing or
+    /// unsupported classifications remain ineligible for a skill-try award.
+    pub fn with_adjacent_melee_skills(
+        mut self,
+        skills_by_server_id: Option<&BTreeMap<u16, PlayerSkill>>,
+    ) -> Self {
+        self.adjacent_melee_skills = skills_by_server_id
+            .map(|skills| {
+                self.entries
+                    .keys()
+                    .filter_map(|item_id| {
+                        skills.get(item_id).copied().map(|skill| (*item_id, skill))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self
+    }
+
+    /// Returns a skill classification only for an already declared adjacent-melee weapon.
+    pub fn adjacent_melee_skill(&self, item_id: u16) -> Option<PlayerSkill> {
+        self.adjacent_melee_skills.get(&item_id).copied()
     }
 
     fn insert(&mut self, definition: DeclarativeWeaponDefinition) -> Result<(), ConfigError> {
@@ -256,6 +282,20 @@ mod tests {
             .unwrap();
         assert_eq!(event.damage_type, CombatDamageType::Physical);
         assert_eq!(event.requested_damage, 24);
+    }
+
+    #[test]
+    fn attaches_skill_classifications_only_to_declared_adjacent_weapons() {
+        let catalog = parse_declarative_weapons_xml(
+            br#"<fe-weapons><weapon itemid="2376" damage="12" intervalticks="2"/></fe-weapons>"#,
+        )
+        .unwrap()
+        .with_adjacent_melee_skills(Some(&BTreeMap::from([
+            (2376, PlayerSkill::Sword),
+            (2400, PlayerSkill::Axe),
+        ])));
+        assert_eq!(catalog.adjacent_melee_skill(2376), Some(PlayerSkill::Sword));
+        assert_eq!(catalog.adjacent_melee_skill(2400), None);
     }
 
     #[test]

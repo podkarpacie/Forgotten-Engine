@@ -7886,6 +7886,14 @@ fn apply_native_selected_player_melee(
         policy.armor_multiplier_by_vocation,
         &target_equipment,
     )?;
+    let declared_weapon_skill = if let Some(catalog) = policy.declarative_weapon_catalog {
+        shared_world
+            .player_equipment(attacker_id)?
+            .item(EquipmentSlot::RightHand)
+            .and_then(|item| catalog.adjacent_melee_skill(item.server_id))
+    } else {
+        Some(PlayerSkill::Fist)
+    };
     let combat_result = if let Some(catalog) = policy.declarative_weapon_catalog {
         let Some(event) =
             shared_world.equipped_declarative_melee_event(attacker_id, target_id, catalog)?
@@ -7974,16 +7982,13 @@ fn apply_native_selected_player_melee(
     } else {
         database.update_player_vitals(target_id, persisted_vitals)?;
     }
-    if let Some(rules_by_vocation) = policy.progression_rules {
+    if let (Some(rules_by_vocation), Some(skill)) =
+        (policy.progression_rules, declared_weapon_skill)
+    {
         let vocation = shared_world.player_progression(attacker_id)?.vocation;
         if let Some(rules) = rules_by_vocation.get(&vocation).copied() {
             let awarded_tries = u64::from(policy.skill_rate);
-            shared_world.apply_player_skill_tries(
-                attacker_id,
-                PlayerSkill::Fist,
-                awarded_tries,
-                rules,
-            )?;
+            shared_world.apply_player_skill_tries(attacker_id, skill, awarded_tries, rules)?;
             database.replace_player_progression(
                 attacker_id,
                 shared_world.player_progression(attacker_id)?,
@@ -12497,7 +12502,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_player_melee_uses_only_an_equipped_declarative_weapon() {
+    fn selected_player_melee_uses_only_an_equipped_declarative_weapon_and_awards_matching_skill() {
         let path = database_path("selected-player-declarative-weapon");
         let mut database = EngineDatabase::open(&path).unwrap();
         let account_id = database.create_account("operator", "hash").unwrap();
@@ -12567,7 +12572,16 @@ mod tests {
         let catalog = parse_declarative_weapons_xml(
             br#"<fe-weapons><weapon itemid="2376" damage="12" intervalticks="1"/></fe-weapons>"#,
         )
-        .unwrap();
+        .unwrap()
+        .with_adjacent_melee_skills(Some(&BTreeMap::from([(2376, PlayerSkill::Sword)])));
+        let multiplier = forgotten_core::ProgressionMultiplier::new(1_000).unwrap();
+        let rules_by_vocation = BTreeMap::from([(
+            VocationId::new(0),
+            PlayerProgressionRules {
+                magic_level_multiplier: multiplier,
+                skill_multipliers: [multiplier; 7],
+            },
+        )]);
         shared.set_player_target(111, Some(112)).unwrap();
         assert!(apply_native_selected_player_melee(
             &mut database,
@@ -12605,8 +12619,8 @@ mod tests {
             111,
             &map,
             NativeSelectedPlayerMeleePolicy {
-                progression_rules: None,
-                skill_rate: 1,
+                progression_rules: Some(&rules_by_vocation),
+                skill_rate: 2,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
                 armor_by_server_id: Some(&armor_by_server_id),
                 armor_multiplier_by_vocation: Some(&armor_multiplier_by_vocation),
@@ -12618,6 +12632,27 @@ mod tests {
         assert_eq!(outcome.requested_damage, 12);
         assert_eq!(outcome.applied_damage, 6);
         assert_eq!(vitals.health, 14);
+        assert_eq!(
+            shared
+                .player_progression_attempts(111)
+                .unwrap()
+                .skill_tries(PlayerSkill::Sword),
+            2
+        );
+        assert_eq!(
+            shared
+                .player_progression_attempts(111)
+                .unwrap()
+                .skill_tries(PlayerSkill::Fist),
+            0
+        );
+        assert_eq!(
+            database
+                .player_progression_attempts(111)
+                .unwrap()
+                .skill_tries(PlayerSkill::Sword),
+            2
+        );
         assert_eq!(
             database
                 .characters_for_account(account_id)

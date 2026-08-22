@@ -21,6 +21,8 @@ The current conservative estimate is **23% of the declared replacement scope**. 
 | Production operations and compatibility evidence | 15% | 1% | Releases, checksums, validation scripts, and documented concurrency boundaries exist. Load, soak, security, migration, cross-platform, and independent real-client evidence are incomplete. |
 | **Total** | **100%** | **23%** | **Foundation and bounded-runtime stage; not production-ready.** |
 
+The declared progression credit now also includes a narrowly bounded persisted weapon-skill source: a successful selected declarative right-hand sword, club, or axe hit can award the configured skill-rate tries through existing vocation rules. This does not credit ranged weapons, shields, spell mana, offline training, generic weapon behavior, or TFS combat parity.
+
 ## Full path to 100%
 
 Each milestone below has an evidence target. Work may proceed in dependency order, but a milestone is not complete merely because an API or parser exists. Existing completed items are retained to show the verified base for the next work.
