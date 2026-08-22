@@ -27,6 +27,8 @@ The declared progression credit now also includes one authenticated bounded decl
 
 The declared creature credit now includes one bounded static-NPC dialogue source. It preserves NPC identity by materialized static ID, resolves a sanitized exact keyword only for one active same-floor NPC within two tiles, and uses the existing parser-backed speech record only for the speaking player. It does not credit NPC Lua scripts, focus, shops, transactions, travel, quests, or broader dialogue behavior.
 
+The declared social credit now includes a session-local party shared-experience eligibility foundation. A leader may request it, and the core computes only deterministic minimum-party, level-spread, leader-relative range/floor, and recent-activity status. It does not award or split experience, change client party shields, accept client enablement, create party chat, persist state, or reproduce full TFS timing.
+
 The declared item credit now also includes one complete source-map compatible-stack merge into an owned top-level container. It remains a single exact source identity removal with durable journal recovery, not a partial stack or generic ground-transfer system.
 
 The same declared item credit now includes an equivalent complete compatible-stack merge into a requested equipment slot. It accepts only an empty slot or one matching bounded destination stack, and keeps incompatible or overflowing occupied slots unchanged.

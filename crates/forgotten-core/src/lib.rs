@@ -2544,6 +2544,44 @@ pub enum PartyDisplayRelation {
     Leader,
 }
 
+/// Fixed bounded inputs for the first session-local shared-experience eligibility model. These
+/// values are explicit clean-room defaults rather than an unvalidated import of legacy config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartySharedExperienceRules {
+    pub maximum_range: u16,
+    pub maximum_floor_delta: u8,
+    pub activity_window_ticks: u64,
+}
+
+impl Default for PartySharedExperienceRules {
+    fn default() -> Self {
+        Self {
+            maximum_range: 30,
+            maximum_floor_delta: 1,
+            activity_window_ticks: 60,
+        }
+    }
+}
+
+/// One deterministic reason why the requested session-local shared experience is not active.
+/// Experience awards, client shield colours, messages, and TFS activity semantics remain host
+/// concerns outside this initial relationship-state model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartySharedExperienceEligibility {
+    NotRequested,
+    Eligible,
+    EmptyParty,
+    LevelSpreadTooLarge,
+    TooFarAway,
+    MemberInactive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartySharedExperienceState {
+    pub requested: bool,
+    pub eligibility: PartySharedExperienceEligibility,
+}
+
 #[derive(Debug, Default)]
 pub struct WorldState {
     players: BTreeMap<u64, Player>,
@@ -2567,6 +2605,8 @@ pub struct WorldState {
     party_leaders: BTreeSet<u64>,
     party_memberships: BTreeMap<u64, u64>,
     party_invitations: BTreeMap<u64, BTreeSet<u64>>,
+    party_shared_experience_requested: BTreeSet<u64>,
+    party_shared_experience_activity_ticks: BTreeMap<u64, u64>,
     static_creatures: BTreeMap<u32, StaticCreatureRuntime>,
     static_occupied_positions: BTreeSet<Position>,
     tick: u64,
@@ -2808,6 +2848,9 @@ impl WorldState {
 
         self.party_leaders.remove(&leader_id);
         self.party_leaders.insert(new_leader_id);
+        if self.party_shared_experience_requested.remove(&leader_id) {
+            self.party_shared_experience_requested.insert(new_leader_id);
+        }
         self.party_memberships.remove(&new_leader_id);
         for member_leader_id in self.party_memberships.values_mut() {
             if *member_leader_id == leader_id {
@@ -2877,6 +2920,130 @@ impl WorldState {
             return Err(CoreError::PlayerNotInParty(leader_id));
         }
         Ok(self.party_member_ids(leader_id))
+    }
+
+    /// Enables or disables the session-local shared-experience request for one current leader.
+    /// The result describes eligibility only; it does not distribute experience or emit a packet.
+    pub fn set_party_shared_experience_requested(
+        &mut self,
+        leader_id: u64,
+        requested: bool,
+        rules: PartySharedExperienceRules,
+    ) -> Result<PartySharedExperienceState, CoreError> {
+        self.ensure_party_player_exists(leader_id)?;
+        if !self.party_leaders.contains(&leader_id) {
+            return Err(CoreError::PlayerNotInParty(leader_id));
+        }
+        let changed = if requested {
+            self.party_shared_experience_requested.insert(leader_id)
+        } else {
+            self.party_shared_experience_requested.remove(&leader_id)
+        };
+        if changed {
+            self.mark_changed();
+        }
+        self.party_shared_experience_state(leader_id, rules)
+    }
+
+    /// Records one explicit bounded participant-activity observation for the current world tick.
+    /// Combat source, damage, healing, flags, packet delivery, and persistence stay outside this
+    /// first eligibility model.
+    pub fn record_party_shared_experience_activity(
+        &mut self,
+        player_id: u64,
+    ) -> Result<(), CoreError> {
+        self.ensure_party_player_exists(player_id)?;
+        if self.player_party_leader(player_id)?.is_none() {
+            return Err(CoreError::PlayerNotInParty(player_id));
+        }
+        if self
+            .party_shared_experience_activity_ticks
+            .insert(player_id, self.tick)
+            != Some(self.tick)
+        {
+            self.mark_changed();
+        }
+        Ok(())
+    }
+
+    /// Returns the session-local request and its deterministic current eligibility. A request is
+    /// active only when there is at least one member and every participant satisfies the bounded
+    /// level, leader-relative range/floor, and recent-activity inputs.
+    pub fn party_shared_experience_state(
+        &self,
+        leader_id: u64,
+        rules: PartySharedExperienceRules,
+    ) -> Result<PartySharedExperienceState, CoreError> {
+        self.ensure_party_player_exists(leader_id)?;
+        if !self.party_leaders.contains(&leader_id) {
+            return Err(CoreError::PlayerNotInParty(leader_id));
+        }
+        let requested = self.party_shared_experience_requested.contains(&leader_id);
+        if !requested {
+            return Ok(PartySharedExperienceState {
+                requested,
+                eligibility: PartySharedExperienceEligibility::NotRequested,
+            });
+        }
+        let member_ids = self.party_member_ids(leader_id);
+        if member_ids.is_empty() {
+            return Ok(PartySharedExperienceState {
+                requested,
+                eligibility: PartySharedExperienceEligibility::EmptyParty,
+            });
+        }
+        let participant_ids = std::iter::once(leader_id)
+            .chain(member_ids)
+            .collect::<Vec<_>>();
+        let highest_level = participant_ids
+            .iter()
+            .filter_map(|id| self.players.get(id).map(|player| player.level))
+            .max()
+            .unwrap_or_default();
+        let minimum_level = highest_level.saturating_mul(2).saturating_add(2) / 3;
+        let leader = self
+            .players
+            .get(&leader_id)
+            .expect("known party leader must remain a live player");
+        for participant_id in participant_ids {
+            let participant = self
+                .players
+                .get(&participant_id)
+                .expect("known party participant must remain a live player");
+            if participant.level < minimum_level {
+                return Ok(PartySharedExperienceState {
+                    requested,
+                    eligibility: PartySharedExperienceEligibility::LevelSpreadTooLarge,
+                });
+            }
+            let range = participant
+                .position
+                .x
+                .abs_diff(leader.position.x)
+                .max(participant.position.y.abs_diff(leader.position.y));
+            if range > rules.maximum_range
+                || participant.position.z.abs_diff(leader.position.z) > rules.maximum_floor_delta
+            {
+                return Ok(PartySharedExperienceState {
+                    requested,
+                    eligibility: PartySharedExperienceEligibility::TooFarAway,
+                });
+            }
+            let active = self
+                .party_shared_experience_activity_ticks
+                .get(&participant_id)
+                .is_some_and(|tick| self.tick.saturating_sub(*tick) <= rules.activity_window_ticks);
+            if !active {
+                return Ok(PartySharedExperienceState {
+                    requested,
+                    eligibility: PartySharedExperienceEligibility::MemberInactive,
+                });
+            }
+        }
+        Ok(PartySharedExperienceState {
+            requested,
+            eligibility: PartySharedExperienceEligibility::Eligible,
+        })
     }
 
     /// Captures the basic party display relation for every current active player in deterministic
@@ -2966,6 +3133,9 @@ impl WorldState {
 
         self.party_leaders.remove(&leader_id);
         self.party_leaders.insert(new_leader_id);
+        if self.party_shared_experience_requested.remove(&leader_id) {
+            self.party_shared_experience_requested.insert(new_leader_id);
+        }
         self.party_memberships.remove(&new_leader_id);
         for member_id in member_ids {
             if member_id != new_leader_id {
@@ -2989,7 +3159,15 @@ impl WorldState {
     }
 
     fn disband_party(&mut self, leader_id: u64) {
+        let member_ids = self.party_member_ids(leader_id);
         self.party_leaders.remove(&leader_id);
+        self.party_shared_experience_requested.remove(&leader_id);
+        self.party_shared_experience_activity_ticks
+            .remove(&leader_id);
+        for member_id in &member_ids {
+            self.party_shared_experience_activity_ticks
+                .remove(member_id);
+        }
         self.party_memberships
             .retain(|_, member_leader_id| *member_leader_id != leader_id);
         self.party_invitations.values_mut().for_each(|leaders| {
@@ -3000,6 +3178,8 @@ impl WorldState {
     }
 
     fn clear_player_party_state(&mut self, player_id: u64) {
+        self.party_shared_experience_activity_ticks
+            .remove(&player_id);
         if self.party_leaders.contains(&player_id) {
             self.remove_party_leader(player_id);
         } else if let Some(leader_id) = self.party_memberships.remove(&player_id) {
@@ -6239,6 +6419,138 @@ mod tests {
         assert_eq!(world.accept_party_invitation(member.id, leader.id), Ok(()));
         assert_eq!(world.player_party_leader(member.id), Ok(Some(leader.id)));
         assert_eq!(world.player_party_members(leader.id), Ok(vec![member.id]));
+    }
+
+    #[test]
+    fn party_shared_experience_eligibility_is_bounded_and_rekeys_with_leadership() {
+        let rules = PartySharedExperienceRules::default();
+        let mut world = WorldState::default();
+        let mut leader = party_player(7, "Knight", 100);
+        leader.level = 30;
+        let mut member = party_player(8, "Druid", 102);
+        member.level = 20;
+        world.add_player(leader.clone()).unwrap();
+        world.add_player(member.clone()).unwrap();
+        world.invite_to_party(leader.id, member.id).unwrap();
+
+        assert_eq!(
+            world
+                .set_party_shared_experience_requested(leader.id, true, rules)
+                .unwrap(),
+            PartySharedExperienceState {
+                requested: true,
+                eligibility: PartySharedExperienceEligibility::EmptyParty,
+            }
+        );
+        world.accept_party_invitation(member.id, leader.id).unwrap();
+        assert_eq!(
+            world
+                .party_shared_experience_state(leader.id, rules)
+                .unwrap(),
+            PartySharedExperienceState {
+                requested: true,
+                eligibility: PartySharedExperienceEligibility::MemberInactive,
+            }
+        );
+        world
+            .record_party_shared_experience_activity(leader.id)
+            .unwrap();
+        world
+            .record_party_shared_experience_activity(member.id)
+            .unwrap();
+        assert_eq!(
+            world
+                .party_shared_experience_state(leader.id, rules)
+                .unwrap(),
+            PartySharedExperienceState {
+                requested: true,
+                eligibility: PartySharedExperienceEligibility::Eligible,
+            }
+        );
+        world
+            .transfer_party_leadership(leader.id, member.id)
+            .unwrap();
+        assert_eq!(
+            world
+                .party_shared_experience_state(member.id, rules)
+                .unwrap(),
+            PartySharedExperienceState {
+                requested: true,
+                eligibility: PartySharedExperienceEligibility::Eligible,
+            }
+        );
+        world.advance_ticks(rules.activity_window_ticks as u16 + 1);
+        assert_eq!(
+            world
+                .party_shared_experience_state(member.id, rules)
+                .unwrap(),
+            PartySharedExperienceState {
+                requested: true,
+                eligibility: PartySharedExperienceEligibility::MemberInactive,
+            }
+        );
+        world.leave_party(leader.id).unwrap();
+        assert_eq!(world.player_party_leader(member.id), Ok(None));
+        assert_eq!(
+            world.party_shared_experience_state(member.id, rules),
+            Err(CoreError::PlayerNotInParty(member.id))
+        );
+    }
+
+    #[test]
+    fn party_shared_experience_rejects_deterministic_level_and_range_inputs() {
+        let rules = PartySharedExperienceRules::default();
+        let mut level_world = WorldState::default();
+        let mut leader = party_player(7, "Knight", 100);
+        leader.level = 30;
+        let mut low_member = party_player(8, "Druid", 101);
+        low_member.level = 19;
+        level_world.add_player(leader.clone()).unwrap();
+        level_world.add_player(low_member.clone()).unwrap();
+        level_world
+            .invite_to_party(leader.id, low_member.id)
+            .unwrap();
+        level_world
+            .accept_party_invitation(low_member.id, leader.id)
+            .unwrap();
+        level_world
+            .record_party_shared_experience_activity(leader.id)
+            .unwrap();
+        level_world
+            .record_party_shared_experience_activity(low_member.id)
+            .unwrap();
+        assert_eq!(
+            level_world
+                .set_party_shared_experience_requested(leader.id, true, rules)
+                .unwrap()
+                .eligibility,
+            PartySharedExperienceEligibility::LevelSpreadTooLarge
+        );
+
+        let mut range_world = WorldState::default();
+        let range_leader = party_player(17, "Paladin", 100);
+        let range_member = party_player(18, "Sorcerer", 131);
+        range_world.add_player(range_leader.clone()).unwrap();
+        range_world.add_player(range_member.clone()).unwrap();
+        range_world
+            .invite_to_party(range_leader.id, range_member.id)
+            .unwrap();
+        range_world
+            .accept_party_invitation(range_member.id, range_leader.id)
+            .unwrap();
+        range_world
+            .record_party_shared_experience_activity(range_leader.id)
+            .unwrap();
+        range_world
+            .record_party_shared_experience_activity(range_member.id)
+            .unwrap();
+        assert_eq!(
+            range_world
+                .set_party_shared_experience_requested(range_leader.id, true, rules)
+                .unwrap()
+                .eligibility,
+            PartySharedExperienceEligibility::TooFarAway
+        );
     }
 
     #[test]
