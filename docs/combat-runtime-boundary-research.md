@@ -5,3 +5,5 @@ The local TFS reference routes combat through a broad health-change path that co
 FE’s current selected-player melee and static-creature routes deliberately own only bounded fixed damage, an explicit cooldown, restricted world-type admission, and separately persisted vitality/death foundations. The next compatible combat slice must therefore remain narrow and profile-evidenced. It must not claim generic spell, weapon, defense, corpse, callback, or Lua parity merely because a common upstream combat entry point exists.
 
 The preferred next investigation is a validated fixed data-backed damage-type admission rule for an already accepted FE event, only if the native 740 packet/result consequences are independently established. Broader TFS combat behavior remains deferred.
+
+The local OTCv8 parser confirms that the classic creature-health record carries a 32-bit creature identifier followed by an 8-bit health percentage. FE already uses that limited record for bounded accepted player/static damage. The parser evidence alone does not establish combat admission, effect, blocking, death, or elemental-damage semantics.
