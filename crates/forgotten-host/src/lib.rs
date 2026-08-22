@@ -4,7 +4,7 @@
 
 use forgotten_config::{
     DeclarativeSpellCatalog, DeclarativeWeaponCatalog, LegacyItemSlotType,
-    LegacyPublicChannelCatalog,
+    LegacyPublicChannelCatalog, WorldType,
 };
 use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
@@ -1010,6 +1010,9 @@ pub struct NativeOtClientHostConfig {
     pub bind_addr: SocketAddr,
     pub client_profile: NativeOtClientProfile,
     pub server_name: String,
+    /// Parsed TFS-style `worldType`. The native selected-player melee route uses it only to admit
+    /// or reject direct player damage; skulls, zones, wars, and other PvP policy remain deferred.
+    pub world_type: WorldType,
     pub advertised_game_addr: SocketAddr,
     pub max_connections: usize,
     pub session_timeout: Duration,
@@ -4787,11 +4790,12 @@ fn handle_native_otclient_game(
                         }
                     }
                     if let Some((target_native_id, target_vitals, outcome)) =
-                        apply_native_selected_player_melee(
+                        apply_native_selected_player_melee_for_world_type(
                             &mut database,
                             shared_world,
                             character.id,
                             world_map.as_ref(),
+                            config.world_type,
                             NativeSelectedPlayerMeleePolicy {
                                 progression_rules: config.progression_rules.as_deref(),
                                 skill_rate: config.skill_rate,
@@ -8004,6 +8008,30 @@ fn apply_native_selected_player_melee(
     )))
 }
 
+/// Applies the existing bounded selected-player melee primitive only when the parsed TFS-style
+/// world type permits direct player-versus-player combat. `no-pvp` leaves target selection intact
+/// but admits no damage, cooldown, death, skill, or client-health transition.
+fn apply_native_selected_player_melee_for_world_type(
+    database: &mut EngineDatabase,
+    shared_world: &SharedNativeWorld,
+    attacker_id: u64,
+    world_map: &WorldMap,
+    world_type: WorldType,
+    policy: NativeSelectedPlayerMeleePolicy<'_>,
+) -> Result<
+    Option<(
+        u32,
+        NativeOtClientPlayerVitals,
+        forgotten_core::PlayerDamageOutcome,
+    )>,
+    HostError,
+> {
+    if matches!(world_type, WorldType::NoPvp) {
+        return Ok(None);
+    }
+    apply_native_selected_player_melee(database, shared_world, attacker_id, world_map, policy)
+}
+
 /// Applies one accepted explicit fixed-percent loss and commits its complete authoritative result.
 /// The caller invokes this only after the existing combat path has entered a validated death state.
 /// Default formulas, promotions, blessings, and client-facing lifecycle presentation remain out of
@@ -8694,6 +8722,7 @@ mod tests {
                 max_padding_bytes: 128,
             },
             server_name: "Forgotten Engine Test".into(),
+            world_type: WorldType::Pvp,
             advertised_game_addr: "127.0.0.1:7265".parse().unwrap(),
             max_connections: 2,
             session_timeout: Duration::from_millis(250),
@@ -12358,6 +12387,112 @@ mod tests {
         .unwrap()
         .is_none());
         assert_eq!(shared.vitals_epoch(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn no_pvp_world_type_rejects_selected_player_melee_without_side_effects() {
+        let path = database_path("selected-player-no-pvp");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("operator", "hash").unwrap();
+        let map = native_world_map();
+        for (id, name, position) in [
+            (151_u64, "Knight", map.spawn()),
+            (
+                152_u64,
+                "Druid",
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+        ] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: account_id as u64,
+                    name: name.into(),
+                    position,
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        for (id, name, position) in [
+            (151_u64, "Knight", map.spawn()),
+            (
+                152_u64,
+                "Druid",
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+        ] {
+            shared
+                .register_player_at_available_position(
+                    Player {
+                        id,
+                        account_id: account_id as u64,
+                        name: name.into(),
+                        position,
+                        level: 8,
+                        experience: 4_900,
+                        skill_points: 3,
+                    },
+                    &map,
+                )
+                .unwrap();
+        }
+        shared.set_player_target(151, Some(152)).unwrap();
+        let before_vitals = shared.player_vitals(152).unwrap();
+        let before_attempts = shared.player_progression_attempts(151).unwrap();
+
+        assert!(apply_native_selected_player_melee_for_world_type(
+            &mut database,
+            &shared,
+            151,
+            &map,
+            WorldType::NoPvp,
+            NativeSelectedPlayerMeleePolicy {
+                progression_rules: None,
+                skill_rate: 1,
+                death_loss_policy: DeathLossPolicy::DefaultFormula,
+                armor_by_server_id: None,
+                armor_multiplier_by_vocation: None,
+                declarative_weapon_catalog: None,
+            },
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(shared.player_vitals(152).unwrap(), before_vitals);
+        assert_eq!(
+            shared.player_progression_attempts(151).unwrap(),
+            before_attempts
+        );
+        assert_eq!(shared.vitals_epoch(), 0);
+        assert_eq!(shared.progression_epoch(), 0);
+        assert_eq!(
+            shared
+                .player_interaction_intent(151)
+                .unwrap()
+                .target_player_id,
+            Some(152)
+        );
+        assert_eq!(
+            database
+                .characters_for_account(account_id)
+                .unwrap()
+                .into_iter()
+                .find(|character| character.id == 152)
+                .unwrap()
+                .vitals,
+            forgotten_persistence::PlayerVitals::default()
+        );
         let _ = fs::remove_file(path);
     }
 

@@ -678,6 +678,7 @@ fn run_host(
             bind_addr: config.otclient_v8_login_socket_addr(),
             client_profile: config.otclient_v8_native_profile(),
             server_name: config.server_name.clone(),
+            world_type: config.world_type,
             advertised_game_addr: SocketAddr::new(
                 advertised_ip,
                 config.advertised_otclient_v8_game_port,
