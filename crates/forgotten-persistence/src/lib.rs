@@ -40,6 +40,8 @@ pub const MAX_VIP_DESCRIPTION_BYTES: usize = 128;
 pub const MAX_GUILD_NAME_BYTES: usize = 64;
 pub const MAX_GUILD_MOTD_BYTES: usize = 255;
 pub const MAX_GUILD_NICK_BYTES: usize = 15;
+pub const MAX_GUILD_RANK_NAME_BYTES: usize = 64;
+pub const MAX_GUILD_RANKS_PER_GUILD: usize = 20;
 
 pub struct EngineDatabase {
     connection: Connection,
@@ -90,8 +92,8 @@ pub struct GuildRecord {
     pub motd: String,
 }
 
-/// One typed rank belonging to a guild. FE provisions the TFS-style three rank levels but does
-/// not yet provide rank management or permission semantics.
+/// One typed rank belonging to a guild. FE provisions the TFS-style three base rank levels and
+/// persistently manages bounded custom ranks, while permissions remain outside this boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuildRankRecord {
     pub id: u64,
@@ -722,6 +724,158 @@ impl EngineDatabase {
             rank_id: member.1 as u64,
             nick: nick.to_owned(),
         })
+    }
+
+    /// Adds one bounded custom rank to an existing guild. Rank names and levels must remain unique
+    /// within that guild; authorization, client packets, and permission semantics remain outside
+    /// this transactional storage operation.
+    pub fn add_guild_rank(
+        &mut self,
+        guild_id: u64,
+        name: &str,
+        level: u8,
+    ) -> Result<GuildRankRecord, PersistenceError> {
+        let name = validated_guild_rank_name(name)?;
+        if level == 0 {
+            return Err(PersistenceError::InvalidGuildRecord(
+                "guild rank level must be between 1 and 255".into(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        let guild_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guilds WHERE id = ?1)",
+            params![guild_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !guild_exists {
+            return Err(PersistenceError::UnknownGuild(guild_id));
+        }
+        let rank_count = transaction.query_row(
+            "SELECT COUNT(*) FROM guild_ranks WHERE guild_id = ?1",
+            params![guild_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        if rank_count >= MAX_GUILD_RANKS_PER_GUILD {
+            return Err(PersistenceError::GuildRankCapExceeded { guild_id });
+        }
+        let duplicate = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guild_ranks WHERE guild_id = ?1 AND (name = ?2 OR level = ?3))",
+            params![guild_id as i64, name, level as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if duplicate {
+            return Err(PersistenceError::DuplicateGuildRank { guild_id });
+        }
+        transaction.execute(
+            "INSERT INTO guild_ranks (guild_id, name, level) VALUES (?1, ?2, ?3)",
+            params![guild_id as i64, name, level as i64],
+        )?;
+        let rank_id = transaction.last_insert_rowid() as u64;
+        transaction.commit()?;
+        Ok(GuildRankRecord {
+            id: rank_id,
+            guild_id,
+            name: name.to_owned(),
+            level,
+        })
+    }
+
+    /// Renames one rank owned by the named guild without changing its level or member assignment.
+    /// Authorization and rank-permission checks remain outside this storage operation.
+    pub fn rename_guild_rank(
+        &mut self,
+        guild_id: u64,
+        rank_id: u64,
+        name: &str,
+    ) -> Result<GuildRankRecord, PersistenceError> {
+        let name = validated_guild_rank_name(name)?;
+        let transaction = self.connection.transaction()?;
+        let guild_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guilds WHERE id = ?1)",
+            params![guild_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !guild_exists {
+            return Err(PersistenceError::UnknownGuild(guild_id));
+        }
+        let (rank_guild_id, level) = transaction
+            .query_row(
+                "SELECT guild_id, level FROM guild_ranks WHERE id = ?1",
+                params![rank_id as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or(PersistenceError::GuildRankOutsideGuild { guild_id, rank_id })?;
+        if rank_guild_id as u64 != guild_id {
+            return Err(PersistenceError::GuildRankOutsideGuild { guild_id, rank_id });
+        }
+        let duplicate_name = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guild_ranks WHERE guild_id = ?1 AND name = ?2 AND id != ?3)",
+            params![guild_id as i64, name, rank_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if duplicate_name {
+            return Err(PersistenceError::DuplicateGuildRank { guild_id });
+        }
+        transaction.execute(
+            "UPDATE guild_ranks SET name = ?1 WHERE id = ?2",
+            params![name, rank_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(GuildRankRecord {
+            id: rank_id,
+            guild_id,
+            name: name.to_owned(),
+            level: level as u8,
+        })
+    }
+
+    /// Deletes one unreferenced custom rank owned by the named guild. The three required
+    /// provisioned rank levels remain protected so later member creation retains its invariant.
+    pub fn remove_guild_rank(
+        &mut self,
+        guild_id: u64,
+        rank_id: u64,
+    ) -> Result<(), PersistenceError> {
+        let transaction = self.connection.transaction()?;
+        let guild_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guilds WHERE id = ?1)",
+            params![guild_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !guild_exists {
+            return Err(PersistenceError::UnknownGuild(guild_id));
+        }
+        let (rank_guild_id, level) = transaction
+            .query_row(
+                "SELECT guild_id, level FROM guild_ranks WHERE id = ?1",
+                params![rank_id as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or(PersistenceError::GuildRankOutsideGuild { guild_id, rank_id })?;
+        if rank_guild_id as u64 != guild_id {
+            return Err(PersistenceError::GuildRankOutsideGuild { guild_id, rank_id });
+        }
+        if (1..=3).contains(&level) {
+            return Err(PersistenceError::InvalidGuildRecord(
+                "guild required rank levels cannot be deleted".into(),
+            ));
+        }
+        let in_use = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guild_membership WHERE rank_id = ?1)",
+            params![rank_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if in_use {
+            return Err(PersistenceError::GuildRankInUse { guild_id, rank_id });
+        }
+        transaction.execute(
+            "DELETE FROM guild_ranks WHERE id = ?1",
+            params![rank_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn guild_ranks(&self, guild_id: u64) -> Result<Vec<GuildRankRecord>, PersistenceError> {
@@ -2751,6 +2905,15 @@ fn validated_guild_nick(value: &str) -> Result<&str, PersistenceError> {
     Ok(value)
 }
 
+fn validated_guild_rank_name(value: &str) -> Result<&str, PersistenceError> {
+    if value.trim().is_empty() || value.len() > MAX_GUILD_RANK_NAME_BYTES {
+        return Err(PersistenceError::InvalidGuildRecord(format!(
+            "guild rank name must be nonempty and at most {MAX_GUILD_RANK_NAME_BYTES} bytes"
+        )));
+    }
+    Ok(value)
+}
+
 fn sqlite_progression_attempt(value: u64) -> Result<i64, PersistenceError> {
     i64::try_from(value).map_err(|_| {
         PersistenceError::InvalidProgressionAttemptRecord(
@@ -2823,6 +2986,16 @@ pub enum PersistenceError {
     GuildRankOutsideGuild {
         guild_id: u64,
         rank_id: u64,
+    },
+    GuildRankCapExceeded {
+        guild_id: u64,
+    },
+    GuildRankInUse {
+        guild_id: u64,
+        rank_id: u64,
+    },
+    DuplicateGuildRank {
+        guild_id: u64,
     },
 }
 
@@ -3079,6 +3252,135 @@ mod tests {
         ));
         assert!(matches!(
             database.update_guild_member_nick(guild.id, 8, &"x".repeat(MAX_GUILD_NICK_BYTES + 1)),
+            Err(PersistenceError::InvalidGuildRecord(_))
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_bounded_custom_guild_rank_management() {
+        let path = temporary_path("guild-custom-ranks");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        for (id, name) in [(7, "Knight"), (8, "Druid"), (9, "Sorcerer")] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: 1,
+                    name: name.into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let guild = database.create_guild(7, "Forgotten", "Welcome").unwrap();
+        let other = database.create_guild(9, "Other", "").unwrap();
+
+        let officer = database.add_guild_rank(guild.id, "Officer", 4).unwrap();
+        assert_eq!(
+            officer,
+            GuildRankRecord {
+                id: officer.id,
+                guild_id: guild.id,
+                name: "Officer".into(),
+                level: 4,
+            }
+        );
+        assert!(matches!(
+            database.add_guild_rank(guild.id, "Officer", 5),
+            Err(PersistenceError::DuplicateGuildRank { guild_id }) if guild_id == guild.id
+        ));
+        assert!(matches!(
+            database.add_guild_rank(guild.id, "Veteran", 4),
+            Err(PersistenceError::DuplicateGuildRank { guild_id }) if guild_id == guild.id
+        ));
+        assert!(matches!(
+            database.add_guild_rank(guild.id, "", 5),
+            Err(PersistenceError::InvalidGuildRecord(_))
+        ));
+        assert!(matches!(
+            database.add_guild_rank(guild.id, "Zero", 0),
+            Err(PersistenceError::InvalidGuildRecord(_))
+        ));
+
+        assert_eq!(
+            database
+                .rename_guild_rank(guild.id, officer.id, "Steward")
+                .unwrap(),
+            GuildRankRecord {
+                id: officer.id,
+                guild_id: guild.id,
+                name: "Steward".into(),
+                level: 4,
+            }
+        );
+        assert!(matches!(
+            database.rename_guild_rank(guild.id, officer.id, "a Member"),
+            Err(PersistenceError::DuplicateGuildRank { guild_id }) if guild_id == guild.id
+        ));
+        assert!(matches!(
+            database.rename_guild_rank(other.id, officer.id, "Wrong guild"),
+            Err(PersistenceError::GuildRankOutsideGuild { guild_id, rank_id })
+                if guild_id == other.id && rank_id == officer.id
+        ));
+
+        database.add_guild_member(guild.id, 8).unwrap();
+        database
+            .assign_guild_member_rank(guild.id, 8, officer.id)
+            .unwrap();
+        assert!(matches!(
+            database.remove_guild_rank(guild.id, officer.id),
+            Err(PersistenceError::GuildRankInUse { guild_id, rank_id })
+                if guild_id == guild.id && rank_id == officer.id
+        ));
+        let member_rank_id = database
+            .guild_ranks(guild.id)
+            .unwrap()
+            .into_iter()
+            .find(|rank| rank.level == 1)
+            .expect("guild retains its required member rank")
+            .id;
+        database
+            .assign_guild_member_rank(guild.id, 8, member_rank_id)
+            .unwrap();
+        database.remove_guild_rank(guild.id, officer.id).unwrap();
+        assert!(!database
+            .guild_ranks(guild.id)
+            .unwrap()
+            .iter()
+            .any(|rank| rank.id == officer.id));
+        assert!(matches!(
+            database.remove_guild_rank(999, officer.id),
+            Err(PersistenceError::UnknownGuild(999))
+        ));
+
+        for level in 4..=20 {
+            database
+                .add_guild_rank(guild.id, &format!("Rank {level}"), level)
+                .unwrap();
+        }
+        assert_eq!(
+            database.guild_ranks(guild.id).unwrap().len(),
+            MAX_GUILD_RANKS_PER_GUILD
+        );
+        assert!(matches!(
+            database.add_guild_rank(guild.id, "Over cap", 21),
+            Err(PersistenceError::GuildRankCapExceeded { guild_id }) if guild_id == guild.id
+        ));
+        let leader_rank_id = database
+            .guild_ranks(guild.id)
+            .unwrap()
+            .into_iter()
+            .find(|rank| rank.level == 3)
+            .expect("guild keeps its required leader rank")
+            .id;
+        assert!(matches!(
+            database.remove_guild_rank(guild.id, leader_rank_id),
             Err(PersistenceError::InvalidGuildRecord(_))
         ));
         let _ = fs::remove_file(path);
