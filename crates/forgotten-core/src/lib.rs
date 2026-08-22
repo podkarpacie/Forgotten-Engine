@@ -3785,7 +3785,7 @@ impl WorldState {
         if max_range == 0 || max_range > MAX_STATIC_CREATURE_TARGET_RANGE {
             return Err(CoreError::InvalidStaticCreatureTargetRange(max_range));
         }
-        let position = {
+        let (position, is_npc) = {
             let runtime = self
                 .static_creatures
                 .get(&creature_id)
@@ -3793,8 +3793,16 @@ impl WorldState {
             if !runtime.active {
                 return Err(CoreError::InactiveStaticCreature(creature_id));
             }
-            runtime.entity.position
+            (runtime.entity.position, runtime.is_npc)
         };
+        if is_npc {
+            self.clear_static_creature_target(creature_id)?;
+            return Ok(StaticCreatureTargetSelection {
+                creature_id,
+                target_player_id: None,
+                max_range,
+            });
+        }
         let max_range_distance = u16::from(max_range);
         let target_player_id = self
             .players
@@ -3870,7 +3878,7 @@ impl WorldState {
         fallback_damage: u16,
         world_map: &WorldMap,
     ) -> Result<StaticCreatureTargetAttackOutcome, CoreError> {
-        let (source, target_player_id, melee_cooldown_ticks, direct_melee_damage_range) = {
+        let (source, target_player_id, melee_cooldown_ticks, direct_melee_damage_range, is_npc) = {
             let runtime = self
                 .static_creatures
                 .get(&creature_id)
@@ -3889,8 +3897,13 @@ impl WorldState {
                 runtime.target_player_id,
                 runtime.melee_cooldown_ticks,
                 runtime.direct_melee_damage_range,
+                runtime.is_npc,
             )
         };
+        if is_npc {
+            self.clear_static_creature_target(creature_id)?;
+            return Ok(StaticCreatureTargetAttackOutcome::NoTarget);
+        }
         let Some(target_player_id) = target_player_id else {
             return Ok(StaticCreatureTargetAttackOutcome::NoTarget);
         };
@@ -3988,7 +4001,7 @@ impl WorldState {
         world_map: &WorldMap,
         max_detour_steps: u8,
     ) -> Result<StaticCreatureTargetStepOutcome, CoreError> {
-        let (source, target_player_id) = {
+        let (source, target_player_id, is_npc) = {
             let runtime = self
                 .static_creatures
                 .get(&creature_id)
@@ -3996,8 +4009,16 @@ impl WorldState {
             if !runtime.active {
                 return Err(CoreError::InactiveStaticCreature(creature_id));
             }
-            (runtime.entity.position, runtime.target_player_id)
+            (
+                runtime.entity.position,
+                runtime.target_player_id,
+                runtime.is_npc,
+            )
         };
+        if is_npc {
+            self.clear_static_creature_target(creature_id)?;
+            return Ok(StaticCreatureTargetStepOutcome::NoTarget);
+        }
         let Some(target_player_id) = target_player_id else {
             return Ok(StaticCreatureTargetStepOutcome::NoTarget);
         };
@@ -6550,6 +6571,71 @@ mod tests {
                 .unwrap()
                 .eligibility,
             PartySharedExperienceEligibility::TooFarAway
+        );
+    }
+
+    #[test]
+    fn validated_static_npcs_remain_inert_under_monster_target_and_combat_primitives() {
+        let npc_id = 0x4000_0001;
+        let npc_position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        let collection = FeTfsStaticSpawnCollection::with_combat_metadata_and_npc_ids(
+            vec![FeTfsStaticEntity {
+                id: npc_id,
+                name: "Guide".into(),
+                position: npc_position,
+                look_type: 128,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 100,
+                direction: 2,
+            }],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::from([npc_id]),
+        )
+        .unwrap();
+        let mut world = WorldState::default();
+        world.install_static_creatures(&collection).unwrap();
+        world.add_player(party_player(7, "Knight", 100)).unwrap();
+        let map = WorldMap::new(
+            "npc-inert",
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+        );
+
+        assert_eq!(
+            world.select_static_creature_target(npc_id, 8).unwrap(),
+            StaticCreatureTargetSelection {
+                creature_id: npc_id,
+                target_player_id: None,
+                max_range: 8,
+            }
+        );
+        assert_eq!(world.static_creature_target(npc_id), Ok(None));
+        assert_eq!(
+            world.step_static_creature_toward_target(npc_id, &map),
+            Ok(StaticCreatureTargetStepOutcome::NoTarget)
+        );
+        assert_eq!(
+            world.apply_static_creature_target_damage(npc_id, 10, &map),
+            Ok(StaticCreatureTargetAttackOutcome::NoTarget)
+        );
+        assert_eq!(
+            world.static_creature(npc_id).unwrap().position,
+            npc_position
         );
     }
 
