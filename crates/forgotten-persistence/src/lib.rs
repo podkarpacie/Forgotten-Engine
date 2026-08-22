@@ -37,7 +37,8 @@ const SCHEMA_VERSION_GUILD_INVITATIONS: i64 = 19;
 const SCHEMA_VERSION_PLAYER_BANK_BALANCE: i64 = 20;
 const SCHEMA_VERSION_PLAYER_DEPOTS: i64 = 21;
 const SCHEMA_VERSION_PLAYER_INBOX: i64 = 22;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_INBOX;
+const SCHEMA_VERSION_HOUSE_OWNERSHIP: i64 = 23;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_HOUSE_OWNERSHIP;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 pub const MAX_VIP_DESCRIPTION_BYTES: usize = 128;
@@ -138,6 +139,14 @@ pub struct GuildInvitationRecord {
 pub struct PlayerDepotRecord {
     pub depot_id: u8,
     pub items: Vec<ItemInstance>,
+}
+
+/// One durable owner assignment for a nonzero TFS-shaped house identity. Map-house binding,
+/// rent, access lists, doors, beds, auctions, and tile contents remain outside this storage slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HouseOwnershipRecord {
+    pub house_id: u32,
+    pub owner_player_id: u64,
 }
 
 /// The complete accepted authoritative state that must be persisted together after a bounded
@@ -2804,6 +2813,59 @@ impl EngineDatabase {
         Ok(items)
     }
 
+    /// Assigns or clears the durable owner of one nonzero house identity. The selected owner must
+    /// be a persisted player. This has no map, rent, access-list, auction, or client side effect.
+    pub fn set_house_owner(
+        &mut self,
+        house_id: u32,
+        owner_player_id: Option<u64>,
+    ) -> Result<(), PersistenceError> {
+        validated_house_id(house_id)?;
+        if let Some(owner_player_id) = owner_player_id {
+            self.ensure_player_exists(owner_player_id)?;
+            self.connection.execute(
+                "INSERT INTO house_ownership (house_id, owner_player_id) VALUES (?1, ?2) ON CONFLICT(house_id) DO UPDATE SET owner_player_id=excluded.owner_player_id",
+                params![i64::from(house_id), owner_player_id as i64],
+            )?;
+        } else {
+            self.connection.execute(
+                "DELETE FROM house_ownership WHERE house_id = ?1",
+                params![i64::from(house_id)],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Returns the durable owner assignment for one nonzero house identity. An absent row is the
+    /// explicit unowned state; malformed or stale raw owner data is rejected.
+    pub fn house_owner(
+        &self,
+        house_id: u32,
+    ) -> Result<Option<HouseOwnershipRecord>, PersistenceError> {
+        validated_house_id(house_id)?;
+        let owner_player_id = self
+            .connection
+            .query_row(
+                "SELECT owner_player_id FROM house_ownership WHERE house_id = ?1",
+                params![i64::from(house_id)],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(owner_player_id) = owner_player_id else {
+            return Ok(None);
+        };
+        let owner_player_id = u64::try_from(owner_player_id).map_err(|_| {
+            PersistenceError::InvalidHouseOwnershipRecord(
+                "owner player ID must be a nonnegative u64".into(),
+            )
+        })?;
+        self.ensure_player_exists(owner_player_id)?;
+        Ok(Some(HouseOwnershipRecord {
+            house_id,
+            owner_player_id,
+        }))
+    }
+
     pub fn record_event(&self, level: &str, message: &str) -> Result<(), PersistenceError> {
         self.connection.execute(
             "INSERT INTO engine_events (level, message, created_at) VALUES (?1, ?2, ?3)",
@@ -3324,6 +3386,15 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_PLAYER_INBOX, unix_seconds()],
             )?;
         }
+        if self.schema_version()? < SCHEMA_VERSION_HOUSE_OWNERSHIP {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS house_ownership (house_id INTEGER PRIMARY KEY, owner_player_id INTEGER NOT NULL);",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_HOUSE_OWNERSHIP, unix_seconds()],
+            )?;
+        }
         Ok(())
     }
 
@@ -3610,6 +3681,15 @@ fn validate_player_inbox_items(items: &[ItemInstance]) -> Result<(), Persistence
     Ok(())
 }
 
+fn validated_house_id(house_id: u32) -> Result<(), PersistenceError> {
+    if house_id == 0 {
+        return Err(PersistenceError::InvalidHouseOwnershipRecord(
+            "house ID must be nonzero".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn player_skills_from_record(record: [i64; 14]) -> Result<PlayerSkills, PersistenceError> {
     let mut skills = PlayerSkills::default();
     for skill in PlayerSkill::ALL {
@@ -3753,6 +3833,7 @@ pub enum PersistenceError {
     InvalidBankBalanceRecord(String),
     InvalidDepotRecord(String),
     InvalidInboxRecord(String),
+    InvalidHouseOwnershipRecord(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
     UnknownGuild(u64),
@@ -5681,6 +5762,72 @@ mod tests {
         assert!(matches!(
             database.player_inbox(999),
             Err(PersistenceError::UnknownPlayer(999))
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_bounded_house_ownership_assignments() {
+        let path = temporary_path("house-ownership");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        assert_eq!(database.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        let account_id = database.create_account("admin", "hash").unwrap();
+        for (id, name) in [(7, "Knight"), (8, "Druid")] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: account_id as u64,
+                    name: name.into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(database.house_owner(42).unwrap(), None);
+        database.set_house_owner(42, Some(7)).unwrap();
+        assert_eq!(
+            database.house_owner(42).unwrap(),
+            Some(HouseOwnershipRecord {
+                house_id: 42,
+                owner_player_id: 7,
+            })
+        );
+        database.set_house_owner(42, Some(8)).unwrap();
+        assert_eq!(
+            database.house_owner(42).unwrap(),
+            Some(HouseOwnershipRecord {
+                house_id: 42,
+                owner_player_id: 8,
+            })
+        );
+        database.set_house_owner(42, None).unwrap();
+        assert_eq!(database.house_owner(42).unwrap(), None);
+
+        assert!(matches!(
+            database.set_house_owner(0, Some(7)),
+            Err(PersistenceError::InvalidHouseOwnershipRecord(_))
+        ));
+        assert!(matches!(
+            database.set_house_owner(42, Some(999)),
+            Err(PersistenceError::UnknownPlayer(999))
+        ));
+        database
+            .connection
+            .execute(
+                "INSERT INTO house_ownership (house_id, owner_player_id) VALUES (?1, ?2)",
+                params![0_i64, 7_i64],
+            )
+            .unwrap();
+        assert!(matches!(
+            database.house_owner(0),
+            Err(PersistenceError::InvalidHouseOwnershipRecord(_))
         ));
         let _ = fs::remove_file(path);
     }
