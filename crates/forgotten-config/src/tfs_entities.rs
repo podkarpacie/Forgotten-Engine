@@ -2,6 +2,7 @@ use crate::legacy_xml::{LegacySpawnKind, LegacyWorldCompanionData};
 use crate::{ConfigError, EngineConfig};
 use forgotten_core::{
     FeTfsStaticEntity, FeTfsStaticSpawnCollection, StaticCreatureDirectMeleeDamageRange,
+    StaticCreatureSpawnArea,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
@@ -149,6 +150,7 @@ pub fn materialize_tfs_static_spawns(
     let mut direct_melee_intervals_millis = BTreeMap::new();
     let mut direct_melee_damage_ranges = BTreeMap::new();
     let mut npc_ids = BTreeSet::new();
+    let mut monster_spawn_areas = BTreeMap::new();
     let mut next_id = STATIC_TFS_ENTITY_ID_START;
     for spawn_area in &companions.spawns {
         for creature in &spawn_area.creatures {
@@ -173,6 +175,13 @@ pub fn materialize_tfs_static_spawns(
                 experience_rewards.insert(next_id, definition.experience);
             }
             if matches!(definition.kind, TfsEntityKind::Monster) {
+                monster_spawn_areas.insert(
+                    next_id,
+                    StaticCreatureSpawnArea {
+                        center: spawn_area.center,
+                        radius: spawn_area.radius,
+                    },
+                );
                 if let Some(direct_melee) = definition.direct_melee {
                     direct_melee_intervals_millis.insert(next_id, direct_melee.interval_millis);
                     direct_melee_damage_ranges.insert(
@@ -227,6 +236,7 @@ pub fn materialize_tfs_static_spawns(
         direct_melee_damage_ranges,
         npc_ids,
     )
+    .and_then(|collection| collection.with_monster_spawn_areas(monster_spawn_areas))
     .map_err(|error| invalid(format!("invalid static TFS spawn collection: {error}")))
 }
 

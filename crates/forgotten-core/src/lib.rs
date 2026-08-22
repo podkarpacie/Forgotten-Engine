@@ -122,6 +122,7 @@ pub struct FeTfsStaticSpawnCollection {
     direct_melee_intervals_millis: BTreeMap<u32, u32>,
     direct_melee_damage_ranges: BTreeMap<u32, StaticCreatureDirectMeleeDamageRange>,
     npc_ids: BTreeSet<u32>,
+    monster_spawn_areas: BTreeMap<u32, StaticCreatureSpawnArea>,
 }
 
 /// Bounded non-negative direct-melee damage values materialized from one legacy monster
@@ -131,6 +132,23 @@ pub struct FeTfsStaticSpawnCollection {
 pub struct StaticCreatureDirectMeleeDamageRange {
     pub min_damage: u16,
     pub max_damage: u16,
+}
+
+/// The validated rectangular legacy spawn area which owns one materialized monster. This is
+/// immutable import metadata; spectator flags, chance selection, rates, and event hooks remain
+/// outside the bounded reactivation model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticCreatureSpawnArea {
+    pub center: Position,
+    pub radius: u16,
+}
+
+impl StaticCreatureSpawnArea {
+    fn contains(self, position: Position) -> bool {
+        position.z == self.center.z
+            && position.x.abs_diff(self.center.x) <= self.radius
+            && position.y.abs_diff(self.center.y) <= self.radius
+    }
 }
 
 impl FeTfsStaticSpawnCollection {
@@ -255,7 +273,33 @@ impl FeTfsStaticSpawnCollection {
             direct_melee_intervals_millis,
             direct_melee_damage_ranges,
             npc_ids,
+            monster_spawn_areas: BTreeMap::new(),
         })
+    }
+
+    /// Attaches one validated owning area only to materialized monster IDs. NPC reactivation
+    /// remains deliberately outside this bounded lifecycle slice.
+    pub fn with_monster_spawn_areas(
+        mut self,
+        monster_spawn_areas: BTreeMap<u32, StaticCreatureSpawnArea>,
+    ) -> Result<Self, CoreError> {
+        let ids = self
+            .entities
+            .iter()
+            .map(|entity| entity.id)
+            .collect::<BTreeSet<_>>();
+        if monster_spawn_areas
+            .keys()
+            .any(|id| !ids.contains(id) || self.npc_ids.contains(id))
+        {
+            return Err(CoreError::UnknownStaticCreatureSchedule);
+        }
+        self.monster_spawn_areas = monster_spawn_areas;
+        Ok(self)
+    }
+
+    pub fn monster_spawn_area(&self, id: u32) -> Option<StaticCreatureSpawnArea> {
+        self.monster_spawn_areas.get(&id).copied()
     }
 
     pub fn respawn_interval_seconds(&self, id: u32) -> u32 {
@@ -413,6 +457,7 @@ struct StaticCreatureRuntime {
     is_npc: bool,
     experience_reward: u64,
     spawn_position: Position,
+    monster_spawn_area: Option<StaticCreatureSpawnArea>,
     active: bool,
     health_percent: u8,
     activated_at_tick: u64,
@@ -3449,6 +3494,7 @@ impl WorldState {
                         is_npc: collection.is_npc(entity.id),
                         experience_reward: collection.experience_reward(entity.id),
                         spawn_position: entity.position,
+                        monster_spawn_area: collection.monster_spawn_area(entity.id),
                         active: true,
                         health_percent: entity.health_percent,
                         activated_at_tick: self.tick,
@@ -3770,6 +3816,7 @@ impl WorldState {
                 .filter(|(_, runtime)| runtime.active && runtime.is_npc)
                 .map(|(id, _)| *id)
                 .collect(),
+            monster_spawn_areas: BTreeMap::new(),
         }
     }
 
@@ -4403,7 +4450,13 @@ impl WorldState {
             if self.tick < reactivation_due_tick {
                 continue;
             }
-            if player_positions.contains(&runtime.spawn_position) {
+            let player_blocks_spawn = player_positions.contains(&runtime.spawn_position)
+                || runtime.monster_spawn_area.is_some_and(|area| {
+                    player_positions
+                        .iter()
+                        .any(|position| area.contains(*position))
+                });
+            if player_blocks_spawn {
                 summary.deferred_by_player_occupancy += 1;
                 runtime.reactivation_due_tick = Some(
                     self.tick
@@ -9335,6 +9388,64 @@ mod tests {
                 deferred_by_player_occupancy: 0,
                 deferred_by_static_creature_occupancy: 0,
             }
+        );
+    }
+
+    #[test]
+    fn monster_due_reactivation_is_blocked_by_a_player_inside_its_retained_spawn_area() {
+        let creature_id = 0x4000_0001;
+        let spawn_position = Position {
+            x: 105,
+            y: 100,
+            z: 7,
+        };
+        let creature = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            position: spawn_position,
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let collection = FeTfsStaticSpawnCollection::with_respawn_intervals(
+            vec![creature],
+            BTreeMap::from([(creature_id, 3)]),
+        )
+        .unwrap()
+        .with_monster_spawn_areas(BTreeMap::from([(
+            creature_id,
+            StaticCreatureSpawnArea {
+                center: spawn_position,
+                radius: 5,
+            },
+        )]))
+        .unwrap();
+        let mut world = WorldState::default();
+        world.install_static_creatures(&collection).unwrap();
+        world.add_player(player()).unwrap();
+        world.deactivate_static_creature(creature_id).unwrap();
+        world.advance_ticks(3);
+
+        assert_eq!(
+            world.reactivate_due_static_creatures(),
+            StaticCreatureResetSummary {
+                reactivated: 0,
+                deferred_by_player_occupancy: 1,
+                deferred_by_static_creature_occupancy: 0,
+            }
+        );
+        assert_eq!(
+            world
+                .static_creature_lifecycle(creature_id)
+                .unwrap()
+                .reactivation_due_tick,
+            Some(6)
         );
     }
 

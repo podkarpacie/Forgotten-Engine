@@ -31,6 +31,8 @@ The declared social credit now includes a session-local party shared-experience 
 
 The declared creature credit now also prevents validated static NPCs from inheriting FE's bounded monster target, pursuit, direct-melee, or player-selected static-melee routes. This is a safety boundary, not NPC AI; scripts, focus, shops, travel, combat, and full NPC behavior remain unimplemented.
 
+The declared creature credit now includes a bounded monster spawn-area reactivation blocker. FE retains each imported monster's owning center and radius, then postpones an otherwise due reactivation if a live player remains in that same-floor rectangle. It does not implement TFS spectator flags, bypasses, chance selection, rate caps, hooks, or placement policy.
+
 The declared item credit now also includes one complete source-map compatible-stack merge into an owned top-level container. It remains a single exact source identity removal with durable journal recovery, not a partial stack or generic ground-transfer system.
 
 The same declared item credit now includes an equivalent complete compatible-stack merge into a requested equipment slot. It accepts only an empty slot or one matching bounded destination stack, and keeps incompatible or overflowing occupied slots unchanged.
