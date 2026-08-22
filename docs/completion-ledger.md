@@ -25,6 +25,8 @@ The declared progression credit now also includes a narrowly bounded persisted w
 
 The declared progression credit now also includes one authenticated bounded declarative spell command. It consumes a catalog-defined mana cost, applies only the configured `rateMagic` multiplier to magic-level progress, and commits mana plus exact progression attempts together. It does not credit TFS spell words, parameters, targets, effects, runes, potions, Lua, or full spell behavior.
 
+The declared creature credit now includes one bounded static-NPC dialogue source. It preserves NPC identity by materialized static ID, resolves a sanitized exact keyword only for one active same-floor NPC within two tiles, and uses the existing parser-backed speech record only for the speaking player. It does not credit NPC Lua scripts, focus, shops, transactions, travel, quests, or broader dialogue behavior.
+
 The declared item credit now also includes one complete source-map compatible-stack merge into an owned top-level container. It remains a single exact source identity removal with durable journal recovery, not a partial stack or generic ground-transfer system.
 
 The same declared item credit now includes an equivalent complete compatible-stack merge into a requested equipment slot. It accepts only an empty slot or one matching bounded destination stack, and keeps incompatible or overflowing occupied slots unchanged.

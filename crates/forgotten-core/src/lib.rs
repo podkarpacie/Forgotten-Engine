@@ -121,6 +121,7 @@ pub struct FeTfsStaticSpawnCollection {
     experience_rewards: BTreeMap<u32, u64>,
     direct_melee_intervals_millis: BTreeMap<u32, u32>,
     direct_melee_damage_ranges: BTreeMap<u32, StaticCreatureDirectMeleeDamageRange>,
+    npc_ids: BTreeSet<u32>,
 }
 
 /// Bounded non-negative direct-melee damage values materialized from one legacy monster
@@ -189,6 +190,26 @@ impl FeTfsStaticSpawnCollection {
         direct_melee_intervals_millis: BTreeMap<u32, u32>,
         direct_melee_damage_ranges: BTreeMap<u32, StaticCreatureDirectMeleeDamageRange>,
     ) -> Result<Self, CoreError> {
+        Self::with_combat_metadata_and_npc_ids(
+            entities,
+            respawn_intervals_seconds,
+            experience_rewards,
+            direct_melee_intervals_millis,
+            direct_melee_damage_ranges,
+            BTreeSet::new(),
+        )
+    }
+
+    /// Retains authoritative NPC identity by materialized static ID. It does not attach dialogue,
+    /// scripts, shops, travel, or mutable conversation state to any entity.
+    pub fn with_combat_metadata_and_npc_ids(
+        entities: Vec<FeTfsStaticEntity>,
+        respawn_intervals_seconds: BTreeMap<u32, u32>,
+        experience_rewards: BTreeMap<u32, u64>,
+        direct_melee_intervals_millis: BTreeMap<u32, u32>,
+        direct_melee_damage_ranges: BTreeMap<u32, StaticCreatureDirectMeleeDamageRange>,
+        npc_ids: BTreeSet<u32>,
+    ) -> Result<Self, CoreError> {
         if entities.len() > MAX_TFS_STATIC_SPAWNS {
             return Err(CoreError::StaticSpawnLimit(MAX_TFS_STATIC_SPAWNS));
         }
@@ -224,12 +245,16 @@ impl FeTfsStaticSpawnCollection {
         {
             return Err(CoreError::UnknownStaticCreatureSchedule);
         }
+        if npc_ids.iter().any(|id| !ids.contains(id)) {
+            return Err(CoreError::UnknownStaticCreatureSchedule);
+        }
         Ok(Self {
             entities,
             respawn_intervals_seconds,
             experience_rewards,
             direct_melee_intervals_millis,
             direct_melee_damage_ranges,
+            npc_ids,
         })
     }
 
@@ -256,6 +281,10 @@ impl FeTfsStaticSpawnCollection {
         id: u32,
     ) -> Option<StaticCreatureDirectMeleeDamageRange> {
         self.direct_melee_damage_ranges.get(&id).copied()
+    }
+
+    pub fn is_npc(&self, id: u32) -> bool {
+        self.npc_ids.contains(&id)
     }
 
     pub fn at(&self, position: Position) -> impl Iterator<Item = &FeTfsStaticEntity> {
@@ -381,6 +410,7 @@ pub struct StaticCreatureDecisionBatch {
 #[derive(Debug, Clone)]
 struct StaticCreatureRuntime {
     entity: FeTfsStaticEntity,
+    is_npc: bool,
     experience_reward: u64,
     spawn_position: Position,
     active: bool,
@@ -3236,6 +3266,7 @@ impl WorldState {
                     entity.id,
                     StaticCreatureRuntime {
                         entity: entity.clone(),
+                        is_npc: collection.is_npc(entity.id),
                         experience_reward: collection.experience_reward(entity.id),
                         spawn_position: entity.position,
                         active: true,
@@ -3552,6 +3583,12 @@ impl WorldState {
                         .then_some(runtime.direct_melee_damage_range.map(|range| (*id, range)))
                         .flatten()
                 })
+                .collect(),
+            npc_ids: self
+                .static_creatures
+                .iter()
+                .filter(|(_, runtime)| runtime.active && runtime.is_npc)
+                .map(|(id, _)| *id)
                 .collect(),
         }
     }

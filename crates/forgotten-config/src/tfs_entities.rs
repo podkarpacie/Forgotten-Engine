@@ -148,6 +148,7 @@ pub fn materialize_tfs_static_spawns(
     let mut experience_rewards = BTreeMap::new();
     let mut direct_melee_intervals_millis = BTreeMap::new();
     let mut direct_melee_damage_ranges = BTreeMap::new();
+    let mut npc_ids = BTreeSet::new();
     let mut next_id = STATIC_TFS_ENTITY_ID_START;
     for spawn_area in &companions.spawns {
         for creature in &spawn_area.creatures {
@@ -182,6 +183,8 @@ pub fn materialize_tfs_static_spawns(
                         },
                     );
                 }
+            } else {
+                npc_ids.insert(next_id);
             }
             let health_percent = match appearance.current_health {
                 Some(current_health) if current_health > appearance.max_health => {
@@ -216,12 +219,13 @@ pub fn materialize_tfs_static_spawns(
                 .ok_or_else(|| invalid("static TFS spawn identifier range is exhausted"))?;
         }
     }
-    FeTfsStaticSpawnCollection::with_combat_metadata(
+    FeTfsStaticSpawnCollection::with_combat_metadata_and_npc_ids(
         entities,
         respawn_intervals_seconds,
         experience_rewards,
         direct_melee_intervals_millis,
         direct_melee_damage_ranges,
+        npc_ids,
     )
     .map_err(|error| invalid(format!("invalid static TFS spawn collection: {error}")))
 }

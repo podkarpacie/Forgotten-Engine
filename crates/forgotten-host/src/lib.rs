@@ -3,8 +3,8 @@
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
 use forgotten_config::{
-    DeclarativeSpellCatalog, DeclarativeWeaponCatalog, LegacyItemSlotType,
-    LegacyPublicChannelCatalog, WorldType,
+    DeclarativeNpcDialogueCatalog, DeclarativeSpellCatalog, DeclarativeWeaponCatalog,
+    LegacyItemSlotType, LegacyPublicChannelCatalog, WorldType,
 };
 use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
@@ -93,6 +93,7 @@ const MAX_EMPTY_WORLD_MOVES_PER_SESSION: usize = 64;
 const NATIVE_OTCLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const NATIVE_OTCLIENT_HEARTBEAT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_NATIVE_OTCLIENT_LOGIN_VIP_ENTRIES: usize = 128;
+const MAX_NATIVE_STATIC_NPC_DIALOGUE_RANGE: u16 = 2;
 const NATIVE_OTCLIENT_DEFAULT_GROUND_SPEED: u64 = 150;
 const NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY: Duration = Duration::from_secs(2);
 const DEFAULT_NATIVE_ARMOR_MULTIPLIER_MILLI: u32 = 1_000;
@@ -1119,6 +1120,9 @@ pub struct NativeOtClientHostConfig {
     /// Optional operator-owned scriptless spell catalog. It is retained as immutable input for a
     /// future profile-approved cast path and does not enable client spell invocation by itself.
     pub declarative_spell_catalog: Option<Arc<DeclarativeSpellCatalog>>,
+    /// Optional operator-owned exact static-NPC dialogue catalog. Until the bounded proximity
+    /// resolver is enabled, this validated data remains inert and cannot execute scripts.
+    pub declarative_npc_dialogue_catalog: Option<Arc<DeclarativeNpcDialogueCatalog>>,
 }
 
 #[derive(Debug, Clone)]
@@ -7266,6 +7270,39 @@ fn handle_native_otclient_game(
                     config.extended_diagnostics,
                     peer,
                 )?;
+                if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
+                    && request.channel_id.is_none()
+                    && request.recipient.is_none()
+                {
+                    if let Some(catalog) = config.declarative_npc_dialogue_catalog.as_deref() {
+                        if let Some((npc_id, npc_name, npc_position, text)) =
+                            resolve_native_static_npc_dialogue(
+                                shared_world,
+                                character.id,
+                                catalog,
+                                &request.message,
+                            )?
+                        {
+                            let record = encode_native_otclient_public_say(
+                                &config.client_profile,
+                                &npc_name,
+                                npc_position,
+                                &text,
+                            )
+                            .map_err(HostError::Protocol)?;
+                            write_frame(stream, &record)?;
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "outbound=npc-dialogue opcode=0xaa mode=1 npc-id={} text-bytes={}",
+                                    npc_id,
+                                    text.len()
+                                ),
+                            );
+                        }
+                    }
+                }
             }
             NativeOtClientGameAction::LeaveGame => break,
             NativeOtClientGameAction::Stop => {
@@ -8397,6 +8434,53 @@ fn native_declarative_spell_command_id(message: &str) -> Option<u16> {
     (spell_id != 0).then_some(spell_id)
 }
 
+/// Resolves one exact, normalized public-speech keyword against the closest active validated NPC
+/// in the bounded same-floor dialogue range. The result is stateless: it does not create focus,
+/// parameters, quest progress, shops, travel, or a Lua callback.
+fn resolve_native_static_npc_dialogue(
+    shared_world: &SharedNativeWorld,
+    player_id: u64,
+    catalog: &DeclarativeNpcDialogueCatalog,
+    message: &str,
+) -> Result<Option<(u32, String, NativeOtClientPosition, String)>, HostError> {
+    let keyword = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if keyword.is_empty() || !keyword.is_ascii() {
+        return Ok(None);
+    }
+    let world = shared_world.lock()?;
+    let player = world
+        .player(player_id)
+        .ok_or(forgotten_core::CoreError::UnknownPlayer(player_id))
+        .map_err(HostError::Core)?;
+    let active_spawns = world.active_static_spawn_collection();
+    Ok(active_spawns
+        .entities
+        .iter()
+        .filter(|entity| active_spawns.is_npc(entity.id))
+        .filter(|entity| entity.position.z == player.position.z)
+        .filter_map(|entity| {
+            let distance = entity
+                .position
+                .x
+                .abs_diff(player.position.x)
+                .max(entity.position.y.abs_diff(player.position.y));
+            if distance > MAX_NATIVE_STATIC_NPC_DIALOGUE_RANGE {
+                return None;
+            }
+            catalog.get(&entity.name, &keyword).map(|response| {
+                (
+                    distance,
+                    entity.id,
+                    entity.name.clone(),
+                    native_position(entity.position),
+                    response.text.clone(),
+                )
+            })
+        })
+        .min_by_key(|(distance, id, _, _, _)| (*distance, *id))
+        .map(|(_, id, name, position, text)| (id, name, position, text)))
+}
+
 /// Applies a catalog-backed spell cast and rate-scaled magic progression under the same shared
 /// world lock, then durably persists the resulting mana, magic level, and exact progression
 /// attempts in one SQLite transaction before publishing the vital refresh epoch.
@@ -9277,7 +9361,8 @@ impl std::error::Error for HostError {}
 mod tests {
     use super::*;
     use forgotten_config::{
-        parse_declarative_spells_xml, parse_declarative_weapons_xml, parse_tfs_public_channels_xml,
+        parse_declarative_npc_dialogue_xml, parse_declarative_spells_xml,
+        parse_declarative_weapons_xml, parse_tfs_public_channels_xml,
     };
     use forgotten_core::{Player, Position, WorldMapTile};
     use forgotten_protocol::FE_7_4_PROFILE;
@@ -9367,7 +9452,108 @@ mod tests {
             death_loss_policy: DeathLossPolicy::DefaultFormula,
             declarative_weapon_catalog: None,
             declarative_spell_catalog: None,
+            declarative_npc_dialogue_catalog: None,
         }
+    }
+
+    #[test]
+    fn native_static_npc_dialogue_requires_one_active_nearby_validated_npc() {
+        let map = native_world_map();
+        let monster_id = 0x4000_0001;
+        let npc_id = 0x4000_0002;
+        let collection = FeTfsStaticSpawnCollection::with_combat_metadata_and_npc_ids(
+            vec![
+                forgotten_core::FeTfsStaticEntity {
+                    id: monster_id,
+                    name: "Guide".into(),
+                    position: Position {
+                        x: 102,
+                        y: 100,
+                        z: 7,
+                    },
+                    look_type: 21,
+                    head: 0,
+                    body: 0,
+                    legs: 0,
+                    feet: 0,
+                    addons: 0,
+                    speed: 134,
+                    health_percent: 100,
+                    direction: 2,
+                },
+                forgotten_core::FeTfsStaticEntity {
+                    id: npc_id,
+                    name: "Guide".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    look_type: 128,
+                    head: 0,
+                    body: 0,
+                    legs: 0,
+                    feet: 0,
+                    addons: 0,
+                    speed: 134,
+                    health_percent: 100,
+                    direction: 2,
+                },
+            ],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::from([npc_id]),
+        )
+        .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&collection)).unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 109,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                &map,
+            )
+            .unwrap();
+        let catalog = parse_declarative_npc_dialogue_xml(
+            br#"<fe-npc-dialogues><npc name="Guide"><response keyword="hi" text="Welcome, traveler."/></npc></fe-npc-dialogues>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_native_static_npc_dialogue(&shared, 109, &catalog, "  hi\t").unwrap(),
+            Some((
+                npc_id,
+                "Guide".into(),
+                NativeOtClientPosition {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                "Welcome, traveler.".into(),
+            ))
+        );
+        assert!(
+            resolve_native_static_npc_dialogue(&shared, 109, &catalog, "trade")
+                .unwrap()
+                .is_none()
+        );
+        shared
+            .lock()
+            .unwrap()
+            .deactivate_static_creature(npc_id)
+            .unwrap();
+        assert!(
+            resolve_native_static_npc_dialogue(&shared, 109, &catalog, "hi")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

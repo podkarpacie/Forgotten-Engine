@@ -6,6 +6,7 @@
 mod channels;
 mod items;
 mod legacy_xml;
+mod npc_dialogue;
 mod otbm;
 mod spells;
 mod stages;
@@ -33,6 +34,10 @@ pub use channels::{
 pub use items::{LegacyItemCatalog, LegacyItemDefinition, LegacyItemSlotType};
 pub use legacy_xml::{
     LegacyHouse, LegacySpawnArea, LegacySpawnCreature, LegacySpawnKind, LegacyWorldCompanionData,
+};
+pub use npc_dialogue::{
+    load_declarative_npc_dialogue_catalog, parse_declarative_npc_dialogue_xml,
+    DeclarativeNpcDialogueCatalog, DeclarativeNpcDialogueResponse,
 };
 pub use spells::{
     load_declarative_spell_catalog, parse_declarative_spells_xml, DeclarativeSpellCatalog,

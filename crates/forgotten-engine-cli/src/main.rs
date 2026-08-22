@@ -1,12 +1,13 @@
 use forgotten_config::{
-    apply_legacy_item_metadata, ensure_content_skeleton, load, load_declarative_spell_catalog,
+    apply_legacy_item_metadata, ensure_content_skeleton, load,
+    load_declarative_npc_dialogue_catalog, load_declarative_spell_catalog,
     load_declarative_weapon_catalog, load_legacy_item_catalog, load_tfs_content_inventory,
     load_tfs_entity_catalog, load_tfs_public_channel_catalog, load_tfs_vocation_registry,
     load_world_companions, load_world_map, materialize_tfs_static_spawns,
     resolve_tfs_registry_script_reference, resolve_tfs_spawn_references, validate_content,
-    world_map_path, write_template, DeclarativeSpellCatalog, DeclarativeWeaponCatalog,
-    EngineConfig, LegacyPublicChannelCatalog, LegacyWorldCompanionData, TfsEntityCatalog,
-    TfsRegistryCategory, TfsVocationRegistry,
+    world_map_path, write_template, DeclarativeNpcDialogueCatalog, DeclarativeSpellCatalog,
+    DeclarativeWeaponCatalog, EngineConfig, LegacyPublicChannelCatalog, LegacyWorldCompanionData,
+    TfsEntityCatalog, TfsRegistryCategory, TfsVocationRegistry,
 };
 use forgotten_core::{
     DeathLossPolicy, EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
@@ -87,6 +88,7 @@ struct IndependentNativeStartupContent {
     public_channel_catalog: Option<LegacyPublicChannelCatalog>,
     declarative_weapon_catalog: Option<DeclarativeWeaponCatalog>,
     declarative_spell_catalog: Option<DeclarativeSpellCatalog>,
+    declarative_npc_dialogue_catalog: Option<DeclarativeNpcDialogueCatalog>,
 }
 
 /// Loads only configuration-independent native content in scoped worker threads. Results are
@@ -106,6 +108,8 @@ fn load_independent_native_startup_content(
             let declarative_weapon_catalog =
                 scope.spawn(|| load_declarative_weapon_catalog(config));
             let declarative_spell_catalog = scope.spawn(|| load_declarative_spell_catalog(config));
+            let declarative_npc_dialogue_catalog =
+                scope.spawn(|| load_declarative_npc_dialogue_catalog(config));
 
             let companions = companions
                 .join()
@@ -125,6 +129,9 @@ fn load_independent_native_startup_content(
             let declarative_spell_catalog = declarative_spell_catalog
                 .join()
                 .map_err(|_| "spell catalog loader worker panicked")??;
+            let declarative_npc_dialogue_catalog = declarative_npc_dialogue_catalog
+                .join()
+                .map_err(|_| "NPC dialogue catalog loader worker panicked")??;
             Ok(IndependentNativeStartupContent {
                 companions,
                 entity_catalog,
@@ -132,6 +139,7 @@ fn load_independent_native_startup_content(
                 public_channel_catalog,
                 declarative_weapon_catalog,
                 declarative_spell_catalog,
+                declarative_npc_dialogue_catalog,
             })
         },
     )
@@ -596,6 +604,7 @@ fn run_host(
         let public_channel_catalog = startup_content.public_channel_catalog.map(Arc::new);
         let declarative_weapon_catalog = startup_content.declarative_weapon_catalog;
         let declarative_spell_catalog = startup_content.declarative_spell_catalog;
+        let declarative_npc_dialogue_catalog = startup_content.declarative_npc_dialogue_catalog;
         let regeneration_rules = vocation_registry
             .as_ref()
             .map(|registry| {
@@ -668,6 +677,13 @@ fn run_host(
                 catalog.len()
             );
         }
+        let declarative_npc_dialogue_catalog = declarative_npc_dialogue_catalog.map(Arc::new);
+        if let Some(catalog) = &declarative_npc_dialogue_catalog {
+            println!(
+                "> Loaded {} bounded declarative NPC dialogue responses; runtime delivery remains limited to the native proximity foundation.",
+                catalog.len()
+            );
+        }
         if let Some(catalog) = &public_channel_catalog {
             println!(
                 "> Loaded {} public TFS channel definitions; joining, messages, membership, scripts, and moderation remain deferred.",
@@ -721,6 +737,7 @@ fn run_host(
             death_loss_policy,
             declarative_weapon_catalog,
             declarative_spell_catalog,
+            declarative_npc_dialogue_catalog,
         })
     } else {
         None
