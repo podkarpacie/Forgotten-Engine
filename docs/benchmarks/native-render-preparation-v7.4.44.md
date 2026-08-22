@@ -156,3 +156,15 @@ The ordered pool is a validated bounded snapshot-publication boundary, **not** a
 server-speed improvement. It remains disconnected from the listener. Future work must still measure
 real queue saturation, lock holds, action latency, memory, socket writes, and authoritative command
 application under a production-like workload.
+
+## Ordered Publication-Pool Rerun — 2026-08-22
+
+The same ignored release benchmark was rerun with its fixed nine samples, 500 batches per sample,
+and three immutable publications per batch. Direct preparation had a median total of **41,206 µs**.
+The bounded ordered pool had a median total of **57,015 µs**, or **1.383×** the direct median.
+Every batch remained byte-identical to direct output and the benchmark passed.
+
+The rerun confirms that this small fixed publication workload remains slower after queueing, worker
+synchronization, and ordered collection. It does not justify live listener integration and does not
+claim end-to-end multi-client throughput, tail latency, memory use, or larger heterogeneous-workload
+benefit.
