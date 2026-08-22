@@ -1254,6 +1254,56 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             println!("updated player town player-id={player_id} town-id={town_id}");
             Ok(())
         }
+        "bank" => {
+            if !(arguments.len() == 5 || arguments.len() == 6) {
+                return Err(
+                    "usage: player bank <directory> <player-id> <get|set|credit|debit> [amount]"
+                        .into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let bank_action = arguments
+                .get(4)
+                .map(String::as_str)
+                .ok_or("a player bank action is required")?;
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            match bank_action {
+                "get" if arguments.len() == 5 => {
+                    let balance = database.player_bank_balance(player_id)?;
+                    println!("player bank player-id={player_id} balance={balance}");
+                    Ok(())
+                }
+                "set" | "credit" | "debit" if arguments.len() == 6 => {
+                    let amount = arguments
+                        .get(5)
+                        .ok_or("a bank amount is required")?
+                        .parse::<u64>()
+                        .map_err(|_| "bank amount must be an unsigned 64-bit integer")?;
+                    let balance = match bank_action {
+                        "set" => {
+                            database.set_player_bank_balance(player_id, amount)?;
+                            amount
+                        }
+                        "credit" => database.credit_player_bank_balance(player_id, amount)?,
+                        "debit" => database.debit_player_bank_balance(player_id, amount)?,
+                        _ => unreachable!("bank action matched above"),
+                    };
+                    println!(
+                        "updated player bank player-id={player_id} action={bank_action} amount={amount} balance={balance}"
+                    );
+                    Ok(())
+                }
+                "get" => Err("usage: player bank <directory> <player-id> get".into()),
+                "set" | "credit" | "debit" => Err(
+                    "usage: player bank <directory> <player-id> <set|credit|debit> <amount>".into(),
+                ),
+                unsupported => {
+                    Err(format!("unsupported player bank action `{unsupported}`").into())
+                }
+            }
+        }
         "respawn" => {
             if arguments.len() != 4 {
                 return Err("usage: player respawn <directory> <player-id>".into());
@@ -1954,6 +2004,7 @@ Commands:
   player unequip <directory> <player-id> <slot>
   player vocation <directory> <player-id> <vocation-id>
   player town <directory> <player-id> <town-id>
+  player bank <directory> <player-id> <get|set|credit|debit> [amount]
   player respawn <directory> <player-id>
   player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]
   player skill-tries <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <awarded-tries>
@@ -2056,6 +2107,7 @@ mod tests {
             "player unequip <directory> <player-id> <slot>",
             "player vocation <directory> <player-id> <vocation-id>",
             "player town <directory> <player-id> <town-id>",
+            "player bank <directory> <player-id> <get|set|credit|debit> [amount]",
             "player respawn <directory> <player-id>",
             "player skill <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <level> [percent]",
             "player skill-tries <directory> <player-id> <fist|club|sword|axe|distance|shielding|fishing> <awarded-tries>",
@@ -2577,6 +2629,76 @@ experienceStages = {
         ])
         .is_err());
         assert_eq!(database.player_by_id(1).unwrap().vitals.magic_level, 1);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stable_cli_player_bank_commands_persist_bounded_balances() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("forgotten-engine-player-bank-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        account_command(&[
+            "account".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "bank-account".into(),
+            "bank-password".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "Banker".into(),
+        ])
+        .unwrap();
+        for (action, amount) in [("set", "100"), ("credit", "25"), ("debit", "75")] {
+            player_command(&[
+                "player".into(),
+                "bank".into(),
+                directory.display().to_string(),
+                "1".into(),
+                action.into(),
+                amount.into(),
+            ])
+            .unwrap();
+        }
+        player_command(&[
+            "player".into(),
+            "bank".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "get".into(),
+        ])
+        .unwrap();
+
+        let config = load(&directory).unwrap();
+        let database = EngineDatabase::open(&config.database_path).unwrap();
+        assert_eq!(database.player_bank_balance(1).unwrap(), 50);
+        assert!(player_command(&[
+            "player".into(),
+            "bank".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "debit".into(),
+            "51".into(),
+        ])
+        .is_err());
+        assert!(player_command(&[
+            "player".into(),
+            "bank".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "credit".into(),
+            "invalid".into(),
+        ])
+        .is_err());
+        assert_eq!(database.player_bank_balance(1).unwrap(), 50);
         let _ = fs::remove_dir_all(directory);
     }
 
