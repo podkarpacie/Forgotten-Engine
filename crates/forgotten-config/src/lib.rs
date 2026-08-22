@@ -16,8 +16,8 @@ mod vocations;
 mod weapons;
 
 use forgotten_core::{
-    CoreError, ExperienceAwardPolicy, OtbmMapHeader, Position, WorldMap, WorldMapItem,
-    WorldMapSource, WorldMapTile, WorldMapTown,
+    CoreError, ExperienceAwardPolicy, OtbmMapHeader, PartySharedExperienceRules, Position,
+    WorldMap, WorldMapItem, WorldMapSource, WorldMapTile, WorldMapTown,
 };
 use forgotten_protocol::{
     profile_by_id, CompatibilityProfile, NativeOtClientFoundation, NativeOtClientProfile,
@@ -101,6 +101,10 @@ pub struct EngineConfig {
     pub magic_rate: u32,
     pub static_creature_target_attack_damage: u16,
     pub static_creature_target_pursuit_range: u8,
+    /// Disabled unless the operator explicitly opts in through the bounded config.lua keys.
+    /// The current FE party model is session-local; these values do not imply persistence or
+    /// complete TFS party behavior.
+    pub party_shared_experience_rules: Option<PartySharedExperienceRules>,
     pub experience_stages: Option<ExperienceStages>,
     pub experience_stages_source: Option<ExperienceStagesSource>,
     pub death_loss_percent: i32,
@@ -290,6 +294,38 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         });
     }
     let static_creature_target_pursuit_range = static_creature_target_pursuit_range as u8;
+    let party_shared_experience_rules =
+        if optional_boolean(&values, "partySharedExperienceEnabled", false)? {
+            let maximum_range = optional_u16(&values, "partySharedExperienceRange", 30)?;
+            if maximum_range == 0 || maximum_range > 64 {
+                return Err(ConfigError::InvalidValue {
+                    key: "partySharedExperienceRange",
+                    message: "must be between 1 and 64 when shared experience is enabled".into(),
+                });
+            }
+            let maximum_floor_delta = optional_u16(&values, "partySharedExperienceFloorDelta", 1)?;
+            if maximum_floor_delta > 15 {
+                return Err(ConfigError::InvalidValue {
+                    key: "partySharedExperienceFloorDelta",
+                    message: "must be between 0 and 15 when shared experience is enabled".into(),
+                });
+            }
+            let activity_window_ticks =
+                optional_u32(&values, "partySharedExperienceActivityTicks", 60)?;
+            if activity_window_ticks == 0 || activity_window_ticks > 3_600 {
+                return Err(ConfigError::InvalidValue {
+                    key: "partySharedExperienceActivityTicks",
+                    message: "must be between 1 and 3600 when shared experience is enabled".into(),
+                });
+            }
+            Some(PartySharedExperienceRules {
+                maximum_range,
+                maximum_floor_delta: maximum_floor_delta as u8,
+                activity_window_ticks: u64::from(activity_window_ticks),
+            })
+        } else {
+            None
+        };
     let content_directory = world_directory.join("data");
     let (experience_stages, experience_stages_source) = match configured_experience_stages {
         Some(Some(stages)) => (Some(stages), Some(ExperienceStagesSource::LegacyConfigLua)),
@@ -428,6 +464,7 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         magic_rate,
         static_creature_target_attack_damage,
         static_creature_target_pursuit_range,
+        party_shared_experience_rules,
         experience_stages,
         experience_stages_source,
         death_loss_percent,
@@ -1379,6 +1416,10 @@ fn is_recognized_config_key(key: &str) -> bool {
             | "rateMagic"
             | "staticCreatureTargetAttackDamage"
             | "staticCreatureTargetPursuitRange"
+            | "partySharedExperienceEnabled"
+            | "partySharedExperienceRange"
+            | "partySharedExperienceFloorDelta"
+            | "partySharedExperienceActivityTicks"
             | "deathLosePercent"
             | "serverName"
             | "mapName"
@@ -1773,6 +1814,45 @@ experienceStages = {
             load(&world),
             Err(ConfigError::InvalidValue {
                 key: "staticCreatureTargetAttackDamage",
+                ..
+            })
+        ));
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn loads_explicit_bounded_shared_experience_rules_and_rejects_invalid_enabled_range() {
+        let world = temporary_world("party-shared-experience-rules");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}partySharedExperienceEnabled = true\npartySharedExperienceRange = 24\npartySharedExperienceFloorDelta = 2\npartySharedExperienceActivityTicks = 90\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            load(&world).unwrap().party_shared_experience_rules,
+            Some(PartySharedExperienceRules {
+                maximum_range: 24,
+                maximum_floor_delta: 2,
+                activity_window_ticks: 90,
+            })
+        );
+
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}partySharedExperienceEnabled = true\npartySharedExperienceRange = 0\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            load(&world),
+            Err(ConfigError::InvalidValue {
+                key: "partySharedExperienceRange",
                 ..
             })
         ));

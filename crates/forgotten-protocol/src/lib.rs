@@ -900,6 +900,7 @@ pub const NATIVE_OTCLIENT_CLIENT_JOIN_PARTY: u8 = 0xa4;
 pub const NATIVE_OTCLIENT_CLIENT_REVOKE_PARTY_INVITATION: u8 = 0xa5;
 pub const NATIVE_OTCLIENT_CLIENT_PASS_PARTY_LEADERSHIP: u8 = 0xa6;
 pub const NATIVE_OTCLIENT_CLIENT_LEAVE_PARTY: u8 = 0xa7;
+pub const NATIVE_OTCLIENT_CLIENT_SHARE_PARTY_EXPERIENCE: u8 = 0xa8;
 pub const NATIVE_OTCLIENT_CLIENT_CANCEL_ATTACK_AND_FOLLOW: u8 = 0xbe;
 pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
 pub const NATIVE_OTCLIENT_CLIENT_REQUEST_CHANNELS: u8 = 0x97;
@@ -1323,6 +1324,7 @@ pub enum NativeOtClientGameAction {
     PartyRevokeInvitation(u32),
     PartyPassLeadership(u32),
     PartyLeave,
+    PartySharedExperience(bool),
     CancelAttackAndFollow,
     IgnoredInteraction(u8),
     Turn(NativeOtClientCardinalDirection),
@@ -2424,6 +2426,17 @@ pub fn decode_native_otclient_game_action(
             NativeOtClientGameAction::PartyPassLeadership(reader.u32()?)
         }
         NATIVE_OTCLIENT_CLIENT_LEAVE_PARTY => NativeOtClientGameAction::PartyLeave,
+        NATIVE_OTCLIENT_CLIENT_SHARE_PARTY_EXPERIENCE => {
+            let active = match reader.byte()? {
+                0 => false,
+                1 => true,
+                _ => return Err(ProtocolError::InvalidNativeGameRequest),
+            };
+            if reader.byte()? != 0 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            NativeOtClientGameAction::PartySharedExperience(active)
+        }
         opcode if is_native_otclient_compatibility_interaction(opcode) => {
             if reader.remaining() > NATIVE_OTCLIENT_MAX_IGNORED_INTERACTION_BYTES {
                 return Err(ProtocolError::InvalidNativeGameRequest);
@@ -4660,8 +4673,34 @@ mod tests {
             .unwrap(),
             NativeOtClientGameAction::PartyLeave
         );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_SHARE_PARTY_EXPERIENCE, 1, 0]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::PartySharedExperience(true)
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![NATIVE_OTCLIENT_CLIENT_SHARE_PARTY_EXPERIENCE, 0, 0]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::PartySharedExperience(false)
+        );
         assert!(decode_native_otclient_game_action(
             &Frame(vec![NATIVE_OTCLIENT_CLIENT_INVITE_TO_PARTY, 3, 0, 0]),
+            &profile,
+        )
+        .is_err());
+        assert!(decode_native_otclient_game_action(
+            &Frame(vec![NATIVE_OTCLIENT_CLIENT_SHARE_PARTY_EXPERIENCE, 2, 0]),
+            &profile,
+        )
+        .is_err());
+        assert!(decode_native_otclient_game_action(
+            &Frame(vec![NATIVE_OTCLIENT_CLIENT_SHARE_PARTY_EXPERIENCE, 1, 1]),
             &profile,
         )
         .is_err());

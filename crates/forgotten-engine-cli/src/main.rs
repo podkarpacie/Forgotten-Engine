@@ -734,6 +734,7 @@ fn run_host(
             skill_rate: config.skill_rate,
             magic_rate: config.magic_rate,
             experience_award_policy: Some(experience_award_policy),
+            party_shared_experience_rules: config.party_shared_experience_rules,
             death_loss_policy,
             declarative_weapon_catalog,
             declarative_spell_catalog,

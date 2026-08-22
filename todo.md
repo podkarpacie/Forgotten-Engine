@@ -235,6 +235,8 @@
 - [x] Apply configured experience rates and `stages.xml` ranges to authoritative operator experience awards, with exact regression coverage; combat/quest/monster event sources remain deferred.
 - [x] Apply configured vocation progression formulas to fixed-melee fist skill-try awards, with no claim of weapon or spell formulas.
 - [x] Verify and publish declared adjacent sword, axe, and club skill-try awards after accepted selected-player melee, preserving the existing rate-scaled, vocation-rule-based behavior and deferring weapon formulas.
+- [x] Decode and route the exact classic 740 shared-experience request only through explicit validated operator configuration, with strict active/reserved-byte framing, session-local leader ownership, accepted static-melee activity recording, and no unsupported client UI or reward distribution.
+- [ ] Add an eligibility-gated, deterministic bounded shared-experience award path only after a single SQLite transaction can persist every participant’s result; native enable controls, full TFS event sources, messages, party UI, loot policy, Lua, and real-client confirmation remain deferred.
 - [ ] Deliver bounded client-visible lifecycle state: condition health updates, death state, temple respawn, and only verified loss policies.
 - [x] Emit one parser-shaped native 740 death frame after a persisted lethal condition transition at a validated town temple. A live socket regression verifies the frame and persisted dead/zero-health state; temple respawn delivery and real-client confirmation remain deferred.
 - [x] Persist and hydrate authoritative dead/respawn/loss state across restarts without claiming client death screens, automatic timers, teleport packets, or unverified default-loss behavior.

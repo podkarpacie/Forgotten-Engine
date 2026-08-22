@@ -9,11 +9,12 @@ use forgotten_config::{
 use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
     EquipmentSlot, ExperienceAwardPolicy, FeTfsStaticSpawnCollection, ItemInstance,
-    NativeItemPresentationCatalog, PartyDisplayRelation, Player, PlayerCombatDefense,
-    PlayerCombatEvent, PlayerCombatEventOutcome, PlayerCondition, PlayerConditionKind,
-    PlayerConditionOutcome, PlayerContainer, PlayerContainerStackToEquipmentOutcome,
-    PlayerContainerToEquipmentOutcome, PlayerContainerToEquipmentSwapOutcome, PlayerContainers,
-    PlayerEquipment, PlayerEquipmentSlotSwapOutcome, PlayerEquipmentStackToContainerOutcome,
+    NativeItemPresentationCatalog, PartyDisplayRelation, PartySharedExperienceRules, Player,
+    PlayerCombatDefense, PlayerCombatEvent, PlayerCombatEventOutcome, PlayerCondition,
+    PlayerConditionKind, PlayerConditionOutcome, PlayerContainer,
+    PlayerContainerStackToEquipmentOutcome, PlayerContainerToEquipmentOutcome,
+    PlayerContainerToEquipmentSwapOutcome, PlayerContainers, PlayerEquipment,
+    PlayerEquipmentSlotSwapOutcome, PlayerEquipmentStackToContainerOutcome,
     PlayerEquipmentToContainerOutcome, PlayerExperienceAwardOutcome, PlayerFightMode,
     PlayerFightModeState, PlayerInteractionIntent, PlayerItemUseCreatureIntent,
     PlayerItemUseCreatureOutcome, PlayerItemUseCreatureTarget, PlayerItemUseExIntent,
@@ -988,6 +989,9 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
             format!("action=party-pass-leadership native-id={native_id}")
         }
         NativeOtClientGameAction::PartyLeave => "action=party-leave".into(),
+        NativeOtClientGameAction::PartySharedExperience(active) => {
+            format!("action=party-shared-experience active={active}")
+        }
         NativeOtClientGameAction::CancelAttackAndFollow => {
             "action=cancel-attack-and-follow".into()
         }
@@ -1110,6 +1114,10 @@ pub struct NativeOtClientHostConfig {
     /// Validated configured flat experience rate and optional level-stage policy. Concrete
     /// gameplay reward sources remain separate from this immutable host input.
     pub experience_award_policy: Option<Arc<ExperienceAwardPolicy>>,
+    /// Explicit operator-configured shared-experience eligibility limits. Absent configuration
+    /// leaves native enable requests inert; party persistence, client messages, and broad reward
+    /// sources remain outside this boundary.
+    pub party_shared_experience_rules: Option<PartySharedExperienceRules>,
     /// Validated `deathLosePercent` mode. The host applies only the bounded explicit fixed-percent
     /// mode when an accepted native death transition has matching vocation progression rules.
     /// Default-formula, promotion, blessing, and client lifecycle semantics remain deferred.
@@ -2420,6 +2428,33 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)?;
         self.party_epoch.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn set_party_shared_experience_requested(
+        &self,
+        leader_id: u64,
+        requested: bool,
+        rules: PartySharedExperienceRules,
+    ) -> Result<(), HostError> {
+        self.lock()?
+            .set_party_shared_experience_requested(leader_id, requested, rules)
+            .map_err(HostError::Core)?;
+        Ok(())
+    }
+
+    fn record_party_shared_experience_activity(&self, player_id: u64) -> Result<bool, HostError> {
+        let mut world = self.lock()?;
+        if world
+            .player_party_leader(player_id)
+            .map_err(HostError::Core)?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        world
+            .record_party_shared_experience_activity(player_id)
+            .map_err(HostError::Core)?;
+        Ok(true)
     }
 
     pub fn player_vitals(&self, player_id: u64) -> Result<PlayerVitals, HostError> {
@@ -5349,6 +5384,10 @@ fn handle_native_otclient_game(
                         character.id,
                         world_map.as_ref(),
                     )? {
+                        if outcome.applied_damage > 0 {
+                            let _ = shared_world
+                                .record_party_shared_experience_activity(character.id)?;
+                        }
                         persist_static_creature_runtime_to_open_database(
                             shared_world,
                             &mut database,
@@ -7126,6 +7165,31 @@ fn handle_native_otclient_game(
                         "action=party-leave outcome=authoritative-membership-removed"
                     } else {
                         "action=party-leave outcome=rejected-core-invariant"
+                    },
+                );
+            }
+            NativeOtClientGameAction::PartySharedExperience(requested) => {
+                let outcome = config.party_shared_experience_rules.map_or_else(
+                    || {
+                        Err(HostError::InvalidConfiguration(
+                            "party shared experience is disabled by configuration".into(),
+                        ))
+                    },
+                    |rules| {
+                        shared_world.set_party_shared_experience_requested(
+                            character.id,
+                            requested,
+                            rules,
+                        )
+                    },
+                );
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    if outcome.is_ok() {
+                        "action=party-shared-experience outcome=authoritative-request-updated"
+                    } else {
+                        "action=party-shared-experience outcome=rejected-disabled-or-core-invariant"
                     },
                 );
             }
@@ -9450,6 +9514,7 @@ mod tests {
             skill_rate: 1,
             magic_rate: 1,
             experience_award_policy: None,
+            party_shared_experience_rules: None,
             death_loss_policy: DeathLossPolicy::DefaultFormula,
             declarative_weapon_catalog: None,
             declarative_spell_catalog: None,
@@ -16827,8 +16892,15 @@ mod tests {
                 .unwrap();
         }
         let shared_world = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let shared_experience_rules = PartySharedExperienceRules {
+            maximum_range: 30,
+            maximum_floor_delta: 1,
+            activity_window_ticks: 60,
+        };
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.party_shared_experience_rules = Some(shared_experience_rules);
         let game = start_native_otclient_game_with_shared_world(
-            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            native_config,
             &database_path,
             shared_world.clone(),
         )
@@ -16976,6 +17048,30 @@ mod tests {
                 .player_party_members(1)
                 .unwrap(),
             vec![2]
+        );
+
+        write_frame(
+            &mut knight,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_SHARE_PARTY_EXPERIENCE,
+                1,
+                0,
+            ]),
+        )
+        .unwrap();
+        write_frame(
+            &mut knight,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING]),
+        )
+        .unwrap();
+        wait_for_ping_back(&mut knight);
+        assert!(
+            shared_world
+                .lock()
+                .unwrap()
+                .party_shared_experience_state(1, shared_experience_rules)
+                .unwrap()
+                .requested
         );
 
         write_frame(
