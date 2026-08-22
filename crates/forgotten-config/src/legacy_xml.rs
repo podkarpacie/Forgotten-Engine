@@ -2,6 +2,7 @@ use crate::{ConfigError, EngineConfig};
 use forgotten_core::{Position, WorldMap, WorldMapSource};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -85,6 +86,7 @@ pub(crate) fn load_legacy_world_companions(
     } else {
         Vec::new()
     };
+    validate_legacy_houses_against_map(&houses, world_map)?;
     Ok(LegacyWorldCompanionData {
         spawn_file: spawn_path.is_file().then_some(spawn_path),
         house_file: house_path.is_file().then_some(house_path),
@@ -304,6 +306,39 @@ fn parse_houses_xml(bytes: &[u8]) -> Result<Vec<LegacyHouse>, ConfigError> {
     Ok(houses)
 }
 
+/// Ensures a parsed legacy house catalog refers only to actual imported OTBM house identities and
+/// walkable entries. Ownership, access-list interpretation, rent, doors, and all runtime effects
+/// remain separate boundaries.
+fn validate_legacy_houses_against_map(
+    houses: &[LegacyHouse],
+    world_map: &WorldMap,
+) -> Result<(), ConfigError> {
+    let map_house_ids = world_map
+        .house_tile_entries()
+        .map(|(_, house_id)| house_id)
+        .collect::<BTreeSet<_>>();
+    let mut seen_house_ids = BTreeSet::new();
+    for house in houses {
+        if house.id == 0 {
+            return Err(invalid("legacy house ID must be nonzero"));
+        }
+        if !seen_house_ids.insert(house.id) {
+            return Err(invalid("legacy house IDs must be unique"));
+        }
+        if !map_house_ids.contains(&house.id) {
+            return Err(invalid(
+                "legacy house ID does not have a matching imported map house tile",
+            ));
+        }
+        if !world_map.is_walkable(house.entry) {
+            return Err(invalid(
+                "legacy house entry must be a walkable imported map tile",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn attribute_string(event: &BytesStart<'_>, name: &[u8]) -> Result<String, ConfigError> {
     event
         .try_get_attribute(name)
@@ -438,6 +473,7 @@ fn invalid(message: impl Into<String>) -> ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forgotten_core::WorldMapTile;
 
     #[test]
     fn parses_hand_authored_spawn_and_house_fixtures() {
@@ -477,5 +513,52 @@ mod tests {
     fn rejects_unsafe_companion_paths_and_malformed_xml() {
         assert!(resolve_companion_path(Path::new("data/world"), "../secret.xml").is_err());
         assert!(parse_spawns_xml(b"<spawns><spawn>").is_err());
+    }
+
+    #[test]
+    fn validates_legacy_house_catalog_against_imported_house_tiles_and_entries() {
+        let entry = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let mut map = WorldMap::new("houses", entry);
+        map.set_tile(
+            entry,
+            WorldMapTile {
+                ground_thing_id: 102,
+                walkable: true,
+            },
+        )
+        .unwrap();
+        map.set_house_tile(entry, 42).unwrap();
+        let house = LegacyHouse {
+            id: 42,
+            name: "Beach House".into(),
+            entry,
+            rent: 150,
+            town_id: 1,
+            size: 12,
+            guildhall: false,
+        };
+        validate_legacy_houses_against_map(std::slice::from_ref(&house), &map).unwrap();
+        assert!(validate_legacy_houses_against_map(&[house.clone(), house.clone()], &map).is_err());
+
+        let mut zero_id = house.clone();
+        zero_id.id = 0;
+        assert!(validate_legacy_houses_against_map(&[zero_id], &map).is_err());
+        let mut missing_tile = house.clone();
+        missing_tile.id = 43;
+        assert!(validate_legacy_houses_against_map(&[missing_tile], &map).is_err());
+
+        map.set_tile(
+            entry,
+            WorldMapTile {
+                ground_thing_id: 102,
+                walkable: false,
+            },
+        )
+        .unwrap();
+        assert!(validate_legacy_houses_against_map(&[house], &map).is_err());
     }
 }
