@@ -572,8 +572,125 @@ impl EngineDatabase {
         })
     }
 
-    /// Removes one non-owner player from exactly the named guild. Ownership transfer and guild
-    /// deletion are separate future transitions, so an owner cannot leave this bounded model.
+    /// Transfers durable guild ownership to an existing guild member. The new owner receives the
+    /// required leader rank and the former owner receives the required vice-leader rank, preserving
+    /// one durable owner and rank consistency without adding authorization or client behavior.
+    pub fn transfer_guild_ownership(
+        &mut self,
+        guild_id: u64,
+        new_owner_player_id: u64,
+    ) -> Result<GuildRecord, PersistenceError> {
+        self.ensure_player_exists(new_owner_player_id)?;
+        let transaction = self.connection.transaction()?;
+        let (name, current_owner_player_id, motd) = transaction
+            .query_row(
+                "SELECT name, owner_player_id, motd FROM guilds WHERE id = ?1",
+                params![guild_id as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(PersistenceError::UnknownGuild(guild_id))?;
+        let current_owner_player_id = current_owner_player_id as u64;
+        if current_owner_player_id == new_owner_player_id {
+            transaction.commit()?;
+            return Ok(GuildRecord {
+                id: guild_id,
+                name,
+                owner_player_id: current_owner_player_id,
+                motd,
+            });
+        }
+        let new_owner_guild_id = transaction
+            .query_row(
+                "SELECT guild_id FROM guild_membership WHERE player_id = ?1",
+                params![new_owner_player_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|id| id as u64)
+            .ok_or(PersistenceError::GuildOwnershipTargetNotMember {
+                guild_id,
+                player_id: new_owner_player_id,
+            })?;
+        if new_owner_guild_id != guild_id {
+            return Err(PersistenceError::GuildOwnershipTargetNotMember {
+                guild_id,
+                player_id: new_owner_player_id,
+            });
+        }
+        let current_owner_guild_id = transaction
+            .query_row(
+                "SELECT guild_id FROM guild_membership WHERE player_id = ?1",
+                params![current_owner_player_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|id| id as u64)
+            .ok_or_else(|| {
+                PersistenceError::InvalidGuildRecord(
+                    "guild owner is missing its required membership".into(),
+                )
+            })?;
+        if current_owner_guild_id != guild_id {
+            return Err(PersistenceError::InvalidGuildRecord(
+                "guild owner membership belongs to another guild".into(),
+            ));
+        }
+        let leader_rank_id = transaction
+            .query_row(
+                "SELECT id FROM guild_ranks WHERE guild_id = ?1 AND level = 3",
+                params![guild_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|id| id as u64)
+            .ok_or_else(|| {
+                PersistenceError::InvalidGuildRecord(
+                    "guild is missing its required leader rank".into(),
+                )
+            })?;
+        let vice_leader_rank_id = transaction
+            .query_row(
+                "SELECT id FROM guild_ranks WHERE guild_id = ?1 AND level = 2",
+                params![guild_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|id| id as u64)
+            .ok_or_else(|| {
+                PersistenceError::InvalidGuildRecord(
+                    "guild is missing its required vice-leader rank".into(),
+                )
+            })?;
+        transaction.execute(
+            "UPDATE guild_membership SET rank_id = ?1 WHERE player_id = ?2",
+            params![leader_rank_id as i64, new_owner_player_id as i64],
+        )?;
+        transaction.execute(
+            "UPDATE guild_membership SET rank_id = ?1 WHERE player_id = ?2",
+            params![vice_leader_rank_id as i64, current_owner_player_id as i64],
+        )?;
+        transaction.execute(
+            "UPDATE guilds SET owner_player_id = ?1 WHERE id = ?2",
+            params![new_owner_player_id as i64, guild_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(GuildRecord {
+            id: guild_id,
+            name,
+            owner_player_id: new_owner_player_id,
+            motd,
+        })
+    }
+
+    /// Removes one non-owner player from exactly the named guild. Guild deletion remains a separate
+    /// future transition, so the current owner cannot leave this bounded model.
     pub fn remove_guild_member(
         &mut self,
         guild_id: u64,
@@ -2983,6 +3100,10 @@ pub enum PersistenceError {
         guild_id: u64,
         player_id: u64,
     },
+    GuildOwnershipTargetNotMember {
+        guild_id: u64,
+        player_id: u64,
+    },
     GuildRankOutsideGuild {
         guild_id: u64,
         rank_id: u64,
@@ -3383,6 +3504,101 @@ mod tests {
             database.remove_guild_rank(guild.id, leader_rank_id),
             Err(PersistenceError::InvalidGuildRecord(_))
         ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_transactional_guild_ownership_transfer() {
+        let path = temporary_path("guild-ownership-transfer");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        for (id, name) in [(7, "Knight"), (8, "Druid"), (9, "Sorcerer")] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: 1,
+                    name: name.into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let guild = database.create_guild(7, "Forgotten", "Welcome").unwrap();
+        database.add_guild_member(guild.id, 8).unwrap();
+        database
+            .update_guild_member_nick(guild.id, 8, "Healer")
+            .unwrap();
+        let other = database.create_guild(9, "Other", "").unwrap();
+        let ranks = database.guild_ranks(guild.id).unwrap();
+        let leader_rank_id = ranks
+            .iter()
+            .find(|rank| rank.level == 3)
+            .expect("guild creates leader rank")
+            .id;
+        let vice_leader_rank_id = ranks
+            .iter()
+            .find(|rank| rank.level == 2)
+            .expect("guild creates vice-leader rank")
+            .id;
+
+        assert_eq!(
+            database.transfer_guild_ownership(guild.id, 8).unwrap(),
+            GuildRecord {
+                id: guild.id,
+                name: "Forgotten".into(),
+                owner_player_id: 8,
+                motd: "Welcome".into(),
+            }
+        );
+        assert_eq!(
+            database.guild_membership(8).unwrap(),
+            Some(GuildMembershipRecord {
+                player_id: 8,
+                guild_id: guild.id,
+                rank_id: leader_rank_id,
+                nick: "Healer".into(),
+            })
+        );
+        assert_eq!(
+            database.guild_membership(7).unwrap(),
+            Some(GuildMembershipRecord {
+                player_id: 7,
+                guild_id: guild.id,
+                rank_id: vice_leader_rank_id,
+                nick: String::new(),
+            })
+        );
+        assert_eq!(
+            database
+                .transfer_guild_ownership(guild.id, 8)
+                .unwrap()
+                .owner_player_id,
+            8
+        );
+        assert!(matches!(
+            database.remove_guild_member(guild.id, 8),
+            Err(PersistenceError::GuildOwnerCannotLeave { guild_id, player_id })
+                if guild_id == guild.id && player_id == 8
+        ));
+        assert!(matches!(
+            database.transfer_guild_ownership(guild.id, 9),
+            Err(PersistenceError::GuildOwnershipTargetNotMember { guild_id, player_id })
+                if guild_id == guild.id && player_id == 9
+        ));
+        assert!(matches!(
+            database.transfer_guild_ownership(guild.id, 999),
+            Err(PersistenceError::UnknownPlayer(999))
+        ));
+        assert!(matches!(
+            database.transfer_guild_ownership(999, 8),
+            Err(PersistenceError::UnknownGuild(999))
+        ));
+        assert_eq!(other.owner_player_id, 9);
         let _ = fs::remove_file(path);
     }
 
