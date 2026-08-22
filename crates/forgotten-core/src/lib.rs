@@ -2738,6 +2738,47 @@ impl WorldState {
         Ok(())
     }
 
+    /// Transfers one active party from its current leader to one of its current live members.
+    /// Pending invitations stay attached to the same party under the new leader; hook vetoes,
+    /// client shields, shared experience, and gameplay delivery remain host concerns.
+    pub fn transfer_party_leadership(
+        &mut self,
+        leader_id: u64,
+        new_leader_id: u64,
+    ) -> Result<(), CoreError> {
+        self.ensure_party_player_exists(leader_id)?;
+        self.ensure_party_player_exists(new_leader_id)?;
+        if leader_id == new_leader_id {
+            return Err(CoreError::SelfInteractionNotAllowed(leader_id));
+        }
+        if !self.party_leaders.contains(&leader_id) {
+            return Err(CoreError::PlayerNotInParty(leader_id));
+        }
+        if self.party_memberships.get(&new_leader_id).copied() != Some(leader_id) {
+            return Err(CoreError::PartyLeadershipTargetNotMember {
+                leader_id,
+                new_leader_id,
+            });
+        }
+
+        self.party_leaders.remove(&leader_id);
+        self.party_leaders.insert(new_leader_id);
+        self.party_memberships.remove(&new_leader_id);
+        for member_leader_id in self.party_memberships.values_mut() {
+            if *member_leader_id == leader_id {
+                *member_leader_id = new_leader_id;
+            }
+        }
+        self.party_memberships.insert(leader_id, new_leader_id);
+        for leaders in self.party_invitations.values_mut() {
+            if leaders.remove(&leader_id) {
+                leaders.insert(new_leader_id);
+            }
+        }
+        self.mark_changed();
+        Ok(())
+    }
+
     /// Revokes exactly one invitation and removes an otherwise empty invitation-only party.
     pub fn revoke_party_invitation(
         &mut self,
@@ -5964,6 +6005,10 @@ pub enum CoreError {
         leader_id: u64,
         invitee_id: u64,
     },
+    PartyLeadershipTargetNotMember {
+        leader_id: u64,
+        new_leader_id: u64,
+    },
     UnknownTown(u32),
     PlayerTownUnassigned(u64),
     InvalidPlayerRespawnState(u64),
@@ -6148,6 +6193,71 @@ mod tests {
         );
         assert_eq!(
             world.accept_party_invitation(invitee.id, first_member.id),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn explicit_party_leadership_transfer_reassigns_members_and_invitations() {
+        let mut world = WorldState::default();
+        let leader = party_player(7, "Knight", 100);
+        let first_member = party_player(8, "Druid", 101);
+        let new_leader = party_player(9, "Paladin", 102);
+        let invitee = party_player(10, "Sorcerer", 103);
+        for player in [
+            leader.clone(),
+            first_member.clone(),
+            new_leader.clone(),
+            invitee.clone(),
+        ] {
+            world.add_player(player).unwrap();
+        }
+        world.invite_to_party(leader.id, first_member.id).unwrap();
+        world
+            .accept_party_invitation(first_member.id, leader.id)
+            .unwrap();
+        world.invite_to_party(leader.id, new_leader.id).unwrap();
+        world
+            .accept_party_invitation(new_leader.id, leader.id)
+            .unwrap();
+        world.invite_to_party(leader.id, invitee.id).unwrap();
+
+        assert_eq!(
+            world.transfer_party_leadership(leader.id, invitee.id),
+            Err(CoreError::PartyLeadershipTargetNotMember {
+                leader_id: leader.id,
+                new_leader_id: invitee.id,
+            })
+        );
+        assert_eq!(
+            world.transfer_party_leadership(leader.id, new_leader.id),
+            Ok(())
+        );
+        assert_eq!(
+            world.player_party_leader(leader.id),
+            Ok(Some(new_leader.id))
+        );
+        assert_eq!(
+            world.player_party_leader(first_member.id),
+            Ok(Some(new_leader.id))
+        );
+        assert_eq!(
+            world.player_party_leader(new_leader.id),
+            Ok(Some(new_leader.id))
+        );
+        assert_eq!(
+            world.player_party_members(new_leader.id),
+            Ok(vec![leader.id, first_member.id])
+        );
+        assert_eq!(
+            world.accept_party_invitation(invitee.id, leader.id),
+            Err(CoreError::PartyInvitationNotFound {
+                leader_id: leader.id,
+                invitee_id: invitee.id,
+            })
+        );
+        assert_eq!(
+            world.accept_party_invitation(invitee.id, new_leader.id),
             Ok(())
         );
     }

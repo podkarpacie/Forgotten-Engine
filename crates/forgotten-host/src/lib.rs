@@ -956,6 +956,9 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         NativeOtClientGameAction::PartyRevokeInvitation(native_id) => {
             format!("action=party-revoke-invitation native-id={native_id}")
         }
+        NativeOtClientGameAction::PartyPassLeadership(native_id) => {
+            format!("action=party-pass-leadership native-id={native_id}")
+        }
         NativeOtClientGameAction::PartyLeave => "action=party-leave".into(),
         NativeOtClientGameAction::CancelAttackAndFollow => {
             "action=cancel-attack-and-follow".into()
@@ -6504,6 +6507,28 @@ fn handle_native_otclient_game(
                         "action=party-revoke-invitation outcome=authoritative-invitation-removed"
                     } else {
                         "action=party-revoke-invitation outcome=rejected-core-invariant"
+                    },
+                );
+            }
+            NativeOtClientGameAction::PartyPassLeadership(native_target_id) => {
+                let Some(new_leader_id) = native_player_id_to_character_id(native_target_id) else {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=party-pass-leadership outcome=rejected-invalid-native-player-id",
+                    );
+                    continue;
+                };
+                let outcome = shared_world
+                    .lock()?
+                    .transfer_party_leadership(character.id, new_leader_id);
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    if outcome.is_ok() {
+                        "action=party-pass-leadership outcome=authoritative-leadership-transferred"
+                    } else {
+                        "action=party-pass-leadership outcome=rejected-core-invariant"
                     },
                 );
             }
@@ -15170,6 +15195,33 @@ mod tests {
         );
 
         write_frame(
+            &mut knight,
+            &party_target_frame(
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PASS_PARTY_LEADERSHIP,
+                2,
+            ),
+        )
+        .unwrap();
+        write_frame(
+            &mut knight,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING]),
+        )
+        .unwrap();
+        wait_for_ping_back(&mut knight);
+        assert_eq!(
+            shared_world.lock().unwrap().player_party_leader(1).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            shared_world
+                .lock()
+                .unwrap()
+                .player_party_members(2)
+                .unwrap(),
+            vec![1]
+        );
+
+        write_frame(
             &mut druid,
             &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_LEAVE_PARTY]),
         )
@@ -15180,6 +15232,21 @@ mod tests {
         )
         .unwrap();
         wait_for_ping_back(&mut druid);
+        assert_eq!(
+            shared_world.lock().unwrap().player_party_leader(1).unwrap(),
+            Some(1)
+        );
+        write_frame(
+            &mut knight,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_LEAVE_PARTY]),
+        )
+        .unwrap();
+        write_frame(
+            &mut knight,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING]),
+        )
+        .unwrap();
+        wait_for_ping_back(&mut knight);
         assert_eq!(
             shared_world.lock().unwrap().player_party_leader(1).unwrap(),
             None

@@ -8,7 +8,7 @@ This ledger measures **declared replacement scope**. It is not a schedule, marke
 
 ## Current weighted position
 
-The current conservative estimate is **23% of the declared replacement scope**. This includes tested runtime progression, lifecycle, condition persistence, server-side condition death activation, static-world behavior, bounded item transfer, and a session-local party relationship foundation with classic request routing plus an unrouted shield encoder. It does not credit unsupported party UI delivery, gameplay parity, Lua execution, or production operations.
+The current conservative estimate is **23% of the declared replacement scope**. This includes tested runtime progression, lifecycle, condition persistence, server-side condition death activation, static-world behavior, bounded item transfer, and a session-local party relationship foundation with classic request routing, leadership transfer, and an unrouted shield encoder. It does not credit unsupported party UI delivery, gameplay parity, Lua execution, or production operations.
 
 | System category | Weight | Current credited scope | Why it is not higher |
 |---|---:|---:|---|

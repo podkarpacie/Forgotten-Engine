@@ -898,6 +898,7 @@ pub const NATIVE_OTCLIENT_CLIENT_SELECT_FOLLOW: u8 = 0xa2;
 pub const NATIVE_OTCLIENT_CLIENT_INVITE_TO_PARTY: u8 = 0xa3;
 pub const NATIVE_OTCLIENT_CLIENT_JOIN_PARTY: u8 = 0xa4;
 pub const NATIVE_OTCLIENT_CLIENT_REVOKE_PARTY_INVITATION: u8 = 0xa5;
+pub const NATIVE_OTCLIENT_CLIENT_PASS_PARTY_LEADERSHIP: u8 = 0xa6;
 pub const NATIVE_OTCLIENT_CLIENT_LEAVE_PARTY: u8 = 0xa7;
 pub const NATIVE_OTCLIENT_CLIENT_CANCEL_ATTACK_AND_FOLLOW: u8 = 0xbe;
 pub const NATIVE_OTCLIENT_CLIENT_TALK: u8 = 0x96;
@@ -1320,6 +1321,7 @@ pub enum NativeOtClientGameAction {
     PartyInvite(u32),
     PartyJoin(u32),
     PartyRevokeInvitation(u32),
+    PartyPassLeadership(u32),
     PartyLeave,
     CancelAttackAndFollow,
     IgnoredInteraction(u8),
@@ -2417,6 +2419,9 @@ pub fn decode_native_otclient_game_action(
         NATIVE_OTCLIENT_CLIENT_JOIN_PARTY => NativeOtClientGameAction::PartyJoin(reader.u32()?),
         NATIVE_OTCLIENT_CLIENT_REVOKE_PARTY_INVITATION => {
             NativeOtClientGameAction::PartyRevokeInvitation(reader.u32()?)
+        }
+        NATIVE_OTCLIENT_CLIENT_PASS_PARTY_LEADERSHIP => {
+            NativeOtClientGameAction::PartyPassLeadership(reader.u32()?)
         }
         NATIVE_OTCLIENT_CLIENT_LEAVE_PARTY => NativeOtClientGameAction::PartyLeave,
         opcode if is_native_otclient_compatibility_interaction(opcode) => {
@@ -4632,6 +4637,20 @@ mod tests {
             )
             .unwrap(),
             NativeOtClientGameAction::PartyRevokeInvitation(5)
+        );
+        assert_eq!(
+            decode_native_otclient_game_action(
+                &Frame(vec![
+                    NATIVE_OTCLIENT_CLIENT_PASS_PARTY_LEADERSHIP,
+                    6,
+                    0,
+                    0,
+                    0,
+                ]),
+                &profile,
+            )
+            .unwrap(),
+            NativeOtClientGameAction::PartyPassLeadership(6)
         );
         assert_eq!(
             decode_native_otclient_game_action(
