@@ -863,6 +863,7 @@ pub const NATIVE_OTCLIENT_GAME_TALK: u8 = 0xaa;
 pub const NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER: u8 = 0x6f;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_HEALTH: u8 = 0x8c;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT: u8 = 0x8e;
+pub const NATIVE_OTCLIENT_GAME_CREATURE_PARTY: u8 = 0x91;
 pub const NATIVE_OTCLIENT_GAME_EDIT_TEXT: u8 = 0x96;
 pub const NATIVE_OTCLIENT_GAME_TEXT_MESSAGE: u8 = 0xb4;
 pub const NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT: u8 = 0x15;
@@ -1106,6 +1107,30 @@ impl NativeOtClientClassicOutfit {
             body: 0,
             legs: 0,
             feet: 0,
+        }
+    }
+}
+
+/// The audited classic party shield values FE can represent without shared-experience state.
+/// Invitation, leader, and member values are intentionally limited to the TFS-compatible basic
+/// display states; shared-experience, blink, and unrelated social shield values remain deferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeOtClientClassicPartyShield {
+    None,
+    InvitationFromLeader,
+    InvitationToLeader,
+    Member,
+    Leader,
+}
+
+impl NativeOtClientClassicPartyShield {
+    const fn classic_value(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::InvitationFromLeader => 1,
+            Self::InvitationToLeader => 2,
+            Self::Member => 3,
+            Self::Leader => 4,
         }
     }
 }
@@ -2697,6 +2722,26 @@ pub fn encode_native_otclient_creature_health(
     Ok(Frame(writer.finish()))
 }
 
+/// Encodes the exact classic creature-party (`0x91`) record for one active native player. The
+/// caller owns party relationships, spectator visibility, and delivery timing; this protocol
+/// function only permits the audited basic shield values for the supported classic profile.
+pub fn encode_native_otclient_creature_party_shield(
+    profile: &NativeOtClientProfile,
+    creature_id: u32,
+    shield: NativeOtClientClassicPartyShield,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation()
+        || !(NATIVE_OTCLIENT_PLAYER_ID_START..NATIVE_OTCLIENT_PLAYER_ID_END).contains(&creature_id)
+    {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_CREATURE_PARTY);
+    writer.u32(creature_id);
+    writer.byte(shield.classic_value());
+    Ok(Frame(writer.finish()))
+}
+
 fn is_native_otclient_creature_id(creature_id: u32) -> bool {
     (NATIVE_OTCLIENT_PLAYER_ID_START..NATIVE_OTCLIENT_PLAYER_ID_END).contains(&creature_id)
         || creature_id > NATIVE_OTCLIENT_PLAYER_ID_END
@@ -3813,6 +3858,27 @@ mod tests {
                 .0,
             vec![NATIVE_OTCLIENT_GAME_CREATURE_HEALTH, 42, 0, 0, 16, 50]
         );
+        for (shield, expected_value) in [
+            (NativeOtClientClassicPartyShield::None, 0),
+            (NativeOtClientClassicPartyShield::InvitationFromLeader, 1),
+            (NativeOtClientClassicPartyShield::InvitationToLeader, 2),
+            (NativeOtClientClassicPartyShield::Member, 3),
+            (NativeOtClientClassicPartyShield::Leader, 4),
+        ] {
+            assert_eq!(
+                encode_native_otclient_creature_party_shield(&profile, snapshot.player_id, shield)
+                    .unwrap()
+                    .0,
+                vec![
+                    NATIVE_OTCLIENT_GAME_CREATURE_PARTY,
+                    42,
+                    0,
+                    0,
+                    16,
+                    expected_value,
+                ]
+            );
+        }
         assert_eq!(
             encode_native_otclient_creature_health(
                 &profile,
@@ -3865,6 +3931,12 @@ mod tests {
             NATIVE_OTCLIENT_PLAYER_ID_END,
             100,
             100,
+        )
+        .is_err());
+        assert!(encode_native_otclient_creature_party_shield(
+            &profile,
+            NATIVE_OTCLIENT_PLAYER_ID_END,
+            NativeOtClientClassicPartyShield::None,
         )
         .is_err());
         assert!(encode_native_otclient_choose_outfit(&profile, classic_outfit, 131, 128).is_err());
