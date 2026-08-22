@@ -9,11 +9,11 @@ use forgotten_config::{
 use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
     EquipmentSlot, ExperienceAwardPolicy, FeTfsStaticSpawnCollection, ItemInstance,
-    NativeItemPresentationCatalog, Player, PlayerCombatDefense, PlayerCombatEvent,
-    PlayerCombatEventOutcome, PlayerCondition, PlayerConditionKind, PlayerConditionOutcome,
-    PlayerContainer, PlayerContainerStackToEquipmentOutcome, PlayerContainerToEquipmentOutcome,
-    PlayerContainerToEquipmentSwapOutcome, PlayerContainers, PlayerEquipment,
-    PlayerEquipmentSlotSwapOutcome, PlayerEquipmentStackToContainerOutcome,
+    NativeItemPresentationCatalog, PartyDisplayRelation, Player, PlayerCombatDefense,
+    PlayerCombatEvent, PlayerCombatEventOutcome, PlayerCondition, PlayerConditionKind,
+    PlayerConditionOutcome, PlayerContainer, PlayerContainerStackToEquipmentOutcome,
+    PlayerContainerToEquipmentOutcome, PlayerContainerToEquipmentSwapOutcome, PlayerContainers,
+    PlayerEquipment, PlayerEquipmentSlotSwapOutcome, PlayerEquipmentStackToContainerOutcome,
     PlayerEquipmentToContainerOutcome, PlayerExperienceAwardOutcome, PlayerFightMode,
     PlayerFightModeState, PlayerInteractionIntent, PlayerItemUseCreatureIntent,
     PlayerItemUseCreatureOutcome, PlayerItemUseCreatureTarget, PlayerItemUseExIntent,
@@ -46,8 +46,9 @@ use forgotten_protocol::{
     encode_native_otclient_classic_vip_entry, encode_native_otclient_classic_vip_presence,
     encode_native_otclient_clear_target, encode_native_otclient_close_container,
     encode_native_otclient_creature_health, encode_native_otclient_creature_outfit,
-    encode_native_otclient_delete_inventory, encode_native_otclient_empty_quest_log,
-    encode_native_otclient_game_cancel_walk_facing, encode_native_otclient_game_death,
+    encode_native_otclient_creature_party_shield, encode_native_otclient_delete_inventory,
+    encode_native_otclient_empty_quest_log, encode_native_otclient_game_cancel_walk_facing,
+    encode_native_otclient_game_death,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
@@ -65,10 +66,11 @@ use forgotten_protocol::{
     InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
     NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection, NativeOtClientClassicChannel,
     NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
-    NativeOtClientClassicOutfit, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
-    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerVitals,
-    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
-    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    NativeOtClientClassicOutfit, NativeOtClientClassicPartyShield,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
+    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
+    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
+    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_MESSAGE_SAY,
     NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -1124,6 +1126,7 @@ pub struct SharedNativeWorld {
     progression_epoch: Arc<AtomicU64>,
     equipment_epoch: Arc<AtomicU64>,
     containers_epoch: Arc<AtomicU64>,
+    party_epoch: Arc<AtomicU64>,
     chat_recipients: Arc<Mutex<BTreeMap<u64, SharedChatRecipient>>>,
     vip_presence_recipients: Arc<Mutex<BTreeMap<u64, SharedVipPresenceRecipient>>>,
 }
@@ -1799,6 +1802,7 @@ impl SharedNativeWorld {
             progression_epoch: Arc::new(AtomicU64::new(0)),
             equipment_epoch: Arc::new(AtomicU64::new(0)),
             containers_epoch: Arc::new(AtomicU64::new(0)),
+            party_epoch: Arc::new(AtomicU64::new(0)),
             chat_recipients: Arc::new(Mutex::new(BTreeMap::new())),
             vip_presence_recipients: Arc::new(Mutex::new(BTreeMap::new())),
         })
@@ -1848,6 +1852,85 @@ impl SharedNativeWorld {
 
     pub fn containers_epoch(&self) -> u64 {
         self.containers_epoch.load(Ordering::SeqCst)
+    }
+
+    pub fn party_epoch(&self) -> u64 {
+        self.party_epoch.load(Ordering::SeqCst)
+    }
+
+    fn party_display_frames(
+        &self,
+        profile: &NativeOtClientProfile,
+        observer_id: u64,
+    ) -> Result<Vec<Frame>, HostError> {
+        self.lock()?
+            .party_display_relations(observer_id)
+            .map_err(HostError::Core)?
+            .into_iter()
+            .map(|(target_id, relation)| {
+                let shield = match relation {
+                    PartyDisplayRelation::None => NativeOtClientClassicPartyShield::None,
+                    PartyDisplayRelation::InvitationFromLeader => {
+                        NativeOtClientClassicPartyShield::InvitationFromLeader
+                    }
+                    PartyDisplayRelation::InvitationToLeader => {
+                        NativeOtClientClassicPartyShield::InvitationToLeader
+                    }
+                    PartyDisplayRelation::Member => NativeOtClientClassicPartyShield::Member,
+                    PartyDisplayRelation::Leader => NativeOtClientClassicPartyShield::Leader,
+                };
+                encode_native_otclient_creature_party_shield(
+                    profile,
+                    native_player_id(target_id)?,
+                    shield,
+                )
+                .map_err(HostError::Protocol)
+            })
+            .collect()
+    }
+
+    fn invite_to_party(&self, leader_id: u64, invitee_id: u64) -> Result<(), HostError> {
+        self.lock()?
+            .invite_to_party(leader_id, invitee_id)
+            .map_err(HostError::Core)?;
+        self.party_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn accept_party_invitation(&self, invitee_id: u64, leader_id: u64) -> Result<(), HostError> {
+        self.lock()?
+            .accept_party_invitation(invitee_id, leader_id)
+            .map_err(HostError::Core)?;
+        self.party_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn revoke_party_invitation(&self, leader_id: u64, invitee_id: u64) -> Result<(), HostError> {
+        self.lock()?
+            .revoke_party_invitation(leader_id, invitee_id)
+            .map_err(HostError::Core)?;
+        self.party_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn transfer_party_leadership(
+        &self,
+        leader_id: u64,
+        new_leader_id: u64,
+    ) -> Result<(), HostError> {
+        self.lock()?
+            .transfer_party_leadership(leader_id, new_leader_id)
+            .map_err(HostError::Core)?;
+        self.party_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn leave_party(&self, player_id: u64) -> Result<(), HostError> {
+        self.lock()?
+            .leave_party(player_id)
+            .map_err(HostError::Core)?;
+        self.party_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn player_vitals(&self, player_id: u64) -> Result<PlayerVitals, HostError> {
@@ -3284,6 +3367,7 @@ impl SharedNativeWorld {
             .map_err(|_| HostError::SharedWorldUnavailable)?
             .remove(&id);
         self.mark_visibility_changed();
+        self.party_epoch.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     pub fn update_player_outfit(
@@ -4396,6 +4480,7 @@ fn handle_native_otclient_game(
     let mut observed_progression_epoch = shared_world.progression_epoch();
     let mut observed_equipment_epoch = shared_world.equipment_epoch();
     let mut observed_containers_epoch = shared_world.containers_epoch();
+    let mut observed_party_epoch = shared_world.party_epoch();
     let mut observed_dead = shared_world.player_respawn_state(character.id)?.dead;
     write_frame(stream, &initialization)?;
     if character.outfit.look_type == player_outfit.look_type && player_outfit.look_type != 0 {
@@ -4505,6 +4590,15 @@ fn handle_native_otclient_game(
             config.extended_diagnostics,
             peer,
         )?;
+        refresh_native_party_shields(
+            stream,
+            shared_world,
+            &config.client_profile,
+            character.id,
+            &mut observed_party_epoch,
+            config.extended_diagnostics,
+            peer,
+        )?;
         if observe_native_death_transition(shared_world, character.id, &mut observed_dead)? {
             let death = encode_native_otclient_game_death(&config.client_profile)
                 .map_err(HostError::Protocol)?;
@@ -4546,6 +4640,15 @@ fn handle_native_otclient_game(
                         &config.client_profile,
                         &chat_events,
                         &open_public_channel_ids,
+                        config.extended_diagnostics,
+                        peer,
+                    )?;
+                    refresh_native_party_shields(
+                        stream,
+                        shared_world,
+                        &config.client_profile,
+                        character.id,
+                        &mut observed_party_epoch,
                         config.extended_diagnostics,
                         peer,
                     )?;
@@ -6453,9 +6556,7 @@ fn handle_native_otclient_game(
                     );
                     continue;
                 };
-                let outcome = shared_world
-                    .lock()?
-                    .invite_to_party(character.id, invitee_id);
+                let outcome = shared_world.invite_to_party(character.id, invitee_id);
                 native_diagnostic(
                     config.extended_diagnostics,
                     peer,
@@ -6475,9 +6576,7 @@ fn handle_native_otclient_game(
                     );
                     continue;
                 };
-                let outcome = shared_world
-                    .lock()?
-                    .accept_party_invitation(character.id, leader_id);
+                let outcome = shared_world.accept_party_invitation(character.id, leader_id);
                 native_diagnostic(
                     config.extended_diagnostics,
                     peer,
@@ -6497,9 +6596,7 @@ fn handle_native_otclient_game(
                     );
                     continue;
                 };
-                let outcome = shared_world
-                    .lock()?
-                    .revoke_party_invitation(character.id, invitee_id);
+                let outcome = shared_world.revoke_party_invitation(character.id, invitee_id);
                 native_diagnostic(
                     config.extended_diagnostics,
                     peer,
@@ -6519,9 +6616,7 @@ fn handle_native_otclient_game(
                     );
                     continue;
                 };
-                let outcome = shared_world
-                    .lock()?
-                    .transfer_party_leadership(character.id, new_leader_id);
+                let outcome = shared_world.transfer_party_leadership(character.id, new_leader_id);
                 native_diagnostic(
                     config.extended_diagnostics,
                     peer,
@@ -6533,7 +6628,7 @@ fn handle_native_otclient_game(
                 );
             }
             NativeOtClientGameAction::PartyLeave => {
-                let outcome = shared_world.lock()?.leave_party(character.id);
+                let outcome = shared_world.leave_party(character.id);
                 native_diagnostic(
                     config.extended_diagnostics,
                     peer,
@@ -7070,6 +7165,38 @@ fn drain_shared_vip_presence(
             Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return Ok(()),
         }
     }
+}
+
+/// Sends one current, bounded party-shield snapshot only after an authoritative party epoch
+/// change. The shared-world lock is released before every socket write, and no visibility or UI
+/// policy beyond the current all-active native render set is claimed here.
+fn refresh_native_party_shields(
+    stream: &mut TcpStream,
+    shared_world: &SharedNativeWorld,
+    profile: &NativeOtClientProfile,
+    observer_id: u64,
+    observed_party_epoch: &mut u64,
+    extended_diagnostics: bool,
+    peer: SocketAddr,
+) -> Result<(), HostError> {
+    let party_epoch = shared_world.party_epoch();
+    if party_epoch == *observed_party_epoch {
+        return Ok(());
+    }
+    let frames = shared_world.party_display_frames(profile, observer_id)?;
+    for frame in &frames {
+        write_frame(stream, frame)?;
+    }
+    *observed_party_epoch = party_epoch;
+    native_diagnostic(
+        extended_diagnostics,
+        peer,
+        &format!(
+            "outbound=party-shield-refresh records={} epoch={party_epoch}",
+            frames.len()
+        ),
+    );
+    Ok(())
 }
 
 /// Applies one externally selected static-creature step and returns a full native map refresh.
@@ -15005,19 +15132,20 @@ mod tests {
             Frame(bytes)
         }
 
-        fn wait_for_ping_back(stream: &mut TcpStream) {
+        fn wait_for_ping_back(stream: &mut TcpStream) -> Vec<Frame> {
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
+            let mut preceding_frames = Vec::new();
             loop {
                 match read_frame(stream) {
                     Ok(frame)
                         if frame.0 == vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_PING_BACK] =>
                     {
-                        return;
+                        return preceding_frames;
                     }
-                    Ok(_) => {}
+                    Ok(frame) => preceding_frames.push(frame),
                     Err(HostError::Io(error))
                         if matches!(
                             error.kind(),
@@ -15109,6 +15237,13 @@ mod tests {
         );
 
         write_frame(
+            &mut druid,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING]),
+        )
+        .unwrap();
+        let _ = wait_for_ping_back(&mut druid);
+
+        write_frame(
             &mut knight,
             &party_target_frame(
                 forgotten_protocol::NATIVE_OTCLIENT_CLIENT_INVITE_TO_PARTY,
@@ -15121,7 +15256,29 @@ mod tests {
             &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_PING]),
         )
         .unwrap();
-        wait_for_ping_back(&mut knight);
+        let knight_invite_frames = wait_for_ping_back(&mut knight);
+        assert!(knight_invite_frames.iter().any(|frame| {
+            frame.0
+                == vec![
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_PARTY,
+                    1,
+                    0,
+                    0,
+                    16,
+                    4,
+                ]
+        }));
+        assert!(knight_invite_frames.iter().any(|frame| {
+            frame.0
+                == vec![
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_PARTY,
+                    2,
+                    0,
+                    0,
+                    16,
+                    2,
+                ]
+        }));
         write_frame(
             &mut knight,
             &party_target_frame(

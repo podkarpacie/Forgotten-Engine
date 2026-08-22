@@ -2499,6 +2499,17 @@ impl<T> Default for DeterministicWorldCommandBatch<T> {
     }
 }
 
+/// The bounded party relationship that one active observer may display for another active player.
+/// It deliberately excludes shared-experience, blinking, guild, skull, and spectator policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartyDisplayRelation {
+    None,
+    InvitationFromLeader,
+    InvitationToLeader,
+    Member,
+    Leader,
+}
+
 #[derive(Debug, Default)]
 pub struct WorldState {
     players: BTreeMap<u64, Player>,
@@ -2832,6 +2843,61 @@ impl WorldState {
             return Err(CoreError::PlayerNotInParty(leader_id));
         }
         Ok(self.party_member_ids(leader_id))
+    }
+
+    /// Captures the basic party display relation for every current active player in deterministic
+    /// player-ID order. The caller owns client visibility, packet framing, and refresh timing.
+    pub fn party_display_relations(
+        &self,
+        observer_id: u64,
+    ) -> Result<Vec<(u64, PartyDisplayRelation)>, CoreError> {
+        self.ensure_party_player_exists(observer_id)?;
+        self.players
+            .keys()
+            .copied()
+            .map(|target_id| {
+                Ok((
+                    target_id,
+                    self.party_display_relation(observer_id, target_id)?,
+                ))
+            })
+            .collect()
+    }
+
+    fn party_display_relation(
+        &self,
+        observer_id: u64,
+        target_id: u64,
+    ) -> Result<PartyDisplayRelation, CoreError> {
+        self.ensure_party_player_exists(observer_id)?;
+        self.ensure_party_player_exists(target_id)?;
+        let observer_leader = self.player_party_leader(observer_id)?;
+        let target_leader = self.player_party_leader(target_id)?;
+
+        if let Some(leader_id) = observer_leader {
+            if target_id == leader_id {
+                return Ok(PartyDisplayRelation::Leader);
+            }
+            if target_leader == Some(leader_id) {
+                return Ok(PartyDisplayRelation::Member);
+            }
+            if self
+                .party_invitations
+                .get(&target_id)
+                .is_some_and(|leaders| leaders.contains(&leader_id))
+            {
+                return Ok(PartyDisplayRelation::InvitationToLeader);
+            }
+        }
+
+        if self
+            .party_invitations
+            .get(&observer_id)
+            .is_some_and(|leaders| leaders.contains(&target_id))
+        {
+            return Ok(PartyDisplayRelation::InvitationFromLeader);
+        }
+        Ok(PartyDisplayRelation::None)
     }
 
     fn ensure_party_player_exists(&self, player_id: u64) -> Result<(), CoreError> {
@@ -6259,6 +6325,54 @@ mod tests {
         assert_eq!(
             world.accept_party_invitation(invitee.id, new_leader.id),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn party_display_relations_are_authoritative_and_deterministic() {
+        let mut world = WorldState::default();
+        let leader = party_player(7, "Knight", 100);
+        let member = party_player(8, "Druid", 101);
+        let invitee = party_player(9, "Paladin", 102);
+        let unrelated = party_player(10, "Sorcerer", 103);
+        for player in [
+            leader.clone(),
+            member.clone(),
+            invitee.clone(),
+            unrelated.clone(),
+        ] {
+            world.add_player(player).unwrap();
+        }
+        world.invite_to_party(leader.id, member.id).unwrap();
+        world.accept_party_invitation(member.id, leader.id).unwrap();
+        world.invite_to_party(leader.id, invitee.id).unwrap();
+
+        assert_eq!(
+            world.party_display_relations(leader.id),
+            Ok(vec![
+                (leader.id, PartyDisplayRelation::Leader),
+                (member.id, PartyDisplayRelation::Member),
+                (invitee.id, PartyDisplayRelation::InvitationToLeader),
+                (unrelated.id, PartyDisplayRelation::None),
+            ])
+        );
+        assert_eq!(
+            world.party_display_relations(member.id),
+            Ok(vec![
+                (leader.id, PartyDisplayRelation::Leader),
+                (member.id, PartyDisplayRelation::Member),
+                (invitee.id, PartyDisplayRelation::InvitationToLeader),
+                (unrelated.id, PartyDisplayRelation::None),
+            ])
+        );
+        assert_eq!(
+            world.party_display_relations(invitee.id),
+            Ok(vec![
+                (leader.id, PartyDisplayRelation::InvitationFromLeader),
+                (member.id, PartyDisplayRelation::None),
+                (invitee.id, PartyDisplayRelation::None),
+                (unrelated.id, PartyDisplayRelation::None),
+            ])
         );
     }
 
