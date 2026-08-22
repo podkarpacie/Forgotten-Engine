@@ -488,6 +488,36 @@ impl EngineDatabase {
         })
     }
 
+    /// Updates one existing guild's bounded message of the day. Caller authorization, online
+    /// delivery, rank permissions, and Lua behavior remain outside this storage operation.
+    pub fn update_guild_motd(
+        &mut self,
+        guild_id: u64,
+        motd: &str,
+    ) -> Result<GuildRecord, PersistenceError> {
+        let motd = validated_guild_motd(motd)?;
+        let transaction = self.connection.transaction()?;
+        let (name, owner_player_id) = transaction
+            .query_row(
+                "SELECT name, owner_player_id FROM guilds WHERE id = ?1",
+                params![guild_id as i64],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or(PersistenceError::UnknownGuild(guild_id))?;
+        transaction.execute(
+            "UPDATE guilds SET motd = ?1 WHERE id = ?2",
+            params![motd, guild_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(GuildRecord {
+            id: guild_id,
+            name,
+            owner_player_id: owner_player_id as u64,
+            motd: motd.to_owned(),
+        })
+    }
+
     /// Adds one persisted player to an existing guild at its provisioned member rank. The primary
     /// membership key remains the authoritative one-guild-per-player guard; invitation, online
     /// authorization, and client delivery are intentionally outside this storage operation.
@@ -651,6 +681,46 @@ impl EngineDatabase {
             guild_id,
             rank_id,
             nick,
+        })
+    }
+
+    /// Replaces the bounded nick of one current guild member. Nicknames are durable member
+    /// metadata only; rank permissions, client display, and online authorization remain separate.
+    pub fn update_guild_member_nick(
+        &mut self,
+        guild_id: u64,
+        player_id: u64,
+        nick: &str,
+    ) -> Result<GuildMembershipRecord, PersistenceError> {
+        let nick = validated_guild_nick(nick)?;
+        let transaction = self.connection.transaction()?;
+        let member = transaction
+            .query_row(
+                "SELECT guild_id, rank_id FROM guild_membership WHERE player_id = ?1",
+                params![player_id as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or(PersistenceError::UnknownGuildMember {
+                guild_id,
+                player_id,
+            })?;
+        if member.0 as u64 != guild_id {
+            return Err(PersistenceError::UnknownGuildMember {
+                guild_id,
+                player_id,
+            });
+        }
+        transaction.execute(
+            "UPDATE guild_membership SET nick = ?1 WHERE player_id = ?2",
+            params![nick, player_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(GuildMembershipRecord {
+            player_id,
+            guild_id,
+            rank_id: member.1 as u64,
+            nick: nick.to_owned(),
         })
     }
 
@@ -2672,6 +2742,15 @@ fn validated_guild_motd(value: &str) -> Result<&str, PersistenceError> {
     Ok(value)
 }
 
+fn validated_guild_nick(value: &str) -> Result<&str, PersistenceError> {
+    if value.len() > MAX_GUILD_NICK_BYTES {
+        return Err(PersistenceError::InvalidGuildRecord(format!(
+            "guild nick exceeds {MAX_GUILD_NICK_BYTES} bytes"
+        )));
+    }
+    Ok(value)
+}
+
 fn sqlite_progression_attempt(value: u64) -> Result<i64, PersistenceError> {
     i64::try_from(value).map_err(|_| {
         PersistenceError::InvalidProgressionAttemptRecord(
@@ -2928,6 +3007,79 @@ mod tests {
         assert!(matches!(
             database.add_guild_member(guild.id, 999),
             Err(PersistenceError::UnknownPlayer(999))
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn persists_validated_guild_motd_and_member_nickname_updates() {
+        let path = temporary_path("guild-profile-metadata");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        for (id, name) in [(7, "Knight"), (8, "Druid"), (9, "Sorcerer")] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: 1,
+                    name: name.into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let guild = database.create_guild(7, "Forgotten", "Welcome").unwrap();
+        database.add_guild_member(guild.id, 8).unwrap();
+        let other = database.create_guild(9, "Other", "").unwrap();
+
+        assert_eq!(
+            database
+                .update_guild_motd(guild.id, "Raid at sunset")
+                .unwrap(),
+            GuildRecord {
+                id: guild.id,
+                name: "Forgotten".into(),
+                owner_player_id: 7,
+                motd: "Raid at sunset".into(),
+            }
+        );
+        assert!(matches!(
+            database.update_guild_motd(999, "unknown"),
+            Err(PersistenceError::UnknownGuild(999))
+        ));
+        assert!(matches!(
+            database.update_guild_motd(guild.id, &"x".repeat(MAX_GUILD_MOTD_BYTES + 1)),
+            Err(PersistenceError::InvalidGuildRecord(_))
+        ));
+
+        let member_rank_id = database.guild_membership(8).unwrap().unwrap().rank_id;
+        assert_eq!(
+            database
+                .update_guild_member_nick(guild.id, 8, "Healer")
+                .unwrap(),
+            GuildMembershipRecord {
+                player_id: 8,
+                guild_id: guild.id,
+                rank_id: member_rank_id,
+                nick: "Healer".into(),
+            }
+        );
+        assert_eq!(
+            database.guild_membership(8).unwrap().unwrap().nick,
+            "Healer"
+        );
+        assert!(matches!(
+            database.update_guild_member_nick(other.id, 8, "wrong"),
+            Err(PersistenceError::UnknownGuildMember { guild_id, player_id })
+                if guild_id == other.id && player_id == 8
+        ));
+        assert!(matches!(
+            database.update_guild_member_nick(guild.id, 8, &"x".repeat(MAX_GUILD_NICK_BYTES + 1)),
+            Err(PersistenceError::InvalidGuildRecord(_))
         ));
         let _ = fs::remove_file(path);
     }
