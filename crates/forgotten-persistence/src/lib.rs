@@ -9,6 +9,7 @@ use forgotten_core::{
     PlayerConditionKind, PlayerContainer, PlayerContainers, PlayerEquipment, PlayerProgression,
     PlayerProgressionAttempts, PlayerRespawnState, PlayerSkill, PlayerSkills, Position,
     SkillProgress, VocationId, WorldMapItemSourceIdentity, WorldMapSourceRevision,
+    MAX_ITEM_STACK_COUNT,
 };
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -39,7 +40,8 @@ const SCHEMA_VERSION_PLAYER_DEPOTS: i64 = 21;
 const SCHEMA_VERSION_PLAYER_INBOX: i64 = 22;
 const SCHEMA_VERSION_HOUSE_OWNERSHIP: i64 = 23;
 const SCHEMA_VERSION_HOUSE_ACCESS_LISTS: i64 = 24;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_HOUSE_ACCESS_LISTS;
+const SCHEMA_VERSION_MAP_ITEM_COUNT_OVERRIDES: i64 = 25;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_MAP_ITEM_COUNT_OVERRIDES;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 pub const MAX_VIP_DESCRIPTION_BYTES: usize = 128;
@@ -84,6 +86,15 @@ pub struct StaticCreatureRuntimeRecord {
 pub struct MapItemRemovalJournal {
     pub map_revision: WorldMapSourceRevision,
     pub removed_items: Vec<WorldMapItemSourceIdentity>,
+}
+
+/// Revision-bound remaining-count override for one imported top-level source-map item. This is
+/// intentionally distinct from the complete-removal journal so partial stack recovery can never
+/// reinterpret a removed source identity as a live item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapItemCountOverrideRecord {
+    pub source_identity: WorldMapItemSourceIdentity,
+    pub remaining_count: u16,
 }
 
 /// One bounded account-owned VIP entry. It retains only validated persisted-player identity and
@@ -3154,6 +3165,61 @@ impl EngineDatabase {
         Ok(())
     }
 
+    /// Atomically replaces the complete revision-bound remaining-count override collection. Each
+    /// override applies only to one still-present source item, so it must use the journal revision
+    /// and keep a strictly positive bounded remaining count.
+    pub fn replace_map_item_count_overrides(
+        &mut self,
+        map_revision: WorldMapSourceRevision,
+        overrides: &[MapItemCountOverrideRecord],
+    ) -> Result<(), PersistenceError> {
+        let mut seen = BTreeMap::new();
+        for override_record in overrides {
+            if override_record.source_identity.map_revision != map_revision {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "every count override must use the requested map revision".into(),
+                ));
+            }
+            if !(1..=MAX_ITEM_STACK_COUNT).contains(&override_record.remaining_count) {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "count override remaining count must stay within the bounded stack range"
+                        .into(),
+                ));
+            }
+            if seen
+                .insert(
+                    (
+                        override_record.source_identity.position,
+                        override_record.source_identity.item_index,
+                    ),
+                    (),
+                )
+                .is_some()
+            {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "duplicate source item identity in count overrides".into(),
+                ));
+            }
+        }
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM map_item_count_overrides", [])?;
+        for override_record in overrides {
+            transaction.execute(
+                "INSERT INTO map_item_count_overrides (map_revision, x, y, z, item_index, remaining_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    format!("{:016x}", map_revision.0),
+                    i64::from(override_record.source_identity.position.x),
+                    i64::from(override_record.source_identity.position.y),
+                    i64::from(override_record.source_identity.position.z),
+                    i64::from(override_record.source_identity.item_index),
+                    i64::from(override_record.remaining_count),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Loads the complete journal without applying it to any map. Callers must compare the loaded
     /// revision with the current `WorldMap::source_revision()` before considering recovery.
     pub fn map_item_removal_journal(
@@ -3212,6 +3278,229 @@ impl EngineDatabase {
             }
         }
         Ok(journal)
+    }
+
+    /// Loads the complete revision-bound remaining-count override collection without applying it to
+    /// any map. Callers must validate it against the immutable source map together with the full
+    /// removal journal before recovery.
+    pub fn map_item_count_overrides(
+        &self,
+    ) -> Result<Option<(WorldMapSourceRevision, Vec<MapItemCountOverrideRecord>)>, PersistenceError>
+    {
+        let mut statement = self.connection.prepare(
+            "SELECT map_revision, x, y, z, item_index, remaining_count FROM map_item_count_overrides ORDER BY map_revision, x, y, z, item_index",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut map_revision: Option<WorldMapSourceRevision> = None;
+        let mut overrides = Vec::new();
+        for row in rows {
+            let (revision, x, y, z, item_index, remaining_count) = row?;
+            let parsed_revision = u64::from_str_radix(&revision, 16).map_err(|_| {
+                PersistenceError::InvalidMapItemJournal(
+                    "count override map revision must be hexadecimal u64".into(),
+                )
+            })?;
+            let parsed_revision = WorldMapSourceRevision(parsed_revision);
+            match map_revision {
+                Some(existing) if existing != parsed_revision => {
+                    return Err(PersistenceError::InvalidMapItemJournal(
+                        "count overrides contain multiple map revisions".into(),
+                    ))
+                }
+                None => map_revision = Some(parsed_revision),
+                Some(_) => {}
+            }
+            let remaining_count = u16::try_from(remaining_count).map_err(|_| {
+                PersistenceError::InvalidMapItemJournal(
+                    "count override remaining count must fit u16".into(),
+                )
+            })?;
+            if !(1..=MAX_ITEM_STACK_COUNT).contains(&remaining_count) {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "count override remaining count must stay within the bounded stack range"
+                        .into(),
+                ));
+            }
+            overrides.push(MapItemCountOverrideRecord {
+                source_identity: WorldMapItemSourceIdentity {
+                    map_revision: parsed_revision,
+                    position: Position {
+                        x: u16::try_from(x).map_err(|_| {
+                            PersistenceError::InvalidMapItemJournal(
+                                "count override x does not fit u16".into(),
+                            )
+                        })?,
+                        y: u16::try_from(y).map_err(|_| {
+                            PersistenceError::InvalidMapItemJournal(
+                                "count override y does not fit u16".into(),
+                            )
+                        })?,
+                        z: u8::try_from(z).map_err(|_| {
+                            PersistenceError::InvalidMapItemJournal(
+                                "count override z does not fit u8".into(),
+                            )
+                        })?,
+                    },
+                    item_index: u8::try_from(item_index).map_err(|_| {
+                        PersistenceError::InvalidMapItemJournal(
+                            "count override item index does not fit u8".into(),
+                        )
+                    })?,
+                },
+                remaining_count,
+            });
+        }
+        Ok(map_revision.map(|revision| (revision, overrides)))
+    }
+
+    /// Replaces a player's complete bounded inventory, the complete revision-bound removal journal,
+    /// and the complete remaining-count override collection in one SQLite transaction. A failed
+    /// commit leaves all durable inventory and map-source recovery state unchanged.
+    pub fn replace_player_inventory_and_map_item_state(
+        &mut self,
+        player_id: u64,
+        equipment: &PlayerEquipment,
+        containers: &PlayerContainers,
+        journal: &MapItemRemovalJournal,
+        overrides: &[MapItemCountOverrideRecord],
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let mut removed = BTreeMap::new();
+        for item in &journal.removed_items {
+            if item.map_revision != journal.map_revision {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "every removed item must use the journal map revision".into(),
+                ));
+            }
+            if removed
+                .insert((item.position, item.item_index), ())
+                .is_some()
+            {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "duplicate removed source item identity".into(),
+                ));
+            }
+        }
+        let mut overridden = BTreeMap::new();
+        for override_record in overrides {
+            if override_record.source_identity.map_revision != journal.map_revision {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "every count override must use the journal map revision".into(),
+                ));
+            }
+            if !(1..=MAX_ITEM_STACK_COUNT).contains(&override_record.remaining_count) {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "count override remaining count must stay within the bounded stack range"
+                        .into(),
+                ));
+            }
+            let key = (
+                override_record.source_identity.position,
+                override_record.source_identity.item_index,
+            );
+            if removed.contains_key(&key) {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "one source item cannot be both removed and count-overridden".into(),
+                ));
+            }
+            if overridden.insert(key, ()).is_some() {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "duplicate source item identity in count overrides".into(),
+                ));
+            }
+        }
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM player_equipment WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM player_container_items WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM player_containers WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        for (slot, item) in equipment.iter() {
+            transaction.execute(
+                "INSERT INTO player_equipment (player_id, slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    player_id as i64,
+                    i64::from(slot.code()),
+                    i64::from(item.server_id),
+                    i64::from(item.count),
+                    item.action_id.map(i64::from),
+                    item.unique_id.map(i64::from),
+                ],
+            )?;
+        }
+        for (container_id, container) in containers.iter() {
+            transaction.execute(
+                "INSERT INTO player_containers (player_id, container_id, server_id, count, name, has_parent, capacity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    player_id as i64,
+                    i64::from(container_id),
+                    i64::from(container.container_item.server_id),
+                    i64::from(container.container_item.count),
+                    container.name,
+                    i64::from(u8::from(container.has_parent)),
+                    i64::from(container.items.capacity()),
+                ],
+            )?;
+            for (slot, item) in container.items.iter().enumerate() {
+                transaction.execute(
+                    "INSERT INTO player_container_items (player_id, container_id, slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        player_id as i64,
+                        i64::from(container_id),
+                        slot as i64,
+                        i64::from(item.server_id),
+                        i64::from(item.count),
+                        item.action_id.map(i64::from),
+                        item.unique_id.map(i64::from),
+                    ],
+                )?;
+            }
+        }
+        transaction.execute("DELETE FROM map_item_removal_journal", [])?;
+        for item in &journal.removed_items {
+            transaction.execute(
+                "INSERT INTO map_item_removal_journal (map_revision, x, y, z, item_index) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    format!("{:016x}", journal.map_revision.0),
+                    i64::from(item.position.x),
+                    i64::from(item.position.y),
+                    i64::from(item.position.z),
+                    i64::from(item.item_index),
+                ],
+            )?;
+        }
+        transaction.execute("DELETE FROM map_item_count_overrides", [])?;
+        for override_record in overrides {
+            transaction.execute(
+                "INSERT INTO map_item_count_overrides (map_revision, x, y, z, item_index, remaining_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    format!("{:016x}", journal.map_revision.0),
+                    i64::from(override_record.source_identity.position.x),
+                    i64::from(override_record.source_identity.position.y),
+                    i64::from(override_record.source_identity.position.z),
+                    i64::from(override_record.source_identity.item_index),
+                    i64::from(override_record.remaining_count),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     fn migrate(&mut self) -> Result<(), PersistenceError> {
@@ -3471,6 +3760,15 @@ impl EngineDatabase {
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![SCHEMA_VERSION_HOUSE_ACCESS_LISTS, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < SCHEMA_VERSION_MAP_ITEM_COUNT_OVERRIDES {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS map_item_count_overrides (map_revision TEXT NOT NULL, x INTEGER NOT NULL, y INTEGER NOT NULL, z INTEGER NOT NULL, item_index INTEGER NOT NULL, remaining_count INTEGER NOT NULL, PRIMARY KEY (map_revision, x, y, z, item_index));",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_MAP_ITEM_COUNT_OVERRIDES, unix_seconds()],
             )?;
         }
         Ok(())

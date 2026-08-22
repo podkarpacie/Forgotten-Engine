@@ -27,6 +27,8 @@ The declared item credit now also includes one complete source-map compatible-st
 
 The same declared item credit now includes an equivalent complete compatible-stack merge into a requested equipment slot. It accepts only an empty slot or one matching bounded destination stack, and keeps incompatible or overflowing occupied slots unchanged.
 
+The declared item credit now also includes a native top-level container partial source-stack transfer. It saves its revision-bound remaining source count beside complete removals and restores that count only after fail-closed immutable-map validation. Equipment destinations, generic ground movement, and full transfer parity remain deferred.
+
 ## Full path to 100%
 
 Each milestone below has an evidence target. Work may proceed in dependency order, but a milestone is not complete merely because an API or parser exists. Existing completed items are retained to show the verified base for the next work.
