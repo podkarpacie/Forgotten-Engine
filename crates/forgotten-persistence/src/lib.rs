@@ -722,6 +722,73 @@ impl EngineDatabase {
         Ok(())
     }
 
+    /// Accepts one exact pending invitation into the named guild's required member rank. The
+    /// membership insert and deletion of every competing pending invitation occur atomically;
+    /// authorization, client delivery, and rank-permission policy remain outside this operation.
+    pub fn accept_guild_invitation(
+        &mut self,
+        guild_id: u64,
+        player_id: u64,
+    ) -> Result<GuildMembershipRecord, PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let transaction = self.connection.transaction()?;
+        let guild_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guilds WHERE id = ?1)",
+            params![guild_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !guild_exists {
+            return Err(PersistenceError::UnknownGuild(guild_id));
+        }
+        let has_membership = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guild_membership WHERE player_id = ?1)",
+            params![player_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if has_membership {
+            return Err(PersistenceError::GuildMemberAlreadyAssigned(player_id));
+        }
+        let invite_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guild_invitations WHERE guild_id = ?1 AND player_id = ?2)",
+            params![guild_id as i64, player_id as i64],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !invite_exists {
+            return Err(PersistenceError::UnknownGuildInvitation {
+                guild_id,
+                player_id,
+            });
+        }
+        let member_rank_id = transaction
+            .query_row(
+                "SELECT id FROM guild_ranks WHERE guild_id = ?1 AND level = 1 ORDER BY id LIMIT 1",
+                params![guild_id as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|id| id as u64)
+            .ok_or_else(|| {
+                PersistenceError::InvalidGuildRecord(
+                    "guild is missing its required member rank".into(),
+                )
+            })?;
+        transaction.execute(
+            "INSERT INTO guild_membership (player_id, guild_id, rank_id, nick) VALUES (?1, ?2, ?3, '')",
+            params![player_id as i64, guild_id as i64, member_rank_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM guild_invitations WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(GuildMembershipRecord {
+            player_id,
+            guild_id,
+            rank_id: member_rank_id,
+            nick: String::new(),
+        })
+    }
+
     /// Transfers durable guild ownership to an existing guild member. The new owner receives the
     /// required leader rank and the former owner receives the required vice-leader rank, preserving
     /// one durable owner and rank consistency without adding authorization or client behavior.
@@ -3871,6 +3938,82 @@ mod tests {
         assert!(matches!(
             database.invite_player_to_guild(guild.id, 30),
             Err(PersistenceError::GuildInvitationCapExceeded { guild_id }) if guild_id == guild.id
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn accepts_one_pending_guild_invitation_transactionally() {
+        let path = temporary_path("guild-invitation-acceptance");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        for (id, name) in [
+            (7, "Knight"),
+            (8, "Druid"),
+            (9, "Sorcerer"),
+            (10, "Paladin"),
+        ] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: 1,
+                    name: name.into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let first = database.create_guild(7, "Forgotten", "Welcome").unwrap();
+        let second = database.create_guild(9, "Other", "").unwrap();
+        database.invite_player_to_guild(first.id, 8).unwrap();
+        database.invite_player_to_guild(second.id, 8).unwrap();
+        let member_rank_id = database
+            .guild_ranks(first.id)
+            .unwrap()
+            .into_iter()
+            .find(|rank| rank.level == 1)
+            .expect("guild creates member rank")
+            .id;
+
+        assert_eq!(
+            database.accept_guild_invitation(first.id, 8).unwrap(),
+            GuildMembershipRecord {
+                player_id: 8,
+                guild_id: first.id,
+                rank_id: member_rank_id,
+                nick: String::new(),
+            }
+        );
+        assert_eq!(
+            database.guild_invitations_for_player(8).unwrap(),
+            Vec::new()
+        );
+        assert!(!database
+            .guild_invitations_for_guild(second.id)
+            .unwrap()
+            .iter()
+            .any(|invitation| invitation.player_id == 8));
+        assert!(matches!(
+            database.accept_guild_invitation(first.id, 8),
+            Err(PersistenceError::GuildMemberAlreadyAssigned(8))
+        ));
+        assert!(matches!(
+            database.accept_guild_invitation(first.id, 10),
+            Err(PersistenceError::UnknownGuildInvitation { guild_id, player_id })
+                if guild_id == first.id && player_id == 10
+        ));
+        assert!(matches!(
+            database.accept_guild_invitation(999, 10),
+            Err(PersistenceError::UnknownGuild(999))
+        ));
+        assert!(matches!(
+            database.accept_guild_invitation(first.id, 999),
+            Err(PersistenceError::UnknownPlayer(999))
         ));
         let _ = fs::remove_file(path);
     }
