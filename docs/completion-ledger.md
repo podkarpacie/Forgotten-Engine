@@ -29,7 +29,7 @@ The declared creature credit now includes one bounded static-NPC dialogue source
 
 The declared social credit now includes a session-local party shared-experience eligibility foundation. A leader may request it, and the core computes only deterministic minimum-party, level-spread, leader-relative range/floor, and recent-activity status. It does not award or split experience, change client party shields, accept client enablement, create party chat, persist state, or reproduce full TFS timing.
 
-The declared creature credit now also prevents validated static NPCs from inheriting FE's bounded monster target, pursuit, or direct-melee routes. This is a safety boundary, not NPC AI; scripts, focus, shops, travel, combat, and full NPC behavior remain unimplemented.
+The declared creature credit now also prevents validated static NPCs from inheriting FE's bounded monster target, pursuit, direct-melee, or player-selected static-melee routes. This is a safety boundary, not NPC AI; scripts, focus, shops, travel, combat, and full NPC behavior remain unimplemented.
 
 The declared item credit now also includes one complete source-map compatible-stack merge into an owned top-level container. It remains a single exact source identity removal with durable journal recovery, not a partial stack or generic ground-transfer system.
 

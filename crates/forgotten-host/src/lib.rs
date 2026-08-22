@@ -8816,6 +8816,7 @@ fn apply_native_selected_static_creature_melee(
         Err(HostError::Core(
             forgotten_core::CoreError::StaticCreatureCombatOutOfRange { .. }
             | forgotten_core::CoreError::InactiveStaticCreature(_)
+            | forgotten_core::CoreError::StaticNpcNotAttackable(_)
             | forgotten_core::CoreError::UnknownStaticCreature(_)
             | forgotten_core::CoreError::CombatCooldownActive { .. },
         )) => Ok(None),

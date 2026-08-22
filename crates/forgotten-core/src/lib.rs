@@ -4276,6 +4276,9 @@ impl WorldState {
         if !target.active {
             return Err(CoreError::InactiveStaticCreature(target_id));
         }
+        if target.is_npc {
+            return Err(CoreError::StaticNpcNotAttackable(target_id));
+        }
         if !attacker.position.is_adjacent_to(target.entity.position) {
             return Err(CoreError::StaticCreatureCombatOutOfRange {
                 attacker_id,
@@ -6296,6 +6299,7 @@ pub enum CoreError {
     PlayerOccupiesPosition(Position),
     UnknownStaticCreature(u32),
     InactiveStaticCreature(u32),
+    StaticNpcNotAttackable(u32),
     StaticCreatureMovementBlocked(Position),
     InvalidMap(String),
     InvalidTransition {
@@ -6632,6 +6636,10 @@ mod tests {
         assert_eq!(
             world.apply_static_creature_target_damage(npc_id, 10, &map),
             Ok(StaticCreatureTargetAttackOutcome::NoTarget)
+        );
+        assert_eq!(
+            world.apply_static_creature_melee_damage(7, npc_id, 10),
+            Err(CoreError::StaticNpcNotAttackable(npc_id))
         );
         assert_eq!(
             world.static_creature(npc_id).unwrap().position,
