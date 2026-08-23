@@ -1,4 +1,4 @@
-﻿//! Persistent TCP host and bounded diagnostic session foundation for Forgotten Engine.
+//! Persistent TCP host and bounded diagnostic session foundation for Forgotten Engine.
 //!
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
@@ -63,20 +63,19 @@ use forgotten_protocol::{
     encode_native_otclient_private_message_from, encode_native_otclient_public_channel_say,
     encode_native_otclient_public_say, encode_native_otclient_read_only_text_window,
     encode_native_otclient_set_inventory, encode_native_otclient_status_message,
-    encode_native_otclient_whisper, encode_native_otclient_yell,
-    encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
-    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
-    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
-    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection, NativeOtClientClassicChannel,
-    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
-    NativeOtClientClassicOutfit, NativeOtClientClassicPartyShield,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
-    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
-    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
-    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    encode_native_otclient_whisper, encode_native_otclient_yell, encode_status_binary,
+    encode_status_xml, generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
+    NativeOtClientCardinalDirection, NativeOtClientClassicChannel, NativeOtClientClassicItemRecord,
+    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
+    NativeOtClientClassicPartyShield, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
+    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerVitals,
+    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
+    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_MESSAGE_SAY,
-    NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL,
-    NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
+    NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL, NATIVE_OTCLIENT_PLAYER_ID_END,
+    NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
@@ -3736,11 +3735,13 @@ impl SharedNativeWorld {
         let mut delivered = 0;
         recipients.retain(|recipient_id, recipient| {
             let within_range = *recipient_id == sender_id
-                || listener_positions.get(recipient_id).is_some_and(|listener| {
-                    listener.z == sender.position.z
-                        && listener.x.abs_diff(sender.position.x) <= u16::from(range_tiles)
-                        && listener.y.abs_diff(sender.position.y) <= u16::from(range_tiles)
-                });
+                || listener_positions
+                    .get(recipient_id)
+                    .is_some_and(|listener| {
+                        listener.z == sender.position.z
+                            && listener.x.abs_diff(sender.position.x) <= range_tiles
+                            && listener.y.abs_diff(sender.position.y) <= range_tiles
+                    });
             if !within_range {
                 return true;
             }
@@ -16813,7 +16814,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_frame(&mut stream).unwrap().0,
+            read_data_frame(&mut stream).0,
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CHANNELS, 0]
         );
 
@@ -18704,10 +18705,42 @@ mod tests {
         // Speaker at spawn (100,100,7); listener adjacent; far listener same floor; cross-floor
         // listener adjacent in x/y but on a different floor.
         for (id, name, position) in [
-            (101u64, "Knight", Position { x: 100, y: 100, z: 7 }),
-            (102, "Druid", Position { x: 101, y: 100, z: 7 }),
-            (103, "Far", Position { x: 130, y: 130, z: 7 }),
-            (104, "Below", Position { x: 101, y: 100, z: 6 }),
+            (
+                101u64,
+                "Knight",
+                Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+            (
+                102,
+                "Druid",
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+            (
+                103,
+                "Far",
+                Position {
+                    x: 130,
+                    y: 130,
+                    z: 7,
+                },
+            ),
+            (
+                104,
+                "Below",
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 6,
+                },
+            ),
         ] {
             shared
                 .register_player_at_available_position(
@@ -18724,16 +18757,20 @@ mod tests {
                 )
                 .unwrap();
         }
-        let knight_events = shared.register_public_chat_recipient(101, "Knight").unwrap();
+        let knight_events = shared
+            .register_public_chat_recipient(101, "Knight")
+            .unwrap();
         let druid_events = shared.register_public_chat_recipient(102, "Druid").unwrap();
         let far_events = shared.register_public_chat_recipient(103, "Far").unwrap();
-        let below_events = shared
-            .register_public_chat_recipient(104, "Below")
-            .unwrap();
+        let below_events = shared.register_public_chat_recipient(104, "Below").unwrap();
         assert_eq!(shared.broadcast_whisper_chat(101, "psst").unwrap(), 2);
         let expected = SharedPublicChatEvent {
             speaker_name: "Knight".into(),
-            speaker_position: native_position(Position { x: 100, y: 100, z: 7 }),
+            speaker_position: native_position(Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            }),
             channel_id: None,
             private: false,
             talk_mode: NATIVE_OTCLIENT_MESSAGE_WHISPER,
@@ -18741,7 +18778,10 @@ mod tests {
         };
         assert_eq!(knight_events.try_recv().unwrap(), expected);
         assert_eq!(druid_events.try_recv().unwrap(), expected);
-        assert!(matches!(far_events.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            far_events.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         assert!(matches!(
             below_events.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -18757,10 +18797,42 @@ mod tests {
         let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
         let map = native_world_map();
         for (id, name, position) in [
-            (201u64, "Speaker", Position { x: 100, y: 100, z: 7 }),
-            (202, "Near", Position { x: 110, y: 110, z: 7 }),
-            (203, "TooFar", Position { x: 140, y: 140, z: 7 }),
-            (204, "Below", Position { x: 110, y: 110, z: 6 }),
+            (
+                201u64,
+                "Speaker",
+                Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+            (
+                202,
+                "Near",
+                Position {
+                    x: 110,
+                    y: 110,
+                    z: 7,
+                },
+            ),
+            (
+                203,
+                "TooFar",
+                Position {
+                    x: 140,
+                    y: 140,
+                    z: 7,
+                },
+            ),
+            (
+                204,
+                "Below",
+                Position {
+                    x: 110,
+                    y: 110,
+                    z: 6,
+                },
+            ),
         ] {
             shared
                 .register_player_at_available_position(
@@ -18784,13 +18856,15 @@ mod tests {
         let too_far_events = shared
             .register_public_chat_recipient(203, "TooFar")
             .unwrap();
-        let below_events = shared
-            .register_public_chat_recipient(204, "Below")
-            .unwrap();
+        let below_events = shared.register_public_chat_recipient(204, "Below").unwrap();
         assert_eq!(shared.broadcast_yell_chat(201, "hail").unwrap(), 2);
         let expected = SharedPublicChatEvent {
             speaker_name: "Speaker".into(),
-            speaker_position: native_position(Position { x: 100, y: 100, z: 7 }),
+            speaker_position: native_position(Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            }),
             channel_id: None,
             private: false,
             talk_mode: NATIVE_OTCLIENT_MESSAGE_YELL,
@@ -19070,6 +19144,19 @@ mod tests {
         add_string(&mut payload, "otcv8-test");
         payload.extend_from_slice(&1_u16.to_le_bytes());
         Frame(payload)
+    }
+
+    /// Reads the next session frame while discarding unsolicited server heartbeat pings so
+    /// timing-sensitive socket regressions stay synchronized whenever a one-second idle window
+    /// elapses between exchanges. Never use this where the ping record itself is expected.
+    fn read_data_frame(stream: &mut TcpStream) -> Frame {
+        loop {
+            let frame = read_frame(stream).unwrap();
+            if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] {
+                continue;
+            }
+            return frame;
+        }
     }
 
     #[test]
@@ -19790,9 +19877,9 @@ mod tests {
             0,
             0,
         ];
-        assert_eq!(read_frame(&mut stream).unwrap().0, expected_backpack);
+        assert_eq!(read_data_frame(&mut stream).0, expected_backpack);
         assert_eq!(
-            read_frame(&mut stream).unwrap().0,
+            read_data_frame(&mut stream).0,
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH,
                 1,
@@ -19820,7 +19907,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_frame(&mut stream).unwrap().0,
+            read_data_frame(&mut stream).0,
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_EDIT_TEXT,
                 0,
@@ -19861,7 +19948,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_frame(&mut stream).unwrap().0,
+            read_data_frame(&mut stream).0,
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
                 forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT,
@@ -19963,7 +20050,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_frame(&mut stream).unwrap().0,
+            read_data_frame(&mut stream).0,
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
                 forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT,
@@ -19995,7 +20082,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_frame(&mut stream).unwrap().0,
+            read_data_frame(&mut stream).0,
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_MODES,
                 3,
@@ -20022,7 +20109,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_frame(&mut stream).unwrap().0,
+            read_data_frame(&mut stream).0,
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_QUEST_LOG, 0, 0]
         );
 
@@ -20053,7 +20140,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_frame(&mut stream).unwrap().0,
+            read_data_frame(&mut stream).0,
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER, 2]
         );
 
@@ -20065,7 +20152,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        assert_eq!(read_frame(&mut stream).unwrap().0, expected_backpack);
+        assert_eq!(read_data_frame(&mut stream).0, expected_backpack);
 
         let heartbeat = read_frame(&mut stream).unwrap();
         assert_eq!(
@@ -20080,7 +20167,7 @@ mod tests {
         write_frame(&mut stream, &Frame(vec![0xa0, 1, 0, 1])).unwrap();
         write_frame(&mut stream, &Frame(vec![0x1d])).unwrap();
         assert_eq!(
-            read_frame(&mut stream).unwrap().0,
+            read_data_frame(&mut stream).0,
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_MODES,
                 1,
@@ -20088,16 +20175,16 @@ mod tests {
                 1,
             ]
         );
-        let ping_back = read_frame(&mut stream).unwrap();
+        let ping_back = read_data_frame(&mut stream);
         assert_eq!(ping_back.0, vec![0x1d]);
 
         let auto_walk_started = Instant::now();
         write_frame(&mut stream, &Frame(vec![0x64, 2, 1, 3])).unwrap();
-        let auto_walk_east = read_frame(&mut stream).unwrap();
+        let auto_walk_east = read_data_frame(&mut stream);
         assert!(auto_walk_started.elapsed() >= Duration::from_millis(500));
         assert_eq!(&auto_walk_east.0[1..7], &[100, 0, 100, 0, 7, 1]);
         assert_eq!(&auto_walk_east.0[7..12], &[101, 0, 100, 0, 7]);
-        let auto_walk_edge = read_frame(&mut stream).unwrap();
+        let auto_walk_edge = read_data_frame(&mut stream);
         assert_eq!(
             auto_walk_edge.0[0],
             NativeOtClientCardinalDirection::East.protocol_direction() + 0x65
@@ -20109,17 +20196,17 @@ mod tests {
         let replacement_started = Instant::now();
         write_frame(&mut stream, &Frame(vec![0x64, 1, 7])).unwrap();
         write_frame(&mut stream, &Frame(vec![0x64, 1, 5])).unwrap();
-        let latest_path_movement = read_frame(&mut stream).unwrap();
+        let latest_path_movement = read_data_frame(&mut stream);
         assert!(replacement_started.elapsed() >= Duration::from_millis(500));
         assert_eq!(&latest_path_movement.0[1..7], &[101, 0, 100, 0, 7, 1]);
         assert_eq!(&latest_path_movement.0[7..12], &[100, 0, 100, 0, 7]);
-        let latest_path_edge = read_frame(&mut stream).unwrap();
+        let latest_path_edge = read_data_frame(&mut stream);
         assert_eq!(latest_path_edge.0[0], 0x68);
         write_frame(&mut stream, &Frame(vec![0x67])).unwrap();
-        let manual_movement = read_frame(&mut stream).unwrap();
+        let manual_movement = read_data_frame(&mut stream);
         assert_eq!(&manual_movement.0[1..7], &[100, 0, 100, 0, 7, 1]);
         assert_eq!(&manual_movement.0[7..12], &[100, 0, 101, 0, 7]);
-        let manual_edge = read_frame(&mut stream).unwrap();
+        let manual_edge = read_data_frame(&mut stream);
         assert_eq!(
             manual_edge.0[0],
             NativeOtClientCardinalDirection::South.protocol_direction() + 0x65
@@ -20141,7 +20228,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_frame(&mut stream).unwrap().0,
+            read_data_frame(&mut stream).0,
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH,
                 1,
@@ -20151,13 +20238,13 @@ mod tests {
                 90,
             ]
         );
-        let static_visibility_refresh = read_frame(&mut stream).unwrap();
+        let static_visibility_refresh = read_data_frame(&mut stream);
         assert_eq!(
             static_visibility_refresh.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
         );
         assert_eq!(
-            read_frame(&mut stream).unwrap().0,
+            read_data_frame(&mut stream).0,
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH,
                 1,
@@ -20169,14 +20256,14 @@ mod tests {
         );
 
         write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
-        let movement = read_frame(&mut stream).unwrap();
+        let movement = read_data_frame(&mut stream);
         assert_eq!(
             movement.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
         );
         assert_eq!(&movement.0[1..7], &[100, 0, 101, 0, 7, 1]);
         assert_eq!(&movement.0[7..12], &[101, 0, 101, 0, 7]);
-        let movement_edge = read_frame(&mut stream).unwrap();
+        let movement_edge = read_data_frame(&mut stream);
         assert_eq!(
             movement_edge.0[0],
             NativeOtClientCardinalDirection::East.protocol_direction() + 0x65
@@ -20199,14 +20286,14 @@ mod tests {
         );
 
         write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
-        let second_east = read_frame(&mut stream).unwrap();
+        let second_east = read_data_frame(&mut stream);
         assert_eq!(&second_east.0[1..7], &[101, 0, 101, 0, 7, 1]);
         assert_eq!(&second_east.0[7..12], &[102, 0, 101, 0, 7]);
-        let second_east_edge = read_frame(&mut stream).unwrap();
+        let second_east_edge = read_data_frame(&mut stream);
         assert_eq!(second_east_edge.0[0], 0x66);
 
         write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
-        let blocked_movement = read_frame(&mut stream).unwrap();
+        let blocked_movement = read_data_frame(&mut stream);
         assert_eq!(
             blocked_movement.0,
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 1]
@@ -20225,16 +20312,16 @@ mod tests {
             ]),
         )
         .unwrap();
-        let diagonal_movement = read_frame(&mut stream).unwrap();
+        let diagonal_movement = read_data_frame(&mut stream);
         assert_eq!(
             diagonal_movement.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
         );
         assert_eq!(&diagonal_movement.0[1..7], &[102, 0, 101, 0, 7, 1]);
         assert_eq!(&diagonal_movement.0[7..12], &[101, 0, 100, 0, 7]);
-        let north_edge = read_frame(&mut stream).unwrap();
+        let north_edge = read_data_frame(&mut stream);
         assert_eq!(north_edge.0[0], 0x65);
-        let west_edge = read_frame(&mut stream).unwrap();
+        let west_edge = read_data_frame(&mut stream);
         assert_eq!(west_edge.0[0], 0x68);
         let diagonal_position = database.characters_for_account(account_id).unwrap()[0].position;
         assert_eq!(diagonal_position.x, 101);
@@ -20246,7 +20333,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        let blocked_diagonal = read_frame(&mut stream).unwrap();
+        let blocked_diagonal = read_data_frame(&mut stream);
         assert_eq!(
             blocked_diagonal.0,
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 3]
@@ -20258,7 +20345,7 @@ mod tests {
 
         write_frame(&mut stream, &Frame(vec![0x96, 1, 2, 0, b'h', b'i'])).unwrap();
         assert_eq!(
-            read_frame(&mut stream).unwrap().0,
+            read_data_frame(&mut stream).0,
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_TALK,
                 6,
@@ -20289,7 +20376,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        let outfit_window = read_frame(&mut stream).unwrap();
+        let outfit_window = read_data_frame(&mut stream);
         assert_eq!(
             outfit_window.0,
             vec![
@@ -20318,7 +20405,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        let applied_outfit = read_frame(&mut stream).unwrap();
+        let applied_outfit = read_data_frame(&mut stream);
         assert_eq!(
             applied_outfit.0,
             vec![
@@ -20356,7 +20443,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        let rejected_outfit = read_frame(&mut stream).unwrap();
+        let rejected_outfit = read_data_frame(&mut stream);
         assert_eq!(
             rejected_outfit.0,
             vec![
@@ -20389,17 +20476,17 @@ mod tests {
         .unwrap();
         write_frame(&mut stream, &Frame(vec![0xa1, 1, 0, 0, 0])).unwrap();
         assert_eq!(
-            read_frame(&mut stream).unwrap().0,
+            read_data_frame(&mut stream).0,
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CLEAR_TARGET]
         );
         write_frame(&mut stream, &Frame(vec![0x69])).unwrap();
-        let cancelled = read_frame(&mut stream).unwrap();
+        let cancelled = read_data_frame(&mut stream);
         assert_eq!(
             cancelled.0,
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 3]
         );
         write_frame(&mut stream, &Frame(vec![0x71])).unwrap();
-        let turned = read_frame(&mut stream).unwrap();
+        let turned = read_data_frame(&mut stream);
         assert_eq!(
             turned.0,
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 2]
@@ -20421,7 +20508,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        let teleport_viewport = read_frame(&mut stream).unwrap();
+        let teleport_viewport = read_data_frame(&mut stream);
         assert_eq!(
             teleport_viewport.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
@@ -20441,7 +20528,7 @@ mod tests {
             &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_SOUTH]),
         )
         .unwrap();
-        let stepped_teleport_viewport = read_frame(&mut stream).unwrap();
+        let stepped_teleport_viewport = read_data_frame(&mut stream);
         assert_eq!(
             stepped_teleport_viewport.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
@@ -20463,7 +20550,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        let diagonal_teleport_viewport = read_frame(&mut stream).unwrap();
+        let diagonal_teleport_viewport = read_data_frame(&mut stream);
         assert_eq!(
             diagonal_teleport_viewport.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
@@ -20483,7 +20570,7 @@ mod tests {
             &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_NORTH]),
         )
         .unwrap();
-        let chain_teleport_viewport = read_frame(&mut stream).unwrap();
+        let chain_teleport_viewport = read_data_frame(&mut stream);
         assert_eq!(
             chain_teleport_viewport.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
@@ -20503,7 +20590,7 @@ mod tests {
             &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_NORTH]),
         )
         .unwrap();
-        let cycle_teleport_viewport = read_frame(&mut stream).unwrap();
+        let cycle_teleport_viewport = read_data_frame(&mut stream);
         assert_eq!(
             cycle_teleport_viewport.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
@@ -20767,7 +20854,7 @@ mod tests {
         let initialization = read_frame(&mut stream).unwrap();
         assert!(initialization.0.windows(3).any(|window| window == b"Rat"));
         assert_eq!(
-            read_frame(&mut stream).unwrap().0,
+            read_data_frame(&mut stream).0,
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH,
                 1,
@@ -20788,7 +20875,7 @@ mod tests {
         )
         .unwrap();
         write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
-        let blocked = read_frame(&mut stream).unwrap();
+        let blocked = read_data_frame(&mut stream);
         assert_eq!(
             blocked.0,
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 2]

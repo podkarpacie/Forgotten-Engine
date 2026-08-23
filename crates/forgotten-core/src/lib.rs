@@ -320,10 +320,7 @@ impl FeTfsStaticSpawnCollection {
                 return Err(CoreError::UnknownStaticCreatureSchedule);
             }
             for entry in loot {
-                if entry.item_id == 0
-                    || entry.min_count == 0
-                    || entry.min_count > entry.max_count
-                {
+                if entry.item_id == 0 || entry.min_count == 0 || entry.min_count > entry.max_count {
                     return Err(CoreError::UnknownStaticCreatureSchedule);
                 }
             }
@@ -3884,8 +3881,7 @@ impl WorldState {
                 .wrapping_add(1442695040888963407);
             let roll = (state >> 33) % u64::from(LOOT_CHANCE_SCALE.max(1));
             if roll < u64::from(entry.chance.min(LOOT_CHANCE_SCALE)) {
-                let span =
-                    u64::from(entry.max_count) - u64::from(entry.min_count) + 1;
+                let span = u64::from(entry.max_count) - u64::from(entry.min_count) + 1;
                 state = state
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
@@ -6720,46 +6716,42 @@ mod tests {
     #[test]
     fn static_loot_tables_reject_unknown_and_invalid_entries() {
         let creature_id = 0x4000_0001;
-        assert!(
-            FeTfsStaticSpawnCollection::with_loot_tables(
-                vec![loot_test_creature(creature_id)],
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeSet::new(),
-                BTreeMap::from([(
-                    999,
-                    vec![StaticCreatureLootEntry {
-                        item_id: 2148,
-                        chance: LOOT_CHANCE_SCALE,
-                        min_count: 1,
-                        max_count: 1,
-                    }]
-                )]),
-            )
-            .is_err()
-        );
-        assert!(
-            FeTfsStaticSpawnCollection::with_loot_tables(
-                vec![loot_test_creature(creature_id)],
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeSet::new(),
-                BTreeMap::from([(
-                    creature_id,
-                    vec![StaticCreatureLootEntry {
-                        item_id: 2148,
-                        chance: LOOT_CHANCE_SCALE,
-                        min_count: 5,
-                        max_count: 2,
-                    }]
-                )]),
-            )
-            .is_err()
-        );
+        assert!(FeTfsStaticSpawnCollection::with_loot_tables(
+            vec![loot_test_creature(creature_id)],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::from([(
+                999,
+                vec![StaticCreatureLootEntry {
+                    item_id: 2148,
+                    chance: LOOT_CHANCE_SCALE,
+                    min_count: 1,
+                    max_count: 1,
+                }]
+            )]),
+        )
+        .is_err());
+        assert!(FeTfsStaticSpawnCollection::with_loot_tables(
+            vec![loot_test_creature(creature_id)],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::from([(
+                creature_id,
+                vec![StaticCreatureLootEntry {
+                    item_id: 2148,
+                    chance: LOOT_CHANCE_SCALE,
+                    min_count: 5,
+                    max_count: 2,
+                }]
+            )]),
+        )
+        .is_err());
     }
 
     fn player() -> Player {
