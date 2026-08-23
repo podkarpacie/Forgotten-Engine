@@ -345,12 +345,16 @@ const NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE: u16 = 10;
 const NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID: u16 = 3065;
 /// Bounded number of simultaneously open native corpse container windows per session.
 const NATIVE_OTCLIENT_MAX_OPEN_CORPSE_WINDOWS: usize = 4;
+/// Classic clients address container windows through a four-bit field, so every native corpse
+/// window ID must stay inside that addressable range.
+const NATIVE_OTCLIENT_CONTAINER_ADDRESSABLE_WINDOW_MAX: u8 = 0x0f;
 /// Fallback display name for a corpse without operator-supplied item-name metadata.
 const NATIVE_OTCLIENT_FALLBACK_CORPSE_NAME: &str = "corpse";
 
-/// Allocates one deterministic free client window ID for a corpse container view. It avoids every
-/// currently open player-owned container window and already-open corpse window, and is bounded by
-/// the configured concurrent corpse-window cap rather than by player container storage.
+/// Allocates one deterministic free client window ID for a corpse container view. Classic
+/// clients address container windows through the four-bit `y & 0x0f` field, so IDs stay within
+/// that addressable range while avoiding every currently open player-owned container window and
+/// already-open corpse window. The bounded concurrent corpse-window cap still applies.
 fn native_corpse_window_id(
     open_player_container_ids: &BTreeSet<u8>,
     open_corpse_window_ids: &BTreeSet<u8>,
@@ -358,7 +362,7 @@ fn native_corpse_window_id(
     if open_corpse_window_ids.len() >= NATIVE_OTCLIENT_MAX_OPEN_CORPSE_WINDOWS {
         return None;
     }
-    (0..=u8::MAX)
+    (0..=NATIVE_OTCLIENT_CONTAINER_ADDRESSABLE_WINDOW_MAX)
         .rev()
         .find(|id| !open_player_container_ids.contains(id) && !open_corpse_window_ids.contains(id))
 }
@@ -1961,6 +1965,276 @@ impl SharedNativeMap {
         *registry = next_registry;
         self.revision.fetch_add(1, Ordering::SeqCst);
         Ok(Some(outcome))
+    }
+
+    /// Resolves the ordered runtime-tail start index for one tile: every map item at or above
+    /// this index belongs to the durable runtime registry rather than imported source content.
+    fn runtime_tail_start(
+        &self,
+        map_items_len: Option<usize>,
+        position: &Position,
+        registry: &[RuntimeMapItemRecord],
+    ) -> usize {
+        let runtime_count = registry
+            .iter()
+            .filter(|record| &record.position == position)
+            .count();
+        map_items_len.unwrap_or(0).saturating_sub(runtime_count)
+    }
+
+    /// Moves one bounded count out of a durable runtime tile item into owned player inventory.
+    /// `child_index = None` takes from the top-level stack itself (whole or partial), while
+    /// `Some(index)` takes from one corpse child. The inventory change and complete registry
+    /// persist in one SQLite transaction while authoritative locks are held; staged memory
+    /// publishes only after commit. Depleted top-level records are removed from both the map and
+    /// the registry together, and surviving sibling ordinals stay contiguous.
+    #[allow(clippy::too_many_arguments)]
+    pub fn move_runtime_item_to_inventory(
+        &self,
+        shared_world: &SharedNativeWorld,
+        database: &mut EngineDatabase,
+        player_id: u64,
+        position: Position,
+        item_index: usize,
+        child_index: Option<usize>,
+        count: u16,
+        destination: forgotten_core::PlayerGroundDropSource,
+    ) -> Result<Option<forgotten_core::PlayerGroundDropOutcome>, HostError> {
+        if count == 0 || count > u16::from(u8::MAX) {
+            return Ok(None);
+        }
+        let mut world = shared_world.lock()?;
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut registry_guard = self
+            .runtime_tile_items
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let runtime_start = self.runtime_tail_start(
+            map.tile_items(position).map(<[WorldMapItem]>::len),
+            &position,
+            &registry_guard,
+        );
+        let Some(items) = map.tile_items(position) else {
+            return Ok(None);
+        };
+        if item_index < runtime_start || item_index >= items.len() {
+            return Ok(None);
+        }
+        let Ok(ordinal) = u8::try_from(item_index - runtime_start) else {
+            return Ok(None);
+        };
+        let Some(record_index) = registry_guard
+            .iter()
+            .position(|record| record.position == position && record.ordinal == ordinal)
+        else {
+            return Ok(None);
+        };
+        let map_item = items[item_index].clone();
+        let top_level_count_before_take = map_item.count;
+        let top_level_server_id = map_item.server_id;
+
+        // Resolve the moved stack plus the staged post-take source shape.
+        let (moved_item, next_children, next_top_count, remove_top, source_remaining_count) =
+            match child_index {
+                Some(child_index) => {
+                    let Some(available_child) = map_item.children.get(child_index).cloned() else {
+                        return Ok(None);
+                    };
+                    let Ok(take) = u8::try_from(count) else {
+                        return Ok(None);
+                    };
+                    if available_child.count < take {
+                        return Ok(None);
+                    }
+                    let mut remaining_child = available_child.clone();
+                    let mut moved = available_child;
+                    moved.count = take;
+                    remaining_child.count -= take;
+                    let source_remaining_count =
+                        (remaining_child.count > 0).then_some(u16::from(remaining_child.count));
+                    let mut next_children = map_item.children.clone();
+                    if remaining_child.count > 0 {
+                        next_children[child_index] = remaining_child;
+                    } else {
+                        next_children.remove(child_index);
+                    }
+                    (moved, next_children, None, false, source_remaining_count)
+                }
+                None => {
+                    if u16::from(map_item.count) < count {
+                        return Ok(None);
+                    }
+                    let Ok(take) = u8::try_from(count) else {
+                        return Ok(None);
+                    };
+                    let mut remaining_top = map_item.clone();
+                    let mut moved = map_item;
+                    moved.count = take;
+                    remaining_top.count -= take;
+                    if remaining_top.count > 0 {
+                        let source_remaining_count = Some(u16::from(remaining_top.count));
+                        (
+                            moved,
+                            remaining_top.children.clone(),
+                            Some(remaining_top.count),
+                            false,
+                            source_remaining_count,
+                        )
+                    } else {
+                        // A fully depleted top-level item leaves nothing on the tile.
+                        let source_remaining_count: Option<u16> = None;
+                        (moved, Vec::new(), None, true, source_remaining_count)
+                    }
+                }
+            };
+
+        // Stage the inventory destination on a cloned world so nothing publishes before
+        // persistence succeeds.
+        let moved_item =
+            forgotten_core::ItemInstance::new(moved_item.server_id, u16::from(moved_item.count))
+                .map_err(HostError::Core)?;
+        let mut staged_world = world.clone();
+        let destination_admission = match destination {
+            forgotten_core::PlayerGroundDropSource::EquipmentSlot(slot) => {
+                let mut equipment = staged_world
+                    .player_equipment(player_id)
+                    .map_err(HostError::Core)?
+                    .clone();
+                match equipment.item(slot).cloned() {
+                    Some(mut existing) => {
+                        if existing.merge_stack(&moved_item).is_err() {
+                            return Ok(None);
+                        }
+                        equipment.equip(slot, existing);
+                    }
+                    None => {
+                        equipment.equip(slot, moved_item.clone());
+                    }
+                }
+                staged_world
+                    .replace_player_equipment(player_id, equipment)
+                    .map_err(HostError::Core)?;
+                true
+            }
+            forgotten_core::PlayerGroundDropSource::ContainerItem { container_id, .. } => {
+                let mut containers = staged_world
+                    .player_containers(player_id)
+                    .map_err(HostError::Core)?
+                    .clone();
+                let Some(mut container) = containers.remove(container_id) else {
+                    return Ok(None);
+                };
+                if container.has_parent
+                    || container
+                        .items
+                        .merge_or_insert_stack(moved_item.clone())
+                        .is_err()
+                {
+                    return Ok(None);
+                }
+                containers.insert(container).map_err(HostError::Core)?;
+                staged_world
+                    .replace_player_containers(player_id, containers)
+                    .map_err(HostError::Core)?;
+                true
+            }
+        };
+        if !destination_admission {
+            return Ok(None);
+        }
+
+        // Stage the registry and map mutations.
+        let mut next_registry = registry_guard.clone();
+        if remove_top {
+            next_registry.remove(record_index);
+            for sibling in next_registry
+                .iter_mut()
+                .filter(|record| record.position == position && record.ordinal > ordinal)
+            {
+                sibling.ordinal -= 1;
+            }
+        } else {
+            match child_index {
+                Some(_) => {
+                    next_registry[record_index].children = next_children
+                        .iter()
+                        .map(|child| RuntimeMapItemChildRecord {
+                            server_id: child.server_id,
+                            count: child.count,
+                        })
+                        .collect();
+                }
+                None => {
+                    next_registry[record_index].count =
+                        next_top_count.expect("partial top-level take keeps its remainder");
+                }
+            }
+        }
+        let mut next_items = items.to_vec();
+        if remove_top {
+            next_items.remove(item_index);
+        } else {
+            next_items[item_index] = WorldMapItem {
+                server_id: top_level_server_id,
+                client_thing_id: None,
+                count: next_top_count.unwrap_or(top_level_count_before_take),
+                action_id: None,
+                unique_id: None,
+                text: None,
+                description: None,
+                teleport_destination: None,
+                duration: None,
+                charges: None,
+                children: next_children,
+            };
+        }
+        let mut next_map = (*map).clone();
+        next_map
+            .set_tile_items(position, next_items)
+            .map_err(HostError::Core)?;
+
+        database.replace_player_inventory_and_runtime_map_items(
+            player_id,
+            &staged_world
+                .player_equipment(player_id)
+                .map_err(HostError::Core)?
+                .clone(),
+            &staged_world
+                .player_containers(player_id)
+                .map_err(HostError::Core)?
+                .clone(),
+            self.source_revision(),
+            &next_registry,
+        )?;
+        let published_equipment = staged_world
+            .player_equipment(player_id)
+            .map_err(HostError::Core)?
+            .clone();
+        let published_containers = staged_world
+            .player_containers(player_id)
+            .map_err(HostError::Core)?
+            .clone();
+        world
+            .replace_player_equipment(player_id, published_equipment)
+            .expect("validated player remains present while the shared-world lock is held");
+        world
+            .replace_player_containers(player_id, published_containers)
+            .expect("validated player remains present while the shared-world lock is held");
+        *map = next_map;
+        *registry_guard = next_registry;
+        drop(world);
+        drop(map);
+        drop(registry_guard);
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(forgotten_core::PlayerGroundDropOutcome {
+            player_id,
+            source: destination,
+            moved_item,
+            source_remaining_count,
+        }))
     }
 
     /// Replaces one imported tile's complete ordered item list after `WorldMap` validates its
@@ -5803,7 +6077,7 @@ fn handle_native_otclient_game(
     let mut last_regeneration_tick = Instant::now();
     let mut last_condition_tick = Instant::now();
     let mut closed_container_ids = BTreeSet::new();
-    let mut open_corpse_windows: BTreeMap<u8, Position> = BTreeMap::new();
+    let mut open_corpse_windows: BTreeMap<u8, (Position, usize)> = BTreeMap::new();
     let mut open_public_channel_ids = BTreeSet::new();
     loop {
         drain_shared_vip_presence(
@@ -6671,6 +6945,156 @@ fn handle_native_otclient_game(
                     continue;
                 }
                 if source_position.x != 0xffff {
+                    let core_source_position = Position {
+                        x: source_position.x,
+                        y: source_position.y,
+                        z: source_position.z,
+                    };
+                    // Runtime ground items (dropped stacks) are picked up from the durable
+                    // registry; imported source items keep their own transfer paths below.
+                    let runtime_pickup = map_owner.runtime_tile_item(
+                        core_source_position,
+                        usize::from(source_stack_position),
+                    )?;
+                    if let Some(runtime_item) = runtime_pickup.filter(|_| !observed_dead) {
+                        let identity_ok = source_client_thing_id == runtime_item.server_id
+                            || catalog.presentation(runtime_item.server_id).is_some_and(
+                                |presentation| {
+                                    presentation.client_thing_id == source_client_thing_id
+                                },
+                            );
+                        if !identity_ok {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-runtime-pickup-identity-mismatch",
+                            );
+                            continue;
+                        }
+                        let destination = if let Some(slot) = target_slot {
+                            Some(forgotten_core::PlayerGroundDropSource::EquipmentSlot(slot))
+                        } else if let Some(container_id) = target_container_id {
+                            if closed_container_ids.contains(&container_id) {
+                                native_diagnostic(
+                                        config.extended_diagnostics,
+                                        peer,
+                                        "action=throw-item outcome=deferred-closed-container-pickup-target",
+                                    );
+                                continue;
+                            }
+                            Some(forgotten_core::PlayerGroundDropSource::ContainerItem {
+                                container_id,
+                                item_index: 0,
+                            })
+                        } else {
+                            None
+                        };
+                        let Some(destination) = destination else {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-unsupported-runtime-pickup-target",
+                            );
+                            continue;
+                        };
+                        match map_owner.move_runtime_item_to_inventory(
+                            shared_world,
+                            &mut database,
+                            character.id,
+                            core_source_position,
+                            usize::from(source_stack_position),
+                            None,
+                            u16::from(count),
+                            destination,
+                        ) {
+                            Ok(Some(outcome)) => {
+                                if let forgotten_core::PlayerGroundDropSource::EquipmentSlot(_) =
+                                    outcome.source
+                                {
+                                    let equipment = shared_world.player_equipment(character.id)?;
+                                    let current_mapped_equipment =
+                                        native_classic_mapped_equipment(Some(catalog), &equipment);
+                                    let equipment_updates = native_classic_equipment_delta_frames(
+                                        &config.client_profile,
+                                        &observed_mapped_equipment,
+                                        &current_mapped_equipment,
+                                    )
+                                    .map_err(HostError::Protocol)?;
+                                    for frame in &equipment_updates {
+                                        write_frame(stream, frame)?;
+                                    }
+                                    observed_mapped_equipment = current_mapped_equipment;
+                                    observed_equipment_epoch = shared_world.equipment_epoch();
+                                }
+                                if let forgotten_core::PlayerGroundDropSource::ContainerItem {
+                                    container_id,
+                                    ..
+                                } = outcome.source
+                                {
+                                    if !closed_container_ids.contains(&container_id) {
+                                        let containers =
+                                            shared_world.player_containers(character.id)?;
+                                        if let Some(container) = containers.container(container_id)
+                                        {
+                                            if let Some(frame) = native_classic_container_frame(
+                                                &config.client_profile,
+                                                Some(catalog),
+                                                container,
+                                            )
+                                            .map_err(HostError::Protocol)?
+                                            {
+                                                write_frame(stream, &frame)?;
+                                            }
+                                        }
+                                    }
+                                    observed_containers_epoch = shared_world.containers_epoch();
+                                }
+                                let mut refreshed_snapshot = snapshot.clone();
+                                refreshed_snapshot.player_position =
+                                    native_position(player_position);
+                                refreshed_snapshot.player_direction = facing.protocol_direction();
+                                let map_snapshot = map_owner.render_snapshot()?;
+                                let refreshed_viewport = encode_shared_native_world_viewport(
+                                    &config.client_profile,
+                                    &refreshed_snapshot,
+                                    map_snapshot.as_ref(),
+                                    shared_world,
+                                    character.id,
+                                )?;
+                                write_frame(stream, &refreshed_viewport)?;
+                                observed_visibility_epoch = shared_world.visibility_epoch();
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    &format!(
+                                        "action=throw-item outcome=runtime-ground-pickup source={},{},{} server-id={} count={} moved={} remaining={:?} index={}",
+                                        core_source_position.x,
+                                        core_source_position.y,
+                                        core_source_position.z,
+                                        runtime_item.server_id,
+                                        source_client_thing_id,
+                                        outcome.moved_item.count,
+                                        outcome.source_remaining_count,
+                                        source_stack_position,
+                                    ),
+                                );
+                            }
+                            Ok(None) => native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-runtime-pickup-rejected",
+                            ),
+                            Err(HostError::Core(_) | HostError::InvalidConfiguration(_)) => {
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    "action=throw-item outcome=deferred-runtime-pickup-failed",
+                                );
+                            }
+                            Err(error) => return Err(error),
+                        }
+                        continue;
+                    }
                     let Some(intent) = native_map_item_use_intent(
                         Some(catalog),
                         character.id,
@@ -6867,9 +7291,156 @@ fn handle_native_otclient_game(
                     continue;
                 }
                 if let Some((container_id, item_index)) = source_container {
-                    // All containerĂ˘â€ â€ťequipment and containerĂ˘â€ â€ťcontainer throw paths below
-                    // persist through the atomic replace_player_inventory boundary so a
-                    // torn two-transaction inventory can never be observed or crash-duplicated.
+                    // Open corpse windows are session-local views over durable runtime registry
+                    // items; taking loot routes through the registry composite instead of
+                    // player-owned container storage.
+                    if let Some((corpse_position, corpse_item_index)) =
+                        open_corpse_windows.get(&container_id).copied()
+                    {
+                        let destination = if let Some(slot) = target_slot {
+                            Some(forgotten_core::PlayerGroundDropSource::EquipmentSlot(slot))
+                        } else if let Some(target_container) = target_container_id {
+                            if closed_container_ids.contains(&target_container)
+                                || target_container == container_id
+                            {
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    "action=throw-item outcome=deferred-closed-corpse-take-target",
+                                );
+                                continue;
+                            }
+                            Some(forgotten_core::PlayerGroundDropSource::ContainerItem {
+                                container_id: target_container,
+                                item_index: 0,
+                            })
+                        } else {
+                            None
+                        };
+                        let Some(destination) = destination.filter(|_| !observed_dead) else {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-unsupported-corpse-take-target",
+                            );
+                            continue;
+                        };
+                        match map_owner.move_runtime_item_to_inventory(
+                            shared_world,
+                            &mut database,
+                            character.id,
+                            corpse_position,
+                            corpse_item_index,
+                            Some(usize::from(source_stack_position)),
+                            u16::from(count),
+                            destination,
+                        ) {
+                            Ok(Some(outcome)) => {
+                                // Re-send the refreshed corpse window so remaining loot stays accurate.
+                                if let Some(runtime_corpse) = map_owner
+                                    .runtime_tile_item(corpse_position, corpse_item_index)?
+                                {
+                                    if let Some(frame) = native_corpse_window_frame(
+                                        &config.client_profile,
+                                        Some(catalog),
+                                        container_id,
+                                        &runtime_corpse,
+                                        config.item_name_by_server_id.as_deref(),
+                                    )
+                                    .map_err(HostError::Protocol)?
+                                    {
+                                        write_frame(stream, &frame)?;
+                                    }
+                                } else {
+                                    open_corpse_windows.remove(&container_id);
+                                }
+                                if let forgotten_core::PlayerGroundDropSource::EquipmentSlot(_) =
+                                    outcome.source
+                                {
+                                    let equipment = shared_world.player_equipment(character.id)?;
+                                    let current_mapped_equipment =
+                                        native_classic_mapped_equipment(Some(catalog), &equipment);
+                                    let equipment_updates = native_classic_equipment_delta_frames(
+                                        &config.client_profile,
+                                        &observed_mapped_equipment,
+                                        &current_mapped_equipment,
+                                    )
+                                    .map_err(HostError::Protocol)?;
+                                    for frame in &equipment_updates {
+                                        write_frame(stream, frame)?;
+                                    }
+                                    observed_mapped_equipment = current_mapped_equipment;
+                                    observed_equipment_epoch = shared_world.equipment_epoch();
+                                }
+                                if let forgotten_core::PlayerGroundDropSource::ContainerItem {
+                                    container_id: target_container,
+                                    ..
+                                } = outcome.source
+                                {
+                                    if !closed_container_ids.contains(&target_container) {
+                                        let containers =
+                                            shared_world.player_containers(character.id)?;
+                                        if let Some(container) =
+                                            containers.container(target_container)
+                                        {
+                                            if let Some(frame) = native_classic_container_frame(
+                                                &config.client_profile,
+                                                Some(catalog),
+                                                container,
+                                            )
+                                            .map_err(HostError::Protocol)?
+                                            {
+                                                write_frame(stream, &frame)?;
+                                            }
+                                        }
+                                    }
+                                    observed_containers_epoch = shared_world.containers_epoch();
+                                }
+                                let mut refreshed_snapshot = snapshot.clone();
+                                refreshed_snapshot.player_position =
+                                    native_position(player_position);
+                                refreshed_snapshot.player_direction = facing.protocol_direction();
+                                let map_snapshot = map_owner.render_snapshot()?;
+                                let refreshed_viewport = encode_shared_native_world_viewport(
+                                    &config.client_profile,
+                                    &refreshed_snapshot,
+                                    map_snapshot.as_ref(),
+                                    shared_world,
+                                    character.id,
+                                )?;
+                                write_frame(stream, &refreshed_viewport)?;
+                                observed_visibility_epoch = shared_world.visibility_epoch();
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    &format!(
+                                        "action=throw-item outcome=corpse-loot-taken window-id={} child-index={} server-id={} moved={} remaining={:?}",
+                                        container_id,
+                                        source_stack_position,
+                                        outcome.moved_item.server_id,
+                                        outcome.moved_item.count,
+                                        outcome.source_remaining_count,
+                                    ),
+                                );
+                            }
+                            Ok(None) => native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-corpse-take-rejected",
+                            ),
+                            Err(HostError::Core(_) | HostError::InvalidConfiguration(_)) => {
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    "action=throw-item outcome=deferred-corpse-take-failed",
+                                );
+                            }
+                            Err(error) => return Err(error),
+                        }
+                        continue;
+                    } // All containerĂ˘â€ â€ťequipment and containerĂ˘â€ â€ťcontainer throw paths below
+                      // persist through the atomic replace_player_inventory boundary so a
+                      // torn two-transaction inventory can never be observed or crash-duplicated.
                     if let Some(target_container_id) = target_container_id {
                         let containers = shared_world.player_containers(character.id)?;
                         let Some(source_container) = containers.container(container_id) else {
@@ -7497,7 +8068,10 @@ fn handle_native_otclient_game(
                             {
                                 Some(frame) => {
                                     write_frame(stream, &frame)?;
-                                    open_corpse_windows.insert(window_id, core_position);
+                                    open_corpse_windows.insert(
+                                        window_id,
+                                        (core_position, usize::from(stack_position)),
+                                    );
                                     native_diagnostic(
                                         config.extended_diagnostics,
                                         peer,
@@ -11603,6 +12177,319 @@ mod tests {
     }
 
     #[test]
+    fn native_throw_item_takes_loot_from_an_open_corpse_window() {
+        let database_path = database_path("native-corpse-take");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        let corpse_position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        {
+            Arc::get_mut(native_config.world_map.as_mut().unwrap())
+                .unwrap()
+                .set_tile_items(
+                    corpse_position,
+                    vec![WorldMapItem {
+                        server_id: 1988,
+                        client_thing_id: Some(1988),
+                        count: 1,
+                        action_id: None,
+                        unique_id: None,
+                        text: None,
+                        description: None,
+                        teleport_destination: None,
+                        duration: None,
+                        charges: None,
+                        children: Vec::new(),
+                    }],
+                )
+                .unwrap();
+        }
+        let source_revision = native_config.world_map.as_ref().unwrap().source_revision();
+        database
+            .replace_runtime_map_items(
+                source_revision,
+                &[RuntimeMapItemRecord {
+                    position: corpse_position,
+                    ordinal: 0,
+                    server_id: NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
+                    count: 1,
+                    children: vec![
+                        RuntimeMapItemChildRecord {
+                            server_id: 2148,
+                            count: 12,
+                        },
+                        RuntimeMapItemChildRecord {
+                            server_id: 2681,
+                            count: 2,
+                        },
+                    ],
+                    despawn_tick: None,
+                }],
+            )
+            .unwrap();
+        drop(database);
+
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for server_id in [3065, 2148, 2681, 1988] {
+            catalog
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id: server_id,
+                        requires_classic_740_subtype: false,
+                    },
+                )
+                .unwrap();
+        }
+        native_config.item_presentation_catalog = Some(Arc::new(catalog));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+
+        // Open the corpse window (stack index 1 above the imported item).
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_USE_ITEM,
+                101,
+                0,
+                100,
+                0,
+                7,
+                0xf9,
+                0x0b,
+                1,
+                0,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_data_frame(&mut stream).0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER
+        );
+
+        // Take all twelve gold coins from corpse child 0 into the empty right hand.
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                0xff,
+                0xff,
+                0x4f,
+                0x00,
+                0x00,
+                0x64,
+                0x08,
+                0x00,
+                0xff,
+                0xff,
+                5,
+                0x00,
+                0x00,
+                12,
+            ]),
+        )
+        .unwrap();
+        // The refreshed corpse window lists only the remaining food child.
+        let refreshed_corpse = read_data_frame(&mut stream);
+        assert_eq!(
+            refreshed_corpse.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER
+        );
+        // [opcode, id, corpse-record(2), len(2)="corpse"(6), capacity, parent, count=1, item]
+        assert_eq!(&refreshed_corpse.0[6..12], b"corpse");
+        assert_eq!(refreshed_corpse.0[14], 1);
+        assert_eq!(&refreshed_corpse.0[15..17], &[0x79, 0x0a]);
+        // The right hand receives the exact moved stack.
+        assert_eq!(
+            read_data_frame(&mut stream).0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_SET_INVENTORY,
+                EquipmentSlot::RightHand.code(),
+                0x64,
+                0x08
+            ]
+        );
+        // A full-map refresh follows the registry change.
+        assert_eq!(
+            read_data_frame(&mut stream).0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+
+        // Durable state: the corpse keeps one child and the hand holds the coins.
+        drop(stream);
+        game.shutdown().unwrap();
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let (_, records) = database.runtime_map_items().unwrap().expect("registry");
+        assert_eq!(records[0].children.len(), 1);
+        assert_eq!(records[0].children[0].server_id, 2681);
+        assert_eq!(
+            database
+                .player_equipment(1)
+                .unwrap()
+                .item(EquipmentSlot::RightHand)
+                .map(|item| (item.server_id, item.count)),
+            Some((2148, 12))
+        );
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_throw_item_picks_up_a_dropped_ground_stack_into_equipment() {
+        let database_path = database_path("native-ground-pickup");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        let stack_position = Position {
+            x: 101,
+            y: 101,
+            z: 7,
+        };
+        let source_revision = native_config.world_map.as_ref().unwrap().source_revision();
+        {
+            let mut database = EngineDatabase::open(&database_path).unwrap();
+            database
+                .replace_runtime_map_items(
+                    source_revision,
+                    &[RuntimeMapItemRecord {
+                        position: stack_position,
+                        ordinal: 0,
+                        server_id: 2148,
+                        count: 10,
+                        children: Vec::new(),
+                        despawn_tick: None,
+                    }],
+                )
+                .unwrap();
+        }
+
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                2148,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 2148,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        native_config.item_presentation_catalog = Some(Arc::new(catalog));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+
+        // Pick the whole dropped stack up from its solo-tile tail index into the right hand.
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                101,
+                0,
+                101,
+                0,
+                7,
+                0x64,
+                0x08,
+                0,
+                0xff,
+                0xff,
+                5,
+                0,
+                0,
+                10,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_data_frame(&mut stream).0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_SET_INVENTORY,
+                EquipmentSlot::RightHand.code(),
+                0x64,
+                0x08
+            ]
+        );
+        let refreshed = read_data_frame(&mut stream);
+        assert_eq!(
+            refreshed.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert!(!refreshed.0.windows(2).any(|window| window == [0x64, 0x08]));
+
+        drop(stream);
+        game.shutdown().unwrap();
+        let database = EngineDatabase::open(&database_path).unwrap();
+        assert_eq!(database.runtime_map_items().unwrap(), None);
+        assert_eq!(
+            database
+                .player_equipment(1)
+                .unwrap()
+                .item(EquipmentSlot::RightHand)
+                .map(|item| (item.server_id, item.count)),
+            Some((2148, 10))
+        );
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn move_player_stack_to_ground_unit_persists_and_publishes() {
         let database_path = database_path("ground-drop-unit");
         let mut database = EngineDatabase::open(&database_path).unwrap();
@@ -11763,7 +12650,6 @@ mod tests {
             )
             .unwrap();
         native_config.item_presentation_catalog = Some(Arc::new(catalog));
-        native_config.extended_diagnostics = true;
         let game = start_native_otclient_game(native_config, &database_path).unwrap();
         let mut stream = TcpStream::connect(game.local_addr()).unwrap();
         write_frame(
@@ -12069,7 +12955,7 @@ mod tests {
         .unwrap();
         let expected_window = vec![
             forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER,
-            0xff,
+            0x0f,
             0xf9,
             0x0b,
             8,
@@ -12096,7 +12982,7 @@ mod tests {
             &mut stream,
             &Frame(vec![
                 forgotten_protocol::NATIVE_OTCLIENT_CLIENT_CLOSE_CONTAINER,
-                0xff,
+                0x0f,
             ]),
         )
         .unwrap();
@@ -12104,7 +12990,7 @@ mod tests {
             read_data_frame(&mut stream).0,
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER,
-                0xff
+                0x0f
             ]
         );
         game.shutdown().unwrap();
