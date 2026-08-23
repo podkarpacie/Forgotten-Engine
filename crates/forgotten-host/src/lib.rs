@@ -5490,6 +5490,7 @@ fn serve_native_otclient_game(
     let heartbeat_death_loss_policy = config.death_loss_policy;
     let heartbeat_progression_rules = config.progression_rules.clone();
     let heartbeat_corpse_despawn_seconds = config.corpse_despawn_seconds;
+    let auth_rate_limiter = Arc::new(NativeAuthRateLimiter::default());
     let heartbeat = thread::spawn(move || {
         run_native_shared_world_heartbeat(
             heartbeat_world,
@@ -5521,6 +5522,7 @@ fn serve_native_otclient_game(
                 let session_connections = Arc::clone(&active_connections);
                 let session_world = shared_world.clone();
                 let session_map = shared_map.clone();
+                let session_rate_limiter = Arc::clone(&auth_rate_limiter);
                 thread::spawn(move || {
                     let result = (|| {
                         let session_config = native_session_config_with_map_snapshot(
@@ -5534,6 +5536,7 @@ fn serve_native_otclient_game(
                             &session_database_path,
                             &session_world,
                             session_map.as_deref(),
+                            &session_rate_limiter,
                         )
                     })();
                     if let Err(error) = result {
@@ -5757,6 +5760,51 @@ fn handle_native_otclient_login(
     Ok(())
 }
 
+/// Bounded fixed-window brute-force guard for native game authentication. Failures are counted
+/// per peer IP; once a peer exceeds the window budget every further attempt is rejected before
+/// any database work happens until the window elapses.
+const NATIVE_AUTH_MAX_FAILURES_PER_WINDOW: u32 = 8;
+const NATIVE_AUTH_WINDOW: Duration = Duration::from_secs(60);
+/// Bounded fixed-window chat flood control: at most this many routed talk records per window;
+/// anything beyond is suppressed before shared delivery.
+const CHAT_FLOOD_MAX_MESSAGES_PER_WINDOW: usize = 10;
+const CHAT_FLOOD_WINDOW: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct NativeAuthRateLimiter {
+    failures: Mutex<BTreeMap<IpAddr, (u32, Instant)>>,
+}
+
+impl NativeAuthRateLimiter {
+    fn is_blocked(&self, peer: IpAddr) -> bool {
+        // A poisoned limiter must not lock every peer out; availability wins here because the
+        // database password check still runs for unblocked peers.
+        let Ok(failures) = self.failures.lock() else {
+            return false;
+        };
+        match failures.get(&peer) {
+            Some((count, window_start)) => {
+                *count >= NATIVE_AUTH_MAX_FAILURES_PER_WINDOW
+                    && window_start.elapsed() < NATIVE_AUTH_WINDOW
+            }
+            None => false,
+        }
+    }
+
+    fn register_failure(&self, peer: IpAddr) {
+        if self.failures.lock().is_err() {
+            return;
+        }
+        let mut failures = self.failures.lock().expect("poisoned rate-limiter mutex");
+        let now = Instant::now();
+        let entry = failures.entry(peer).or_insert((0, now));
+        if entry.1.elapsed() >= NATIVE_AUTH_WINDOW {
+            *entry = (0, now);
+        }
+        entry.0 = entry.0.saturating_add(1);
+    }
+}
+
 fn handle_native_otclient_game(
     stream: &mut TcpStream,
     peer: SocketAddr,
@@ -5764,17 +5812,28 @@ fn handle_native_otclient_game(
     database_path: &Path,
     shared_world: &SharedNativeWorld,
     map_owner: Option<&SharedNativeMap>,
+    auth_rate_limiter: &NativeAuthRateLimiter,
 ) -> Result<(), HostError> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(config.session_timeout))?;
     stream.set_write_timeout(Some(config.session_timeout))?;
     let request = decode_native_otclient_game_request(&read_frame(stream)?, &config.client_profile)
         .map_err(HostError::Protocol)?;
+    if auth_rate_limiter.is_blocked(peer.ip()) {
+        write_frame(
+            stream,
+            &encode_native_otclient_game_login_error(
+                "Too many failed attempts from your address. Try again later.",
+            ),
+        )?;
+        return Ok(());
+    }
     let mut database = EngineDatabase::open(database_path).map_err(HostError::Persistence)?;
     let Some(account) = database
         .authenticate_account_id(request.account_id, &request.password)
         .map_err(HostError::Persistence)?
     else {
+        auth_rate_limiter.register_failure(peer.ip());
         write_frame(
             stream,
             &encode_native_otclient_game_login_error("Account name or password is not correct."),
@@ -6106,6 +6165,7 @@ fn handle_native_otclient_game(
     let mut closed_container_ids = BTreeSet::new();
     let mut open_corpse_windows: BTreeMap<u8, (Position, usize)> = BTreeMap::new();
     let mut open_public_channel_ids = BTreeSet::new();
+    let mut talk_windows: VecDeque<Instant> = VecDeque::new();
     loop {
         drain_shared_vip_presence(
             stream,
@@ -8813,6 +8873,24 @@ fn handle_native_otclient_game(
                 );
             }
             NativeOtClientGameAction::Talk(request) => {
+                // Bounded fixed-window flood control over every routed talk record. Suppressed
+                // messages emit no client feedback and never reach the shared chat queue.
+                let now = Instant::now();
+                while talk_windows
+                    .front()
+                    .is_some_and(|sent| now.saturating_duration_since(*sent) >= CHAT_FLOOD_WINDOW)
+                {
+                    talk_windows.pop_front();
+                }
+                if talk_windows.len() >= CHAT_FLOOD_MAX_MESSAGES_PER_WINDOW {
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        "action=talk outcome=flood-suppressed",
+                    );
+                    continue;
+                }
+                talk_windows.push_back(now);
                 if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
                     && request.channel_id.is_none()
                     && request.recipient.is_none()
@@ -16874,6 +16952,147 @@ mod tests {
         .is_none());
         assert_eq!(shared.vitals_epoch(), 1);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_game_auth_blocks_peers_after_the_bounded_failure_window() {
+        let database_path = database_path("native-auth-rate-limit");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        drop(database);
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+
+        let wrong_password_frame = native_game_request(
+            account_id.try_into().unwrap(),
+            "Knight",
+            "definitely-not-the-password",
+        );
+        let mut saw_wrong_password_error = false;
+        for _ in 0..NATIVE_AUTH_MAX_FAILURES_PER_WINDOW {
+            let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+            write_frame(&mut stream, &wrong_password_frame).unwrap();
+            if read_frame(&mut stream).unwrap().0[0]
+                == forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+            {
+                panic!("a wrong password must never authenticate");
+            }
+        }
+        // The next failure budget overflow switches the peer to pre-auth rejection.
+        let limiter_probe = {
+            let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+            write_frame(&mut stream, &wrong_password_frame).unwrap();
+            read_frame(&mut stream).unwrap()
+        };
+        assert_eq!(
+            limiter_probe.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_ERROR
+        );
+        saw_wrong_password_error = true;
+        let _ = saw_wrong_password_error;
+
+        // A correct password from the blocked peer is still refused before authentication.
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let blocked = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            blocked.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_ERROR
+        );
+        assert!(String::from_utf8_lossy(&blocked.0).contains("Too many failed attempts"));
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_talk_flood_is_suppressed_beyond_the_bounded_window_budget() {
+        let database_path = database_path("native-chat-flood");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        drop(database);
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+
+        for _ in 0..(CHAT_FLOOD_MAX_MESSAGES_PER_WINDOW + 5) {
+            write_frame(&mut stream, &Frame(vec![0x96, 1, 2, 0, b'h', b'i'])).unwrap();
+        }
+        let mut delivered = 0usize;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue;
+                }
+                Ok(frame)
+                    if frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_TALK) =>
+                {
+                    delivered += 1;
+                    assert!(delivered <= CHAT_FLOOD_MAX_MESSAGES_PER_WINDOW);
+                }
+                Ok(_) => break,
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("native session ended during flood probe: {error}"),
+            }
+        }
+        assert_eq!(
+            delivered, CHAT_FLOOD_MAX_MESSAGES_PER_WINDOW,
+            "exactly the bounded window budget is delivered"
+        );
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
     }
 
     #[test]
