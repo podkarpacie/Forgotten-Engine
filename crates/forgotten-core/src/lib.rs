@@ -1895,6 +1895,24 @@ pub struct PlayerContainerStackToContainerOutcome {
     pub destination_count: u16,
 }
 
+/// Typed source of one authoritative player stack drop onto the ground. Container sources
+/// address one exact top-level item index inside one owned non-nested window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerGroundDropSource {
+    EquipmentSlot(EquipmentSlot),
+    ContainerItem { container_id: u8, item_index: usize },
+}
+
+/// Result of one bounded player stack drop onto the ground. The moved stack is removed from
+/// inventory state; map placement and persistence remain caller-owned boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerGroundDropOutcome {
+    pub player_id: u64,
+    pub source: PlayerGroundDropSource,
+    pub moved_item: ItemInstance,
+    pub source_remaining_count: Option<u16>,
+}
+
 /// Presentation metadata validated from an operator-supplied item catalog. It deliberately holds
 /// only the data needed to construct a classic client item record; gameplay properties stay in
 /// the content/runtime layers.
@@ -5530,6 +5548,70 @@ impl WorldState {
             moved_item,
             source_remaining_count,
             destination_count,
+        })
+    }
+
+    /// Removes a requested bounded count from one owned equipment slot or top-level container
+    /// item so the caller can place the returned stack onto the ground. The map position is a
+    /// caller-owned concern; this transition only mutates inventory state.
+    pub fn take_player_stack_for_ground_drop(
+        &mut self,
+        player_id: u64,
+        source: PlayerGroundDropSource,
+        count: u16,
+    ) -> Result<PlayerGroundDropOutcome, CoreError> {
+        let mut equipment = self.player_equipment(player_id)?.clone();
+        let mut containers = self.player_containers(player_id)?.clone();
+        let (moved_item, source_remaining_count) = match source {
+            PlayerGroundDropSource::EquipmentSlot(slot) => {
+                let mut stack = equipment
+                    .unequip(slot)
+                    .ok_or(CoreError::EmptyEquipmentSlot { player_id, slot })?;
+                let moved = stack.split_off(count)?;
+                let remaining = (stack.count > 0).then_some(stack.count);
+                if remaining.is_some() {
+                    equipment.equip(slot, stack);
+                }
+                (moved, remaining)
+            }
+            PlayerGroundDropSource::ContainerItem {
+                container_id,
+                item_index,
+            } => {
+                let mut container =
+                    containers
+                        .remove(container_id)
+                        .ok_or(CoreError::UnknownPlayerContainer {
+                            player_id,
+                            container_id,
+                        })?;
+                let stack = container.items.remove(item_index).ok_or(
+                    CoreError::UnknownPlayerContainerItem {
+                        player_id,
+                        container_id,
+                        item_index,
+                    },
+                )?;
+                let mut remaining_stack = stack;
+                let moved = remaining_stack.split_off(count)?;
+                let remaining = (remaining_stack.count > 0).then_some(remaining_stack.count);
+                if remaining.is_some() {
+                    container.items.items.insert(item_index, remaining_stack);
+                }
+                containers.insert(container)?;
+                (moved, remaining)
+            }
+        };
+        if let PlayerGroundDropSource::EquipmentSlot(_) = source {
+            self.player_equipments.insert(player_id, equipment);
+        }
+        self.player_containers.insert(player_id, containers);
+        self.mark_changed();
+        Ok(PlayerGroundDropOutcome {
+            player_id,
+            source,
+            moved_item,
+            source_remaining_count,
         })
     }
 

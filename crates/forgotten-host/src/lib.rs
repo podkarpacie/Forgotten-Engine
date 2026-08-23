@@ -1826,6 +1826,143 @@ impl SharedNativeMap {
             .collect())
     }
 
+    /// Moves one requested bounded player stack from owned inventory onto an authoritative ground
+    /// tile adjacent to (or under) the player, appending it to the durable runtime registry. The
+    /// inventory change and registry persist in one SQLite transaction while authoritative locks
+    /// are held; staged memory commits only after a successful commit.
+    pub fn move_player_stack_to_ground(
+        &self,
+        shared_world: &SharedNativeWorld,
+        database: &mut EngineDatabase,
+        player_id: u64,
+        source: forgotten_core::PlayerGroundDropSource,
+        target_position: Position,
+        count: u16,
+    ) -> Result<Option<forgotten_core::PlayerGroundDropOutcome>, HostError> {
+        let mut world = shared_world.lock()?;
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut registry = self
+            .runtime_tile_items
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        // Bounded placement rules: existing walkable tile, within one step of the player, and
+        // below the per-tile item limit.
+        let Some(tile) = map.tile(target_position) else {
+            return Ok(None);
+        };
+        if !tile.walkable {
+            return Ok(None);
+        }
+        let player = world.player(player_id).ok_or(HostError::Core(
+            forgotten_core::CoreError::UnknownPlayer(player_id),
+        ))?;
+        if player.position.z != target_position.z
+            || player.position.x.abs_diff(target_position.x) > 1
+            || player.position.y.abs_diff(target_position.y) > 1
+        {
+            return Ok(None);
+        }
+        let current_items = map
+            .tile_items(target_position)
+            .map(<[WorldMapItem]>::len)
+            .unwrap_or(0);
+        if current_items >= forgotten_core::MAX_WORLD_MAP_ITEMS_PER_TILE {
+            return Ok(None);
+        }
+        if count == 0 || count > u16::from(u8::MAX) {
+            return Ok(None);
+        }
+        // Stage the inventory mutation on a clone so nothing publishes before persistence.
+        let mut staged_world = world.clone();
+        let outcome = match staged_world.take_player_stack_for_ground_drop(player_id, source, count)
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return match error {
+                    forgotten_core::CoreError::EmptyEquipmentSlot { .. }
+                    | forgotten_core::CoreError::UnknownPlayerContainer { .. }
+                    | forgotten_core::CoreError::UnknownPlayerContainerItem { .. } => Ok(None),
+                    other => Err(HostError::Core(other)),
+                };
+            }
+        };
+        let ordinal = u8::try_from(
+            registry
+                .iter()
+                .filter(|record| record.position == target_position)
+                .count(),
+        )
+        .map_err(|_| {
+            HostError::Core(forgotten_core::CoreError::InvalidMap(
+                "runtime tile-item ordinals exhausted for this tile".into(),
+            ))
+        })?;
+        let Ok(dropped_count) = u8::try_from(outcome.moved_item.count) else {
+            return Err(HostError::InvalidConfiguration(
+                "dropped stack exceeds the ground count bound".into(),
+            ));
+        };
+        let record = RuntimeMapItemRecord {
+            position: target_position,
+            ordinal,
+            server_id: outcome.moved_item.server_id,
+            count: dropped_count,
+            children: Vec::new(),
+            despawn_tick: None,
+        };
+        let mut next_registry = registry.clone();
+        next_registry.push(record);
+        let mut next_map = (*map).clone();
+        let mut next_items = map
+            .tile_items(target_position)
+            .map(<[WorldMapItem]>::to_vec)
+            .unwrap_or_default();
+        next_items.push(WorldMapItem {
+            server_id: outcome.moved_item.server_id,
+            client_thing_id: None,
+            count: dropped_count,
+            action_id: None,
+            unique_id: None,
+            text: None,
+            description: None,
+            teleport_destination: None,
+            duration: None,
+            charges: None,
+            children: Vec::new(),
+        });
+        next_map
+            .set_tile_items(target_position, next_items)
+            .map_err(HostError::Core)?;
+        let published_equipment = staged_world
+            .player_equipment(player_id)
+            .map_err(HostError::Core)?
+            .clone();
+        let published_containers = staged_world
+            .player_containers(player_id)
+            .map_err(HostError::Core)?
+            .clone();
+        database.replace_player_inventory_and_runtime_map_items(
+            player_id,
+            &published_equipment,
+            &published_containers,
+            self.source_revision(),
+            &next_registry,
+        )?;
+        world
+            .replace_player_equipment(player_id, published_equipment)
+            .expect("validated player remains present while the shared-world lock is held");
+        world
+            .replace_player_containers(player_id, published_containers)
+            .expect("validated player remains present while the shared-world lock is held");
+        *map = next_map;
+        *registry = next_registry;
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(outcome))
+    }
+
     /// Replaces one imported tile's complete ordered item list after `WorldMap` validates its
     /// per-tile limit. This is an ownership primitive only; it does not transfer an item into a
     /// player inventory, persist a change, or emit any native packet.
@@ -6369,6 +6506,168 @@ fn handle_native_otclient_game(
                         peer,
                         "action=throw-item outcome=deferred-zero-count",
                     );
+                    continue;
+                }
+                // Owned-inventory drops onto a real ground tile route through the durable
+                // runtime registry. Map-source and unknown sources stay deferred.
+                if target_position.x != 0xffff {
+                    let target_tile = Position {
+                        x: target_position.x,
+                        y: target_position.y,
+                        z: target_position.z,
+                    };
+                    let drop_source = if let Some(slot) = source_slot {
+                        Some(forgotten_core::PlayerGroundDropSource::EquipmentSlot(slot))
+                    } else if let Some((container_id, item_index)) = source_container {
+                        if closed_container_ids.contains(&container_id) {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-closed-container-ground-drop",
+                            );
+                            continue;
+                        }
+                        Some(forgotten_core::PlayerGroundDropSource::ContainerItem {
+                            container_id,
+                            item_index,
+                        })
+                    } else {
+                        None
+                    };
+                    let Some(drop_source) = drop_source.filter(|_| !observed_dead) else {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-unsupported-ground-drop-source",
+                        );
+                        continue;
+                    };
+                    // Validate the requested stack identity before any authoritative mutation.
+                    let identity_ok = match &drop_source {
+                        forgotten_core::PlayerGroundDropSource::EquipmentSlot(slot) => shared_world
+                            .player_equipment(character.id)
+                            .ok()
+                            .and_then(|equipment| equipment.item(*slot).cloned())
+                            .is_some_and(|item| {
+                                native_classic_item_record(Some(catalog), &item).is_some_and(
+                                    |record| record.client_thing_id == source_client_thing_id,
+                                )
+                            }),
+                        forgotten_core::PlayerGroundDropSource::ContainerItem {
+                            container_id,
+                            item_index,
+                        } => shared_world
+                            .player_containers(character.id)
+                            .ok()
+                            .and_then(|containers| containers.container(*container_id).cloned())
+                            .and_then(|container| container.items.item(*item_index).cloned())
+                            .is_some_and(|item| {
+                                native_classic_item_record(Some(catalog), &item).is_some_and(
+                                    |record| record.client_thing_id == source_client_thing_id,
+                                )
+                            }),
+                    };
+                    if !identity_ok {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-ground-drop-identity-mismatch",
+                        );
+                        continue;
+                    }
+                    match map_owner.move_player_stack_to_ground(
+                        shared_world,
+                        &mut database,
+                        character.id,
+                        drop_source,
+                        target_tile,
+                        u16::from(count),
+                    ) {
+                        Ok(Some(outcome)) => {
+                            if let forgotten_core::PlayerGroundDropSource::EquipmentSlot(_) =
+                                outcome.source
+                            {
+                                let equipment = shared_world.player_equipment(character.id)?;
+                                let current_mapped_equipment =
+                                    native_classic_mapped_equipment(Some(catalog), &equipment);
+                                let equipment_updates = native_classic_equipment_delta_frames(
+                                    &config.client_profile,
+                                    &observed_mapped_equipment,
+                                    &current_mapped_equipment,
+                                )
+                                .map_err(HostError::Protocol)?;
+                                for frame in &equipment_updates {
+                                    write_frame(stream, frame)?;
+                                }
+                                observed_mapped_equipment = current_mapped_equipment;
+                                observed_equipment_epoch = shared_world.equipment_epoch();
+                            }
+                            if let forgotten_core::PlayerGroundDropSource::ContainerItem {
+                                container_id,
+                                ..
+                            } = outcome.source
+                            {
+                                if !closed_container_ids.contains(&container_id) {
+                                    let containers =
+                                        shared_world.player_containers(character.id)?;
+                                    if let Some(container) = containers.container(container_id) {
+                                        if let Some(container_frame) =
+                                            native_classic_container_frame(
+                                                &config.client_profile,
+                                                Some(catalog),
+                                                container,
+                                            )
+                                            .map_err(HostError::Protocol)?
+                                        {
+                                            write_frame(stream, &container_frame)?;
+                                        }
+                                    }
+                                }
+                                observed_containers_epoch = shared_world.containers_epoch();
+                            }
+                            let mut refreshed_snapshot = snapshot.clone();
+                            refreshed_snapshot.player_position = native_position(player_position);
+                            refreshed_snapshot.player_direction = facing.protocol_direction();
+                            let map_snapshot = map_owner.render_snapshot()?;
+                            let refreshed_viewport = encode_shared_native_world_viewport(
+                                &config.client_profile,
+                                &refreshed_snapshot,
+                                map_snapshot.as_ref(),
+                                shared_world,
+                                character.id,
+                            )?;
+                            write_frame(stream, &refreshed_viewport)?;
+                            observed_visibility_epoch = shared_world.visibility_epoch();
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "action=throw-item outcome=inventory-to-ground target={},{},{} server-id={} count={} moved={} remaining={:?} map-revision={}",
+                                    target_tile.x,
+                                    target_tile.y,
+                                    target_tile.z,
+                                    outcome.moved_item.server_id,
+                                    source_client_thing_id,
+                                    outcome.moved_item.count,
+                                    outcome.source_remaining_count,
+                                    map_owner.revision(),
+                                ),
+                            );
+                        }
+                        Ok(None) => native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=throw-item outcome=deferred-ground-drop-rejected",
+                        ),
+                        Err(HostError::Core(_) | HostError::InvalidConfiguration(_)) => {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=throw-item outcome=deferred-ground-drop-failed",
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
                     continue;
                 }
                 if source_position.x != 0xffff {
@@ -11301,6 +11600,259 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn move_player_stack_to_ground_unit_persists_and_publishes() {
+        let database_path = database_path("ground-drop-unit");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account("ground-drop-operator", "hash")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 9,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let source_map = (*native_world_map()).clone();
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let owner =
+            SharedNativeMap::recover_complete_map_item_state(source_map.clone(), None, None, None)
+                .unwrap();
+        let map_snapshot = owner.render_snapshot().unwrap();
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(
+            EquipmentSlot::RightHand,
+            forgotten_core::ItemInstance::new(2148, 10).unwrap(),
+        );
+        shared
+            .register_player_at_available_position_with_vitals_equipment_containers_progression_and_conditions(
+                Player {
+                    id: 9,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                PlayerVitals::default(),
+                NativePlayerHydration {
+                    progression: PlayerProgression::default(),
+                    progression_attempts: PlayerProgressionAttempts::default(),
+                    town_id: 1,
+                    respawn_state: PlayerRespawnState::default(),
+                    equipment,
+                    containers: PlayerContainers::default(),
+                    conditions: BTreeMap::new(),
+                },
+                &map_snapshot,
+            )
+            .unwrap();
+        let outcome = owner
+            .move_player_stack_to_ground(
+                &shared,
+                &mut database,
+                9,
+                forgotten_core::PlayerGroundDropSource::EquipmentSlot(EquipmentSlot::RightHand),
+                Position {
+                    x: 101,
+                    y: 101,
+                    z: 7,
+                },
+                4,
+            )
+            .unwrap()
+            .expect("adjacent walkable drop succeeds");
+        assert_eq!(outcome.moved_item.count, 4);
+        assert_eq!(outcome.source_remaining_count, Some(6));
+        assert_eq!(
+            shared
+                .player_equipment(9)
+                .unwrap()
+                .item(EquipmentSlot::RightHand)
+                .map(|i| i.count),
+            Some(6)
+        );
+        let (_, records) = database.runtime_map_items().unwrap().expect("registry");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].count, 4);
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_throw_item_drops_an_equipped_stack_onto_the_ground_and_persists_it() {
+        let database_path = database_path("native-ground-drop");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        // Ten gold coins in the right hand; four will be dropped onto an adjacent tile.
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(
+            EquipmentSlot::RightHand,
+            forgotten_core::ItemInstance::new(2148, 10).unwrap(),
+        );
+        database.replace_player_equipment(1, &equipment).unwrap();
+
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        // One imported item on the destination tile means the dropped stack lands at a
+        // client-visible tail index of that tile's ordered list.
+        {
+            Arc::get_mut(native_config.world_map.as_mut().unwrap())
+                .unwrap()
+                .set_tile_items(
+                    Position {
+                        x: 101,
+                        y: 101,
+                        z: 7,
+                    },
+                    vec![WorldMapItem {
+                        server_id: 1988,
+                        client_thing_id: Some(1988),
+                        count: 1,
+                        action_id: None,
+                        unique_id: None,
+                        text: None,
+                        description: None,
+                        teleport_destination: None,
+                        duration: None,
+                        charges: None,
+                        children: Vec::new(),
+                    }],
+                )
+                .unwrap();
+        }
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                2148,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 2148,
+                    requires_classic_740_subtype: true,
+                },
+            )
+            .unwrap();
+        native_config.item_presentation_catalog = Some(Arc::new(catalog));
+        native_config.extended_diagnostics = true;
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let initialization = read_data_frame(&mut stream);
+        assert_eq!(
+            initialization.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+        // Bootstrap delivers the equipped stack as its own inventory record.
+        assert_eq!(
+            read_data_frame(&mut stream).0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_SET_INVENTORY,
+                EquipmentSlot::RightHand.code(),
+                0x64,
+                0x08,
+                10
+            ]
+        );
+
+        // Drop four of the ten right-hand coins onto the adjacent south-east tile.
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                0xff,
+                0xff,
+                5,
+                0,
+                0,
+                0x64,
+                0x08,
+                0,
+                101,
+                0,
+                101,
+                0,
+                7,
+                4,
+            ]),
+        )
+        .unwrap();
+        // The remaining six coins emit an exact set delta, then the map refresh arrives.
+        let delete_delta = read_data_frame(&mut stream);
+        assert_eq!(
+            delete_delta.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_SET_INVENTORY,
+                EquipmentSlot::RightHand.code(),
+                0x64,
+                0x08,
+                6
+            ]
+        );
+        let refreshed = read_data_frame(&mut stream);
+        assert_eq!(
+            refreshed.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert!(refreshed.0.windows(2).any(|window| window == [0x64, 0x08]));
+
+        // The dropped stack is durable registry state and the slot keeps its remainder.
+        drop(stream);
+        game.shutdown().unwrap();
+        let database = EngineDatabase::open(&database_path).unwrap();
+        assert_eq!(
+            database
+                .player_equipment(1)
+                .unwrap()
+                .item(EquipmentSlot::RightHand)
+                .map(|item| item.count),
+            Some(6)
+        );
+        let (_, records) = database.runtime_map_items().unwrap().expect("registry");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].position.x, 101);
+        assert_eq!(records[0].position.y, 101);
+        assert_eq!(records[0].server_id, 2148);
+        assert_eq!(records[0].count, 4);
+        assert_eq!(records[0].despawn_tick, None);
+        let _ = fs::remove_file(database_path);
     }
 
     #[test]

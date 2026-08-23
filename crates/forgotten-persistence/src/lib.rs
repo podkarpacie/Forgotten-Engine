@@ -62,6 +62,97 @@ pub const MAX_PLAYER_INBOX_TOP_LEVEL_ITEMS: usize = 30;
 pub const MAX_HOUSE_ACCESS_LISTS_PER_HOUSE: usize = 64;
 pub const MAX_HOUSE_ACCESS_LIST_TEXT_BYTES: usize = 8_192;
 
+/// Validates one complete runtime tile-item registry before any durable write. Bounds, nonzero
+/// identities, unique ordered positions, and signed-integer-safe despawn ticks are enforced here
+/// so every writer shares one contract.
+fn validate_runtime_map_item_records(
+    items: &[RuntimeMapItemRecord],
+) -> Result<(), PersistenceError> {
+    if items.len() > MAX_RUNTIME_MAP_ITEMS {
+        return Err(PersistenceError::InvalidMapItemJournal(
+            "runtime map-item registry exceeds the supported bound".into(),
+        ));
+    }
+    let mut seen_items = BTreeSet::new();
+    for item in items {
+        if item.server_id == 0 {
+            return Err(PersistenceError::InvalidMapItemJournal(
+                "runtime map item server id must be nonzero".into(),
+            ));
+        }
+        if !(1..=u8::MAX).contains(&item.count) {
+            return Err(PersistenceError::InvalidMapItemJournal(
+                "runtime map item count must stay within the bounded stack range".into(),
+            ));
+        }
+        if let Some(tick) = item.despawn_tick {
+            i64::try_from(tick).map_err(|_| {
+                PersistenceError::InvalidMapItemJournal(
+                    "runtime item despawn tick does not fit a signed integer".into(),
+                )
+            })?;
+        }
+        if !seen_items.insert((item.position, item.ordinal)) {
+            return Err(PersistenceError::InvalidMapItemJournal(
+                "duplicate runtime map item position and ordinal".into(),
+            ));
+        }
+        if item.children.len() > MAX_RUNTIME_MAP_ITEM_CHILDREN {
+            return Err(PersistenceError::InvalidMapItemJournal(
+                "runtime map item children exceed the supported bound".into(),
+            ));
+        }
+        for child in &item.children {
+            if child.server_id == 0 || child.count == 0 {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "runtime map item children need a nonzero server id and count".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Writes one validated registry into an open transaction. Callers own the surrounding DELETE and
+/// commit so this helper composes with inventory writes.
+fn insert_runtime_map_items(
+    transaction: &rusqlite::Transaction<'_>,
+    map_revision: WorldMapSourceRevision,
+    items: &[RuntimeMapItemRecord],
+) -> Result<(), PersistenceError> {
+    for item in items {
+        transaction.execute(
+            "INSERT INTO runtime_map_items (map_revision, x, y, z, ordinal, server_id, count, despawn_tick) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                format!("{:016x}", map_revision.0),
+                i64::from(item.position.x),
+                i64::from(item.position.y),
+                i64::from(item.position.z),
+                i64::from(item.ordinal),
+                i64::from(item.server_id),
+                i64::from(item.count),
+                item.despawn_tick
+                    .map(|tick| i64::try_from(tick).expect("validated tick fits i64")),
+            ],
+        )?;
+        for (child_index, child) in item.children.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO runtime_map_item_children (x, y, z, ordinal, child_index, server_id, count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    i64::from(item.position.x),
+                    i64::from(item.position.y),
+                    i64::from(item.position.z),
+                    i64::from(item.ordinal),
+                    i64::try_from(child_index).expect("bounded child index fits i64"),
+                    i64::from(child.server_id),
+                    i64::from(child.count),
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub struct EngineDatabase {
     connection: Connection,
     path: PathBuf,
@@ -3453,80 +3544,86 @@ impl EngineDatabase {
         map_revision: WorldMapSourceRevision,
         items: &[RuntimeMapItemRecord],
     ) -> Result<(), PersistenceError> {
-        if items.len() > MAX_RUNTIME_MAP_ITEMS {
-            return Err(PersistenceError::InvalidMapItemJournal(
-                "runtime map-item registry exceeds the supported bound".into(),
-            ));
-        }
-        let mut seen_items = BTreeSet::new();
-        for item in items {
-            if item.server_id == 0 {
-                return Err(PersistenceError::InvalidMapItemJournal(
-                    "runtime map item server id must be nonzero".into(),
-                ));
-            }
-            if !(1..=u8::MAX).contains(&item.count) {
-                return Err(PersistenceError::InvalidMapItemJournal(
-                    "runtime map item count must stay within the bounded stack range".into(),
-                ));
-            }
-            if let Some(tick) = item.despawn_tick {
-                i64::try_from(tick).map_err(|_| {
-                    PersistenceError::InvalidMapItemJournal(
-                        "runtime item despawn tick does not fit a signed integer".into(),
-                    )
-                })?;
-            }
-            if !seen_items.insert((item.position, item.ordinal)) {
-                return Err(PersistenceError::InvalidMapItemJournal(
-                    "duplicate runtime map item position and ordinal".into(),
-                ));
-            }
-            if item.children.len() > MAX_RUNTIME_MAP_ITEM_CHILDREN {
-                return Err(PersistenceError::InvalidMapItemJournal(
-                    "runtime map item children exceed the supported bound".into(),
-                ));
-            }
-            for child in &item.children {
-                if child.server_id == 0 || child.count == 0 {
-                    return Err(PersistenceError::InvalidMapItemJournal(
-                        "runtime map item children need a nonzero server id and count".into(),
-                    ));
-                }
-            }
-        }
+        validate_runtime_map_item_records(items)?;
         let transaction = self.connection.transaction()?;
         transaction.execute("DELETE FROM runtime_map_item_children", [])?;
         transaction.execute("DELETE FROM runtime_map_items", [])?;
-        for item in items {
+        insert_runtime_map_items(&transaction, map_revision, items)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Replaces a player's complete bounded inventory and the complete runtime tile-item registry
+    /// in one SQLite transaction. Callers use this only after validating a composite
+    /// authoritative inventory-to-ground transition; a failed commit leaves both durable
+    /// collections unchanged.
+    pub fn replace_player_inventory_and_runtime_map_items(
+        &mut self,
+        player_id: u64,
+        equipment: &PlayerEquipment,
+        containers: &PlayerContainers,
+        map_revision: WorldMapSourceRevision,
+        runtime_items: &[RuntimeMapItemRecord],
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        validate_runtime_map_item_records(runtime_items)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM player_equipment WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM player_container_items WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM player_containers WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        for (slot, item) in equipment.iter() {
             transaction.execute(
-                "INSERT INTO runtime_map_items (map_revision, x, y, z, ordinal, server_id, count, despawn_tick) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO player_equipment (player_id, slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
-                    format!("{:016x}", map_revision.0),
-                    i64::from(item.position.x),
-                    i64::from(item.position.y),
-                    i64::from(item.position.z),
-                    i64::from(item.ordinal),
+                    player_id as i64,
+                    i64::from(slot.code()),
                     i64::from(item.server_id),
                     i64::from(item.count),
-                    item.despawn_tick.map(|tick| i64::try_from(tick).expect("validated tick fits i64")),
+                    item.action_id.map(i64::from),
+                    item.unique_id.map(i64::from),
                 ],
             )?;
-            for (child_index, child) in item.children.iter().enumerate() {
+        }
+        for (container_id, container) in containers.iter() {
+            transaction.execute(
+                "INSERT INTO player_containers (player_id, container_id, server_id, count, name, has_parent, capacity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    player_id as i64,
+                    i64::from(container_id),
+                    i64::from(container.container_item.server_id),
+                    i64::from(container.container_item.count),
+                    container.name,
+                    i64::from(u8::from(container.has_parent)),
+                    i64::from(container.items.capacity()),
+                ],
+            )?;
+            for (slot, item) in container.items.iter().enumerate() {
                 transaction.execute(
-                    "INSERT INTO runtime_map_item_children (x, y, z, ordinal, child_index, server_id, count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO player_container_items (player_id, container_id, slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
-                        i64::from(item.position.x),
-                        i64::from(item.position.y),
-                        i64::from(item.position.z),
-                        i64::from(item.ordinal),
-                        i64::try_from(child_index).expect("bounded child index fits i64"),
-                        i64::from(child.server_id),
-                        i64::from(child.count),
+                        player_id as i64,
+                        i64::from(container_id),
+                        slot as i64,
+                        i64::from(item.server_id),
+                        i64::from(item.count),
+                        item.action_id.map(i64::from),
+                        item.unique_id.map(i64::from),
                     ],
                 )?;
             }
         }
+        transaction.execute("DELETE FROM runtime_map_item_children", [])?;
+        transaction.execute("DELETE FROM runtime_map_items", [])?;
+        insert_runtime_map_items(&transaction, map_revision, runtime_items)?;
         transaction.commit()?;
         Ok(())
     }
