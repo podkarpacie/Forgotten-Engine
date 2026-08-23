@@ -26,7 +26,7 @@ use forgotten_core::{
     StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
     StaticCreatureTargetAttackOutcome, StaticCreatureTargetStepOutcome, VocationId,
     VocationLevelUpGains, WorldMap, WorldMapItem, WorldMapItemSourceIdentity,
-    WorldMapSourceRevision, WorldState, MAX_COMBAT_EVENT_DAMAGE,
+    WorldMapSourceRevision, WorldState, MAX_COMBAT_EVENT_DAMAGE, MAX_ITEM_STACK_COUNT,
 };
 use forgotten_persistence::{
     EngineDatabase, MapItemCountOverrideRecord, MapItemRemovalJournal,
@@ -1193,6 +1193,9 @@ pub struct NativeOtClientHostConfig {
     /// left-hand (shield-hand) item inside the bounded physical mitigation bridge. Weapon-hand
     /// defense, blocking chance, and TFS formula parity remain excluded.
     pub item_shield_defense_by_server_id: Option<Arc<BTreeMap<u16, u16>>>,
+    /// Optional operator-declared instant consumable effects keyed by server item ID. UseItem on
+    /// an owned inventory item restores the declared health/mana once per item unit.
+    pub consumable_effects: Option<Arc<BTreeMap<u16, (u16, u16)>>>,
     /// Immutable validated legacy `items.xml` slot types. They are used only by the bounded
     /// native map-source-to-empty-equipment route; generic inventories, stacks, swaps, and
     /// two-handed placement remain outside this policy.
@@ -1437,6 +1440,197 @@ fn native_carried_weight(
         }
     }
     total
+}
+
+/// Legacy currency coin identities and their gold values. These are factual classic item
+/// identifiers, not redistributed client assets.
+const NATIVE_CURRENCY_COINS: &[(u16, u64)] = &[(2148, 1), (2152, 100), (2160, 10_000)];
+/// Bounded same-floor proximity to an active static NPC for banking keywords.
+const NATIVE_BANK_NPC_RANGE_TILES: i32 = 2;
+
+fn native_coin_value(server_id: u16) -> Option<u64> {
+    NATIVE_CURRENCY_COINS
+        .iter()
+        .find(|(id, _)| *id == server_id)
+        .map(|(_, value)| *value)
+}
+
+/// Returns whether an active static NPC stands within the bounded banking range on the player's
+/// floor. Banking stays an NPC-adjacent service; remote or offline banking remains deferred.
+fn native_bank_officer_nearby(
+    shared_world: &SharedNativeWorld,
+    player_id: u64,
+) -> Result<bool, HostError> {
+    let (player, _) = shared_world.player_and_vitals(player_id)?;
+    let spawns = shared_world.active_static_spawns()?;
+    for entity in &spawns.entities {
+        if !spawns.is_npc(entity.id) || entity.position.z != player.position.z {
+            continue;
+        }
+        if entity.position.x.abs_diff(player.position.x) as i32 <= NATIVE_BANK_NPC_RANGE_TILES
+            && entity.position.y.abs_diff(player.position.y) as i32 <= NATIVE_BANK_NPC_RANGE_TILES
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Handles bounded NPC banking Say keywords ("balance", "deposit all", "withdraw <n>") for one
+/// authenticated player standing near an active static NPC. `Ok(None)` means the message is not
+/// a handled banking command and falls through to ordinary routing. Deposit converts every
+/// carried coin stack into bank credit atomically with inventory persistence; withdraw debits
+/// first and only creates coin stacks that actually fit owned top-level containers.
+fn handle_native_bank_keyword(
+    shared_world: &SharedNativeWorld,
+    database: &mut EngineDatabase,
+    player_id: u64,
+    message: &str,
+) -> Result<Option<String>, HostError> {
+    let normalized = message.trim().to_ascii_lowercase();
+    let is_balance = normalized == "balance";
+    let is_deposit_all = normalized == "deposit all";
+    let withdraw_amount = normalized
+        .strip_prefix("withdraw ")
+        .and_then(|amount| amount.trim().parse::<u64>().ok())
+        .filter(|amount| *amount > 0);
+    if !is_balance && !is_deposit_all && withdraw_amount.is_none() {
+        return Ok(None);
+    }
+    if !native_bank_officer_nearby(shared_world, player_id)? {
+        return Ok(None);
+    }
+
+    let mut equipment = shared_world.player_equipment(player_id)?;
+    let mut containers = shared_world.player_containers(player_id)?;
+
+    if is_balance {
+        let balance = database
+            .player_bank_balance(player_id)
+            .map_err(HostError::Persistence)?;
+        return Ok(Some(format!("Your account balance is {balance} gold.")));
+    }
+
+    if is_deposit_all {
+        let mut deposited = 0_u64;
+        // Strip every carried coin stack from staged inventory clones while summing value.
+        for slot in [
+            EquipmentSlot::Head,
+            EquipmentSlot::Neck,
+            EquipmentSlot::Backpack,
+            EquipmentSlot::Armor,
+            EquipmentSlot::RightHand,
+            EquipmentSlot::LeftHand,
+            EquipmentSlot::Legs,
+            EquipmentSlot::Feet,
+            EquipmentSlot::Ring,
+            EquipmentSlot::Ammo,
+        ] {
+            if let Some(item) = equipment.item(slot).cloned() {
+                if let Some(value) = native_coin_value(item.server_id) {
+                    deposited += value.saturating_mul(u64::from(item.count));
+                    equipment.unequip(slot);
+                }
+            }
+        }
+        let mut next_containers = PlayerContainers::default();
+        for (_, container) in containers.iter() {
+            let mut next = container.clone();
+            for index in (0..next.items.len()).rev() {
+                if let Some(item) = next.items.item(index).cloned() {
+                    if let Some(value) = native_coin_value(item.server_id) {
+                        deposited += value.saturating_mul(u64::from(item.count));
+                        next.items.remove(index);
+                    }
+                }
+            }
+            next_containers.insert(next).map_err(HostError::Core)?;
+        }
+        containers = next_containers;
+        if deposited == 0 {
+            return Ok(Some("You have no coins to deposit.".into()));
+        }
+        let new_balance = database
+            .player_bank_balance(player_id)
+            .map_err(HostError::Persistence)?
+            .saturating_add(deposited);
+        database.replace_player_inventory_and_bank_balance(
+            player_id,
+            &equipment,
+            &containers,
+            new_balance,
+        )?;
+        shared_world
+            .replace_player_equipment(player_id, equipment)
+            .expect("validated player remains present while banking");
+        shared_world
+            .replace_player_containers(player_id, containers)
+            .expect("validated player remains present while banking");
+        return Ok(Some(format!("You deposited {deposited} gold.")));
+    }
+
+    let amount = withdraw_amount.expect("withdraw branch implies a parsed amount");
+    let balance = database
+        .player_bank_balance(player_id)
+        .map_err(HostError::Persistence)?;
+    if balance < amount {
+        return Ok(Some("You do not have enough gold on your account.".into()));
+    }
+    // Chunk the withdrawal into bounded stacks and place them into free top-level container
+    // slots without debiting unless every chunk fits.
+    let mut chunks = Vec::new();
+    let mut remaining_amount = amount;
+    while remaining_amount > 0 {
+        let chunk = remaining_amount.min(u64::from(MAX_ITEM_STACK_COUNT));
+        let chunk = u16::try_from(chunk)
+            .map_err(|_| HostError::InvalidConfiguration("chunk overflow".into()))?;
+        chunks.push(chunk);
+        remaining_amount -= u64::from(chunk);
+        if chunks.len() > 256 {
+            return Ok(Some("You cannot withdraw that much at once.".into()));
+        }
+    }
+    let mut staged_containers = containers.clone();
+    for chunk in &chunks {
+        let item = ItemInstance::new(NATIVE_CURRENCY_COINS[0].0, u16::from(*chunk))
+            .map_err(HostError::Core)?;
+        let container_ids: Vec<u8> = staged_containers.iter().map(|(id, _)| id).collect();
+        let mut placed = false;
+        for container_id in container_ids {
+            let Some(mut container) = staged_containers.remove(container_id) else {
+                continue;
+            };
+            if !container.has_parent && container.items.merge_or_insert_stack(item.clone()).is_ok()
+            {
+                placed = true;
+            }
+            staged_containers
+                .insert(container)
+                .map_err(HostError::Core)?;
+            if placed {
+                break;
+            }
+        }
+        if !placed {
+            return Ok(Some(
+                "You need a container with free space to withdraw.".into(),
+            ));
+        }
+    }
+    let new_balance = balance - amount;
+    database.replace_player_inventory_and_bank_balance(
+        player_id,
+        &equipment,
+        &staged_containers,
+        new_balance,
+    )?;
+    shared_world
+        .replace_player_equipment(player_id, equipment)
+        .expect("validated player remains present while banking");
+    shared_world
+        .replace_player_containers(player_id, staged_containers)
+        .expect("validated player remains present while banking");
+    Ok(Some(format!("You withdrew {amount} gold.")))
 }
 
 impl SharedNativeMap {
@@ -8139,6 +8333,146 @@ fn handle_native_otclient_game(
                 stack_position,
                 index,
             } => {
+                let source_is_own_inventory = position.x == 0xffff;
+                // Owned-inventory consumable use runs before map-item routing: classic clients
+                // address own equipment with x=0xFFFF and a plain slot code in y, and own
+                // container items with the container flag plus the child index in z.
+                if source_is_own_inventory {
+                    if observed_dead {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=use-item outcome=deferred-consume-while-dead",
+                        );
+                        continue;
+                    }
+                    let consumable_target: Option<(
+                        u16,
+                        Option<EquipmentSlot>,
+                        Option<(u8, usize)>,
+                    )> = if position.x == 0xffff && position.y & 0x40 == 0 {
+                        EquipmentSlot::from_code(position.y as u8).and_then(|slot| {
+                            let equipment = shared_world.player_equipment(character.id).ok()?;
+                            let item = equipment.item(slot)?;
+                            Some((item.server_id, Some(slot), None::<(u8, usize)>))
+                        })
+                    } else if position.x == 0xffff && position.y & 0x40 != 0 {
+                        let container_id = (position.y & 0x0f) as u8;
+                        let child_index = usize::from(position.z);
+                        shared_world
+                            .player_containers(character.id)
+                            .ok()
+                            .and_then(|containers| containers.container(container_id).cloned())
+                            .and_then(|container| container.items.item(child_index).cloned())
+                            .map(|item| (item.server_id, None, Some((container_id, child_index))))
+                    } else {
+                        None
+                    };
+                    let Some((consumable_server_id, slot, container_ref)) = consumable_target
+                    else {
+                        continue;
+                    };
+                    let _ = client_thing_id;
+                    let Some(&(heal, mana_restore)) = config
+                        .consumable_effects
+                        .as_deref()
+                        .and_then(|effects| effects.get(&consumable_server_id))
+                    else {
+                        continue;
+                    };
+                    let mut vitals = shared_world.player_vitals(character.id)?;
+                    if heal > 0 {
+                        vitals.health = vitals
+                            .health
+                            .saturating_add(heal)
+                            .min(vitals.max_health)
+                            .min(u16::MAX);
+                    }
+                    if mana_restore > 0 {
+                        vitals.mana = vitals
+                            .mana
+                            .saturating_add(mana_restore)
+                            .min(vitals.max_mana)
+                            .min(u16::MAX);
+                    }
+                    // Consume one unit from the resolved inventory location.
+                    match (&slot, &container_ref) {
+                        (Some(slot), _) => {
+                            let mut equipment = shared_world.player_equipment(character.id)?;
+                            if let Some(item) = equipment.item(*slot).cloned() {
+                                if item.count > 1 {
+                                    let mut remaining = item;
+                                    remaining.count -= 1;
+                                    equipment.equip(*slot, remaining);
+                                } else {
+                                    equipment.unequip(*slot);
+                                }
+                            }
+                            shared_world
+                                .replace_player_equipment(character.id, equipment.clone())
+                                .expect("validated player remains present while consuming");
+                            database
+                                .replace_player_equipment(u64::from(character.id), &equipment)
+                                .map_err(HostError::Persistence)?;
+                        }
+                        (_, Some((container_id, child_index))) => {
+                            let mut containers = shared_world.player_containers(character.id)?;
+                            let mut container = match containers.remove(*container_id) {
+                                Some(container) => container,
+                                None => continue,
+                            };
+                            if !container.items.consume_item_unit(*child_index) {
+                                continue;
+                            }
+                            containers.insert(container).map_err(HostError::Core)?;
+                            database
+                                .replace_player_containers(u64::from(character.id), &containers)
+                                .map_err(HostError::Persistence)?;
+                        }
+                        _ => {}
+                    }
+                    shared_world
+                        .lock()?
+                        .update_player_vitals(character.id, vitals)
+                        .map_err(HostError::Core)?;
+                    shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+                    database
+                        .update_player_vitals(
+                            character.id,
+                            PersistedPlayerVitals {
+                                health: vitals.health,
+                                max_health: vitals.max_health,
+                                mana: vitals.mana,
+                                max_mana: vitals.max_mana,
+                                capacity: vitals.capacity,
+                                magic_level: vitals.magic_level,
+                            },
+                        )
+                        .map_err(HostError::Persistence)?;
+                    let self_native_id = native_player_id(character.id)?;
+                    let health_update = encode_native_otclient_creature_health(
+                        &config.client_profile,
+                        self_native_id,
+                        u16::from(vitals.health.min(u16::MAX)),
+                        u16::from(vitals.max_health),
+                    )
+                    .map_err(HostError::Protocol)?;
+                    write_frame(stream, &health_update)?;
+                    observed_vitals_epoch = shared_world.vitals_epoch();
+                    native_diagnostic(
+                        config.extended_diagnostics,
+                        peer,
+                        &format!(
+                            "action=use-item outcome=consumed server-id={} heal={} mana={} health={} mana={}",
+                            consumable_server_id,
+                            heal,
+                            mana_restore,
+                            vitals.health,
+                            vitals.mana,
+                        ),
+                    );
+                    continue;
+                }
                 // Runtime-corpse opening runs first because identity comes from FE's own durable
                 // registry rather than the operator presentation catalog.
                 let corpse_attempt = map_owner.runtime_tile_item(
@@ -9075,6 +9409,35 @@ fn handle_native_otclient_game(
                             }
                             Err(error) => return Err(error),
                         }
+                        continue;
+                    }
+                }
+                // Bounded NPC banking keywords ("balance", "deposit all", "withdraw <n>") are
+                // only handled for authenticated living players; unmatched messages fall through
+                // to ordinary chat delivery.
+                if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
+                    && request.channel_id.is_none()
+                    && request.recipient.is_none()
+                    && !observed_dead
+                {
+                    if let Some(reply) = handle_native_bank_keyword(
+                        shared_world,
+                        &mut database,
+                        character.id,
+                        &request.message,
+                    )? {
+                        let reply_frame =
+                            encode_native_otclient_status_message(&config.client_profile, &reply)
+                                .map_err(HostError::Protocol)?;
+                        write_frame(stream, &reply_frame)?;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "action=talk outcome=bank-keyword reply-bytes={}",
+                                reply.len()
+                            ),
+                        );
                         continue;
                     }
                 }
@@ -11473,6 +11836,7 @@ mod tests {
             public_channel_catalog: None,
             item_armor_by_server_id: None,
             item_shield_defense_by_server_id: None,
+            consumable_effects: None,
             item_slot_types_by_server_id: None,
             item_weight_by_server_id: None,
             item_name_by_server_id: None,
@@ -17236,6 +17600,236 @@ mod tests {
             "exactly the bounded window budget is delivered"
         );
         game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_bank_keywords_deposit_and_withdraw_gold_near_an_npc() {
+        let database_path = database_path("native-bank-keywords");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        // A backpack holding 30 gold coins stands next to the player; an NPC banker is adjacent.
+        let mut containers = PlayerContainers::default();
+        let mut backpack = PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        backpack
+            .items
+            .merge_or_insert_stack(ItemInstance::new(2148, 30).unwrap())
+            .unwrap();
+        containers.insert(backpack).unwrap();
+        database.replace_player_containers(1, &containers).unwrap();
+
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.static_spawns = Some(Arc::new(
+            FeTfsStaticSpawnCollection::with_combat_metadata_and_npc_ids(
+                vec![forgotten_core::FeTfsStaticEntity {
+                    id: NATIVE_OTCLIENT_PLAYER_ID_END + 2,
+                    name: "Banker".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    look_type: 128,
+                    head: 0,
+                    body: 0,
+                    legs: 0,
+                    feet: 0,
+                    addons: 0,
+                    speed: 134,
+                    health_percent: 100,
+                    direction: 2,
+                }],
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::from([NATIVE_OTCLIENT_PLAYER_ID_END + 2]),
+            )
+            .unwrap(),
+        ));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+        // Bootstrap follows with one static-creature health record for the nearby banker.
+        let bootstrap_health = read_data_frame(&mut stream);
+        assert_eq!(
+            bootstrap_health.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH
+        );
+
+        // Deposit all carried coins near the banker. Classic Talk framing: mode byte then text.
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                0x96, 1, 11, 0, b'd', b'e', b'p', b'o', b's', b'i', b't', b' ', b'a', b'l', b'l',
+            ]),
+        )
+        .unwrap();
+        let reply = read_data_frame(&mut stream);
+        assert!(String::from_utf8_lossy(&reply.0).contains("You deposited 30 gold."));
+
+        drop(stream);
+        game.shutdown().unwrap();
+        let database = EngineDatabase::open(&database_path).unwrap();
+        assert_eq!(database.player_bank_balance(1).unwrap(), 30);
+        let drained = database.player_containers(1).unwrap();
+        let backpack_items: Vec<(u16, u16)> = drained
+            .container(2)
+            .unwrap()
+            .items
+            .iter()
+            .map(|item| (item.server_id, item.count))
+            .collect();
+        assert!(
+            !backpack_items.iter().any(|(id, _)| *id == 2148),
+            "carried gold must leave inventory on deposit"
+        );
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_use_item_consumes_a_backpack_potion_and_heals_the_drinker() {
+        let database_path = database_path("native-consumable");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        database
+            .update_player_vitals(
+                1,
+                PersistedPlayerVitals {
+                    health: 50,
+                    max_health: 150,
+                    mana: 10,
+                    max_mana: 50,
+                    capacity: 32_000,
+                    magic_level: 0,
+                },
+            )
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        let mut backpack = PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        backpack
+            .items
+            .merge_or_insert_stack(ItemInstance::new(2666, 2).unwrap())
+            .unwrap();
+        containers.insert(backpack).unwrap();
+        database.replace_player_containers(1, &containers).unwrap();
+
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.consumable_effects =
+            Some(Arc::new(BTreeMap::from([(2666_u16, (25_u16, 0_u16))])));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+
+        // Drink from the backpack potion stack: own-container addressing with child index 0.
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_USE_ITEM,
+                0xff,
+                0xff,
+                0x42,
+                0x00,
+                0x00,
+                0x6a,
+                0x0a,
+                0x00,
+                0x00,
+            ]),
+        )
+        .unwrap();
+        let healed = read_data_frame(&mut stream);
+        assert_eq!(
+            healed.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH
+        );
+        // 75 of 150 maximum health renders as a 50-percent display value.
+        assert_eq!(*healed.0.last().unwrap(), 50);
+
+        drop(stream);
+        game.shutdown().unwrap();
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let character = database
+            .characters_for_account(account_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("character persists");
+        assert_eq!(character.vitals.health, 75);
+        let drained = database.player_containers(1).unwrap();
+        let potion_count = drained
+            .container(2)
+            .unwrap()
+            .items
+            .item(0)
+            .map(|item| item.count);
+        assert_eq!(potion_count, Some(1));
         let _ = fs::remove_file(database_path);
     }
 

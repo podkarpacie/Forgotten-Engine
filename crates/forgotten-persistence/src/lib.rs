@@ -334,6 +334,80 @@ impl EngineDatabase {
         &self.path
     }
 
+    /// Replaces a player's complete bounded inventory and bank balance in one SQLite transaction.
+    /// Callers use this only for composite currency transitions such as depositing carried coin
+    /// stacks; a failed commit leaves both durable collections unchanged.
+    pub fn replace_player_inventory_and_bank_balance(
+        &mut self,
+        player_id: u64,
+        equipment: &PlayerEquipment,
+        containers: &PlayerContainers,
+        balance: u64,
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let balance_value = sqlite_bank_balance_value(balance)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM player_equipment WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM player_container_items WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM player_containers WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        for (slot, item) in equipment.iter() {
+            transaction.execute(
+                "INSERT INTO player_equipment (player_id, slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    player_id as i64,
+                    i64::from(slot.code()),
+                    i64::from(item.server_id),
+                    i64::from(item.count),
+                    item.action_id.map(i64::from),
+                    item.unique_id.map(i64::from),
+                ],
+            )?;
+        }
+        for (container_id, container) in containers.iter() {
+            transaction.execute(
+                "INSERT INTO player_containers (player_id, container_id, server_id, count, name, has_parent, capacity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    player_id as i64,
+                    i64::from(container_id),
+                    i64::from(container.container_item.server_id),
+                    i64::from(container.container_item.count),
+                    container.name,
+                    i64::from(u8::from(container.has_parent)),
+                    i64::from(container.items.capacity()),
+                ],
+            )?;
+            for (slot, item) in container.items.iter().enumerate() {
+                transaction.execute(
+                    "INSERT INTO player_container_items (player_id, container_id, slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        player_id as i64,
+                        i64::from(container_id),
+                        slot as i64,
+                        i64::from(item.server_id),
+                        i64::from(item.count),
+                        item.action_id.map(i64::from),
+                        item.unique_id.map(i64::from),
+                    ],
+                )?;
+            }
+        }
+        transaction.execute(
+            "UPDATE players SET bank_balance = ?1 WHERE id = ?2",
+            params![balance_value, player_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn schema_version(&self) -> Result<i64, PersistenceError> {
         Ok(self.connection.query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",

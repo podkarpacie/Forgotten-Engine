@@ -2133,6 +2133,20 @@ impl ItemContainer {
         (index < self.items.len()).then(|| self.items.remove(index))
     }
 
+    /// Consumes one unit of the bounded stack at `index`, removing the entry entirely when the
+    /// last unit is used. Returns false when the index does not resolve.
+    pub fn consume_item_unit(&mut self, index: usize) -> bool {
+        let Some(item) = self.items.get_mut(index) else {
+            return false;
+        };
+        if item.count > 1 {
+            item.count -= 1;
+        } else {
+            self.items.remove(index);
+        }
+        true
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &ItemInstance> + '_ {
         self.items.iter()
     }

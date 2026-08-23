@@ -4,6 +4,7 @@
 //! execute Lua; a sandboxed scripting runtime belongs to a later milestone.
 
 mod channels;
+mod consumables;
 mod items;
 mod legacy_xml;
 mod npc_dialogue;
@@ -30,6 +31,9 @@ use std::path::{Path, PathBuf};
 pub use channels::{
     load_tfs_public_channel_catalog, parse_tfs_public_channels_xml, LegacyPublicChannelCatalog,
     LegacyPublicChannelDefinition,
+};
+pub use consumables::{
+    load_consumable_catalog, parse_consumables_xml, ConsumableCatalog, ConsumableEffect,
 };
 pub use items::{LegacyItemCatalog, LegacyItemDefinition, LegacyItemSlotType};
 pub use legacy_xml::{
