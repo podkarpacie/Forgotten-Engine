@@ -44,8 +44,9 @@ const SCHEMA_VERSION_MAP_ITEM_COUNT_OVERRIDES: i64 = 25;
 const SCHEMA_VERSION_RUNTIME_MAP_ITEMS: i64 = 26;
 const SCHEMA_VERSION_PLAYER_QUESTS: i64 = 28;
 const SCHEMA_VERSION_BLESS_PROMOTION: i64 = 29;
+const SCHEMA_VERSION_PLAYER_PARTIES: i64 = 30;
 const SCHEMA_VERSION_CORPSE_DESPAWN_TICKS: i64 = 27;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_BLESS_PROMOTION;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_PARTIES;
 /// Classic blessing count ceiling; the audited default death-loss reduction consumes this.
 pub const MAX_PLAYER_BLESSINGS: u8 = 5;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -4377,6 +4378,18 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_BLESS_PROMOTION, unix_seconds()],
             )?;
         }
+        if self.schema_version()? < SCHEMA_VERSION_PLAYER_PARTIES {
+            self.connection.execute_batch(
+                "CREATE TABLE player_parties (
+                    player_id INTEGER PRIMARY KEY REFERENCES players(id),
+                    party_leader_id INTEGER NOT NULL REFERENCES players(id)
+                );",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_PLAYER_PARTIES, unix_seconds()],
+            )?;
+        }
         Ok(())
     }
 
@@ -4509,6 +4522,63 @@ impl EngineDatabase {
             params![i64::from(u8::from(promoted)), player_id as i64],
         )?;
         Ok(())
+    }
+
+    /// Replaces every persisted party row with one bounded snapshot of (leader, non-leader
+    /// members) records in a single SQLite transaction. Leaders must not appear in member
+    /// lists; every referenced player must exist. An empty slice clears all party rows.
+    pub fn replace_player_parties(
+        &mut self,
+        snapshots: &[(u64, Vec<u64>)],
+    ) -> Result<(), PersistenceError> {
+        let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for (leader_id, members) in snapshots {
+            if members.contains(leader_id) {
+                return Err(PersistenceError::InvalidPartySnapshot(format!(
+                    "members list for leader {leader_id} contains the leader"
+                )));
+            }
+            if !seen.insert(*leader_id) {
+                return Err(PersistenceError::InvalidPartySnapshot(format!(
+                    "duplicate leader {leader_id}"
+                )));
+            }
+            for member in members {
+                if !seen.insert(*member) {
+                    return Err(PersistenceError::InvalidPartySnapshot(format!(
+                        "player {member} appears in multiple parties"
+                    )));
+                }
+            }
+        }
+        let tx = self.connection.transaction()?;
+        tx.execute("DELETE FROM player_parties", [])?;
+        for (leader_id, members) in snapshots {
+            for member in members {
+                tx.execute(
+                    "INSERT INTO player_parties (player_id, party_leader_id) VALUES (?1, ?2)",
+                    params![*member as i64, *leader_id as i64],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Returns the persisted party leader for one player, if any.
+    pub fn party_leader_of(&self, player_id: u64) -> Result<Option<u64>, PersistenceError> {
+        let leader = self.connection.query_row(
+            "SELECT party_leader_id FROM player_parties WHERE player_id = ?1",
+            params![player_id as i64],
+            |row| row.get::<_, i64>(0),
+        );
+        match leader {
+            Ok(raw) => Ok(Some(u64::try_from(raw).map_err(|_| {
+                PersistenceError::InvalidPartySnapshot("persisted leader does not fit u64".into())
+            })?)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn ensure_player_exists(&self, player_id: u64) -> Result<(), PersistenceError> {
@@ -4964,6 +5034,8 @@ pub enum PersistenceError {
     InvalidPlayerName,
     InvalidPlayerVitals,
     InvalidQuestState(String),
+    /// A persisted party snapshot violated membership or live-state invariants.
+    InvalidPartySnapshot(String),
     DuplicatePlayerExperienceUpdate(u64),
     InvalidPlayerOutfit,
     InvalidEquipmentRecord(String),
@@ -5136,6 +5208,38 @@ mod tests {
             ),
             Err(PersistenceError::InvalidQuestState(message))
                 if message.contains("duplicate")
+        ));
+
+        // Party snapshots replace wholesale and reject leader-listing and cross-party overlaps.
+        for pid in 6..=9_u64 {
+            database
+                .save_player(&Player {
+                    id: pid,
+                    account_id: account_id as u64,
+                    name: format!("Party{pid}"),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        database
+            .replace_player_parties(&[(5, vec![6, 7]), (8, vec![9])])
+            .unwrap();
+        assert_eq!(database.party_leader_of(6).unwrap(), Some(5));
+        assert_eq!(database.party_leader_of(9).unwrap(), Some(8));
+        assert_eq!(database.party_leader_of(7).unwrap(), Some(5));
+        database.replace_player_parties(&[]).unwrap();
+        assert_eq!(database.party_leader_of(6).unwrap(), None);
+        assert!(matches!(
+            database.replace_player_parties(&[(5, vec![5])]),
+            Err(PersistenceError::InvalidPartySnapshot(message))
+                if message.contains("contains the leader")
         ));
         let _ = fs::remove_file(path);
     }
