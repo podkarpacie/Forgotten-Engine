@@ -2147,6 +2147,22 @@ impl ItemContainer {
         true
     }
 
+    /// Takes up to `units` units from the bounded stack at `index`, decrementing or removing the
+    /// entry as needed. Returns the number of units actually taken.
+    pub fn take_item_units(&mut self, index: usize, mut units: u16) -> u16 {
+        let Some(item) = self.items.get_mut(index) else {
+            return 0;
+        };
+        let available = item.count.min(units);
+        item.count -= available;
+        if item.count == 0 {
+            self.items.remove(index);
+        }
+        units -= available;
+        let _ = &mut units;
+        available
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &ItemInstance> + '_ {
         self.items.iter()
     }

@@ -3,8 +3,9 @@
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
 use forgotten_config::{
-    DeclarativeNpcDialogueCatalog, DeclarativeSpellCatalog, DeclarativeWeaponCatalog,
-    LegacyItemSlotType, LegacyPublicChannelCatalog, WorldType,
+    parse_declarative_shops_xml, DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog,
+    DeclarativeSpellCatalog, DeclarativeWeaponCatalog, LegacyItemSlotType,
+    LegacyPublicChannelCatalog, WorldType,
 };
 use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
@@ -1196,6 +1197,9 @@ pub struct NativeOtClientHostConfig {
     /// Optional operator-declared instant consumable effects keyed by server item ID. UseItem on
     /// an owned inventory item restores the declared health/mana once per item unit.
     pub consumable_effects: Option<Arc<BTreeMap<u16, (u16, u16)>>>,
+    /// Optional operator-declared NPC shop catalog. Say keywords near a matching active NPC buy
+    /// or sell bounded stacks through the durable bank balance.
+    pub shop_catalog: Option<Arc<DeclarativeShopCatalog>>,
     /// Immutable validated legacy `items.xml` slot types. They are used only by the bounded
     /// native map-source-to-empty-equipment route; generic inventories, stacks, swaps, and
     /// two-handed placement remain outside this policy.
@@ -1631,6 +1635,199 @@ fn handle_native_bank_keyword(
         .replace_player_containers(player_id, staged_containers)
         .expect("validated player remains present while banking");
     Ok(Some(format!("You withdrew {amount} gold.")))
+}
+
+/// Handles bounded NPC shop keywords ("buy <server-id> <count>" / "sell <server-id> <count>")
+/// near an active static NPC whose declared shop matches. Payments and proceeds flow through the
+/// durable bank balance; bought stacks chunk into free owned container slots, sold units leave
+/// carried equipment and containers. `Ok(None)` falls through to ordinary routing.
+fn handle_native_shop_keyword(
+    shared_world: &SharedNativeWorld,
+    database: &mut EngineDatabase,
+    player_id: u64,
+    message: &str,
+    shop_catalog: &DeclarativeShopCatalog,
+) -> Result<Option<String>, HostError> {
+    let normalized = message.trim().to_ascii_lowercase();
+    let mut parts = normalized.split_whitespace();
+    let verb = parts.next().unwrap_or("");
+    if verb != "buy" && verb != "sell" {
+        return Ok(None);
+    }
+    let (player, _) = shared_world.player_and_vitals(player_id)?;
+    let spawns = shared_world.active_static_spawns()?;
+    let mut npc_name: Option<String> = None;
+    for entity in &spawns.entities {
+        if !spawns.is_npc(entity.id) || entity.position.z != player.position.z {
+            continue;
+        }
+        if entity.position.x.abs_diff(player.position.x) as i32 <= NATIVE_BANK_NPC_RANGE_TILES
+            && entity.position.y.abs_diff(player.position.y) as i32 <= NATIVE_BANK_NPC_RANGE_TILES
+        {
+            npc_name = Some(entity.name.clone());
+            break;
+        }
+    }
+    let Some(npc_name) = npc_name else {
+        return Ok(None);
+    };
+    let Some(shop) = shop_catalog.by_npc_name(&npc_name) else {
+        return Ok(None);
+    };
+    let server_id = parts
+        .next()
+        .and_then(|id| id.parse::<u16>().ok())
+        .filter(|id| *id != 0);
+    let count = parts.next().and_then(|count| count.parse::<u64>().ok());
+    let (Some(server_id), Some(count)) = (server_id, count) else {
+        return Ok(Some(
+            "Usage: buy <item-id> <count> or sell <item-id> <count>.".into(),
+        ));
+    };
+    if count == 0 || count > 100 {
+        return Ok(Some("You must trade between 1 and 100 at once.".into()));
+    }
+    let Some(entry) = shop.entry(server_id) else {
+        return Ok(Some("I do not trade that item.".into()));
+    };
+    let mut equipment = shared_world.player_equipment(player_id)?;
+    let mut containers = shared_world.player_containers(player_id)?;
+
+    if verb == "buy" {
+        let Some(price) = entry.buy_price_gold else {
+            return Ok(Some("I do not sell that item.".into()));
+        };
+        let total = price.saturating_mul(count);
+        let balance = database
+            .player_bank_balance(player_id)
+            .map_err(HostError::Persistence)?;
+        if balance < total {
+            return Ok(Some("You do not have enough gold on your account.".into()));
+        }
+        let mut staged_containers = containers.clone();
+        for _ in 0..count {
+            let item = ItemInstance::new(server_id, 1).map_err(HostError::Core)?;
+            let container_ids: Vec<u8> = staged_containers.iter().map(|(id, _)| id).collect();
+            let mut placed = false;
+            for container_id in container_ids {
+                let Some(mut container) = staged_containers.remove(container_id) else {
+                    continue;
+                };
+                if !container.has_parent
+                    && container.items.merge_or_insert_stack(item.clone()).is_ok()
+                {
+                    placed = true;
+                }
+                staged_containers
+                    .insert(container)
+                    .map_err(HostError::Core)?;
+                if placed {
+                    break;
+                }
+            }
+            if !placed {
+                return Ok(Some("You need a container with free space to buy.".into()));
+            }
+        }
+        database.replace_player_inventory_and_bank_balance(
+            player_id,
+            &equipment,
+            &staged_containers,
+            balance - total,
+        )?;
+        shared_world
+            .replace_player_equipment(player_id, equipment)
+            .expect("validated player remains present while shopping");
+        shared_world
+            .replace_player_containers(player_id, staged_containers)
+            .expect("validated player remains present while shopping");
+        shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+        return Ok(Some(format!("You bought {count} for {total} gold.")));
+    }
+
+    // Sell path: gather the requested unit count from carried equipment and container items.
+    let Some(unit_price) = entry.sell_price_gold else {
+        return Ok(Some("I do not buy that item.".into()));
+    };
+    let mut remaining_units = count;
+    for slot in [
+        EquipmentSlot::Head,
+        EquipmentSlot::Neck,
+        EquipmentSlot::Backpack,
+        EquipmentSlot::Armor,
+        EquipmentSlot::RightHand,
+        EquipmentSlot::LeftHand,
+        EquipmentSlot::Legs,
+        EquipmentSlot::Feet,
+        EquipmentSlot::Ring,
+        EquipmentSlot::Ammo,
+    ] {
+        if remaining_units == 0 {
+            break;
+        }
+        if let Some(item) = equipment.item(slot).cloned() {
+            if item.server_id != server_id {
+                continue;
+            }
+            let take = remaining_units.min(u64::from(item.count)) as u16;
+            let mut kept = item;
+            kept.count -= take;
+            remaining_units -= u64::from(take);
+            if kept.count > 0 {
+                equipment.equip(slot, kept);
+            } else {
+                equipment.unequip(slot);
+            }
+        }
+    }
+    if remaining_units > 0 {
+        let mut next_containers = PlayerContainers::default();
+        for (_, container) in containers.iter() {
+            let mut next = container.clone();
+            while remaining_units > 0 {
+                let mut matched = None;
+                for index in 0..next.items.len() {
+                    if let Some(item) = next.items.item(index) {
+                        if item.server_id == server_id {
+                            matched = Some(index);
+                            break;
+                        }
+                    }
+                }
+                let Some(index) = matched else { break };
+                let Some(item) = next.items.item(index).cloned() else {
+                    break;
+                };
+                let take = remaining_units.min(u64::from(item.count));
+                remaining_units -= take;
+                next.items.take_item_units(index, take as u16);
+            }
+            next_containers.insert(next).map_err(HostError::Core)?;
+        }
+        containers = next_containers;
+    }
+    if remaining_units > 0 {
+        return Ok(Some("You do not carry enough of that item.".into()));
+    }
+    let total = unit_price.saturating_mul(count);
+    let new_balance = database
+        .player_bank_balance(player_id)
+        .map_err(HostError::Persistence)?
+        .saturating_add(total);
+    database.replace_player_inventory_and_bank_balance(
+        player_id,
+        &equipment,
+        &containers,
+        new_balance,
+    )?;
+    shared_world
+        .replace_player_equipment(player_id, equipment)
+        .expect("validated player remains present while shopping");
+    shared_world
+        .replace_player_containers(player_id, containers)
+        .expect("validated player remains present while shopping");
+    shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+    Ok(Some(format!("You sold {count} for {total} gold.")))
 }
 
 impl SharedNativeMap {
@@ -9440,6 +9637,35 @@ fn handle_native_otclient_game(
                         );
                         continue;
                     }
+                    // Bounded NPC shop keywords ("buy <id> <count>" / "sell <id> <count>") are
+                    // only handled near an active NPC whose declared shop matches.
+                    if let Some(shop_catalog) = config.shop_catalog.as_deref() {
+                        if let Some(reply) = handle_native_shop_keyword(
+                            shared_world,
+                            &mut database,
+                            character.id,
+                            &request.message,
+                            shop_catalog,
+                        )? {
+                            let reply_frame = encode_native_otclient_status_message(
+                                &config.client_profile,
+                                &reply,
+                            )
+                            .map_err(HostError::Protocol)?;
+                            write_frame(stream, &reply_frame)?;
+                            shared_world.mark_visibility_changed();
+                            observed_visibility_epoch = shared_world.visibility_epoch();
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "action=talk outcome=shop-keyword reply-bytes={}",
+                                    reply.len()
+                                ),
+                            );
+                            continue;
+                        }
+                    }
                 }
                 let recipient_count = if request.mode == 5 {
                     let Some(recipient_name) = request.recipient.as_deref() else {
@@ -11837,6 +12063,7 @@ mod tests {
             item_armor_by_server_id: None,
             item_shield_defense_by_server_id: None,
             consumable_effects: None,
+            shop_catalog: None,
             item_slot_types_by_server_id: None,
             item_weight_by_server_id: None,
             item_name_by_server_id: None,
@@ -17830,6 +18057,120 @@ mod tests {
             .item(0)
             .map(|item| item.count);
         assert_eq!(potion_count, Some(1));
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_shop_keywords_buy_and_sell_through_the_bank_balance() {
+        let database_path = database_path("native-shop-keywords");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        database.set_player_bank_balance(1, 500).unwrap();
+        let mut containers = PlayerContainers::default();
+        let mut backpack = PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        backpack
+            .items
+            .merge_or_insert_stack(ItemInstance::new(3294, 2).unwrap())
+            .unwrap();
+        containers.insert(backpack).unwrap();
+        database.replace_player_containers(1, &containers).unwrap();
+
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.static_spawns = Some(Arc::new(
+            FeTfsStaticSpawnCollection::with_combat_metadata_and_npc_ids(
+                vec![forgotten_core::FeTfsStaticEntity {
+                    id: NATIVE_OTCLIENT_PLAYER_ID_END + 3,
+                    name: "Trader".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    look_type: 128,
+                    head: 0,
+                    body: 0,
+                    legs: 0,
+                    feet: 0,
+                    addons: 0,
+                    speed: 134,
+                    health_percent: 100,
+                    direction: 2,
+                }],
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::from([NATIVE_OTCLIENT_PLAYER_ID_END + 3]),
+            )
+            .unwrap(),
+        ));
+        let shop_catalog = parse_declarative_shops_xml(
+            br#"<fe-shops><fe-shop npc="Trader"><fe-item id="3294" sell="200"/><fe-item id="2666" buy="75"/></fe-shop></fe-shops>"#,
+        )
+        .unwrap();
+        native_config.shop_catalog = Some(Arc::new(shop_catalog));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+        // Consume the banker-style bootstrap health record for the nearby NPC.
+        read_data_frame(&mut stream);
+
+        // Sell both swords at 150 gold each.
+        // Sell both swords: sell <item-id> <count>, at 200 gold each from the catalog.
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                0x96, 1, 11, 0, b's', b'e', b'l', b'l', b' ', b'3', b'2', b'9', b'4', b' ', b'2',
+            ]),
+        )
+        .unwrap();
+        let reply = read_data_frame(&mut stream);
+        assert!(String::from_utf8_lossy(&reply.0).contains("You sold"));
+
+        drop(stream);
+        game.shutdown().unwrap();
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        assert_eq!(database.player_bank_balance(1).unwrap(), 500 + 400);
+        let drained = database.player_containers(1).unwrap();
+        assert!(drained
+            .container(2)
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| item.server_id != 3294));
         let _ = fs::remove_file(database_path);
     }
 

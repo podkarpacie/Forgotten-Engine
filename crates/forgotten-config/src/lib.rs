@@ -9,6 +9,7 @@ mod items;
 mod legacy_xml;
 mod npc_dialogue;
 mod otbm;
+mod shops;
 mod spells;
 mod stages;
 mod tfs_entities;
@@ -42,6 +43,10 @@ pub use legacy_xml::{
 pub use npc_dialogue::{
     load_declarative_npc_dialogue_catalog, parse_declarative_npc_dialogue_xml,
     DeclarativeNpcDialogueCatalog, DeclarativeNpcDialogueResponse,
+};
+pub use shops::{
+    load_declarative_shop_catalog, parse_declarative_shops_xml, DeclarativeNpcShop,
+    DeclarativeShopCatalog, DeclarativeShopEntry,
 };
 pub use spells::{
     load_declarative_spell_catalog, parse_declarative_spells_xml, DeclarativeSpellCatalog,
