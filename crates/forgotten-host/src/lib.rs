@@ -12497,7 +12497,7 @@ mod tests {
     #[test]
     fn native_throw_item_picks_up_a_dropped_ground_stack_into_equipment() {
         let database_path = database_path("native-ground-pickup");
-        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let database = EngineDatabase::open(&database_path).unwrap();
         let account_id = database
             .create_account_with_password("operator", "correct horse battery staple")
             .unwrap();
@@ -16991,15 +16991,14 @@ mod tests {
             "Knight",
             "definitely-not-the-password",
         );
-        let mut saw_wrong_password_error = false;
         for _ in 0..NATIVE_AUTH_MAX_FAILURES_PER_WINDOW {
             let mut stream = TcpStream::connect(game.local_addr()).unwrap();
             write_frame(&mut stream, &wrong_password_frame).unwrap();
-            if read_frame(&mut stream).unwrap().0[0]
-                == forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
-            {
-                panic!("a wrong password must never authenticate");
-            }
+            assert_ne!(
+                read_frame(&mut stream).unwrap().0[0],
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE,
+                "a wrong password must never authenticate"
+            );
         }
         // The next failure budget overflow switches the peer to pre-auth rejection.
         let limiter_probe = {
@@ -17011,8 +17010,6 @@ mod tests {
             limiter_probe.0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_ERROR
         );
-        saw_wrong_password_error = true;
-        let _ = saw_wrong_password_error;
 
         // A correct password from the blocked peer is still refused before authentication.
         let mut stream = TcpStream::connect(game.local_addr()).unwrap();
@@ -17038,7 +17035,7 @@ mod tests {
     #[test]
     fn native_talk_flood_is_suppressed_beyond_the_bounded_window_budget() {
         let database_path = database_path("native-chat-flood");
-        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let database = EngineDatabase::open(&database_path).unwrap();
         let account_id = database
             .create_account_with_password("operator", "correct horse battery staple")
             .unwrap();
@@ -22337,7 +22334,7 @@ mod tests {
     fn answers_an_fe_metrics_status_request_with_authoritative_counters() {
         let database = database_path("status-metrics");
         {
-            let mut database = EngineDatabase::open(&database).unwrap();
+            let database = EngineDatabase::open(&database).unwrap();
             database
                 .create_account_with_password("operator", "correct horse battery staple")
                 .unwrap();

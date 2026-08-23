@@ -5,7 +5,10 @@
 > milestone lands. Companion documents: `docs/capability-matrix.md` (per-feature truth),
 > `todo.md` (short-term checklist), `docs/completion-ledger.md` (landed-work ledger).
 >
-> **Last updated:** ledger re-weighted to **30%** after corpse opening/decay (schema v27), owned-inventory ground drops, whisper/yell delivery, and the durable runtime tile-item registry.
+> **Last updated:** ledger re-weighted to **40%** — the owned-inventory movement loop is closed
+> in both directions (drops, pickups, corpse-window loot taking with live window refreshes),
+> left-hand shield defense joined the mitigation bridge, brute-force/flood limiting and an
+> operator metrics endpoint landed, and official Docker packaging shipped.
 > (schema v26), defeated-creature roll fix, whisper/yell delivery, and socket-test
 > stabilization; pushed to `podkarpacie/Forgotten-Engine`.
 
@@ -106,15 +109,17 @@ loot corpses, equip gear, chat, die and respawn.*
 - [ ] **Multi-floor viewport correctness audit (70%)** — verify floor-stack rendering against real
       client screenshots *(est. 2 days)*
 
-#### 1.2 Items & Inventory — ~50%
+#### 1.2 Items & Inventory — ~65%
 - [x] Equipment slots, stack merges/splits, container↔equipment transfers (atomic persistence)
 - [x] Depot/inbox/bank schema + storage APIs; house ownership/access-list schema
+- [x] **Owned-inventory movement loop closed** — drops to adjacent ground, pickups, and
+      corpse-window loot taking all persist atomically with the durable runtime registry
 - [ ] **Item definitions completeness (40%)** — weight, stackable, slotType, defense, attack,
       requirements fully wired into combat/equipment admission *(est. 5 days)*
-- [ ] **Container open/close via UseItem (25%)** — open backpack-in-hand/backpack-on-tile as
-      nested window (depth ≤ 2), up-arrow parent navigation *(est. 4 days)*
-- [ ] **Ground pickup/drop (30%)** — throw-to-ground creates map item; pick-up returns to
-      container with capacity checks *(est. 3 days)*
+- [ ] **Container open/close via UseItem (55%)** — corpse windows prove the window machinery;
+      backpack-in-hand nested windows (depth ≤ 2) remain *(est. 3 days)*
+- [x] **Ground pickup/drop (85%)** — owned items move both directions with persistence; foreign-
+      stack merging and map-source returns remain
 - [ ] **Depot & inbox client windows (20%)** — open depot in town, move items in/out *(est. 5 days)*
 - [ ] **Money handling (10%)** — gold coin stacks ↔ bank balance conversion, buy/sell plumbing
       *(est. 3 days)*
@@ -126,11 +131,10 @@ loot corpses, equip gear, chat, die and respawn.*
 - [x] Declarative weapon catalog (scriptless), spell-cast foundation (mana/timing)
 - [x] Static spawn lifecycle: reactivation intervals, spawn-area blockers, pursuit, direct melee
 - [x] **Loot rolls + corpse spawn on defeat (new)** — deterministic seeded rolls, flat `<loot>`
-      parsing, corpse as runtime map item *(just landed; needs persistence + client-open wiring)*
-- [x] **Loot persistence across restart (new)** — durable revision-bound runtime tile-item
-      registry (schema v26); corpses re-materialize on startup and fail closed on incompatible
-      state; defeated-roll fix so loot tables roll after deactivation *(client corpse opening
-      remains deferred)*
+      parsing, corpse as runtime map item
+- [x] **Loot persistence + full loot loop (new)** — durable runtime registry, restart recovery,
+      corpse windows with live refresh, taking into inventory, configured decay; defeated-roll
+      fix so loot tables roll after deactivation
 - [ ] **Monster health/condition effects (10%)** — poison/fire/burn conditions on players from
       monster attacks *(est. 4 days)*
 - [ ] **Death list & frags (0%)** — kill tracking, skull system, unjustified kills *(est. 5 days)*
@@ -139,7 +143,9 @@ loot corpses, equip gear, chat, die and respawn.*
 - [ ] **Spells v1 (20%)** — declarative spell catalog executes: damage/heal/area effects with
       cooldowns and mana; no Lua yet *(est. 8 days)*
 - [ ] **Ranged/weapons distance (0%)** — bows/wands, ammo consumption *(est. 5 days)*
-- [ ] **Blocking/shield/defense formulas (25%)** — shield defense value, block chance *(est. 3 days)*
+- [x] **Blocking/shield/defense formulas (45%)** — validated legacy left-hand shield defense
+      joins the capped armor-only reduction with the vocation multiplier; blocking chance and
+      right-hand weapons remain excluded
 
 #### 1.4 Player Lifecycle — ~70%
 - [x] Numeric-account login, character select, session bootstrap, HUD stats/skills/outfit
@@ -221,16 +227,18 @@ its simple Lua scripts (talkaction hello, action door) run unmodified through th
 - [ ] **Memory audit (0%)** — arena/pool allocations for frames, tile snapshots *(est. 4 days)*
 - [ ] **Target:** 1,000 simulated players, p99 input-ack < 50ms, < 2GB RSS *(est. ongoing)*
 
-#### 3.2 Reliability & Ops — ~45%
+#### 3.2 Reliability & Ops — ~55%
 - [x] Backups (SQLite copy + manifest), event log, graceful shutdown, crash-safe transactions
+- [x] **Operator metrics endpoint (new)** — fe-metrics status request returns authoritative
+      counters without touching classic-client responses
+- [x] **Official Docker image + compose** — non-root runtime, /data world contract
 - [ ] **Auto-save cadence (0%)** — periodic world snapshot flush *(est. 2 days)*
 - [ ] **Watchdog/self-heal (0%)** — session leak detection, stuck-lock breaker *(est. 3 days)*
-- [ ] **Metrics endpoint (0%)** — Prometheus-style counters *(est. 3 days)*
-- [ ] **Docker image (0%)** — official image + compose example *(est. 2 days)*
 
-#### 3.3 Security — ~50%
+#### 3.3 Security — ~65%
 - [x] Argon2 passwords, bounded inputs everywhere, no unsafe, path-traversal rejection
-- [ ] **Rate limiting (0%)** — login attempts, chat spam, packet floods *(est. 3 days)*
+- [x] **Rate limiting (core paths)** — per-peer brute-force guard on game auth and fixed-window
+      chat flood suppression
 - [ ] **Ban/mute system (0%)** — account/IP bans, mutes with expiry *(est. 4 days)*
 - [ ] **Fuzzing (0%)** — cargo-fuzz targets for decoders *(est. 5 days)*
 
@@ -330,16 +338,15 @@ is itself a useful, releasable product.
 
 ## 4. Immediate Next Steps (this week)
 
-1. **Loot completion** — persist corpses across restart via runtime-item registry; wire
-   client-visible corpse opening (UseItem on corpse → container window). *(registry, opening,
-   decay, and ground drops all landed; remaining half is loot taking from opened windows)*
-2. **Container UseItem opening** — backpack-in-hand nested windows (Phase 1.2); the corpse
-   window machinery (window IDs, close handling, catalog rendering) now provides the base.
-3. ~~Whisper/yell/private chat modes~~ — whisper and yell landed (`d98ecc5`).
-4. ~~Update capability matrix / ledger / commit / push~~ — ledger re-weighted to **30%** with
-   evidence-backed credits for whisper/yell, the durable runtime registry, corpse
-   opening/decay, and owned-inventory ground drops.
-5. **Next:** loot taking from opened corpse windows → then pickup of dropped runtime items.
+1. ~~Loot completion~~ — **done**: registry, corpse windows with live refresh, loot taking,
+   decay, and the ground drop/pickup loop all landed with socket evidence.
+2. **Container UseItem opening** — backpack-in-hand nested windows (depth ≤ 2); the corpse-window
+   machinery (addressable window IDs, close handling, catalog rendering, live refresh) is the base.
+3. **Capacity-weight gating** of the now-complete owned-inventory movement loop (weights already
+   imported; see `docs/protocol-evidence/native-capacity-audit.md`).
+4. ~~Ledger re-weighted to **40%**~~ with evidence-backed credits for the movement loop, shield
+   defense, rate limiting, metrics, and Docker packaging.
+5. Then: depot/inbox client windows → money/bank plumbing → quest log v1.
 
 ---
 
