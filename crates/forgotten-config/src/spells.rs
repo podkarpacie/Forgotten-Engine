@@ -8,18 +8,25 @@ use std::collections::BTreeMap;
 use std::fs;
 
 const MAX_SPELL_CATALOG_BYTES: usize = 256 * 1024;
+/// Bounded Say-keyword length for exact spell invocation routing.
+const MAX_SPELL_WORDS_BYTES: usize = 32;
+/// Bounded fixed spell damage; shares the combat-event ceiling scale.
+pub const MAX_SPELL_DAMAGE: u32 = 500;
 const MAX_SPELL_CATALOG_DEPTH: usize = 4;
 const MAX_SPELL_CATALOG_ENTRIES: usize = 10_000;
 const SPELL_CATALOG_RELATIVE_PATH: &str = "spells/forgotten-engine-spells.xml";
 
 /// An operator-owned, scriptless spell declaration. It creates only a typed resource-and-timing
-/// event; target resolution, formula execution, effects, words, Lua, and client delivery remain
-/// outside this adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// event; target resolution, formula execution, effects, Lua, and client delivery remain
+/// outside this adapter. Optional `words` route exact Say-keyword invocation, and optional
+/// `damage` applies one bounded fixed hit to the caster's already-selected living adjacent target.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclarativeSpellDefinition {
     pub spell_id: u16,
     pub mana_cost: u16,
     pub timing: CombatAttackTiming,
+    pub words: Option<String>,
+    pub damage: Option<u16>,
 }
 
 impl DeclarativeSpellDefinition {
@@ -36,7 +43,23 @@ pub struct DeclarativeSpellCatalog {
 
 impl DeclarativeSpellCatalog {
     pub fn get(&self, spell_id: u16) -> Option<DeclarativeSpellDefinition> {
-        self.entries.get(&spell_id).copied()
+        self.entries.get(&spell_id).cloned()
+    }
+
+    /// Resolves one exact Say-keyword invocation to its spell. Keywords are matched after ASCII
+    /// whitespace trimming and ASCII lowercasing on both sides; an empty catalog word list never
+    /// matches.
+    pub fn by_words(&self, message: &str) -> Option<DeclarativeSpellDefinition> {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let mut normalized = trimmed.to_owned();
+        normalized.make_ascii_lowercase();
+        self.entries
+            .values()
+            .find(|spell| spell.words.as_deref() == Some(normalized.as_str()))
+            .cloned()
     }
 
     pub fn len(&self) -> usize {
@@ -50,7 +73,7 @@ impl DeclarativeSpellCatalog {
     pub fn iter(&self) -> impl Iterator<Item = (u16, DeclarativeSpellDefinition)> + '_ {
         self.entries
             .iter()
-            .map(|(spell_id, definition)| (*spell_id, *definition))
+            .map(|(spell_id, definition)| (*spell_id, definition.clone()))
     }
 
     fn insert(&mut self, definition: DeclarativeSpellDefinition) -> Result<(), ConfigError> {
@@ -171,7 +194,9 @@ fn parse_spell(event: &BytesStart<'_>) -> Result<DeclarativeSpellDefinition, Con
     }
     let timing = CombatAttackTiming::new(interval_ticks)
         .map_err(|_| invalid("declarative spell interval is outside the configured range"))?;
-    let mut known = [false; 3];
+    let mut known = [false; 5];
+    let mut words: Option<String> = None;
+    let mut damage: Option<u16> = None;
     for attribute in event.attributes().with_checks(false) {
         let attribute =
             attribute.map_err(|error| invalid(format!("invalid spell attribute: {error}")))?;
@@ -179,16 +204,46 @@ fn parse_spell(event: &BytesStart<'_>) -> Result<DeclarativeSpellDefinition, Con
             b"id" => known[0] = true,
             b"manacost" => known[1] = true,
             b"intervalticks" => known[2] = true,
+            b"words" => {
+                let value = attribute
+                    .decoded_and_normalized_value(XmlVersion::Implicit1_0, event.decoder())
+                    .map_err(|error| invalid(format!("invalid spell words: {error}")))?;
+                let value = value.trim();
+                if value.is_empty() || value.len() > MAX_SPELL_WORDS_BYTES {
+                    return Err(invalid(
+                        "declarative spell words must stay within the bounded length",
+                    ));
+                }
+                if !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+                    return Err(invalid(
+                        "declarative spell words must be bounded ASCII without whitespace",
+                    ));
+                }
+                words = Some(value.to_ascii_lowercase());
+                known[3] = true;
+            }
+            b"damage" => {
+                let value = required_u16(event, b"damage")?;
+                if value == 0 || value as u32 > MAX_SPELL_DAMAGE {
+                    return Err(invalid(
+                        "declarative spell damage is outside the configured range",
+                    ));
+                }
+                damage = Some(value);
+                known[4] = true;
+            }
             _ => return Err(invalid("unsupported declarative spell attribute")),
         }
     }
-    if known.iter().any(|known| !known) {
+    if known.iter().take(3).any(|known| !known) {
         return Err(invalid("declarative spell is missing a required attribute"));
     }
     Ok(DeclarativeSpellDefinition {
         spell_id,
         mana_cost,
         timing,
+        words,
+        damage,
     })
 }
 
@@ -202,7 +257,7 @@ fn required_u16(event: &BytesStart<'_>, key: &[u8]) -> Result<u16, ConfigError> 
         })
         .ok_or_else(|| invalid("declarative spell is missing a required attribute"))?;
     let value = value
-        .normalized_value(XmlVersion::Explicit1_0)
+        .decoded_and_normalized_value(XmlVersion::Implicit1_0, event.decoder())
         .map_err(|error| invalid(format!("invalid spell attribute value: {error}")))?;
     value
         .parse::<u16>()
@@ -234,12 +289,43 @@ mod tests {
                 spell_id: 100,
                 mana_cost: 20,
                 timing: CombatAttackTiming::new(2).unwrap(),
+                words: None,
+                damage: None,
             })
         );
         let event = catalog.get(200).unwrap().cast_event(7).unwrap();
         assert_eq!(event.caster_id, 7);
         assert_eq!(event.spell_id, 200);
         assert_eq!(event.mana_cost, 35);
+    }
+
+    #[test]
+    fn parses_spell_words_and_damage_with_validation() {
+        let catalog = parse_declarative_spells_xml(
+            br#"<fe-spells>
+                    <fe-spell id="100" manacost="20" intervalticks="2" words="exura" damage="15"/>
+                    <fe-spell id="200" manacost="35" intervalticks="4"/>
+                </fe-spells>"#,
+        )
+        .unwrap();
+        let healer = catalog.get(100).unwrap();
+        assert_eq!(healer.words.as_deref(), Some("exura"));
+        assert_eq!(healer.damage, Some(15));
+        assert_eq!(
+            catalog.by_words("  EXURA ").map(|spell| spell.spell_id),
+            Some(100)
+        );
+        assert_eq!(catalog.by_words("exura vita"), None);
+        // Damage beyond the bounded ceiling is rejected.
+        assert!(parse_declarative_spells_xml(
+            br#"<fe-spells><fe-spell id="300" manacost="20" intervalticks="2" damage="501"/></fe-spells>"#,
+        )
+        .is_err());
+        // Empty or whitespace words are rejected.
+        assert!(parse_declarative_spells_xml(
+            br#"<fe-spells><fe-spell id="300" manacost="20" intervalticks="2" words="  "/></fe-spells>"#,
+        )
+        .is_err());
     }
 
     #[test]

@@ -1414,6 +1414,31 @@ fn runtime_world_map_item_to_record(
     })
 }
 
+/// Computes the bounded flat carried weight in hundredths of an ounce across equipment slots,
+/// owned container shells, and their top-level items. Recursive nested trees stay outside this
+/// first gate because FE's container model remains non-nested.
+fn native_carried_weight(
+    weight_by_server_id: &BTreeMap<u16, u32>,
+    equipment: &PlayerEquipment,
+    containers: &PlayerContainers,
+) -> u64 {
+    let item_weight = |item: &ItemInstance| -> u64 {
+        u64::from(*weight_by_server_id.get(&item.server_id).unwrap_or(&0))
+            .saturating_mul(u64::from(item.count))
+    };
+    let mut total = 0_u64;
+    for (_, item) in equipment.iter() {
+        total = total.saturating_add(item_weight(item));
+    }
+    for (_, container) in containers.iter() {
+        total = total.saturating_add(item_weight(&container.container_item));
+        for item in container.items.iter() {
+            total = total.saturating_add(item_weight(item));
+        }
+    }
+    total
+}
+
 impl SharedNativeMap {
     pub fn new(map: WorldMap) -> Self {
         Self::recover_from_removal_journal(map, None)
@@ -1868,6 +1893,7 @@ impl SharedNativeMap {
         source: forgotten_core::PlayerGroundDropSource,
         target_position: Position,
         count: u16,
+        item_weight_by_server_id: Option<&BTreeMap<u16, u32>>,
     ) -> Result<Option<forgotten_core::PlayerGroundDropOutcome>, HostError> {
         let mut world = shared_world.lock()?;
         let mut map = self
@@ -1974,6 +2000,21 @@ impl SharedNativeMap {
             .player_containers(player_id)
             .map_err(HostError::Core)?
             .clone();
+        // Bounded capacity-weight gate: hundredths-of-an-ounce carried weight must stay within
+        // the player's ounce capacity after the move. Missing operator weight metadata skips
+        // the gate entirely, preserving prior transfer behavior.
+        if let Some(weights) = item_weight_by_server_id {
+            let capacity = world
+                .player_vitals(player_id)
+                .map_err(HostError::Core)?
+                .capacity;
+            let capacity_hundredths = u64::from(capacity).saturating_mul(100);
+            if native_carried_weight(weights, &published_equipment, &published_containers)
+                > capacity_hundredths
+            {
+                return Ok(None);
+            }
+        }
         database.replace_player_inventory_and_runtime_map_items(
             player_id,
             &published_equipment,
@@ -2025,6 +2066,7 @@ impl SharedNativeMap {
         child_index: Option<usize>,
         count: u16,
         destination: forgotten_core::PlayerGroundDropSource,
+        item_weight_by_server_id: Option<&BTreeMap<u16, u32>>,
     ) -> Result<Option<forgotten_core::PlayerGroundDropOutcome>, HostError> {
         if count == 0 || count > u16::from(u8::MAX) {
             return Ok(None);
@@ -2221,20 +2263,6 @@ impl SharedNativeMap {
         next_map
             .set_tile_items(position, next_items)
             .map_err(HostError::Core)?;
-
-        database.replace_player_inventory_and_runtime_map_items(
-            player_id,
-            &staged_world
-                .player_equipment(player_id)
-                .map_err(HostError::Core)?
-                .clone(),
-            &staged_world
-                .player_containers(player_id)
-                .map_err(HostError::Core)?
-                .clone(),
-            self.source_revision(),
-            &next_registry,
-        )?;
         let published_equipment = staged_world
             .player_equipment(player_id)
             .map_err(HostError::Core)?
@@ -2243,6 +2271,28 @@ impl SharedNativeMap {
             .player_containers(player_id)
             .map_err(HostError::Core)?
             .clone();
+        // Bounded capacity-weight gate: hundredths-of-an-ounce carried weight must stay within
+        // the player's ounce capacity after the move. Missing operator weight metadata skips
+        // the gate entirely, preserving prior transfer behavior.
+        if let Some(weights) = item_weight_by_server_id {
+            let capacity = world
+                .player_vitals(player_id)
+                .map_err(HostError::Core)?
+                .capacity;
+            let capacity_hundredths = u64::from(capacity).saturating_mul(100);
+            if native_carried_weight(weights, &published_equipment, &published_containers)
+                > capacity_hundredths
+            {
+                return Ok(None);
+            }
+        }
+        database.replace_player_inventory_and_runtime_map_items(
+            player_id,
+            &published_equipment,
+            &published_containers,
+            self.source_revision(),
+            &next_registry,
+        )?;
         world
             .replace_player_equipment(player_id, published_equipment)
             .expect("validated player remains present while the shared-world lock is held");
@@ -6947,6 +6997,7 @@ fn handle_native_otclient_game(
                         drop_source,
                         target_tile,
                         u16::from(count),
+                        config.item_weight_by_server_id.as_deref(),
                     ) {
                         Ok(Some(outcome)) => {
                             if let forgotten_core::PlayerGroundDropSource::EquipmentSlot(_) =
@@ -7097,6 +7148,7 @@ fn handle_native_otclient_game(
                             None,
                             u16::from(count),
                             destination,
+                            config.item_weight_by_server_id.as_deref(),
                         ) {
                             Ok(Some(outcome)) => {
                                 if let forgotten_core::PlayerGroundDropSource::EquipmentSlot(_) =
@@ -7425,6 +7477,7 @@ fn handle_native_otclient_game(
                             Some(usize::from(source_stack_position)),
                             u16::from(count),
                             destination,
+                            config.item_weight_by_server_id.as_deref(),
                         ) {
                             Ok(Some(outcome)) => {
                                 // Re-send the refreshed corpse window so remaining loot stays accurate.
@@ -8896,25 +8949,42 @@ fn handle_native_otclient_game(
                     && request.channel_id.is_none()
                     && request.recipient.is_none()
                 {
-                    if let Some(spell_id) = native_declarative_spell_command_id(&request.message) {
-                        let (Some(catalog), Some(rules_by_vocation)) = (
-                            config.declarative_spell_catalog.as_deref(),
-                            config.progression_rules.as_deref(),
-                        ) else {
+                    // Spell invocation resolves either through the operator command or an exact
+                    // declared Say keyword; both consume mana/cooldowns identically and may apply
+                    // one bounded declared-damage hit to the caster's selected adjacent target.
+                    let catalog = config.declarative_spell_catalog.as_deref();
+                    let invoked_spell = match native_declarative_spell_command_id(&request.message)
+                    {
+                        Some(spell_id) => catalog.and_then(|catalog| {
+                            catalog
+                                .get(spell_id)
+                                .map(|definition| (catalog, definition))
+                        }),
+                        None => catalog.and_then(|catalog| {
+                            catalog
+                                .by_words(&request.message)
+                                .map(|definition| (catalog, definition))
+                        }),
+                    };
+                    if let Some((catalog, definition)) = invoked_spell {
+                        if config.progression_rules.is_none() {
                             native_diagnostic(
                                 config.extended_diagnostics,
                                 peer,
                                 "action=declarative-spell outcome=deferred-missing-catalog-or-progression-rules",
                             );
                             continue;
-                        };
+                        }
                         match apply_and_persist_native_declarative_spell_cast(
                             &mut database,
                             shared_world,
                             character.id,
-                            spell_id,
+                            definition.spell_id,
                             catalog,
-                            rules_by_vocation,
+                            config
+                                .progression_rules
+                                .as_deref()
+                                .expect("progression rules were gated above"),
                             config.magic_rate,
                         ) {
                             Ok((cast, magic)) => {
@@ -8932,6 +9002,64 @@ fn handle_native_otclient_game(
                                         magic.gained_levels,
                                     ),
                                 );
+                                // One bounded declared-damage hit on the selected living
+                                // adjacent static target, sharing the per-player combat cooldown.
+                                if let Some(damage) = definition.damage.filter(|_| !observed_dead) {
+                                    let target_id = shared_world
+                                        .player_interaction_intent(character.id)
+                                        .ok()
+                                        .and_then(|intent| intent.target_static_creature_id);
+                                    if let Some(target_id) = target_id {
+                                        match shared_world.apply_static_creature_melee_damage(
+                                            character.id,
+                                            target_id,
+                                            damage,
+                                        ) {
+                                            Ok(outcome) if outcome.applied_damage > 0 => {
+                                                persist_static_creature_runtime_to_open_database(
+                                                    shared_world,
+                                                    &mut database,
+                                                )?;
+                                                let health_update =
+                                                    encode_native_otclient_creature_health(
+                                                        &config.client_profile,
+                                                        outcome.target_id,
+                                                        u16::from(outcome.remaining_health_percent),
+                                                        100,
+                                                    )
+                                                    .map_err(HostError::Protocol)?;
+                                                write_frame(stream, &health_update)?;
+                                                if outcome.deactivated {
+                                                    for frame in
+                                                        native_selected_player_death_target_frames(
+                                                            &config.client_profile,
+                                                            true,
+                                                        )
+                                                        .map_err(HostError::Protocol)?
+                                                    {
+                                                        write_frame(stream, &frame)?;
+                                                    }
+                                                }
+                                                observed_visibility_epoch =
+                                                    shared_world.visibility_epoch();
+                                                native_diagnostic(
+                                                    config.extended_diagnostics,
+                                                    peer,
+                                                    &format!(
+                                                        "combat=declarative-spell-damage target={} damage={} health-percent={} deactivated={}",
+                                                        outcome.target_id,
+                                                        outcome.applied_damage,
+                                                        outcome.remaining_health_percent,
+                                                        outcome.deactivated,
+                                                    ),
+                                                );
+                                            }
+                                            Ok(_) => {}
+                                            Err(HostError::Core(_)) => {}
+                                            Err(error) => return Err(error),
+                                        }
+                                    }
+                                }
                             }
                             Err(HostError::Core(
                                 forgotten_core::CoreError::InsufficientMana { .. }
@@ -12691,6 +12819,7 @@ mod tests {
                     z: 7,
                 },
                 4,
+                None,
             )
             .unwrap()
             .expect("adjacent walkable drop succeeds");
