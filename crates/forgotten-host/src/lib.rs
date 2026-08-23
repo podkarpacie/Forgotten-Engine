@@ -5982,6 +5982,9 @@ fn handle_native_otclient_game(
                     continue;
                 }
                 if let Some((container_id, item_index)) = source_container {
+                    // All container↔equipment and container↔container throw paths below
+                    // persist through the atomic replace_player_inventory boundary so a
+                    // torn two-transaction inventory can never be observed or crash-duplicated.
                     if let Some(target_container_id) = target_container_id {
                         let containers = shared_world.player_containers(character.id)?;
                         let Some(source_container) = containers.container(container_id) else {
@@ -6127,8 +6130,11 @@ fn handle_native_otclient_game(
                         )?;
                         let next_equipment = shared_world.player_equipment(character.id)?;
                         let next_containers = shared_world.player_containers(character.id)?;
-                        database.replace_player_equipment(character.id, &next_equipment)?;
-                        database.replace_player_containers(character.id, &next_containers)?;
+                        database.replace_player_inventory(
+                            character.id,
+                            &next_equipment,
+                            &next_containers,
+                        )?;
                         native_diagnostic(
                             config.extended_diagnostics,
                             peer,
@@ -6156,8 +6162,11 @@ fn handle_native_otclient_game(
                         )?;
                         let next_equipment = shared_world.player_equipment(character.id)?;
                         let next_containers = shared_world.player_containers(character.id)?;
-                        database.replace_player_equipment(character.id, &next_equipment)?;
-                        database.replace_player_containers(character.id, &next_containers)?;
+                        database.replace_player_inventory(
+                            character.id,
+                            &next_equipment,
+                            &next_containers,
+                        )?;
                         native_diagnostic(
                             config.extended_diagnostics,
                             peer,
@@ -6182,8 +6191,11 @@ fn handle_native_otclient_game(
                             )?;
                             let next_equipment = shared_world.player_equipment(character.id)?;
                             let next_containers = shared_world.player_containers(character.id)?;
-                            database.replace_player_equipment(character.id, &next_equipment)?;
-                            database.replace_player_containers(character.id, &next_containers)?;
+                            database.replace_player_inventory(
+                                character.id,
+                                &next_equipment,
+                                &next_containers,
+                            )?;
                             native_diagnostic(
                                 config.extended_diagnostics,
                                 peer,
@@ -6225,8 +6237,11 @@ fn handle_native_otclient_game(
                     )?;
                     let next_equipment = shared_world.player_equipment(character.id)?;
                     let next_containers = shared_world.player_containers(character.id)?;
-                    database.replace_player_equipment(character.id, &next_equipment)?;
-                    database.replace_player_containers(character.id, &next_containers)?;
+                    database.replace_player_inventory(
+                        character.id,
+                        &next_equipment,
+                        &next_containers,
+                    )?;
                     native_diagnostic(
                         config.extended_diagnostics,
                         peer,
@@ -6360,8 +6375,11 @@ fn handle_native_otclient_game(
                             )?;
                             let next_equipment = shared_world.player_equipment(character.id)?;
                             let next_containers = shared_world.player_containers(character.id)?;
-                            database.replace_player_equipment(character.id, &next_equipment)?;
-                            database.replace_player_containers(character.id, &next_containers)?;
+                            database.replace_player_inventory(
+                                character.id,
+                                &next_equipment,
+                                &next_containers,
+                            )?;
                             native_diagnostic(
                                 config.extended_diagnostics,
                                 peer,
@@ -6404,8 +6422,11 @@ fn handle_native_otclient_game(
                         )?;
                         let next_equipment = shared_world.player_equipment(character.id)?;
                         let next_containers = shared_world.player_containers(character.id)?;
-                        database.replace_player_equipment(character.id, &next_equipment)?;
-                        database.replace_player_containers(character.id, &next_containers)?;
+                        database.replace_player_inventory(
+                            character.id,
+                            &next_equipment,
+                            &next_containers,
+                        )?;
                         native_diagnostic(
                             config.extended_diagnostics,
                             peer,
@@ -9023,6 +9044,10 @@ fn handle_game_session(
 ) -> Result<(), HostError> {
     stream.set_read_timeout(Some(config.session_timeout))?;
     stream.set_write_timeout(Some(config.session_timeout))?;
+    // On Windows, accepted sockets inherit the listener's non-blocking mode,
+    // which would surface transient WouldBlock reads as session rejections.
+    // Restore blocking behavior for the per-connection stream.
+    stream.set_nonblocking(false)?;
     let challenge = generate_legacy_74_game_challenge();
     write_frame(stream, &encode_legacy_74_game_challenge(challenge))?;
     let envelope = decode_legacy_74_game_session_envelope(&read_frame(stream)?)
@@ -9212,6 +9237,9 @@ fn handle_status_session(
 ) -> Result<(), HostError> {
     stream.set_read_timeout(Some(config.session_timeout))?;
     stream.set_write_timeout(Some(config.session_timeout))?;
+    // Windows accepted sockets inherit the listener's non-blocking mode; see
+    // handle_game_session for why blocking mode is restored per connection.
+    stream.set_nonblocking(false)?;
     let request = decode_status_request(&read_frame(stream)?).map_err(HostError::Protocol)?;
     let snapshot = StatusSnapshot {
         server_name: config.server_name.clone(),
@@ -20221,17 +20249,33 @@ mod tests {
         .unwrap();
         drop(first);
 
-        let mut second = TcpStream::connect(game.local_addr()).unwrap();
-        write_frame(
-            &mut second,
-            &native_game_request(
-                account_id.try_into().unwrap(),
-                "Knight",
-                "correct horse battery staple",
-            ),
-        )
-        .unwrap();
-        let second_initialization = read_frame(&mut second).unwrap();
+        // Session teardown races the reconnect: the old session thread may still hold the
+        // character registered when the new login arrives. Retry like the abrupt-disconnect
+        // variant until the shared world releases the previous session.
+        let mut relog = None;
+        for _ in 0..20 {
+            let mut candidate = TcpStream::connect(game.local_addr()).unwrap();
+            write_frame(
+                &mut candidate,
+                &native_game_request(
+                    account_id.try_into().unwrap(),
+                    "Knight",
+                    "correct horse battery staple",
+                ),
+            )
+            .unwrap();
+            let initialization = read_frame(&mut candidate).unwrap();
+            if initialization.0.first()
+                == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_ERROR)
+            {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            relog = Some((candidate, initialization));
+            break;
+        }
+        let (_second, second_initialization) =
+            relog.expect("native disconnect cleanup did not release relog");
         assert_eq!(&second_initialization.0[9..14], &[101, 0, 100, 0, 7]);
 
         game.shutdown().unwrap();

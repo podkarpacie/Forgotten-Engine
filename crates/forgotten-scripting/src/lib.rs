@@ -968,11 +968,14 @@ mod tests {
             "return function(_, _, value) return value end",
         )
         .unwrap();
-        std::os::unix::fs::symlink(&escaped_source, root.join("escape.lua")).unwrap();
-        assert_eq!(
-            dispatcher.register_callback_file("escape", &root, Path::new("escape.lua")),
-            Err(SandboxedLuaCallbackFileRegistrationError::SourceOutsideRoot)
-        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&escaped_source, root.join("escape.lua")).unwrap();
+            assert_eq!(
+                dispatcher.register_callback_file("escape", &root, Path::new("escape.lua")),
+                Err(SandboxedLuaCallbackFileRegistrationError::SourceOutsideRoot)
+            );
+        }
 
         let constrained_limits =
             SandboxedLuaLimits::new(64, MAX_SANDBOXED_LUA_MEMORY_BYTES, 32).unwrap();
