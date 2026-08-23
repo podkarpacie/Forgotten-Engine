@@ -1320,6 +1320,40 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             println!("updated player town player-id={player_id} town-id={town_id}");
             Ok(())
         }
+        "bless" => {
+            if arguments.len() != 5 {
+                return Err("usage: player bless <directory> <player-id> <count 0-5>".into());
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let count = arguments
+                .get(4)
+                .ok_or("a blessing count is required")?
+                .parse::<u8>()
+                .map_err(|_| "blessing count must fit an unsigned byte")?;
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            database.set_player_blessings(player_id, count)?;
+            println!("updated player bless player-id={player_id} count={count}");
+            Ok(())
+        }
+        "promote" => {
+            if arguments.len() != 5 {
+                return Err("usage: player promote <directory> <player-id> <true|false>".into());
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let promoted = match arguments.get(4).map(String::as_str) {
+                Some("true") => true,
+                Some("false") => false,
+                _ => return Err("promotion flag must be true or false".into()),
+            };
+            let config = load(&directory)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
+            database.set_player_promoted(player_id, promoted)?;
+            println!("updated player promote player-id={player_id} promoted={promoted}");
+            Ok(())
+        }
         "bank" => {
             if !(arguments.len() == 5 || arguments.len() == 6) {
                 return Err(

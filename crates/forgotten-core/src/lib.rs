@@ -4775,6 +4775,12 @@ impl WorldState {
         self.players.get(&id)
     }
 
+    /// Returns the IDs of every registered player, sorted. Callers use this for bounded periodic
+    /// snapshot flushes; it grants no mutation access.
+    pub fn registered_player_ids(&self) -> Vec<u64> {
+        self.players.keys().copied().collect()
+    }
+
     /// Applies a prevalidated global/stage experience policy to a known player in one
     /// authoritative transition. Event sources such as weapons, spells, quests, or monsters are
     /// intentionally separate from this arithmetic and client delivery remains a host concern.

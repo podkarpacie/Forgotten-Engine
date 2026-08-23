@@ -43,8 +43,11 @@ const SCHEMA_VERSION_HOUSE_ACCESS_LISTS: i64 = 24;
 const SCHEMA_VERSION_MAP_ITEM_COUNT_OVERRIDES: i64 = 25;
 const SCHEMA_VERSION_RUNTIME_MAP_ITEMS: i64 = 26;
 const SCHEMA_VERSION_PLAYER_QUESTS: i64 = 28;
+const SCHEMA_VERSION_BLESS_PROMOTION: i64 = 29;
 const SCHEMA_VERSION_CORPSE_DESPAWN_TICKS: i64 = 27;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_QUESTS;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_BLESS_PROMOTION;
+/// Classic blessing count ceiling; the audited default death-loss reduction consumes this.
+pub const MAX_PLAYER_BLESSINGS: u8 = 5;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 pub const MAX_VIP_DESCRIPTION_BYTES: usize = 128;
@@ -4362,6 +4365,18 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_PLAYER_QUESTS, unix_seconds()],
             )?;
         }
+        if self.schema_version()? < SCHEMA_VERSION_BLESS_PROMOTION {
+            self.connection.execute_batch(
+                "ALTER TABLE players ADD COLUMN bless_count INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            self.connection.execute_batch(
+                "ALTER TABLE players ADD COLUMN promoted INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_BLESS_PROMOTION, unix_seconds()],
+            )?;
+        }
         Ok(())
     }
 
@@ -4437,6 +4452,63 @@ impl EngineDatabase {
             quests.push((quest_id, completed));
         }
         Ok(quests)
+    }
+
+    /// Returns the player's persisted blessing count (0 through the classic ceiling of five)
+    /// and promotion flag. These are typed foundations for the audited default death-loss
+    /// reduction and promoted-vocation behavior; neither formula runs yet.
+    pub fn player_blessing_state(&self, player_id: u64) -> Result<(u8, bool), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let row = self.connection.query_row(
+            "SELECT bless_count, promoted FROM players WHERE id = ?1",
+            params![player_id as i64],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        let (bless_raw, promoted_raw) = row;
+        let bless_count = u8::try_from(bless_raw).map_err(|_| {
+            PersistenceError::InvalidLifecycleRecord("bless count does not fit u8".into())
+        })?;
+        if bless_count > MAX_PLAYER_BLESSINGS {
+            return Err(PersistenceError::InvalidLifecycleRecord(format!(
+                "bless count exceeds {MAX_PLAYER_BLESSINGS}"
+            )));
+        }
+        let promoted = match promoted_raw {
+            0 => false,
+            _ => true,
+        };
+        Ok((bless_count, promoted))
+    }
+
+    /// Persists one player's blessing count within the classic zero-to-five bound.
+    pub fn set_player_blessings(
+        &mut self,
+        player_id: u64,
+        bless_count: u8,
+    ) -> Result<(), PersistenceError> {
+        if bless_count > MAX_PLAYER_BLESSINGS {
+            return Err(PersistenceError::InvalidLifecycleRecord(format!(
+                "bless count exceeds {MAX_PLAYER_BLESSINGS}"
+            )));
+        }
+        self.connection.execute(
+            "UPDATE players SET bless_count = ?1 WHERE id = ?2",
+            params![i64::from(bless_count), player_id as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Persists one player's promotion flag.
+    pub fn set_player_promoted(
+        &mut self,
+        player_id: u64,
+        promoted: bool,
+    ) -> Result<(), PersistenceError> {
+        self.connection.execute(
+            "UPDATE players SET promoted = ?1 WHERE id = ?2",
+            params![i64::from(u8::from(promoted)), player_id as i64],
+        )?;
+        Ok(())
     }
 
     fn ensure_player_exists(&self, player_id: u64) -> Result<(), PersistenceError> {
@@ -5010,6 +5082,61 @@ mod tests {
         let path = temporary_path("migration");
         let database = EngineDatabase::open(&path).unwrap();
         assert_eq!(database.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn bless_promotion_and_quest_state_persist_with_validation() {
+        let path = temporary_path("bless-promotion-quests");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id = database.create_account("lifecycle", "hash").unwrap();
+        database
+            .save_player(&Player {
+                id: 5,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        // Fresh players start unblessed and unpromoted.
+        assert_eq!(database.player_blessing_state(5).unwrap(), (0, false));
+        assert_eq!(database.player_quests(5).unwrap(), Vec::new());
+
+        database.set_player_blessings(5, 3).unwrap();
+        database.set_player_promoted(5, true).unwrap();
+        assert_eq!(database.player_blessing_state(5).unwrap(), (3, true));
+
+        let quests = vec![(100_u16, true), (101_u16, false)];
+        database.replace_player_quests(5, &quests).unwrap();
+        assert_eq!(database.player_quests(5).unwrap(), quests);
+        // Replacing clears prior rows rather than appending.
+        database
+            .replace_player_quests(5, &[(101_u16, true)])
+            .unwrap();
+        assert_eq!(database.player_quests(5).unwrap(), vec![(101_u16, true)]);
+
+        assert!(database.set_player_blessings(5, 6).is_err());
+        assert!(matches!(
+            database.replace_player_quests(5, &[(0_u16, false)]),
+            Err(PersistenceError::InvalidQuestState(message))
+                if message.contains("nonzero")
+        ));
+        assert!(matches!(
+            database.replace_player_quests(
+                5,
+                &[(100_u16, false), (100_u16, true)]
+            ),
+            Err(PersistenceError::InvalidQuestState(message))
+                if message.contains("duplicate")
+        ));
         let _ = fs::remove_file(path);
     }
 

@@ -326,7 +326,8 @@ fn run_native_shared_world_heartbeat(
             }
         }
         // Bounded auto-save cadence: a hard kill (panel stop, power loss) loses at most one
-        // interval of static runtime state. Most player state already persists eagerly.
+        // interval of static runtime and player snapshot state. Most player state already
+        // persists eagerly; this flush covers vitals drift and position deltas.
         if last_auto_save.elapsed() >= NATIVE_AUTOSAVE_INTERVAL {
             last_auto_save = Instant::now();
             let mut auto_save_database = EngineDatabase::open(&config.database_path)?;
@@ -334,6 +335,21 @@ fn run_native_shared_world_heartbeat(
                 &shared_world,
                 &mut auto_save_database,
             )?;
+            for player_id in shared_world.registered_player_ids()? {
+                let (player, vitals) = shared_world.player_and_vitals(player_id)?;
+                auto_save_database.update_player_position(player_id, player.position)?;
+                auto_save_database.update_player_vitals(
+                    player_id,
+                    PersistedPlayerVitals {
+                        health: vitals.health,
+                        max_health: vitals.max_health,
+                        mana: vitals.mana,
+                        max_mana: vitals.max_mana,
+                        capacity: vitals.capacity,
+                        magic_level: vitals.magic_level,
+                    },
+                )?;
+            }
         }
         if config.corpse_despawn_seconds > 0 {
             if let Some(map_owner) = config.map_owner.as_ref() {
@@ -3687,6 +3703,12 @@ impl SharedNativeWorld {
 
     pub fn visibility_epoch(&self) -> u64 {
         self.visibility_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Returns the IDs of every registered player, sorted. Callers use this for bounded periodic
+    /// snapshot flushes; it grants no mutation access.
+    pub fn registered_player_ids(&self) -> Result<Vec<u64>, HostError> {
+        Ok(self.lock()?.registered_player_ids())
     }
 
     pub fn vitals_epoch(&self) -> u64 {
