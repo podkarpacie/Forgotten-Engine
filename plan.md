@@ -5,7 +5,7 @@
 > milestone lands. Companion documents: `docs/capability-matrix.md` (per-feature truth),
 > `todo.md` (short-term checklist), `docs/completion-ledger.md` (landed-work ledger).
 >
-> **Last updated:** after the loot-persistence slice — durable runtime tile-item registry
+> **Last updated:** ledger re-weighted to **30%** after corpse opening/decay (schema v27), owned-inventory ground drops, whisper/yell delivery, and the durable runtime tile-item registry.
 > (schema v26), defeated-creature roll fix, whisper/yell delivery, and socket-test
 > stabilization; pushed to `podkarpacie/Forgotten-Engine`.
 
@@ -331,13 +331,15 @@ is itself a useful, releasable product.
 ## 4. Immediate Next Steps (this week)
 
 1. **Loot completion** — persist corpses across restart via runtime-item registry; wire
-   client-visible corpse opening (UseItem on corpse → container window). *(persistence +
-   registry recovery landed; client corpse opening is the remaining half)*
-2. **Container UseItem opening** — backpack-in-hand nested windows (Phase 1.2).
-3. ~~Whisper/yell/private chat modes~~ — whisper and yell landed (`d98ecc5`); private-message
-   routing exists session-locally.
-4. ~~Update `docs/capability-matrix.md/.json`~~ for loot foundation + corpse persistence.
-5. ~~Commit + push~~ this milestone (pushed to `podkarpacie/Forgotten-Engine`).
+   client-visible corpse opening (UseItem on corpse → container window). *(registry, opening,
+   decay, and ground drops all landed; remaining half is loot taking from opened windows)*
+2. **Container UseItem opening** — backpack-in-hand nested windows (Phase 1.2); the corpse
+   window machinery (window IDs, close handling, catalog rendering) now provides the base.
+3. ~~Whisper/yell/private chat modes~~ — whisper and yell landed (`d98ecc5`).
+4. ~~Update capability matrix / ledger / commit / push~~ — ledger re-weighted to **30%** with
+   evidence-backed credits for whisper/yell, the durable runtime registry, corpse
+   opening/decay, and owned-inventory ground drops.
+5. **Next:** loot taking from opened corpse windows → then pickup of dropped runtime items.
 
 ---
 
