@@ -1,0 +1,14 @@
+services:
+  forgotten-engine:
+    build: .
+    image: forgotten-engine:local
+    container_name: forgotten-engine
+    restart: unless-stopped
+    ports:
+      - "7171:7171" # status / legacy login (config-driven)
+      - "7172:7172" # game port (config-driven)
+      - "7173:7173" # native OTClient game port (config-driven)
+    volumes:
+      # Operators provision this directory with `forgotten-engine init` and their own
+      # TFS-style config.lua, world data, and item definitions.
+      - ./my-world:/data

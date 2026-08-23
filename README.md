@@ -36,4 +36,14 @@ forgotten-engine validate ./my-world
 forgotten-engine run ./my-world
 ```
 
+## Docker
+
+```bash
+docker compose up --build
+```
+
+Provision the mounted world directory first (`forgotten-engine init ./my-world`), then point the
+compose file at it. The image runs as a non-root user and exposes the classic status/login, game,
+and native OTClient ports; all real port bindings come from your `config.lua`.
+
 Operator documentation, compatibility notes, and changelogs will be maintained in the future Forgotten Engine GitBook rather than duplicated throughout this repository.
