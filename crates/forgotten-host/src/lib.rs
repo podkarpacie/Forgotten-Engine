@@ -3,9 +3,9 @@
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
 use forgotten_config::{
-    parse_declarative_shops_xml, DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog,
-    DeclarativeSpellCatalog, DeclarativeWeaponCatalog, LegacyItemSlotType,
-    LegacyPublicChannelCatalog, WorldType,
+    parse_declarative_shops_xml, parse_quests_xml, DeclarativeNpcDialogueCatalog,
+    DeclarativeShopCatalog, DeclarativeSpellCatalog, DeclarativeWeaponCatalog, LegacyItemSlotType,
+    LegacyPublicChannelCatalog, QuestCatalog, WorldType,
 };
 use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
@@ -63,20 +63,20 @@ use forgotten_protocol::{
     encode_native_otclient_open_public_channel, encode_native_otclient_player_modes,
     encode_native_otclient_player_skills, encode_native_otclient_player_stats,
     encode_native_otclient_private_message_from, encode_native_otclient_public_channel_say,
-    encode_native_otclient_public_say, encode_native_otclient_read_only_text_window,
-    encode_native_otclient_set_inventory, encode_native_otclient_status_message,
-    encode_native_otclient_whisper, encode_native_otclient_yell, encode_status_binary,
-    encode_status_metrics, encode_status_xml, generate_legacy_74_game_challenge,
-    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
-    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
-    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection, NativeOtClientClassicChannel,
-    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
-    NativeOtClientClassicOutfit, NativeOtClientClassicPartyShield,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
-    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
-    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
-    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE, MAX_LOGIN_STRING_BYTES,
-    NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_MESSAGE_SAY,
+    encode_native_otclient_public_say, encode_native_otclient_quest_list,
+    encode_native_otclient_read_only_text_window, encode_native_otclient_set_inventory,
+    encode_native_otclient_status_message, encode_native_otclient_whisper,
+    encode_native_otclient_yell, encode_status_binary, encode_status_metrics, encode_status_xml,
+    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
+    NativeOtClientCardinalDirection, NativeOtClientClassicChannel, NativeOtClientClassicItemRecord,
+    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
+    NativeOtClientClassicPartyShield, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
+    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerVitals,
+    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
+    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    MAX_LOGIN_STRING_BYTES, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_MESSAGE_SAY,
     NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -272,12 +272,15 @@ fn advance_native_shared_world_heartbeat_with_static_target_policies(
     })
 }
 
+const NATIVE_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
+
 fn run_native_shared_world_heartbeat(
     shared_world: SharedNativeWorld,
     shutdown: Arc<AtomicBool>,
     config: NativeHeartbeatConfig,
 ) -> Result<(), HostError> {
     let mut last_tick = Instant::now();
+    let mut last_auto_save = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
         thread::sleep(NATIVE_OTCLIENT_HEARTBEAT_POLL_INTERVAL);
         let now = Instant::now();
@@ -320,6 +323,16 @@ fn run_native_shared_world_heartbeat(
                 let (player, _) = shared_world.player_and_vitals(player_id)?;
                 database.update_player_position(player_id, player.position)?;
             }
+        }
+        // Bounded auto-save cadence: a hard kill (panel stop, power loss) loses at most one
+        // interval of static runtime state. Most player state already persists eagerly.
+        if last_auto_save.elapsed() >= NATIVE_AUTOSAVE_INTERVAL {
+            last_auto_save = Instant::now();
+            let mut auto_save_database = EngineDatabase::open(&config.database_path)?;
+            persist_static_creature_runtime_to_open_database(
+                &shared_world,
+                &mut auto_save_database,
+            )?;
         }
         if config.corpse_despawn_seconds > 0 {
             if let Some(map_owner) = config.map_owner.as_ref() {
@@ -1197,6 +1210,9 @@ pub struct NativeOtClientHostConfig {
     /// Optional operator-declared instant consumable effects keyed by server item ID. UseItem on
     /// an owned inventory item restores the declared health/mana once per item unit.
     pub consumable_effects: Option<Arc<BTreeMap<u16, (u16, u16)>>>,
+    /// Optional operator quest catalog. RequestQuestLog lists only quests the persisted player
+    /// state has started, resolved through this catalog for display names.
+    pub quest_catalog: Option<Arc<QuestCatalog>>,
     /// Optional operator-declared NPC shop catalog. Say keywords near a matching active NPC buy
     /// or sell bounded stacks through the durable bank balance.
     pub shop_catalog: Option<Arc<DeclarativeShopCatalog>>,
@@ -9097,14 +9113,39 @@ fn handle_native_otclient_game(
                 );
             }
             NativeOtClientGameAction::RequestQuestLog => {
-                let quest_log = encode_native_otclient_empty_quest_log(&config.client_profile)
-                    .map_err(HostError::Protocol)?;
+                // With an operator quest catalog, only started persisted quests appear, resolved
+                // through catalog display names; without one the parser-shaped empty response
+                // keeps prior behavior.
+                let quest_entries = match config.quest_catalog.as_deref() {
+                    Some(catalog) if !catalog.is_empty() => {
+                        let mut entries = Vec::new();
+                        for (quest_id, completed) in database
+                            .player_quests(u64::from(character.id))
+                            .map_err(HostError::Persistence)?
+                        {
+                            if let Some(name) = catalog.get(quest_id) {
+                                let _ = completed;
+                                entries.push((quest_id, name.to_owned()));
+                            }
+                        }
+                        entries
+                    }
+                    _ => Vec::new(),
+                };
+                let quest_log = if quest_entries.is_empty() {
+                    encode_native_otclient_empty_quest_log(&config.client_profile)
+                        .map_err(HostError::Protocol)?
+                } else {
+                    encode_native_otclient_quest_list(&config.client_profile, &quest_entries)
+                        .map_err(HostError::Protocol)?
+                };
                 write_frame(stream, &quest_log)?;
                 native_diagnostic(
                     config.extended_diagnostics,
                     peer,
                     &format!(
-                        "outbound=quest-log-empty opcode=0xf0 bytes={}",
+                        "outbound=quest-log opcode=0xf0 entries={} bytes={}",
+                        quest_entries.len(),
                         quest_log.0.len()
                     ),
                 );
@@ -12063,6 +12104,7 @@ mod tests {
             item_armor_by_server_id: None,
             item_shield_defense_by_server_id: None,
             consumable_effects: None,
+            quest_catalog: None,
             shop_catalog: None,
             item_slot_types_by_server_id: None,
             item_weight_by_server_id: None,
@@ -18171,6 +18213,91 @@ mod tests {
             .items
             .iter()
             .all(|item| item.server_id != 3294));
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_quest_log_lists_started_quests_from_the_operator_catalog() {
+        let database_path = database_path("native-quest-log");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        // The player has started two quests; one unknown catalog id stays filtered out.
+        database
+            .replace_player_quests(1, &[(100, false), (101, true), (999, false)])
+            .unwrap();
+
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.quest_catalog = Some(Arc::new(
+            parse_quests_xml(
+                br#"<fe-quests>
+                        <fe-quest id="100" name="The Rat Hunt"/>
+                        <fe-quest id="101" name="Sewer Secrets"/>
+                    </fe-quests>"#,
+            )
+            .unwrap(),
+        ));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG,
+            ]),
+        )
+        .unwrap();
+        let quest_frame = read_data_frame(&mut stream);
+        assert_eq!(
+            quest_frame.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_QUEST_LOG
+        );
+        // Two entries: [opcode][count u16][id u16][name string]...
+        assert_eq!(quest_frame.0[1], 2);
+        assert_eq!(quest_frame.0[3], 100);
+        assert!(String::from_utf8_lossy(&quest_frame.0).contains("The Rat Hunt"));
+        assert!(String::from_utf8_lossy(&quest_frame.0).contains("Sewer Secrets"));
+        assert!(!String::from_utf8_lossy(&quest_frame.0).contains("999"));
+
+        // Session remains usable after the quest exchange.
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_data_frame(&mut stream).0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_QUEST_LOG
+        );
+        game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }
 

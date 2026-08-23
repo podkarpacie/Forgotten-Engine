@@ -9,6 +9,7 @@ mod items;
 mod legacy_xml;
 mod npc_dialogue;
 mod otbm;
+mod quests;
 mod shops;
 mod spells;
 mod stages;
@@ -44,6 +45,7 @@ pub use npc_dialogue::{
     load_declarative_npc_dialogue_catalog, parse_declarative_npc_dialogue_xml,
     DeclarativeNpcDialogueCatalog, DeclarativeNpcDialogueResponse,
 };
+pub use quests::{load_quest_catalog, parse_quests_xml, QuestCatalog};
 pub use shops::{
     load_declarative_shop_catalog, parse_declarative_shops_xml, DeclarativeNpcShop,
     DeclarativeShopCatalog, DeclarativeShopEntry,

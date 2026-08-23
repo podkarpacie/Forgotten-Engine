@@ -2671,6 +2671,37 @@ pub fn encode_native_otclient_empty_quest_log(
     Ok(Frame(writer.finish()))
 }
 
+/// Encodes the classic quest-list response: one u16 entry count followed by per-entry
+/// u16 quest ID and bounded display name. Entries must be sorted by ID and carry nonzero IDs
+/// with nonempty names; the caller owns that ordering.
+pub fn encode_native_otclient_quest_list(
+    profile: &NativeOtClientProfile,
+    quests: &[(u16, String)],
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    if quests.len() > u16::MAX as usize
+        || quests
+            .iter()
+            .any(|(id, name)| *id == 0 || name.is_empty() || name.len() > MAX_LOGIN_STRING_BYTES)
+    {
+        return Err(ProtocolError::InvalidLength(quests.len()));
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_QUEST_LOG);
+    writer.u16(quests.len() as u16);
+    for (id, name) in quests {
+        writer.u16(*id);
+        writer.string(name);
+    }
+    let frame = Frame(writer.finish());
+    if frame.0.len() > MAX_FRAME_SIZE {
+        return Err(ProtocolError::InvalidLength(frame.0.len()));
+    }
+    Ok(frame)
+}
+
 /// Encodes an explicitly empty classic 7.4 channel list. FE does not yet claim channel
 /// membership, private messages, moderation, persistence, guild, party, or gameplay semantics.
 pub fn encode_native_otclient_empty_channel_list(

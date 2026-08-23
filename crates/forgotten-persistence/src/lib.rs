@@ -42,8 +42,9 @@ const SCHEMA_VERSION_HOUSE_OWNERSHIP: i64 = 23;
 const SCHEMA_VERSION_HOUSE_ACCESS_LISTS: i64 = 24;
 const SCHEMA_VERSION_MAP_ITEM_COUNT_OVERRIDES: i64 = 25;
 const SCHEMA_VERSION_RUNTIME_MAP_ITEMS: i64 = 26;
+const SCHEMA_VERSION_PLAYER_QUESTS: i64 = 28;
 const SCHEMA_VERSION_CORPSE_DESPAWN_TICKS: i64 = 27;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_CORPSE_DESPAWN_TICKS;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_QUESTS;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 pub const MAX_VIP_DESCRIPTION_BYTES: usize = 128;
@@ -4352,7 +4353,90 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_CORPSE_DESPAWN_TICKS, unix_seconds()],
             )?;
         }
+        if self.schema_version()? < SCHEMA_VERSION_PLAYER_QUESTS {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS player_quests (player_id INTEGER NOT NULL, quest_id INTEGER NOT NULL, completed INTEGER NOT NULL, PRIMARY KEY (player_id, quest_id));",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_PLAYER_QUESTS, unix_seconds()],
+            )?;
+        }
         Ok(())
+    }
+
+    /// Replaces one player's bounded quest-state rows in one SQLite transaction. Quest IDs must
+    /// be nonzero and unique; completed flags are stored exactly as given.
+    pub fn replace_player_quests(
+        &mut self,
+        player_id: u64,
+        quests: &[(u16, bool)],
+    ) -> Result<(), PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let mut seen = BTreeSet::new();
+        for (quest_id, _) in quests {
+            if *quest_id == 0 {
+                return Err(PersistenceError::InvalidQuestState(
+                    "quest id must be nonzero".into(),
+                ));
+            }
+            if !seen.insert(*quest_id) {
+                return Err(PersistenceError::InvalidQuestState(
+                    "duplicate quest id".into(),
+                ));
+            }
+        }
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM player_quests WHERE player_id = ?1",
+            params![player_id as i64],
+        )?;
+        for (quest_id, completed) in quests {
+            transaction.execute(
+                "INSERT INTO player_quests (player_id, quest_id, completed) VALUES (?1, ?2, ?3)",
+                params![
+                    player_id as i64,
+                    i64::from(*quest_id),
+                    i64::from(u8::from(*completed)),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Loads one player's bounded quest state sorted by quest ID.
+    pub fn player_quests(&self, player_id: u64) -> Result<Vec<(u16, bool)>, PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT quest_id, completed FROM player_quests WHERE player_id = ?1 ORDER BY quest_id",
+        )?;
+        let rows = statement.query_map(params![player_id as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut quests = Vec::new();
+        for row in rows {
+            let (quest_id, completed) = row?;
+            let quest_id = u16::try_from(quest_id).map_err(|_| {
+                PersistenceError::InvalidQuestState("quest id does not fit u16".into())
+            })?;
+            if quest_id == 0 {
+                return Err(PersistenceError::InvalidQuestState(
+                    "persisted quest id must be nonzero".into(),
+                ));
+            }
+            let completed = match completed {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(PersistenceError::InvalidQuestState(
+                        "completed flag must be zero or one".into(),
+                    ))
+                }
+            };
+            quests.push((quest_id, completed));
+        }
+        Ok(quests)
     }
 
     fn ensure_player_exists(&self, player_id: u64) -> Result<(), PersistenceError> {
@@ -4807,6 +4891,7 @@ pub enum PersistenceError {
     PasswordHash(String),
     InvalidPlayerName,
     InvalidPlayerVitals,
+    InvalidQuestState(String),
     DuplicatePlayerExperienceUpdate(u64),
     InvalidPlayerOutfit,
     InvalidEquipmentRecord(String),

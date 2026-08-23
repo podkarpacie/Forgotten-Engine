@@ -2,13 +2,14 @@ use forgotten_config::{
     apply_legacy_item_metadata, ensure_content_skeleton, load, load_consumable_catalog,
     load_declarative_npc_dialogue_catalog, load_declarative_shop_catalog,
     load_declarative_spell_catalog, load_declarative_weapon_catalog, load_legacy_item_catalog,
-    load_tfs_content_inventory, load_tfs_entity_catalog, load_tfs_public_channel_catalog,
-    load_tfs_vocation_registry, load_world_companions, load_world_map,
-    materialize_tfs_static_spawns, resolve_tfs_registry_script_reference,
+    load_quest_catalog, load_tfs_content_inventory, load_tfs_entity_catalog,
+    load_tfs_public_channel_catalog, load_tfs_vocation_registry, load_world_companions,
+    load_world_map, materialize_tfs_static_spawns, resolve_tfs_registry_script_reference,
     resolve_tfs_spawn_references, validate_content, world_map_path, write_template,
     ConsumableCatalog, DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog,
     DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig, LegacyPublicChannelCatalog,
-    LegacyWorldCompanionData, TfsEntityCatalog, TfsRegistryCategory, TfsVocationRegistry,
+    LegacyWorldCompanionData, QuestCatalog, TfsEntityCatalog, TfsRegistryCategory,
+    TfsVocationRegistry,
 };
 use forgotten_core::{
     DeathLossPolicy, EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
@@ -92,6 +93,7 @@ struct IndependentNativeStartupContent {
     declarative_npc_dialogue_catalog: Option<DeclarativeNpcDialogueCatalog>,
     consumable_catalog: Option<ConsumableCatalog>,
     shop_catalog: Option<DeclarativeShopCatalog>,
+    quest_catalog: QuestCatalog,
 }
 
 /// Loads only configuration-independent native content in scoped worker threads. Results are
@@ -115,6 +117,7 @@ fn load_independent_native_startup_content(
                 scope.spawn(|| load_declarative_npc_dialogue_catalog(config));
             let consumable_catalog = scope.spawn(|| load_consumable_catalog(config));
             let shop_catalog = scope.spawn(|| load_declarative_shop_catalog(config));
+            let quest_catalog = scope.spawn(|| load_quest_catalog(config));
 
             let companions = companions
                 .join()
@@ -143,6 +146,9 @@ fn load_independent_native_startup_content(
             let shop_catalog = shop_catalog
                 .join()
                 .map_err(|_| "shop catalog loader worker panicked")??;
+            let quest_catalog = quest_catalog
+                .join()
+                .map_err(|_| "quest catalog loader worker panicked")??;
             Ok(IndependentNativeStartupContent {
                 companions,
                 entity_catalog,
@@ -153,6 +159,7 @@ fn load_independent_native_startup_content(
                 declarative_npc_dialogue_catalog,
                 consumable_catalog,
                 shop_catalog,
+                quest_catalog,
             })
         },
     )
@@ -623,6 +630,7 @@ fn run_host(
         let declarative_npc_dialogue_catalog = startup_content.declarative_npc_dialogue_catalog;
         let consumable_catalog = startup_content.consumable_catalog;
         let shop_catalog = startup_content.shop_catalog;
+        let quest_catalog = startup_content.quest_catalog;
         let regeneration_rules = vocation_registry
             .as_ref()
             .map(|registry| {
@@ -768,6 +776,7 @@ fn run_host(
             declarative_npc_dialogue_catalog,
             consumable_effects,
             shop_catalog: shop_catalog.map(Arc::new),
+            quest_catalog: Some(Arc::new(quest_catalog)),
             corpse_despawn_seconds: config.corpse_despawn_seconds,
         })
     } else {
