@@ -321,6 +321,9 @@ fn run_native_shared_world_heartbeat(
 const NATIVE_OTCLIENT_SHARED_CHAT_QUEUE_CAPACITY: usize = 64;
 const NATIVE_OTCLIENT_SHARED_VIP_QUEUE_CAPACITY: usize = 64;
 const NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE: u16 = 10;
+/// Default corpse container server item ID for native static-monster defeats. A dedicated
+/// operator mapping can replace this later; the bounded default keeps the defeat loop closed.
+const NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID: u16 = 3065;
 
 fn native_classic_item_record(
     catalog: Option<&NativeItemPresentationCatalog>,
@@ -3255,6 +3258,18 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)
     }
 
+    /// Rolls one deterministic loot result for an active static creature under the shared-world
+    /// lock. The seed is caller-supplied so equal defeat ticks always produce equal corpses.
+    pub fn roll_static_creature_loot(
+        &self,
+        creature_id: u32,
+        seed: u64,
+    ) -> Result<forgotten_core::StaticCreatureLootRoll, HostError> {
+        self.lock()?
+            .roll_static_creature_loot(creature_id, seed)
+            .map_err(HostError::Core)
+    }
+
     pub fn static_creature_runtime_snapshot(
         &self,
     ) -> Result<Vec<StaticCreatureRuntimeSnapshot>, HostError> {
@@ -5393,6 +5408,25 @@ fn handle_native_otclient_game(
                             &mut database,
                         )?;
                         if outcome.deactivated {
+                            if let Some(corpse_position) = spawn_native_static_defeat_corpse(
+                                shared_world,
+                                map_owner,
+                                outcome.target_id,
+                                shared_world.tick()?,
+                                NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
+                            )? {
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    &format!(
+                                        "loot=corpse-spawned creature={} position={},{},{}",
+                                        outcome.target_id,
+                                        corpse_position.x,
+                                        corpse_position.y,
+                                        corpse_position.z
+                                    ),
+                                );
+                            }
                             apply_and_persist_native_static_defeat_experience(
                                 &mut database,
                                 shared_world,
@@ -8879,6 +8913,71 @@ fn apply_and_persist_native_fixed_death_loss(
         state,
     })?;
     Ok(())
+}
+
+/// Places one deterministic loot corpse on the defeated static creature's tile. The corpse is a
+/// runtime-only map item (no source identity, no journal entry) whose children are the rolled
+/// loot. The caller owns defeat validation, persistence of the map state, and client delivery.
+fn spawn_native_static_defeat_corpse(
+    shared_world: &SharedNativeWorld,
+    map_owner: &SharedNativeMap,
+    creature_id: u32,
+    seed: u64,
+    corpse_server_id: u16,
+) -> Result<Option<Position>, HostError> {
+    let roll = shared_world.roll_static_creature_loot(creature_id, seed)?;
+    if roll.items.is_empty() {
+        return Ok(None);
+    }
+    let lifecycle = {
+        let world = shared_world.lock()?;
+        world.static_creature_lifecycle(creature_id)
+    };
+    let Some(lifecycle) = lifecycle else {
+        return Ok(None);
+    };
+    let position = lifecycle.position;
+    let children = roll
+        .items
+        .iter()
+        .map(|(item_id, count)| WorldMapItem {
+            server_id: *item_id,
+            client_thing_id: None,
+            count: (*count).min(u8::MAX as u16) as u8,
+            action_id: None,
+            unique_id: None,
+            text: None,
+            description: None,
+            teleport_destination: None,
+            duration: None,
+            charges: None,
+            children: Vec::new(),
+        })
+        .collect();
+    let mut items = map_owner
+        .render_snapshot()?
+        .tile_items(position)
+        .map(<[WorldMapItem]>::to_vec)
+        .unwrap_or_default();
+    if items.len() + 1 > forgotten_core::MAX_WORLD_MAP_ITEMS_PER_TILE {
+        return Ok(None);
+    }
+    items.push(WorldMapItem {
+        server_id: corpse_server_id,
+        client_thing_id: None,
+        count: 1,
+        action_id: None,
+        unique_id: None,
+        text: None,
+        description: None,
+        teleport_destination: None,
+        duration: None,
+        charges: None,
+        children,
+    });
+    map_owner.replace_tile_items(position, items)?;
+    shared_world.mark_visibility_changed();
+    Ok(Some(position))
 }
 
 fn apply_native_selected_static_creature_melee(

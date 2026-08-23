@@ -2,7 +2,7 @@ use crate::legacy_xml::{LegacySpawnKind, LegacyWorldCompanionData};
 use crate::{ConfigError, EngineConfig};
 use forgotten_core::{
     FeTfsStaticEntity, FeTfsStaticSpawnCollection, StaticCreatureDirectMeleeDamageRange,
-    StaticCreatureSpawnArea,
+    StaticCreatureLootEntry, StaticCreatureSpawnArea,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
@@ -13,6 +13,9 @@ use std::path::{Component, Path, PathBuf};
 const MAX_ENTITY_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ENTITY_DEFINITION_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ENTITY_XML_DEPTH: usize = 32;
+/// Bounded flat loot entries retained per monster definition. Nested containers and chance
+/// tuning remain outside this import boundary.
+const MAX_MONSTER_LOOT_ITEMS: usize = 32;
 const MAX_ENTITY_DEFINITIONS: usize = 200_000;
 const STATIC_TFS_ENTITY_ID_START: u32 = 0x4000_0001;
 const DEFAULT_STATIC_ENTITY_SPEED: u16 = 220;
@@ -42,11 +45,27 @@ pub struct TfsEntityDefinition {
     /// One bounded direct `melee` XML declaration retained for a future scriptless static-combat
     /// adapter. Area, ranged, status, chance, and scripted attacks remain unexecuted.
     pub direct_melee: Option<TfsDirectMeleeAttack>,
+    /// Bounded declarative `<loot>` item declarations retained for a future scriptless corpse
+    /// adapter. Chance-tuned nested containers and scripted loot remain unexecuted.
+    pub loot: Vec<TfsLootItem>,
     pub definition_path: PathBuf,
     pub script_path: Option<PathBuf>,
     pub script_present: bool,
     /// Render-only metadata from XML. Definition scripts remain unexecuted.
     pub appearance: Option<TfsEntityAppearance>,
+}
+
+/// One bounded declarative monster `<loot>` entry. Only flat `item id=".." chance=".." count/max
+/// =".."` declarations are retained; nested containers, chance tuning, and scripted drops remain
+/// outside this import boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TfsLootItem {
+    pub item_id: u16,
+    /// Retained raw legacy chance value (TFS convention: 100000 equals always). Roll policy is a
+    /// separate runtime decision.
+    pub chance: u32,
+    pub min_count: u16,
+    pub max_count: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +168,7 @@ pub fn materialize_tfs_static_spawns(
     let mut experience_rewards = BTreeMap::new();
     let mut direct_melee_intervals_millis = BTreeMap::new();
     let mut direct_melee_damage_ranges = BTreeMap::new();
+    let mut loot_tables = BTreeMap::new();
     let mut npc_ids = BTreeSet::new();
     let mut monster_spawn_areas = BTreeMap::new();
     let mut next_id = STATIC_TFS_ENTITY_ID_START;
@@ -192,6 +212,21 @@ pub fn materialize_tfs_static_spawns(
                         },
                     );
                 }
+                if !definition.loot.is_empty() {
+                    loot_tables.insert(
+                        next_id,
+                        definition
+                            .loot
+                            .iter()
+                            .map(|entry| StaticCreatureLootEntry {
+                                item_id: entry.item_id,
+                                chance: entry.chance,
+                                min_count: entry.min_count,
+                                max_count: entry.max_count,
+                            })
+                            .collect(),
+                    );
+                }
             } else {
                 npc_ids.insert(next_id);
             }
@@ -228,13 +263,14 @@ pub fn materialize_tfs_static_spawns(
                 .ok_or_else(|| invalid("static TFS spawn identifier range is exhausted"))?;
         }
     }
-    FeTfsStaticSpawnCollection::with_combat_metadata_and_npc_ids(
+    FeTfsStaticSpawnCollection::with_loot_tables(
         entities,
         respawn_intervals_seconds,
         experience_rewards,
         direct_melee_intervals_millis,
         direct_melee_damage_ranges,
         npc_ids,
+        loot_tables,
     )
     .and_then(|collection| collection.with_monster_spawn_areas(monster_spawn_areas))
     .map_err(|error| invalid(format!("invalid static TFS spawn collection: {error}")))
@@ -447,6 +483,7 @@ fn parse_entity_definition(
     let mut max_health = None;
     let mut current_health = None;
     let mut direct_melee = None;
+    let mut loot = Vec::new();
     loop {
         match reader.read_event_into(&mut buffer).map_err(xml_error)? {
             Event::Start(event) => {
@@ -488,7 +525,11 @@ fn parse_entity_definition(
                         &mut current_health,
                     )?;
                 } else if matches!(kind, TfsEntityKind::Monster) && depth + 1 == 3 {
-                    parse_direct_melee_event(&event, &mut direct_melee)?;
+                    if event.name().as_ref() == b"item" {
+                        parse_loot_item_event(&event, &mut loot)?;
+                    } else {
+                        parse_direct_melee_event(&event, &mut direct_melee)?;
+                    }
                 }
             }
             Event::End(_) => {
@@ -510,6 +551,7 @@ fn parse_entity_definition(
         ))
     })?;
     definition.direct_melee = direct_melee;
+    definition.loot = loot;
     definition.appearance = look.map(|look| TfsEntityAppearance {
         look_type: look.look_type,
         head: look.head,
@@ -546,6 +588,7 @@ fn entity_from_root_event(
             0
         },
         direct_melee: None,
+        loot: Vec::new(),
         definition_path: definition_path.to_path_buf(),
         script_path,
         script_present,
@@ -593,6 +636,60 @@ fn parse_direct_melee_event(
         interval_millis,
         min_damage: parse_damage(b"min")?,
         max_damage: parse_damage(b"max")?,
+    });
+    Ok(())
+}
+
+/// Retains one bounded flat monster `<loot><item id=".." chance=".." [count|maxcount]/>` entry.
+/// Nested containers, `chance1`/`chance2` tuning, and `subtype`/`actionId` attributes remain
+/// outside this import boundary.
+fn parse_loot_item_event(
+    event: &BytesStart<'_>,
+    loot: &mut Vec<TfsLootItem>,
+) -> Result<(), ConfigError> {
+    if event.name().as_ref() != b"item" {
+        return Ok(());
+    }
+    if loot.len() >= MAX_MONSTER_LOOT_ITEMS {
+        return Err(invalid("monster loot list exceeds the supported bound"));
+    }
+    let item_id = optional_attribute_string(event, b"id")?
+        .ok_or_else(|| invalid("monster loot item is missing its id attribute"))?
+        .parse::<u16>()
+        .map_err(|_| invalid("monster loot item id must fit an unsigned 16-bit integer"))?;
+    if item_id == 0 {
+        return Err(invalid("monster loot item id must be nonzero"));
+    }
+    let chance = optional_attribute_string(event, b"chance")?
+        .ok_or_else(|| invalid("monster loot item is missing its chance attribute"))?
+        .parse::<u32>()
+        .map_err(|_| invalid("monster loot chance must be an unsigned integer"))?;
+    let max_count = match optional_attribute_string(event, b"maxcount")? {
+        Some(value) => value
+            .parse::<u16>()
+            .map_err(|_| invalid("monster loot maxcount must be an unsigned integer"))?,
+        None => 1,
+    };
+    if max_count == 0 {
+        return Err(invalid("monster loot maxcount must be positive"));
+    }
+    let min_count = match optional_attribute_string(event, b"count")? {
+        Some(value) => {
+            let parsed = value
+                .parse::<u16>()
+                .map_err(|_| invalid("monster loot count must be an unsigned integer"))?;
+            if parsed > max_count {
+                return Err(invalid("monster loot count exceeds its declared maxcount"));
+            }
+            parsed
+        }
+        None => 1,
+    };
+    loot.push(TfsLootItem {
+        item_id,
+        chance,
+        min_count,
+        max_count,
     });
     Ok(())
 }

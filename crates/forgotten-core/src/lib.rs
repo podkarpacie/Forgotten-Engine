@@ -96,6 +96,13 @@ pub const MAX_WORLD_MAP_TOWNS: usize = 8_192;
 pub const MAX_WORLD_MAP_WAYPOINTS: usize = 8_192;
 pub const MAX_TFS_STATIC_SPAWNS: usize = 65_536;
 
+/// Legacy loot-chance scale: the TFS convention where a declared chance of this value means the
+/// item always drops. Smaller declared chances are proportional probabilities.
+pub const LOOT_CHANCE_SCALE: u32 = 100_000;
+
+/// Bounded number of declarative loot entries retained per static monster.
+pub const MAX_STATIC_LOOT_ENTRIES: usize = 32;
+
 /// A deterministic, display-only entity materialized from a verified private TFS spawn record.
 /// It intentionally excludes AI, combat, movement scheduling, Lua state, and lifecycle behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +128,7 @@ pub struct FeTfsStaticSpawnCollection {
     experience_rewards: BTreeMap<u32, u64>,
     direct_melee_intervals_millis: BTreeMap<u32, u32>,
     direct_melee_damage_ranges: BTreeMap<u32, StaticCreatureDirectMeleeDamageRange>,
+    loot_tables: BTreeMap<u32, Vec<StaticCreatureLootEntry>>,
     npc_ids: BTreeSet<u32>,
     monster_spawn_areas: BTreeMap<u32, StaticCreatureSpawnArea>,
 }
@@ -132,6 +140,24 @@ pub struct FeTfsStaticSpawnCollection {
 pub struct StaticCreatureDirectMeleeDamageRange {
     pub min_damage: u16,
     pub max_damage: u16,
+}
+
+/// One bounded declarative loot entry retained per static monster. `chance` uses the legacy
+/// convention where 100000 equals always. Roll policy is a separate deterministic transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticCreatureLootEntry {
+    pub item_id: u16,
+    pub chance: u32,
+    pub min_count: u16,
+    pub max_count: u16,
+}
+
+/// The deterministic loot roll result for one defeated static creature. Counts are inclusive of
+/// both bounds and every selected item is a distinct top-level corpse child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticCreatureLootRoll {
+    pub creature_id: u32,
+    pub items: Vec<(u16, u16)>,
 }
 
 /// The validated rectangular legacy spawn area which owns one materialized monster. This is
@@ -228,6 +254,29 @@ impl FeTfsStaticSpawnCollection {
         direct_melee_damage_ranges: BTreeMap<u32, StaticCreatureDirectMeleeDamageRange>,
         npc_ids: BTreeSet<u32>,
     ) -> Result<Self, CoreError> {
+        Self::with_loot_tables(
+            entities,
+            respawn_intervals_seconds,
+            experience_rewards,
+            direct_melee_intervals_millis,
+            direct_melee_damage_ranges,
+            npc_ids,
+            BTreeMap::new(),
+        )
+    }
+
+    /// Retains validated declarative loot tables by stable static creature ID. Loot entries are
+    /// immutable import metadata; roll policy remains an explicit deterministic transition.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_loot_tables(
+        entities: Vec<FeTfsStaticEntity>,
+        respawn_intervals_seconds: BTreeMap<u32, u32>,
+        experience_rewards: BTreeMap<u32, u64>,
+        direct_melee_intervals_millis: BTreeMap<u32, u32>,
+        direct_melee_damage_ranges: BTreeMap<u32, StaticCreatureDirectMeleeDamageRange>,
+        npc_ids: BTreeSet<u32>,
+        loot_tables: BTreeMap<u32, Vec<StaticCreatureLootEntry>>,
+    ) -> Result<Self, CoreError> {
         if entities.len() > MAX_TFS_STATIC_SPAWNS {
             return Err(CoreError::StaticSpawnLimit(MAX_TFS_STATIC_SPAWNS));
         }
@@ -266,12 +315,26 @@ impl FeTfsStaticSpawnCollection {
         if npc_ids.iter().any(|id| !ids.contains(id)) {
             return Err(CoreError::UnknownStaticCreatureSchedule);
         }
+        for (id, loot) in &loot_tables {
+            if !ids.contains(id) || npc_ids.contains(id) || loot.len() > MAX_STATIC_LOOT_ENTRIES {
+                return Err(CoreError::UnknownStaticCreatureSchedule);
+            }
+            for entry in loot {
+                if entry.item_id == 0
+                    || entry.min_count == 0
+                    || entry.min_count > entry.max_count
+                {
+                    return Err(CoreError::UnknownStaticCreatureSchedule);
+                }
+            }
+        }
         Ok(Self {
             entities,
             respawn_intervals_seconds,
             experience_rewards,
             direct_melee_intervals_millis,
             direct_melee_damage_ranges,
+            loot_tables,
             npc_ids,
             monster_spawn_areas: BTreeMap::new(),
         })
@@ -325,6 +388,13 @@ impl FeTfsStaticSpawnCollection {
         id: u32,
     ) -> Option<StaticCreatureDirectMeleeDamageRange> {
         self.direct_melee_damage_ranges.get(&id).copied()
+    }
+
+    pub fn loot_table(&self, id: u32) -> &[StaticCreatureLootEntry] {
+        self.loot_tables
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     pub fn is_npc(&self, id: u32) -> bool {
@@ -456,6 +526,7 @@ struct StaticCreatureRuntime {
     entity: FeTfsStaticEntity,
     is_npc: bool,
     experience_reward: u64,
+    loot: Vec<StaticCreatureLootEntry>,
     spawn_position: Position,
     monster_spawn_area: Option<StaticCreatureSpawnArea>,
     active: bool,
@@ -3517,6 +3588,7 @@ impl WorldState {
                         entity: entity.clone(),
                         is_npc: collection.is_npc(entity.id),
                         experience_reward: collection.experience_reward(entity.id),
+                        loot: collection.loot_table(entity.id).to_vec(),
                         spawn_position: entity.position,
                         monster_spawn_area: collection.monster_spawn_area(entity.id),
                         active: true,
@@ -3774,6 +3846,53 @@ impl WorldState {
             .ok_or(CoreError::UnknownStaticCreature(id))
     }
 
+    /// Rolls one deterministic bounded loot result for an active static monster. The caller
+    /// supplies the seed (for example the authoritative defeat tick); equal seeds always produce
+    /// equal results. NPCs, inactive creatures, and empty loot tables yield no items.
+    pub fn roll_static_creature_loot(
+        &self,
+        id: u32,
+        seed: u64,
+    ) -> Result<StaticCreatureLootRoll, CoreError> {
+        let runtime = self
+            .static_creatures
+            .get(&id)
+            .ok_or(CoreError::UnknownStaticCreature(id))?;
+        if !runtime.active || runtime.is_npc || runtime.loot.is_empty() {
+            return Ok(StaticCreatureLootRoll {
+                creature_id: id,
+                items: Vec::new(),
+            });
+        }
+        let mut items = Vec::new();
+        let mut state = seed
+            ^ (u64::from(id) << 32)
+            ^ u64::from(runtime.entity.position.x)
+            ^ (u64::from(runtime.entity.position.y) << 16);
+        for entry in &runtime.loot {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let roll = (state >> 33) % u64::from(LOOT_CHANCE_SCALE.max(1));
+            if roll < u64::from(entry.chance.min(LOOT_CHANCE_SCALE)) {
+                let span =
+                    u64::from(entry.max_count) - u64::from(entry.min_count) + 1;
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let count = u64::from(entry.min_count) + (state >> 33) % span;
+                items.push((
+                    entry.item_id,
+                    u16::try_from(count).unwrap_or(entry.max_count),
+                ));
+            }
+        }
+        Ok(StaticCreatureLootRoll {
+            creature_id: id,
+            items,
+        })
+    }
+
     /// Changes one active static creature's display health only. This bounded state is not
     /// connected to damage, death, targeting consequences, loot, corpses, AI, or scripts.
     /// A zero value remains a valid display percentage and does not deactivate the creature.
@@ -3833,6 +3952,12 @@ impl WorldState {
                         .then_some(runtime.direct_melee_damage_range.map(|range| (*id, range)))
                         .flatten()
                 })
+                .collect(),
+            loot_tables: self
+                .static_creatures
+                .iter()
+                .filter(|(_, runtime)| runtime.active && !runtime.loot.is_empty())
+                .map(|(id, runtime)| (*id, runtime.loot.clone()))
                 .collect(),
             npc_ids: self
                 .static_creatures
@@ -6470,6 +6595,163 @@ impl std::error::Error for CoreError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loot_test_creature(id: u32) -> FeTfsStaticEntity {
+        FeTfsStaticEntity {
+            id,
+            name: "Rat".into(),
+            position: Position {
+                x: 104,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        }
+    }
+
+    fn always_loot(item_id: u16) -> StaticCreatureLootEntry {
+        StaticCreatureLootEntry {
+            item_id,
+            chance: LOOT_CHANCE_SCALE,
+            min_count: 2,
+            max_count: 5,
+        }
+    }
+
+    #[test]
+    fn static_loot_roll_is_deterministic_and_respects_bounds() {
+        let creature_id = 0x4000_0001;
+        let collection = FeTfsStaticSpawnCollection::with_loot_tables(
+            vec![loot_test_creature(creature_id)],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::from([(
+                creature_id,
+                vec![
+                    always_loot(2148),
+                    StaticCreatureLootEntry {
+                        item_id: 2666,
+                        chance: 0,
+                        min_count: 1,
+                        max_count: 1,
+                    },
+                ],
+            )]),
+        )
+        .unwrap();
+        let mut world = WorldState::default();
+        world.install_static_creatures(&collection).unwrap();
+
+        let first = world.roll_static_creature_loot(creature_id, 42).unwrap();
+        let second = world.roll_static_creature_loot(creature_id, 42).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.items.len(), 1);
+        let (item_id, count) = first.items[0];
+        assert_eq!(item_id, 2148);
+        assert!((2..=5).contains(&count));
+    }
+
+    #[test]
+    fn static_loot_roll_skips_npcs_inactive_and_empty_tables() {
+        let npc_id = 0x4000_0001;
+        let monster_id = 0x4000_0002;
+        let mut npc = loot_test_creature(npc_id);
+        npc.name = "Guide".into();
+        let collection = FeTfsStaticSpawnCollection::with_loot_tables(
+            vec![npc, loot_test_creature(monster_id)],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::from([npc_id]),
+            BTreeMap::from([(monster_id, vec![always_loot(2148)])]),
+        )
+        .unwrap();
+        let mut world = WorldState::default();
+        world.install_static_creatures(&collection).unwrap();
+
+        assert_eq!(
+            world
+                .roll_static_creature_loot(npc_id, 7)
+                .unwrap()
+                .items
+                .len(),
+            0
+        );
+        assert_eq!(
+            world
+                .roll_static_creature_loot(monster_id, 7)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        world.deactivate_static_creature(monster_id).unwrap();
+        assert_eq!(
+            world
+                .roll_static_creature_loot(monster_id, 7)
+                .unwrap()
+                .items
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn static_loot_tables_reject_unknown_and_invalid_entries() {
+        let creature_id = 0x4000_0001;
+        assert!(
+            FeTfsStaticSpawnCollection::with_loot_tables(
+                vec![loot_test_creature(creature_id)],
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+                BTreeMap::from([(
+                    999,
+                    vec![StaticCreatureLootEntry {
+                        item_id: 2148,
+                        chance: LOOT_CHANCE_SCALE,
+                        min_count: 1,
+                        max_count: 1,
+                    }]
+                )]),
+            )
+            .is_err()
+        );
+        assert!(
+            FeTfsStaticSpawnCollection::with_loot_tables(
+                vec![loot_test_creature(creature_id)],
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+                BTreeMap::from([(
+                    creature_id,
+                    vec![StaticCreatureLootEntry {
+                        item_id: 2148,
+                        chance: LOOT_CHANCE_SCALE,
+                        min_count: 5,
+                        max_count: 2,
+                    }]
+                )]),
+            )
+            .is_err()
+        );
+    }
 
     fn player() -> Player {
         Player {
