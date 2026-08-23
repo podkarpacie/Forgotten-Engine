@@ -42,7 +42,8 @@ const SCHEMA_VERSION_HOUSE_OWNERSHIP: i64 = 23;
 const SCHEMA_VERSION_HOUSE_ACCESS_LISTS: i64 = 24;
 const SCHEMA_VERSION_MAP_ITEM_COUNT_OVERRIDES: i64 = 25;
 const SCHEMA_VERSION_RUNTIME_MAP_ITEMS: i64 = 26;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_RUNTIME_MAP_ITEMS;
+const SCHEMA_VERSION_CORPSE_DESPAWN_TICKS: i64 = 27;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_CORPSE_DESPAWN_TICKS;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 pub const MAX_VIP_DESCRIPTION_BYTES: usize = 128;
@@ -109,6 +110,9 @@ pub struct RuntimeMapItemRecord {
     pub server_id: u16,
     pub count: u8,
     pub children: Vec<RuntimeMapItemChildRecord>,
+    /// Authoritative world tick after which a heartbeat may remove this runtime item. `None`
+    /// marks an immortal record (decay disabled at placement time).
+    pub despawn_tick: Option<u64>,
 }
 
 /// One ordered flat child of a durable runtime tile item. Nested trees, attributes, and text
@@ -3466,6 +3470,13 @@ impl EngineDatabase {
                     "runtime map item count must stay within the bounded stack range".into(),
                 ));
             }
+            if let Some(tick) = item.despawn_tick {
+                i64::try_from(tick).map_err(|_| {
+                    PersistenceError::InvalidMapItemJournal(
+                        "runtime item despawn tick does not fit a signed integer".into(),
+                    )
+                })?;
+            }
             if !seen_items.insert((item.position, item.ordinal)) {
                 return Err(PersistenceError::InvalidMapItemJournal(
                     "duplicate runtime map item position and ordinal".into(),
@@ -3489,7 +3500,7 @@ impl EngineDatabase {
         transaction.execute("DELETE FROM runtime_map_items", [])?;
         for item in items {
             transaction.execute(
-                "INSERT INTO runtime_map_items (map_revision, x, y, z, ordinal, server_id, count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO runtime_map_items (map_revision, x, y, z, ordinal, server_id, count, despawn_tick) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     format!("{:016x}", map_revision.0),
                     i64::from(item.position.x),
@@ -3498,6 +3509,7 @@ impl EngineDatabase {
                     i64::from(item.ordinal),
                     i64::from(item.server_id),
                     i64::from(item.count),
+                    item.despawn_tick.map(|tick| i64::try_from(tick).expect("validated tick fits i64")),
                 ],
             )?;
             for (child_index, child) in item.children.iter().enumerate() {
@@ -3526,7 +3538,7 @@ impl EngineDatabase {
         &self,
     ) -> Result<Option<(WorldMapSourceRevision, Vec<RuntimeMapItemRecord>)>, PersistenceError> {
         let mut item_statement = self.connection.prepare(
-            "SELECT map_revision, x, y, z, ordinal, server_id, count FROM runtime_map_items ORDER BY x, y, z, ordinal",
+            "SELECT map_revision, x, y, z, ordinal, server_id, count, despawn_tick FROM runtime_map_items ORDER BY x, y, z, ordinal",
         )?;
         let item_rows = item_statement.query_map([], |row| {
             Ok((
@@ -3537,12 +3549,13 @@ impl EngineDatabase {
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
                 row.get::<_, i64>(6)?,
+                row.get::<_, Option<i64>>(7)?,
             ))
         })?;
         let mut map_revision: Option<WorldMapSourceRevision> = None;
         let mut items = Vec::new();
         for row in item_rows {
-            let (revision, x, y, z, ordinal, server_id, count) = row?;
+            let (revision, x, y, z, ordinal, server_id, count, despawn_tick) = row?;
             let parsed_revision = u64::from_str_radix(&revision, 16).map_err(|_| {
                 PersistenceError::InvalidMapItemJournal(
                     "runtime map item revision must be hexadecimal u64".into(),
@@ -3606,6 +3619,15 @@ impl EngineDatabase {
                 server_id,
                 count,
                 children: Vec::new(),
+                despawn_tick: despawn_tick
+                    .map(|tick| {
+                        u64::try_from(tick).map_err(|_| {
+                            PersistenceError::InvalidMapItemJournal(
+                                "runtime item despawn tick must be nonnegative".into(),
+                            )
+                        })
+                    })
+                    .transpose()?,
             });
         }
         if items.len() > MAX_RUNTIME_MAP_ITEMS {
@@ -4131,6 +4153,14 @@ impl EngineDatabase {
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![SCHEMA_VERSION_RUNTIME_MAP_ITEMS, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < SCHEMA_VERSION_CORPSE_DESPAWN_TICKS {
+            self.connection
+                .execute_batch("ALTER TABLE runtime_map_items ADD COLUMN despawn_tick INTEGER;")?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_CORPSE_DESPAWN_TICKS, unix_seconds()],
             )?;
         }
         Ok(())
@@ -4735,6 +4765,7 @@ mod tests {
                         count: 3,
                     },
                 ],
+                despawn_tick: Some(1_234),
             },
             RuntimeMapItemRecord {
                 position: Position {
@@ -4746,6 +4777,7 @@ mod tests {
                 server_id: 3065,
                 count: 1,
                 children: Vec::new(),
+                despawn_tick: None,
             },
             RuntimeMapItemRecord {
                 position: Position {
@@ -4760,6 +4792,7 @@ mod tests {
                     server_id: 2398,
                     count: 1,
                 }],
+                despawn_tick: Some(42),
             },
         ];
         database
@@ -4782,6 +4815,7 @@ mod tests {
                 server_id: 3065,
                 count: 1,
                 children: Vec::new(),
+                despawn_tick: None,
             },
             RuntimeMapItemRecord {
                 position: Position { x: 9, y: 9, z: 7 },
@@ -4789,6 +4823,7 @@ mod tests {
                 server_id: 3065,
                 count: 1,
                 children: Vec::new(),
+                despawn_tick: None,
             },
         ];
         assert!(matches!(
@@ -4802,6 +4837,7 @@ mod tests {
             server_id: 0,
             count: 1,
             children: Vec::new(),
+            despawn_tick: None,
         }];
         assert!(database
             .replace_runtime_map_items(revision, &zero_id)
@@ -4818,6 +4854,7 @@ mod tests {
                 };
                 MAX_RUNTIME_MAP_ITEM_CHILDREN + 1
             ],
+            despawn_tick: None,
         }];
         assert!(matches!(
             database.replace_runtime_map_items(revision, &too_many_children),
@@ -4833,6 +4870,7 @@ mod tests {
                 server_id: 2148,
                 count: 0,
             }],
+            despawn_tick: None,
         }];
         assert!(matches!(
             database.replace_runtime_map_items(revision, &zero_child_count),

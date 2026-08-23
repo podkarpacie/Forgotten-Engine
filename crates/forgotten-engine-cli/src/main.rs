@@ -739,6 +739,7 @@ fn run_host(
             declarative_weapon_catalog,
             declarative_spell_catalog,
             declarative_npc_dialogue_catalog,
+            corpse_despawn_seconds: config.corpse_despawn_seconds,
         })
     } else {
         None

@@ -101,6 +101,9 @@ pub struct EngineConfig {
     pub magic_rate: u32,
     pub static_creature_target_attack_damage: u16,
     pub static_creature_target_pursuit_range: u8,
+    /// Configured corpse despawn delay in seconds. `0` disables decay; a positive value expires
+    /// each spawned runtime corpse on a later native heartbeat.
+    pub corpse_despawn_seconds: u32,
     /// Disabled unless the operator explicitly opts in through the bounded config.lua keys.
     /// The current FE party model is session-local; these values do not imply persistence or
     /// complete TFS party behavior.
@@ -294,6 +297,13 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         });
     }
     let static_creature_target_pursuit_range = static_creature_target_pursuit_range as u8;
+    let corpse_despawn_seconds = optional_u32(&values, "corpseDespawnSeconds", 0)?;
+    if corpse_despawn_seconds > 86_400 {
+        return Err(ConfigError::InvalidValue {
+            key: "corpseDespawnSeconds",
+            message: "must stay within one day".into(),
+        });
+    }
     let party_shared_experience_rules =
         if optional_boolean(&values, "partySharedExperienceEnabled", false)? {
             let maximum_range = optional_u16(&values, "partySharedExperienceRange", 30)?;
@@ -464,6 +474,7 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         magic_rate,
         static_creature_target_attack_damage,
         static_creature_target_pursuit_range,
+        corpse_despawn_seconds,
         party_shared_experience_rules,
         experience_stages,
         experience_stages_source,
@@ -1416,6 +1427,7 @@ fn is_recognized_config_key(key: &str) -> bool {
             | "rateMagic"
             | "staticCreatureTargetAttackDamage"
             | "staticCreatureTargetPursuitRange"
+            | "corpseDespawnSeconds"
             | "partySharedExperienceEnabled"
             | "partySharedExperienceRange"
             | "partySharedExperienceFloorDelta"
@@ -1814,6 +1826,38 @@ experienceStages = {
             load(&world),
             Err(ConfigError::InvalidValue {
                 key: "staticCreatureTargetAttackDamage",
+                ..
+            })
+        ));
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn loads_a_bounded_corpse_despawn_delay_and_rejects_overdue_values() {
+        let world = temporary_world("corpse-despawn-seconds");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!("{}corpseDespawnSeconds = 300\n", template(FE_7_4_PROFILE)),
+        )
+        .unwrap();
+        assert_eq!(load(&world).unwrap().corpse_despawn_seconds, 300);
+        fs::write(world.join(CONFIG_FILE_NAME), template(FE_7_4_PROFILE)).unwrap();
+        assert_eq!(
+            load(&world).unwrap().corpse_despawn_seconds,
+            0,
+            "decay stays disabled by default"
+        );
+
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!("{}corpseDespawnSeconds = 86401\n", template(FE_7_4_PROFILE)),
+        )
+        .unwrap();
+        assert!(matches!(
+            load(&world),
+            Err(ConfigError::InvalidValue {
+                key: "corpseDespawnSeconds",
                 ..
             })
         ));
