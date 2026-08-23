@@ -65,16 +65,17 @@ use forgotten_protocol::{
     encode_native_otclient_public_say, encode_native_otclient_read_only_text_window,
     encode_native_otclient_set_inventory, encode_native_otclient_status_message,
     encode_native_otclient_whisper, encode_native_otclient_yell, encode_status_binary,
-    encode_status_xml, generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
-    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
-    NativeOtClientCardinalDirection, NativeOtClientClassicChannel, NativeOtClientClassicItemRecord,
-    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
-    NativeOtClientClassicPartyShield, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
-    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerVitals,
-    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
-    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
-    MAX_LOGIN_STRING_BYTES, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_MESSAGE_SAY,
+    encode_status_metrics, encode_status_xml, generate_legacy_74_game_challenge,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
+    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
+    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection, NativeOtClientClassicChannel,
+    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
+    NativeOtClientClassicOutfit, NativeOtClientClassicPartyShield,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
+    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
+    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
+    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE, MAX_LOGIN_STRING_BYTES,
+    NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_MESSAGE_SAY,
     NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -11025,6 +11026,23 @@ fn handle_status_session(
         StatusRequest::Binary { flags, .. } => {
             let response = encode_status_binary(&snapshot, flags, &[] as &[StatusPlayer], false);
             write_frame(stream, &response)?;
+        }
+        StatusRequest::Metrics => {
+            // One authoritative database read per metrics scrape keeps counters exact without
+            // any shared-world locking on the status path.
+            let database = EngineDatabase::open(database_path).map_err(HostError::Persistence)?;
+            let (registered_accounts, registered_characters) =
+                database.metrics_counts().map_err(HostError::Persistence)?;
+            let schema_version = database.schema_version().map_err(HostError::Persistence)?;
+            let metrics = forgotten_protocol::StatusMetrics {
+                uptime_seconds: snapshot.uptime_seconds,
+                registered_accounts,
+                registered_characters,
+                schema_version,
+                players_online_cap: config.max_players,
+            };
+            stream.write_all(&encode_status_metrics(&metrics))?;
+            stream.flush()?;
         }
     }
     record_event(
@@ -22311,6 +22329,53 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         assert!(response.contains("<tsqp version=\"1.0\">"));
         assert!(response.contains("Forgotten Engine Test"));
+        status.shutdown().unwrap();
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn answers_an_fe_metrics_status_request_with_authoritative_counters() {
+        let database = database_path("status-metrics");
+        {
+            let mut database = EngineDatabase::open(&database).unwrap();
+            database
+                .create_account_with_password("operator", "correct horse battery staple")
+                .unwrap();
+            database
+                .save_player(&Player {
+                    id: 1,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        let status = start_status(status_config(), &database).unwrap();
+        let mut stream = TcpStream::connect(status.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &Frame({
+                let mut payload = vec![0xff, 0x0a, 0x00];
+                payload.extend_from_slice(b"fe-metrics");
+                payload
+            }),
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        let response = String::from_utf8(response).unwrap();
+        eprintln!("metrics response: {response}");
+        assert!(response.contains("\"registered_accounts\":1"));
+        assert!(response.contains("\"registered_characters\":1"));
+        assert!(response.contains("\"players_online_cap\":100"));
+        assert!(response.contains("\"schema_version\":"));
         status.shutdown().unwrap();
         let _ = fs::remove_file(database);
     }

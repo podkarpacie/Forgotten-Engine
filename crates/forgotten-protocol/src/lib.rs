@@ -121,6 +121,9 @@ pub enum StatusRequest {
         flags: StatusRequestFlags,
         player_name: Option<String>,
     },
+    /// FE-specific operator metrics request. Classic clients never send this magic, so the
+    /// existing XML and binary responses stay byte-identical for them.
+    Metrics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,8 +147,16 @@ pub struct StatusPlayer {
 pub fn decode_status_request(frame: &Frame) -> Result<StatusRequest, ProtocolError> {
     let mut reader = Reader::new(&frame.0);
     match reader.byte()? {
-        0xff if reader.string(MAX_LOGIN_STRING_BYTES)? == "info" && reader.done() => {
-            Ok(StatusRequest::XmlInfo)
+        0xff => {
+            let tag = reader.string(MAX_LOGIN_STRING_BYTES)?;
+            if !reader.done() {
+                return Err(ProtocolError::InvalidStatusRequest);
+            }
+            match tag.as_str() {
+                "info" => Ok(StatusRequest::XmlInfo),
+                "fe-metrics" => Ok(StatusRequest::Metrics),
+                _ => Err(ProtocolError::InvalidStatusRequest),
+            }
         }
         0x01 => {
             let flags = StatusRequestFlags::from_bits(reader.u16()?);
@@ -166,6 +177,29 @@ pub fn decode_status_request(frame: &Frame) -> Result<StatusRequest, ProtocolErr
 
 pub fn encode_status_xml(snapshot: &StatusSnapshot) -> Vec<u8> {
     format!("<?xml version=\"1.0\"?><tsqp version=\"1.0\"><serverinfo uptime=\"{}\" ip=\"{}\" servername=\"{}\" port=\"{}\" server=\"Forgotten Engine\" version=\"{}\" client=\"{}\"/><players online=\"{}\" max=\"{}\" peak=\"{}\"/><map name=\"{}\" author=\"Original Forgotten Engine content\" width=\"0\" height=\"0\"/></tsqp>", snapshot.uptime_seconds, xml(&snapshot.bind_ip.to_string()), xml(&snapshot.server_name), snapshot.status_port, snapshot.profile.fe_release, snapshot.profile.tibia_protocol, snapshot.players_online, snapshot.max_players, snapshot.players_peak, xml(&snapshot.map_name)).into_bytes()
+}
+
+/// Encodes the FE-specific operator metrics document. Field order is stable so operators can
+/// scrape it; values come from one authoritative database read plus process-local clocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusMetrics {
+    pub uptime_seconds: u64,
+    pub registered_accounts: u32,
+    pub registered_characters: u32,
+    pub schema_version: i64,
+    pub players_online_cap: u32,
+}
+
+pub fn encode_status_metrics(metrics: &StatusMetrics) -> Vec<u8> {
+    format!(
+        "{{\"uptime_seconds\":{},\"registered_accounts\":{},\"registered_characters\":{},\"schema_version\":{},\"players_online_cap\":{}}}\n",
+        metrics.uptime_seconds,
+        metrics.registered_accounts,
+        metrics.registered_characters,
+        metrics.schema_version,
+        metrics.players_online_cap
+    )
+    .into_bytes()
 }
 
 pub fn encode_status_binary(
@@ -3293,6 +3327,26 @@ mod tests {
             decode_status_request(&Frame(vec![1, 9, 0])),
             Ok(StatusRequest::Binary { .. })
         ));
+        let metrics_frame = {
+            let mut payload = vec![0xff, 0x0a, 0x00];
+            payload.extend_from_slice(b"fe-metrics");
+            Frame(payload)
+        };
+        assert_eq!(
+            decode_status_request(&metrics_frame).unwrap(),
+            StatusRequest::Metrics
+        );
+        assert_eq!(
+            String::from_utf8(encode_status_metrics(&StatusMetrics {
+                uptime_seconds: 12,
+                registered_accounts: 3,
+                registered_characters: 7,
+                schema_version: 27,
+                players_online_cap: 100,
+            }))
+            .unwrap(),
+            "{\"uptime_seconds\":12,\"registered_accounts\":3,\"registered_characters\":7,\"schema_version\":27,\"players_online_cap\":100}\n"
+        );
         assert!(String::from_utf8(encode_status_xml(&snapshot()))
             .unwrap()
             .contains("&amp;"));

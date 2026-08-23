@@ -342,6 +342,24 @@ impl EngineDatabase {
         )?)
     }
 
+    /// Returns bounded operator metrics: total persisted accounts and characters. One read-only
+    /// query pair backs the status metrics endpoint; it never mutates state.
+    pub fn metrics_counts(&self) -> Result<(u32, u32), PersistenceError> {
+        let accounts = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM accounts", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        let characters = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM players", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        let accounts = u32::try_from(accounts).unwrap_or(u32::MAX);
+        let characters = u32::try_from(characters).unwrap_or(u32::MAX);
+        Ok((accounts, characters))
+    }
+
     /// Inserts an account whose hash has already been produced by an approved password provider.
     pub fn create_account(&self, name: &str, password_hash: &str) -> Result<i64, PersistenceError> {
         self.connection.execute(
