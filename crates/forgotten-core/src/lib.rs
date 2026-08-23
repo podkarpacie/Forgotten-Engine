@@ -3083,6 +3083,61 @@ impl WorldState {
         Ok(self.party_member_ids(leader_id))
     }
 
+    /// Exports every live party as deterministic (leader, sorted non-leader members) records
+    /// for bounded persistence snapshots, matching `player_party_members` semantics. Empty
+    /// output means no live parties.
+    pub fn party_snapshots(&self) -> Vec<(u64, Vec<u64>)> {
+        self.party_leaders
+            .iter()
+            .map(|leader| (*leader, self.party_member_ids(*leader)))
+            .collect()
+    }
+
+    /// Restores one persisted party snapshot into the session-local party state. The members
+    /// slice lists non-leader members (leadership is implicit), every player must exist,
+    /// duplicates are rejected, and rows that would overwrite an existing live party are
+    /// rejected so a stale snapshot can never clobber runtime state formed after the snapshot.
+    pub fn restore_party_snapshot(
+        &mut self,
+        leader_id: u64,
+        members: &[u64],
+    ) -> Result<(), CoreError> {
+        let mut unique = members.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() != members.len() {
+            return Err(CoreError::InvalidPartySnapshot(
+                "party snapshot contains duplicate members".into(),
+            ));
+        }
+        if unique.contains(&leader_id) {
+            return Err(CoreError::InvalidPartySnapshot(
+                "party snapshot members must not list the leader".into(),
+            ));
+        }
+        self.ensure_party_player_exists(leader_id)?;
+        if self.party_leaders.contains(&leader_id)
+            || self.party_memberships.contains_key(&leader_id)
+        {
+            return Err(CoreError::InvalidPartySnapshot(
+                "leader already holds live party state".into(),
+            ));
+        }
+        for member in &unique {
+            self.ensure_party_player_exists(*member)?;
+            if self.party_leaders.contains(member) || self.party_memberships.contains_key(member) {
+                return Err(CoreError::InvalidPartySnapshot(
+                    "member already holds live party state".into(),
+                ));
+            }
+        }
+        for member in &unique {
+            self.party_memberships.insert(*member, leader_id);
+        }
+        self.party_leaders.insert(leader_id);
+        Ok(())
+    }
+
     /// Enables or disables the session-local shared-experience request for one current leader.
     /// The result describes eligibility only; it does not distribute experience or emit a packet.
     pub fn set_party_shared_experience_requested(
@@ -6573,6 +6628,8 @@ pub enum CoreError {
     InvalidContainerCapacity(u16),
     InvalidContainerName(usize),
     TooManyPlayerContainers(usize),
+    /// A persisted party snapshot violated membership or live-state invariants.
+    InvalidPartySnapshot(String),
     ContainerFull {
         capacity: u16,
     },
@@ -7327,6 +7384,75 @@ mod tests {
             world.accept_party_invitation(invitee.id, new_leader.id),
             Ok(())
         );
+    }
+
+    #[test]
+    fn party_snapshots_round_trip_and_reject_stale_or_invalid_restores() {
+        let mut world = WorldState::default();
+        let leader = party_player(7, "Snap Leader", 100);
+        let first = party_player(8, "Snap One", 101);
+        let second = party_player(9, "Snap Two", 102);
+        for player in [&leader, &first, &second] {
+            world.add_player(player.clone()).unwrap();
+        }
+        world.invite_to_party(leader.id, first.id).unwrap();
+        world.accept_party_invitation(first.id, leader.id).unwrap();
+        world.invite_to_party(leader.id, second.id).unwrap();
+        world.accept_party_invitation(second.id, leader.id).unwrap();
+
+        let snapshots = world.party_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].0, leader.id);
+        assert_eq!(snapshots[0].1, vec![first.id, second.id]);
+
+        // Simulate a restart: fresh world, same players, no live party state.
+        let mut restored = WorldState::default();
+        for player in [&leader, &first, &second] {
+            restored.add_player(player.clone()).unwrap();
+        }
+        restored
+            .restore_party_snapshot(leader.id, &[second.id, first.id])
+            .unwrap();
+        assert_eq!(restored.player_party_leader(second.id), Ok(Some(leader.id)));
+        assert_eq!(
+            restored.player_party_members(leader.id),
+            Ok(vec![first.id, second.id])
+        );
+        assert_eq!(restored.party_snapshots(), snapshots);
+
+        // Stale snapshot must never clobber live state formed after it was taken.
+        let mut live = WorldState::default();
+        for player in [&leader, &first] {
+            live.add_player(player.clone()).unwrap();
+        }
+        live.restore_party_snapshot(leader.id, &[first.id]).unwrap();
+        assert!(matches!(
+            live.restore_party_snapshot(first.id, &[]),
+            Err(CoreError::InvalidPartySnapshot(message))
+                if message.contains("already holds")
+        ));
+
+        // Structural validation: leaderless and duplicate-member forms are rejected.
+        let mut clean = WorldState::default();
+        for player in [&leader, &first] {
+            clean.add_player(player.clone()).unwrap();
+        }
+        assert!(matches!(
+            clean.restore_party_snapshot(leader.id, &[leader.id]),
+            Err(CoreError::InvalidPartySnapshot(message))
+                if message.contains("must not list the leader")
+        ));
+        assert!(matches!(
+            clean.restore_party_snapshot(leader.id, &[first.id, first.id]),
+            Err(CoreError::InvalidPartySnapshot(message))
+                if message.contains("duplicate")
+        ));
+        // Unknown players cannot be resurrected into a party by a stale snapshot.
+        assert_eq!(
+            clean.restore_party_snapshot(leader.id, &[999]),
+            Err(CoreError::UnknownPlayer(999))
+        );
+        assert_eq!(clean.player_party_leader(leader.id), Ok(None));
     }
 
     #[test]
