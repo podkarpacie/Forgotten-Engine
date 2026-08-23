@@ -8,29 +8,33 @@ const QUEST_CATALOG_RELATIVE_PATH: &str = "XML/forgotten-engine-quests.xml";
 const MAX_QUEST_CATALOG_BYTES: usize = 128 * 1024;
 const MAX_QUEST_NAME_BYTES: usize = 64;
 const MAX_QUESTS: usize = 256;
+const MAX_QUEST_MISSIONS: usize = 16;
 
-/// One bounded operator-declared quest identity: a stable numeric ID clients understand plus a
-/// display name. Mission lines, storage flags, and reward logic remain outside this adapter.
+/// One bounded operator-declared quest identity plus optional mission lines. Storage flags and
+/// reward logic remain outside this adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuestDefinition {
     pub quest_id: u16,
     pub name: String,
+    pub missions: Vec<(String, String)>,
 }
 
 /// Validated quest catalog keyed by numeric quest ID.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QuestCatalog {
-    quests: BTreeMap<u16, String>,
+    quests: BTreeMap<u16, QuestDefinition>,
 }
 
 impl QuestCatalog {
-    pub fn get(&self, quest_id: u16) -> Option<&str> {
-        self.quests.get(&quest_id).map(|name| name.as_str())
+    pub fn get(&self, quest_id: u16) -> Option<&QuestDefinition> {
+        self.quests.get(&quest_id)
     }
 
     /// Returns the catalog entries sorted by quest ID.
     pub fn iter(&self) -> impl Iterator<Item = (u16, &str)> + '_ {
-        self.quests.iter().map(|(&id, name)| (id, name.as_str()))
+        self.quests
+            .iter()
+            .map(|(&id, quest)| (id, quest.name.as_str()))
     }
 
     pub fn len(&self) -> usize {
@@ -41,8 +45,12 @@ impl QuestCatalog {
         self.quests.is_empty()
     }
 
-    fn insert(&mut self, quest_id: u16, name: String) -> Result<(), ConfigError> {
-        if self.quests.insert(quest_id, name).is_some() {
+    fn insert(&mut self, definition: QuestDefinition) -> Result<(), ConfigError> {
+        if self
+            .quests
+            .insert(definition.quest_id, definition)
+            .is_some()
+        {
             return Err(invalid("duplicate quest declaration"));
         }
         Ok(())
@@ -77,11 +85,12 @@ pub fn parse_quests_xml(bytes: &[u8]) -> Result<QuestCatalog, ConfigError> {
     let mut depth = 0_usize;
     let mut root_seen = false;
     let mut catalog = QuestCatalog::default();
+    let mut active_quest: Option<QuestDefinition> = None;
     loop {
         match reader.read_event_into(&mut buffer).map_err(xml_error)? {
             Event::Start(event) => {
                 depth += 1;
-                if depth > 2 {
+                if depth > 3 {
                     return Err(invalid("quest XML nesting exceeds the configured limit"));
                 }
                 if depth == 1 {
@@ -89,25 +98,53 @@ pub fn parse_quests_xml(bytes: &[u8]) -> Result<QuestCatalog, ConfigError> {
                         return Err(invalid("quest root element is invalid"));
                     }
                     root_seen = true;
-                } else {
+                } else if depth == 2 && event.name().as_ref() == b"fe-quest" {
+                    if catalog.len() >= MAX_QUESTS {
+                        return Err(invalid("quest catalog exceeds the supported bound"));
+                    }
+                    let (quest_id, name) = parse_quest(&event)?;
+                    active_quest = Some(QuestDefinition {
+                        quest_id,
+                        name,
+                        missions: Vec::new(),
+                    });
+                } else if !(depth == 3 && event.name().as_ref() == b"fe-mission") {
                     return Err(invalid("unexpected quest XML element"));
                 }
             }
             Event::Empty(event) => {
-                if depth != 1 || event.name().as_ref() != b"fe-quest" {
+                if depth == 2 && event.name().as_ref() == b"fe-mission" && active_quest.is_some() {
+                    let Some(quest) = active_quest.as_mut() else {
+                        return Err(invalid("mission outside a quest element"));
+                    };
+                    if quest.missions.len() >= MAX_QUEST_MISSIONS {
+                        return Err(invalid("quest missions exceed the supported bound"));
+                    }
+                    quest.missions.push(parse_mission(&event)?);
+                } else if depth == 1 && event.name().as_ref() == b"fe-quest" {
+                    if catalog.len() >= MAX_QUESTS {
+                        return Err(invalid("quest catalog exceeds the supported bound"));
+                    }
+                    let (quest_id, name) = parse_quest(&event)?;
+                    catalog.insert(QuestDefinition {
+                        quest_id,
+                        name,
+                        missions: Vec::new(),
+                    })?;
+                } else {
                     return Err(invalid("unexpected quest XML element"));
                 }
-                if catalog.len() >= MAX_QUESTS {
-                    return Err(invalid("quest catalog exceeds the supported bound"));
-                }
-                let (quest_id, name) = parse_quest(&event)?;
-                catalog.insert(quest_id, name)?;
             }
             Event::End(event) => {
                 if depth == 0 {
                     return Err(invalid("unexpected closing XML element"));
                 }
-                if depth == 1 && event.name().as_ref() != b"fe-quests" {
+                if depth == 2 && event.name().as_ref() == b"fe-quest" {
+                    let Some(definition) = active_quest.take() else {
+                        return Err(invalid("quest closing tag without an opening element"));
+                    };
+                    catalog.insert(definition)?;
+                } else if depth == 1 && event.name().as_ref() != b"fe-quests" {
                     return Err(invalid("quest root closing tag is invalid"));
                 }
                 depth -= 1;
@@ -125,6 +162,43 @@ pub fn parse_quests_xml(bytes: &[u8]) -> Result<QuestCatalog, ConfigError> {
         return Err(invalid("quest catalog is missing a complete root"));
     }
     Ok(catalog)
+}
+
+fn parse_mission(event: &BytesStart<'_>) -> Result<(String, String), ConfigError> {
+    let name = event
+        .attributes()
+        .with_checks(false)
+        .find_map(|attribute| {
+            let attribute = attribute.ok()?;
+            (attribute.key.as_ref() == b"name").then_some(attribute)
+        })
+        .ok_or_else(|| invalid("quest mission is missing its name attribute"))?;
+    let description = event
+        .attributes()
+        .with_checks(false)
+        .find_map(|attribute| {
+            let attribute = attribute.ok()?;
+            (attribute.key.as_ref() == b"description").then_some(attribute)
+        })
+        .ok_or_else(|| invalid("quest mission is missing its description attribute"))?;
+    let name_value = name
+        .unescape_value()
+        .map_err(|error| invalid(format!("invalid mission name: {error}")))?;
+    let description_value = description
+        .unescape_value()
+        .map_err(|error| invalid(format!("invalid mission description: {error}")))?;
+    let name_value = name_value.trim();
+    let description_value = description_value.trim();
+    if name_value.is_empty()
+        || name_value.len() > 64
+        || description_value.is_empty()
+        || description_value.len() > 255
+    {
+        return Err(invalid(
+            "mission name and description must stay within bounded lengths",
+        ));
+    }
+    Ok((name_value.to_owned(), description_value.to_owned()))
 }
 
 fn parse_quest(event: &BytesStart<'_>) -> Result<(u16, String), ConfigError> {

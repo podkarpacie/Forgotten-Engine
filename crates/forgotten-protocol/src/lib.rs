@@ -144,6 +144,37 @@ pub struct StatusPlayer {
     pub level: u32,
 }
 
+/// Encodes the classic quest-line response: the requested quest ID, one bounded mission count,
+/// then per mission a name and description pair. Unknown or not-started quests encode an empty
+/// mission list so the client window opens without inventing content.
+pub fn encode_native_otclient_quest_line(
+    profile: &NativeOtClientProfile,
+    quest_id: u16,
+    missions: &[(String, String)],
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() || missions.len() > u8::MAX as usize {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    for (name, description) in missions {
+        if name.is_empty()
+            || name.len() > MAX_LOGIN_STRING_BYTES
+            || description.is_empty()
+            || description.len() > MAX_LOGIN_STRING_BYTES
+        {
+            return Err(ProtocolError::InvalidLength(name.len()));
+        }
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_QUEST_LINE);
+    writer.u16(quest_id);
+    writer.byte(missions.len() as u8);
+    for (name, description) in missions {
+        writer.string(name);
+        writer.string(description);
+    }
+    Ok(Frame(writer.finish()))
+}
+
 pub fn decode_status_request(frame: &Frame) -> Result<StatusRequest, ProtocolError> {
     let mut reader = Reader::new(&frame.0);
     match reader.byte()? {
@@ -960,6 +991,8 @@ pub const NATIVE_OTCLIENT_CLIENT_REMOVE_VIP: u8 = 0xdd;
 pub const NATIVE_OTCLIENT_CLIENT_EDIT_VIP: u8 = 0xde;
 pub const NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG: u8 = 0xf0;
 pub const NATIVE_OTCLIENT_GAME_QUEST_LOG: u8 = 0xf0;
+pub const NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LINE: u8 = 0xf1;
+pub const NATIVE_OTCLIENT_GAME_QUEST_LINE: u8 = 0xf1;
 pub const NATIVE_OTCLIENT_GAME_CHANNELS: u8 = 0xab;
 pub const NATIVE_OTCLIENT_GAME_OPEN_CHANNEL: u8 = 0xac;
 pub const NATIVE_OTCLIENT_MAX_IGNORED_INTERACTION_BYTES: usize = 512;
@@ -1340,6 +1373,9 @@ pub enum NativeOtClientGameAction {
     },
     RequestOutfit,
     RequestQuestLog,
+    RequestQuestLine {
+        quest_id: u16,
+    },
     RequestChannels,
     JoinChannel(u16),
     LeaveChannel(u16),
@@ -2456,6 +2492,14 @@ pub fn decode_native_otclient_game_action(
         }
         NATIVE_OTCLIENT_CLIENT_REQUEST_OUTFIT => NativeOtClientGameAction::RequestOutfit,
         NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LOG => NativeOtClientGameAction::RequestQuestLog,
+        NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LINE => {
+            if reader.remaining() != 2 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            NativeOtClientGameAction::RequestQuestLine {
+                quest_id: reader.u16()?,
+            }
+        }
         NATIVE_OTCLIENT_CLIENT_REQUEST_CHANNELS => NativeOtClientGameAction::RequestChannels,
         NATIVE_OTCLIENT_CLIENT_JOIN_CHANNEL => NativeOtClientGameAction::JoinChannel(reader.u16()?),
         NATIVE_OTCLIENT_CLIENT_LEAVE_CHANNEL => {

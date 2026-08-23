@@ -3,9 +3,9 @@
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
 use forgotten_config::{
-    parse_declarative_shops_xml, parse_quests_xml, DeclarativeNpcDialogueCatalog,
-    DeclarativeShopCatalog, DeclarativeSpellCatalog, DeclarativeWeaponCatalog, LegacyItemSlotType,
-    LegacyPublicChannelCatalog, QuestCatalog, WorldType,
+    DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog, DeclarativeSpellCatalog,
+    DeclarativeWeaponCatalog, LegacyItemSlotType, LegacyPublicChannelCatalog, QuestCatalog,
+    WorldType,
 };
 use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
@@ -63,20 +63,21 @@ use forgotten_protocol::{
     encode_native_otclient_open_public_channel, encode_native_otclient_player_modes,
     encode_native_otclient_player_skills, encode_native_otclient_player_stats,
     encode_native_otclient_private_message_from, encode_native_otclient_public_channel_say,
-    encode_native_otclient_public_say, encode_native_otclient_quest_list,
-    encode_native_otclient_read_only_text_window, encode_native_otclient_set_inventory,
-    encode_native_otclient_status_message, encode_native_otclient_whisper,
-    encode_native_otclient_yell, encode_status_binary, encode_status_metrics, encode_status_xml,
-    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
-    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
-    NativeOtClientCardinalDirection, NativeOtClientClassicChannel, NativeOtClientClassicItemRecord,
-    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
-    NativeOtClientClassicPartyShield, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
-    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerVitals,
-    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint,
-    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
-    MAX_LOGIN_STRING_BYTES, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_MESSAGE_SAY,
+    encode_native_otclient_public_say, encode_native_otclient_quest_line,
+    encode_native_otclient_quest_list, encode_native_otclient_read_only_text_window,
+    encode_native_otclient_set_inventory, encode_native_otclient_status_message,
+    encode_native_otclient_whisper, encode_native_otclient_yell, encode_status_binary,
+    encode_status_metrics, encode_status_xml, generate_legacy_74_game_challenge,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
+    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
+    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection, NativeOtClientClassicChannel,
+    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
+    NativeOtClientClassicOutfit, NativeOtClientClassicPartyShield,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
+    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
+    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
+    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE, MAX_LOGIN_STRING_BYTES,
+    NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_MESSAGE_SAY,
     NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
@@ -1096,6 +1097,9 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         }
         NativeOtClientGameAction::RequestOutfit => "action=request-outfit".into(),
         NativeOtClientGameAction::RequestQuestLog => "action=request-quest-log".into(),
+        NativeOtClientGameAction::RequestQuestLine { quest_id } => {
+            format!("action=request-quest-line quest-id={quest_id}")
+        }
         NativeOtClientGameAction::RequestChannels => "action=request-channels".into(),
         NativeOtClientGameAction::JoinChannel(channel_id) => {
             format!("action=join-channel channel-id={channel_id}")
@@ -8686,6 +8690,66 @@ fn handle_native_otclient_game(
                     );
                     continue;
                 }
+                // Backpack-in-hand: using the equipped backpack item opens the lowest owned
+                // top-level container as a client window. FE links one backpack to one
+                // container by convention until full nesting lands.
+                if position.x == 0xffff
+                    && position.y & 0x40 == 0
+                    && EquipmentSlot::from_code(position.y as u8) == Some(EquipmentSlot::Backpack)
+                {
+                    if observed_dead {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=use-item outcome=deferred-backpack-while-dead",
+                        );
+                        continue;
+                    }
+                    let equipped_backpack = shared_world
+                        .player_equipment(character.id)
+                        .ok()
+                        .and_then(|equipment| equipment.item(EquipmentSlot::Backpack).cloned());
+                    if equipped_backpack.is_none() {
+                        continue;
+                    }
+                    let containers = shared_world.player_containers(character.id)?;
+                    let open_container = containers
+                        .iter()
+                        .map(|(id, container)| (id, container))
+                        .find(|(_, container)| !container.has_parent)
+                        .map(|(id, _)| id);
+                    let Some(container_id) = open_container else {
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            "action=use-item outcome=deferred-backpack-no-container",
+                        );
+                        continue;
+                    };
+                    if closed_container_ids.contains(&container_id) {
+                        closed_container_ids.remove(&container_id);
+                    }
+                    if let Some(container) = containers.container(container_id) {
+                        if let Some(frame) = native_classic_container_frame(
+                            &config.client_profile,
+                            config.item_presentation_catalog.as_deref(),
+                            container,
+                        )
+                        .map_err(HostError::Protocol)?
+                        {
+                            write_frame(stream, &frame)?;
+                            observed_containers_epoch = shared_world.containers_epoch();
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "action=use-item outcome=backpack-window-opened container-id={container_id}"
+                                ),
+                            );
+                        }
+                    }
+                    continue;
+                }
                 // Runtime-corpse opening runs first because identity comes from FE's own durable
                 // registry rather than the operator presentation catalog.
                 let corpse_attempt = map_owner.runtime_tile_item(
@@ -9123,9 +9187,9 @@ fn handle_native_otclient_game(
                             .player_quests(u64::from(character.id))
                             .map_err(HostError::Persistence)?
                         {
-                            if let Some(name) = catalog.get(quest_id) {
+                            if let Some(definition) = catalog.get(quest_id) {
                                 let _ = completed;
-                                entries.push((quest_id, name.to_owned()));
+                                entries.push((quest_id, definition.name.clone()));
                             }
                         }
                         entries
@@ -9147,6 +9211,37 @@ fn handle_native_otclient_game(
                         "outbound=quest-log opcode=0xf0 entries={} bytes={}",
                         quest_entries.len(),
                         quest_log.0.len()
+                    ),
+                );
+            }
+            NativeOtClientGameAction::RequestQuestLine { quest_id } => {
+                // The quest line window opens for started persisted quests with declared
+                // missions; unknown or not-started quests receive an empty mission list.
+                let missions = match config.quest_catalog.as_deref() {
+                    Some(catalog) => {
+                        let started = database
+                            .player_quests(u64::from(character.id))
+                            .map_err(HostError::Persistence)?
+                            .iter()
+                            .any(|(started_id, _)| *started_id == quest_id);
+                        match catalog.get(quest_id).filter(|_| started) {
+                            Some(definition) => definition.missions.clone(),
+                            None => Vec::new(),
+                        }
+                    }
+                    None => Vec::new(),
+                };
+                let line_frame =
+                    encode_native_otclient_quest_line(&config.client_profile, quest_id, &missions)
+                        .map_err(HostError::Protocol)?;
+                write_frame(stream, &line_frame)?;
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!(
+                        "outbound=quest-line opcode=0xf1 quest-id={quest_id} missions={} bytes={}",
+                        missions.len(),
+                        line_frame.0.len()
                     ),
                 );
             }
@@ -12031,6 +12126,7 @@ mod tests {
         parse_declarative_npc_dialogue_xml, parse_declarative_spells_xml,
         parse_declarative_weapons_xml, parse_tfs_public_channels_xml,
     };
+    use forgotten_config::{parse_declarative_shops_xml, parse_quests_xml};
     use forgotten_core::{Player, Position, WorldMapTile};
     use forgotten_protocol::FE_7_4_PROFILE;
     use std::fs;
@@ -18297,6 +18393,207 @@ mod tests {
             read_data_frame(&mut stream).0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_QUEST_LOG
         );
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_use_item_opens_an_equipped_backpack_container_window() {
+        let database_path = database_path("native-backpack-window");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        // Equipped backpack plus one owned container holding a mapped item.
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(EquipmentSlot::Backpack, ItemInstance::new(1988, 1).unwrap());
+        database.replace_player_equipment(1, &equipment).unwrap();
+        let mut containers = PlayerContainers::default();
+        let mut backpack = PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        backpack
+            .items
+            .merge_or_insert_stack(ItemInstance::new(2148, 5).unwrap())
+            .unwrap();
+        containers.insert(backpack).unwrap();
+        database.replace_player_containers(1, &containers).unwrap();
+
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for server_id in [1988, 2148] {
+            catalog
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id: server_id,
+                        requires_classic_740_subtype: false,
+                    },
+                )
+                .unwrap();
+        }
+        native_config.item_presentation_catalog = Some(Arc::new(catalog));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+        // Bootstrap equipment records for the equipped backpack.
+        assert_eq!(
+            read_data_frame(&mut stream).0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_SET_INVENTORY
+        );
+
+        // Use the equipped backpack (slot code 3).
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_USE_ITEM,
+                0xff,
+                0xff,
+                3,
+                0x00,
+                0x00,
+                0xc4,
+                0x07,
+                0x00,
+                0x00,
+            ]),
+        )
+        .unwrap();
+        let window = read_data_frame(&mut stream);
+        assert_eq!(
+            window.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER
+        );
+        // Container id 2 opens; after the bounded "Backpack" name the item count follows.
+        assert_eq!(window.0[1], 2);
+        assert_eq!(&window.0[6..14], b"Backpack");
+        assert_eq!(window.0[16], 1);
+
+        drop(stream);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_quest_line_returns_declared_missions_for_started_quests() {
+        let database_path = database_path("native-quest-line");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        database.replace_player_quests(1, &[(100, false)]).unwrap();
+
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.quest_catalog = Some(Arc::new(
+            parse_quests_xml(
+                br#"<fe-quests>
+                        <fe-quest id="100" name="The Rat Hunt">
+                            <fe-mission name="Kill Rats" description="Slay ten rats in the sewers."/>
+                            <fe-mission name="Report Back" description="Return to Captain Harsky."/>
+                        </fe-quest>
+                    </fe-quests>"#,
+            )
+            .unwrap(),
+        ));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+
+        // Request the quest line for the started quest.
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LINE,
+                100,
+                0,
+            ]),
+        )
+        .unwrap();
+        let line = read_data_frame(&mut stream);
+        assert_eq!(
+            line.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_QUEST_LINE
+        );
+        assert_eq!(&line.0[1..3], &[100, 0]);
+        assert_eq!(line.0[3], 2);
+        assert!(String::from_utf8_lossy(&line.0).contains("Kill Rats"));
+        assert!(String::from_utf8_lossy(&line.0).contains("Captain Harsky"));
+
+        // An unknown quest still receives a valid empty line frame.
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_REQUEST_QUEST_LINE,
+                200,
+                0,
+            ]),
+        )
+        .unwrap();
+        let empty_line = read_data_frame(&mut stream);
+        assert_eq!(
+            empty_line.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_QUEST_LINE,
+                200,
+                0,
+                0
+            ]
+        );
+
+        drop(stream);
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }
