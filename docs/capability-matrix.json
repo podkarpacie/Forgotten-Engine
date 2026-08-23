@@ -190,7 +190,9 @@
       "operationsMetrics": "partial",
       "operationsMetricsDetail": "the status listener answers an FE-specific fe-metrics request with stable-field JSON counters (uptime, persisted account and character counts, SQLite schema version, configured player cap) sourced from one authoritative database read; classic-client XML and binary responses stay byte-identical because the new tag cannot collide with their magic. Prometheus scraping, dashboards, and alerting remain deferred",
       "packagingDocker": "partial",
-      "packagingDockerDetail": "an official multi-stage Docker image builds the release binary onto debian-slim under a non-root system user with the /data world-directory contract, plus a compose deployment example mapping the classic status/login, game, and native OTClient ports; real port bindings stay config.lua-driven. Registry publication, multi-arch builds, and CI image jobs remain deferred"
+      "packagingDockerDetail": "an official multi-stage Docker image builds the release binary onto debian-slim under a non-root system user with the /data world-directory contract, plus a compose deployment example mapping the classic status/login, game, and native OTClient ports; real port bindings stay config.lua-driven. Registry publication, multi-arch builds, and CI image jobs remain deferred",
+      "playerBlessingPromotionPersistence": "partial",
+      "playerBlessingPromotionPersistenceDetail": "SQLite schema v29 adds typed bless_count (validated 0-5 classic ceiling on read and write) and promoted columns with authoritative accessors plus player bless / player promote CLI commands. The state is provisionable and restart-surviving but no runtime behavior consumes it yet: the audited default death-loss reduction and promoted-vocation semantics remain deferred."
     },
     {
       "id": "fe-8.0",
@@ -205,7 +207,9 @@
       "combat": "deferred",
       "creatures": "deferred",
       "scripting": "deferred",
-      "socialAndEconomy": "deferred"
+      "socialAndEconomy": "deferred",
+      "playerBlessingPromotionPersistence": "partial",
+      "playerBlessingPromotionPersistenceDetail": "SQLite schema v29 adds typed bless_count (validated 0-5 classic ceiling on read and write) and promoted columns with authoritative accessors plus player bless / player promote CLI commands. The state is provisionable and restart-surviving but no runtime behavior consumes it yet: the audited default death-loss reduction and promoted-vocation semantics remain deferred."
     },
     {
       "id": "fe-1.2",
@@ -219,7 +223,9 @@
       "combat": "deferred",
       "creatures": "deferred",
       "scripting": "deferred",
-      "socialAndEconomy": "deferred"
+      "socialAndEconomy": "deferred",
+      "playerBlessingPromotionPersistence": "partial",
+      "playerBlessingPromotionPersistenceDetail": "SQLite schema v29 adds typed bless_count (validated 0-5 classic ceiling on read and write) and promoted columns with authoritative accessors plus player bless / player promote CLI commands. The state is provisionable and restart-surviving but no runtime behavior consumes it yet: the audited default death-loss reduction and promoted-vocation semantics remain deferred."
     }
   ],
   "cliCompatibility": {
