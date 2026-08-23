@@ -335,6 +335,10 @@ fn run_native_shared_world_heartbeat(
                 &shared_world,
                 &mut auto_save_database,
             )?;
+            // Party relations flush with the same bounded cadence; any party mutation
+            // rebuilds the whole table from live state, so offline-stale rows are pruned
+            // only after hydration had its chance at registration time.
+            auto_save_database.replace_player_parties(&shared_world.party_snapshots()?)?;
             for player_id in shared_world.registered_player_ids()? {
                 let (player, vitals) = shared_world.player_and_vitals(player_id)?;
                 auto_save_database.update_player_position(player_id, player.position)?;
@@ -3711,6 +3715,34 @@ impl SharedNativeWorld {
         Ok(self.lock()?.registered_player_ids())
     }
 
+    /// Returns every live party as deterministic (leader, non-leader members) records for
+    /// bounded persistence flushes.
+    pub fn party_snapshots(&self) -> Result<Vec<(u64, Vec<u64>)>, HostError> {
+        Ok(self.lock()?.party_snapshots())
+    }
+
+    /// Attaches an unaffiliated player directly to a live leader's party (hydration path).
+    pub fn add_existing_party_member(
+        &self,
+        leader_id: u64,
+        player_id: u64,
+    ) -> Result<(), HostError> {
+        self.lock()?
+            .add_existing_party_member(leader_id, player_id)
+            .map_err(HostError::Core)?;
+        self.party_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Rebuilds one persisted party when neither participant holds live party state.
+    pub fn restore_party_snapshot(&self, leader_id: u64, members: &[u64]) -> Result<(), HostError> {
+        self.lock()?
+            .restore_party_snapshot(leader_id, members)
+            .map_err(HostError::Core)?;
+        self.party_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     pub fn vitals_epoch(&self) -> u64 {
         self.vitals_epoch.load(Ordering::SeqCst)
     }
@@ -5874,6 +5906,36 @@ fn serve_game_session(
     Ok(())
 }
 
+/// Best-effort reattach of a relogging player to their persisted party. The stored relation
+/// is only consumed when the stored leader is online; otherwise the row is left in place so
+/// a later leader login can still reform the party through the same path.
+fn try_hydrate_persisted_party(
+    shared_world: &SharedNativeWorld,
+    database: &EngineDatabase,
+    player_id: u64,
+) -> Result<(), HostError> {
+    let Some(leader_id) = database.party_leader_of(player_id)? else {
+        return Ok(());
+    };
+    if leader_id == player_id {
+        return Ok(());
+    }
+    let leader_online = shared_world.player_and_vitals(leader_id).is_ok();
+    if !leader_online {
+        return Ok(());
+    }
+    let leader_leads_live_party = matches!(
+        shared_world.lock()?.player_party_leader(leader_id),
+        Ok(Some(_))
+    );
+    if leader_leads_live_party {
+        shared_world.add_existing_party_member(leader_id, player_id)?;
+    } else {
+        shared_world.restore_party_snapshot(leader_id, &[player_id])?;
+    }
+    Ok(())
+}
+
 fn serve_native_otclient_login(
     listener: TcpListener,
     config: NativeOtClientHostConfig,
@@ -6422,6 +6484,16 @@ fn handle_native_otclient_game(
         player_id: character.id,
         vip_presence_announced: false,
     };
+    // Persisted-party hydration: if this character's stored leader is online, reattach to
+    // that live party (or reform it when the online leader has none yet). Failures are
+    // non-fatal; the stored row survives until the next bounded snapshot flush prunes it.
+    if let Err(error) = try_hydrate_persisted_party(shared_world, &database, character.id) {
+        native_diagnostic(
+            config.extended_diagnostics,
+            peer,
+            &format!("party=hydration-failed error={error}"),
+        );
+    }
     let hydrated_armor_defense = sync_native_equipment_armor_defense(
         shared_world,
         character.id,

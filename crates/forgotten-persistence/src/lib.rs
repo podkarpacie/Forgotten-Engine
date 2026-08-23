@@ -4581,6 +4581,22 @@ impl EngineDatabase {
         }
     }
 
+    /// Returns every persisted member of one stored leader's party, sorted.
+    pub fn party_members_of(&self, leader_id: u64) -> Result<Vec<u64>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT player_id FROM player_parties WHERE party_leader_id = ?1 ORDER BY player_id",
+        )?;
+        let rows = statement.query_map(params![leader_id as i64], |row| row.get::<_, i64>(0))?;
+        let mut members = Vec::new();
+        for row in rows {
+            let raw = row?;
+            members.push(u64::try_from(raw).map_err(|_| {
+                PersistenceError::InvalidPartySnapshot("persisted member does not fit u64".into())
+            })?);
+        }
+        Ok(members)
+    }
+
     fn ensure_player_exists(&self, player_id: u64) -> Result<(), PersistenceError> {
         let exists = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM players WHERE id = ?1)",

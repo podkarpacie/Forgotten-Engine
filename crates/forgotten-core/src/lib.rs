@@ -3138,6 +3138,33 @@ impl WorldState {
         Ok(())
     }
 
+    /// Attaches one unaffiliated player directly to a live leader's party without an
+    /// invitation round-trip. Used by persisted-party hydration on relog; ordinary gameplay
+    /// must keep using invite/accept.
+    pub fn add_existing_party_member(
+        &mut self,
+        leader_id: u64,
+        player_id: u64,
+    ) -> Result<(), CoreError> {
+        if player_id == leader_id {
+            return Err(CoreError::InvalidPartySnapshot(
+                "leader cannot be added as a member of itself".into(),
+            ));
+        }
+        self.ensure_party_player_exists(leader_id)?;
+        self.ensure_party_player_exists(player_id)?;
+        if !self.party_leaders.contains(&leader_id) {
+            return Err(CoreError::PlayerNotInParty(leader_id));
+        }
+        if self.party_leaders.contains(&player_id)
+            || self.party_memberships.contains_key(&player_id)
+        {
+            return Err(CoreError::PlayerNotInPartyFree(player_id));
+        }
+        self.party_memberships.insert(player_id, leader_id);
+        Ok(())
+    }
+
     /// Enables or disables the session-local shared-experience request for one current leader.
     /// The result describes eligibility only; it does not distribute experience or emit a packet.
     pub fn set_party_shared_experience_requested(
@@ -6713,6 +6740,7 @@ pub enum CoreError {
     UnknownPlayer(u64),
     PlayerNotInParty(u64),
     PlayerAlreadyInParty(u64),
+    PlayerNotInPartyFree(u64),
     PartyInvitationNotFound {
         leader_id: u64,
         invitee_id: u64,
@@ -7453,6 +7481,47 @@ mod tests {
             Err(CoreError::UnknownPlayer(999))
         );
         assert_eq!(clean.player_party_leader(leader.id), Ok(None));
+    }
+
+    #[test]
+    fn add_existing_party_member_attaches_only_to_live_unaffiliated_players() {
+        let mut world = WorldState::default();
+        let leader = party_player(7, "Hydra Leader", 100);
+        let member = party_player(8, "Hydra One", 101);
+        let outsider = party_player(9, "Hydra Two", 102);
+        for player in [&leader, &member, &outsider] {
+            world.add_player(player.clone()).unwrap();
+        }
+        // No live party yet: direct attach must fail.
+        assert_eq!(
+            world.add_existing_party_member(leader.id, member.id),
+            Err(CoreError::PlayerNotInParty(leader.id))
+        );
+        world.invite_to_party(leader.id, outsider.id).unwrap();
+        world
+            .accept_party_invitation(outsider.id, leader.id)
+            .unwrap();
+        // Already-affiliated targets are rejected without disturbing the party.
+        assert_eq!(
+            world.add_existing_party_member(leader.id, outsider.id),
+            Err(CoreError::PlayerNotInPartyFree(outsider.id))
+        );
+        assert_eq!(
+            world.party_snapshots(),
+            vec![(leader.id, vec![outsider.id])]
+        );
+        world
+            .add_existing_party_member(leader.id, member.id)
+            .unwrap();
+        assert_eq!(
+            world.player_party_members(leader.id),
+            Ok(vec![member.id, outsider.id])
+        );
+        // Self-attach is structurally invalid.
+        assert!(matches!(
+            world.add_existing_party_member(leader.id, leader.id),
+            Err(CoreError::InvalidPartySnapshot(_))
+        ));
     }
 
     #[test]
