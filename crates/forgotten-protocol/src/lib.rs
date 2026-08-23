@@ -868,6 +868,10 @@ pub const NATIVE_OTCLIENT_GAME_EDIT_TEXT: u8 = 0x96;
 pub const NATIVE_OTCLIENT_GAME_TEXT_MESSAGE: u8 = 0xb4;
 pub const NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT: u8 = 0x15;
 pub const NATIVE_OTCLIENT_MESSAGE_SAY: u8 = 0x01;
+/// Classic server-talk mode for a whispered message delivered only to nearby listeners.
+pub const NATIVE_OTCLIENT_MESSAGE_WHISPER: u8 = 0x02;
+/// Classic server-talk mode for a yelled message delivered to a wider same-floor audience.
+pub const NATIVE_OTCLIENT_MESSAGE_YELL: u8 = 0x03;
 pub const NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT: u8 = 0xc8;
 pub const NATIVE_OTCLIENT_GAME_VIP_ADD: u8 = 0xd2;
 pub const NATIVE_OTCLIENT_GAME_VIP_STATE: u8 = 0xd3;
@@ -1523,6 +1527,75 @@ pub fn encode_native_otclient_public_say(
     writer.byte(NATIVE_OTCLIENT_GAME_TALK);
     writer.string(speaker_name);
     writer.byte(NATIVE_OTCLIENT_MESSAGE_SAY);
+    writer.u16(speaker_position.x);
+    writer.u16(speaker_position.y);
+    writer.byte(speaker_position.z);
+    writer.string(text);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes one classic 740 whispered Talk record. The local OTCv8 parser maps server mode `2`
+/// to `MessageWhisper` for protocol 740 and reads the speaker position before the text, exactly
+/// like the ordinary Say layout.
+pub fn encode_native_otclient_whisper(
+    profile: &NativeOtClientProfile,
+    speaker_name: &str,
+    speaker_position: NativeOtClientPosition,
+    text: &str,
+) -> Result<Frame, ProtocolError> {
+    encode_native_otclient_positioned_talk(
+        profile,
+        NATIVE_OTCLIENT_MESSAGE_WHISPER,
+        speaker_name,
+        speaker_position,
+        text,
+    )
+}
+
+/// Encodes one classic 740 yelled Talk record. The local OTCv8 parser maps server mode `3`
+/// to `MessageYell` for protocol 740 and reads the speaker position before the text, exactly
+/// like the ordinary Say layout.
+pub fn encode_native_otclient_yell(
+    profile: &NativeOtClientProfile,
+    speaker_name: &str,
+    speaker_position: NativeOtClientPosition,
+    text: &str,
+) -> Result<Frame, ProtocolError> {
+    encode_native_otclient_positioned_talk(
+        profile,
+        NATIVE_OTCLIENT_MESSAGE_YELL,
+        speaker_name,
+        speaker_position,
+        text,
+    )
+}
+
+fn encode_native_otclient_positioned_talk(
+    profile: &NativeOtClientProfile,
+    mode: u8,
+    speaker_name: &str,
+    speaker_position: NativeOtClientPosition,
+    text: &str,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    if speaker_name.is_empty()
+        || text.is_empty()
+        || text.len() > NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES
+    {
+        return Err(ProtocolError::StringTooLong(text.len()));
+    }
+    let fixed_bytes = 8usize;
+    if speaker_name.len() + text.len() + fixed_bytes > MAX_FRAME_SIZE {
+        return Err(ProtocolError::StringTooLong(
+            speaker_name.len().saturating_add(text.len()),
+        ));
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_TALK);
+    writer.string(speaker_name);
+    writer.byte(mode);
     writer.u16(speaker_position.x);
     writer.u16(speaker_position.y);
     writer.byte(speaker_position.z);
@@ -4805,6 +4878,63 @@ mod tests {
                 b'h',
                 b't',
                 4,
+                2,
+                0,
+                b'h',
+                b'i',
+            ]
+        );
+        let whisper_position = NativeOtClientPosition {
+            x: 100,
+            y: 200,
+            z: 7,
+        };
+        assert_eq!(
+            encode_native_otclient_whisper(&profile, "Knight", whisper_position, "hi")
+                .unwrap()
+                .0,
+            vec![
+                NATIVE_OTCLIENT_GAME_TALK,
+                6,
+                0,
+                b'K',
+                b'n',
+                b'i',
+                b'g',
+                b'h',
+                b't',
+                NATIVE_OTCLIENT_MESSAGE_WHISPER,
+                100,
+                0,
+                200,
+                0,
+                7,
+                2,
+                0,
+                b'h',
+                b'i',
+            ]
+        );
+        assert_eq!(
+            encode_native_otclient_yell(&profile, "Knight", whisper_position, "hi")
+                .unwrap()
+                .0,
+            vec![
+                NATIVE_OTCLIENT_GAME_TALK,
+                6,
+                0,
+                b'K',
+                b'n',
+                b'i',
+                b'g',
+                b'h',
+                b't',
+                NATIVE_OTCLIENT_MESSAGE_YELL,
+                100,
+                0,
+                200,
+                0,
+                7,
                 2,
                 0,
                 b'h',

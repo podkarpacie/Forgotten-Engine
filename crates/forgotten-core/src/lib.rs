@@ -3380,6 +3380,15 @@ impl WorldState {
             .collect()
     }
 
+    /// Captures one detached ID-to-position map for every registered player. Chat range checks
+    /// and similar read-only policies can consult this snapshot without retaining the world lock.
+    pub fn player_positions(&self) -> BTreeMap<u64, Position> {
+        self.players
+            .iter()
+            .map(|(id, player)| (*id, player.position))
+            .collect()
+    }
+
     pub fn player_interaction_intent(
         &self,
         player_id: u64,

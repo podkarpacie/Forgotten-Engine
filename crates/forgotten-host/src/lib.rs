@@ -1,4 +1,4 @@
-//! Persistent TCP host and bounded diagnostic session foundation for Forgotten Engine.
+﻿//! Persistent TCP host and bounded diagnostic session foundation for Forgotten Engine.
 //!
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
@@ -63,6 +63,7 @@ use forgotten_protocol::{
     encode_native_otclient_private_message_from, encode_native_otclient_public_channel_say,
     encode_native_otclient_public_say, encode_native_otclient_read_only_text_window,
     encode_native_otclient_set_inventory, encode_native_otclient_status_message,
+    encode_native_otclient_whisper, encode_native_otclient_yell,
     encode_status_binary, encode_status_xml, generate_legacy_74_game_challenge,
     xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
     InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
@@ -74,6 +75,7 @@ use forgotten_protocol::{
     NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
     StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
     NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_MESSAGE_SAY,
+    NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL,
     NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -320,6 +322,10 @@ fn run_native_shared_world_heartbeat(
 }
 const NATIVE_OTCLIENT_SHARED_CHAT_QUEUE_CAPACITY: usize = 64;
 const NATIVE_OTCLIENT_SHARED_VIP_QUEUE_CAPACITY: usize = 64;
+/// Audited classic whisper delivery range: same floor within one cardinal or diagonal step.
+const NATIVE_CLASSIC_WHISPER_RANGE_TILES: u16 = 1;
+/// Audited classic yell delivery range: same floor within 18 tiles in each axis.
+const NATIVE_CLASSIC_YELL_RANGE_TILES: u16 = 18;
 const NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE: u16 = 10;
 /// Default corpse container server item ID for native static-monster defeats. A dedicated
 /// operator mapping can replace this later; the bounded default keeps the defeat loop closed.
@@ -2073,7 +2079,23 @@ struct SharedPublicChatEvent {
     speaker_position: NativeOtClientPosition,
     channel_id: Option<u16>,
     private: bool,
+    /// Classic server-talk mode for delivery: 1 say, 2 whisper, 3 yell. Channel and private
+    /// events retain their existing dedicated encoders and ignore this field.
+    talk_mode: u8,
     text: String,
+}
+
+impl Default for SharedPublicChatEvent {
+    fn default() -> Self {
+        Self {
+            speaker_name: String::new(),
+            speaker_position: NativeOtClientPosition { x: 0, y: 0, z: 0 },
+            channel_id: None,
+            private: false,
+            talk_mode: NATIVE_OTCLIENT_MESSAGE_SAY,
+            text: String::new(),
+        }
+    }
 }
 
 /// One queued classic VIP presence change for an exact persisted watched player ID.
@@ -3663,6 +3685,77 @@ impl SharedNativeWorld {
         self.broadcast_chat(sender_id, message, None)
     }
 
+    fn broadcast_whisper_chat(&self, sender_id: u64, message: &str) -> Result<usize, HostError> {
+        self.broadcast_ranged_chat(sender_id, message, NATIVE_CLASSIC_WHISPER_RANGE_TILES)
+    }
+
+    fn broadcast_yell_chat(&self, sender_id: u64, message: &str) -> Result<usize, HostError> {
+        self.broadcast_ranged_chat(sender_id, message, NATIVE_CLASSIC_YELL_RANGE_TILES)
+    }
+
+    /// Delivers one whisper or yell to same-floor recipients within the audited classic range of
+    /// the authoritative speaker position. The speaker always receives their own message. The
+    /// listener-position snapshot is captured under one short lock so no world lock is taken
+    /// while the chat-recipient mutex is held.
+    fn broadcast_ranged_chat(
+        &self,
+        sender_id: u64,
+        message: &str,
+        range_tiles: u16,
+    ) -> Result<usize, HostError> {
+        let (sender, listener_positions) = {
+            let world = self.lock()?;
+            let sender = world
+                .player(sender_id)
+                .cloned()
+                .ok_or(forgotten_core::CoreError::UnknownPlayer(sender_id))
+                .map_err(HostError::Core)?;
+            (sender, world.player_positions())
+        };
+        let body = message.split_whitespace().collect::<Vec<_>>().join(" ");
+        if body.is_empty() {
+            return Ok(0);
+        }
+        let talk_mode = if range_tiles <= NATIVE_CLASSIC_WHISPER_RANGE_TILES {
+            NATIVE_OTCLIENT_MESSAGE_WHISPER
+        } else {
+            NATIVE_OTCLIENT_MESSAGE_YELL
+        };
+        let event = SharedPublicChatEvent {
+            speaker_name: sender.name.clone(),
+            speaker_position: native_position(sender.position),
+            channel_id: None,
+            private: false,
+            talk_mode,
+            text: truncate_native_chat_text(&body),
+        };
+        let mut recipients = self
+            .chat_recipients
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut delivered = 0;
+        recipients.retain(|recipient_id, recipient| {
+            let within_range = *recipient_id == sender_id
+                || listener_positions.get(recipient_id).is_some_and(|listener| {
+                    listener.z == sender.position.z
+                        && listener.x.abs_diff(sender.position.x) <= u16::from(range_tiles)
+                        && listener.y.abs_diff(sender.position.y) <= u16::from(range_tiles)
+                });
+            if !within_range {
+                return true;
+            }
+            match recipient.sender.try_send(event.clone()) {
+                Ok(()) => {
+                    delivered += 1;
+                    true
+                }
+                Err(mpsc::TrySendError::Full(_)) => true,
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            }
+        });
+        Ok(delivered)
+    }
+
     fn broadcast_configured_public_channel_chat(
         &self,
         sender_id: u64,
@@ -3693,6 +3786,7 @@ impl SharedNativeWorld {
             speaker_position: native_position(sender.position),
             channel_id: None,
             private: true,
+            talk_mode: NATIVE_OTCLIENT_MESSAGE_SAY,
             text: truncate_native_chat_text(&body),
         };
         let mut recipients = self
@@ -3737,6 +3831,7 @@ impl SharedNativeWorld {
             speaker_position: native_position(sender.position),
             channel_id,
             private: false,
+            talk_mode: NATIVE_OTCLIENT_MESSAGE_SAY,
             text: truncate_native_chat_text(&body),
         };
         let mut recipients = self
@@ -6016,7 +6111,7 @@ fn handle_native_otclient_game(
                     continue;
                 }
                 if let Some((container_id, item_index)) = source_container {
-                    // All container↔equipment and container↔container throw paths below
+                    // All containerĂ˘â€ â€ťequipment and containerĂ˘â€ â€ťcontainer throw paths below
                     // persist through the atomic replace_player_inventory boundary so a
                     // torn two-transaction inventory can never be observed or crash-duplicated.
                     if let Some(target_container_id) = target_container_id {
@@ -7358,6 +7453,10 @@ fn handle_native_otclient_game(
                         channel_id,
                         &request.message,
                     )?
+                } else if request.mode == 2 {
+                    shared_world.broadcast_whisper_chat(character.id, &request.message)?
+                } else if request.mode == 3 {
+                    shared_world.broadcast_yell_chat(character.id, &request.message)?
                 } else if request.channel_id.is_some() || request.recipient.is_some() {
                     native_diagnostic(
                         config.extended_diagnostics,
@@ -7803,17 +7902,41 @@ fn drain_shared_public_chat(
                             7,
                             "public-channel-chat",
                         )),
-                        None => Some((
-                            encode_native_otclient_public_say(
-                                profile,
-                                &event.speaker_name,
-                                event.speaker_position,
-                                &event.text,
-                            )
-                            .map_err(HostError::Protocol)?,
-                            1,
-                            "public-chat",
-                        )),
+                        None => match event.talk_mode {
+                            NATIVE_OTCLIENT_MESSAGE_WHISPER => Some((
+                                encode_native_otclient_whisper(
+                                    profile,
+                                    &event.speaker_name,
+                                    event.speaker_position,
+                                    &event.text,
+                                )
+                                .map_err(HostError::Protocol)?,
+                                2,
+                                "whisper-chat",
+                            )),
+                            NATIVE_OTCLIENT_MESSAGE_YELL => Some((
+                                encode_native_otclient_yell(
+                                    profile,
+                                    &event.speaker_name,
+                                    event.speaker_position,
+                                    &event.text,
+                                )
+                                .map_err(HostError::Protocol)?,
+                                3,
+                                "yell-chat",
+                            )),
+                            _ => Some((
+                                encode_native_otclient_public_say(
+                                    profile,
+                                    &event.speaker_name,
+                                    event.speaker_position,
+                                    &event.text,
+                                )
+                                .map_err(HostError::Protocol)?,
+                                1,
+                                "public-chat",
+                            )),
+                        },
                     }
                 }) else {
                     continue;
@@ -8414,7 +8537,7 @@ fn native_click_walk_steps(
         .collect()
 }
 
-/// The selected 740 map encoder renders an 18×14 same-floor viewport centered at offset (8, 6),
+/// The selected 740 map encoder renders an 18Ä‚â€”14 same-floor viewport centered at offset (8, 6),
 /// which yields horizontal offsets -8 through +9 and vertical offsets -6 through +7. Creature
 /// inspection is intentionally no broader than that already encoded viewport.
 fn native_classic_viewport_contains(observer: Position, target: Position) -> bool {
@@ -18503,6 +18626,7 @@ mod tests {
             speaker_position: native_position(map.spawn()),
             channel_id: None,
             private: false,
+            talk_mode: NATIVE_OTCLIENT_MESSAGE_SAY,
             text: "hello world".into(),
         };
         assert_eq!(knight_events.try_recv().unwrap(), expected);
@@ -18518,6 +18642,7 @@ mod tests {
             speaker_position: native_position(map.spawn()),
             channel_id: Some(7),
             private: false,
+            talk_mode: NATIVE_OTCLIENT_MESSAGE_SAY,
             text: "trade offer".into(),
         };
         assert_eq!(knight_events.try_recv().unwrap(), channel_event);
@@ -18539,6 +18664,7 @@ mod tests {
                 speaker_position: native_position(map.spawn()),
                 channel_id: None,
                 private: true,
+                talk_mode: NATIVE_OTCLIENT_MESSAGE_SAY,
                 text: "private hello".into(),
             }
         );
@@ -18569,6 +18695,121 @@ mod tests {
         shared.unregister_public_chat_recipient(101);
         shared.remove_player(101).unwrap();
         shared.remove_player(102).unwrap();
+    }
+
+    #[test]
+    fn shared_whisper_reaches_only_nearby_same_floor_listeners() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        // Speaker at spawn (100,100,7); listener adjacent; far listener same floor; cross-floor
+        // listener adjacent in x/y but on a different floor.
+        for (id, name, position) in [
+            (101u64, "Knight", Position { x: 100, y: 100, z: 7 }),
+            (102, "Druid", Position { x: 101, y: 100, z: 7 }),
+            (103, "Far", Position { x: 130, y: 130, z: 7 }),
+            (104, "Below", Position { x: 101, y: 100, z: 6 }),
+        ] {
+            shared
+                .register_player_at_available_position(
+                    Player {
+                        id,
+                        account_id: id,
+                        name: name.into(),
+                        position,
+                        level: 8,
+                        experience: 0,
+                        skill_points: 0,
+                    },
+                    &map,
+                )
+                .unwrap();
+        }
+        let knight_events = shared.register_public_chat_recipient(101, "Knight").unwrap();
+        let druid_events = shared.register_public_chat_recipient(102, "Druid").unwrap();
+        let far_events = shared.register_public_chat_recipient(103, "Far").unwrap();
+        let below_events = shared
+            .register_public_chat_recipient(104, "Below")
+            .unwrap();
+        assert_eq!(shared.broadcast_whisper_chat(101, "psst").unwrap(), 2);
+        let expected = SharedPublicChatEvent {
+            speaker_name: "Knight".into(),
+            speaker_position: native_position(Position { x: 100, y: 100, z: 7 }),
+            channel_id: None,
+            private: false,
+            talk_mode: NATIVE_OTCLIENT_MESSAGE_WHISPER,
+            text: "psst".into(),
+        };
+        assert_eq!(knight_events.try_recv().unwrap(), expected);
+        assert_eq!(druid_events.try_recv().unwrap(), expected);
+        assert!(matches!(far_events.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            below_events.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        for id in [101u64, 102, 103, 104] {
+            shared.unregister_public_chat_recipient(id);
+            shared.remove_player(id).unwrap();
+        }
+    }
+
+    #[test]
+    fn shared_yell_reaches_wide_range_but_not_cross_floor() {
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        for (id, name, position) in [
+            (201u64, "Speaker", Position { x: 100, y: 100, z: 7 }),
+            (202, "Near", Position { x: 110, y: 110, z: 7 }),
+            (203, "TooFar", Position { x: 140, y: 140, z: 7 }),
+            (204, "Below", Position { x: 110, y: 110, z: 6 }),
+        ] {
+            shared
+                .register_player_at_available_position(
+                    Player {
+                        id,
+                        account_id: id,
+                        name: name.into(),
+                        position,
+                        level: 8,
+                        experience: 0,
+                        skill_points: 0,
+                    },
+                    &map,
+                )
+                .unwrap();
+        }
+        let speaker_events = shared
+            .register_public_chat_recipient(201, "Speaker")
+            .unwrap();
+        let near_events = shared.register_public_chat_recipient(202, "Near").unwrap();
+        let too_far_events = shared
+            .register_public_chat_recipient(203, "TooFar")
+            .unwrap();
+        let below_events = shared
+            .register_public_chat_recipient(204, "Below")
+            .unwrap();
+        assert_eq!(shared.broadcast_yell_chat(201, "hail").unwrap(), 2);
+        let expected = SharedPublicChatEvent {
+            speaker_name: "Speaker".into(),
+            speaker_position: native_position(Position { x: 100, y: 100, z: 7 }),
+            channel_id: None,
+            private: false,
+            talk_mode: NATIVE_OTCLIENT_MESSAGE_YELL,
+            text: "hail".into(),
+        };
+        assert_eq!(speaker_events.try_recv().unwrap(), expected);
+        assert_eq!(near_events.try_recv().unwrap(), expected);
+        assert!(matches!(
+            too_far_events.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            below_events.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        for id in [201u64, 202, 203, 204] {
+            shared.unregister_public_chat_recipient(id);
+            shared.remove_player(id).unwrap();
+        }
     }
 
     #[test]
