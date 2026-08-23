@@ -5,8 +5,9 @@
 > milestone lands. Companion documents: `docs/capability-matrix.md` (per-feature truth),
 > `todo.md` (short-term checklist), `docs/completion-ledger.md` (landed-work ledger).
 >
-> **Last updated:** after commit `41d9485` (Windows build/socket fixes + atomic inventory
-> persistence) and the static-monster loot foundation.
+> **Last updated:** after the loot-persistence slice — durable runtime tile-item registry
+> (schema v26), defeated-creature roll fix, whisper/yell delivery, and socket-test
+> stabilization; pushed to `podkarpacie/Forgotten-Engine`.
 
 ---
 
@@ -126,8 +127,10 @@ loot corpses, equip gear, chat, die and respawn.*
 - [x] Static spawn lifecycle: reactivation intervals, spawn-area blockers, pursuit, direct melee
 - [x] **Loot rolls + corpse spawn on defeat (new)** — deterministic seeded rolls, flat `<loot>`
       parsing, corpse as runtime map item *(just landed; needs persistence + client-open wiring)*
-- [ ] **Loot persistence across restart (0%)** — corpse contents survive shutdown/startup via
-      runtime-item registry *(est. 3 days)*
+- [x] **Loot persistence across restart (new)** — durable revision-bound runtime tile-item
+      registry (schema v26); corpses re-materialize on startup and fail closed on incompatible
+      state; defeated-roll fix so loot tables roll after deactivation *(client corpse opening
+      remains deferred)*
 - [ ] **Monster health/condition effects (10%)** — poison/fire/burn conditions on players from
       monster attacks *(est. 4 days)*
 - [ ] **Death list & frags (0%)** — kill tracking, skull system, unjustified kills *(est. 5 days)*
@@ -328,11 +331,13 @@ is itself a useful, releasable product.
 ## 4. Immediate Next Steps (this week)
 
 1. **Loot completion** — persist corpses across restart via runtime-item registry; wire
-   client-visible corpse opening (UseItem on corpse → container window). *(in progress)*
+   client-visible corpse opening (UseItem on corpse → container window). *(persistence +
+   registry recovery landed; client corpse opening is the remaining half)*
 2. **Container UseItem opening** — backpack-in-hand nested windows (Phase 1.2).
-3. **Whisper/yell/private chat modes** — small, high-visibility win (Phase 1.5).
-4. **Update `docs/capability-matrix.md/.json`** for loot foundation.
-5. **Commit + push** this milestone.
+3. ~~Whisper/yell/private chat modes~~ — whisper and yell landed (`d98ecc5`); private-message
+   routing exists session-locally.
+4. ~~Update `docs/capability-matrix.md/.json`~~ for loot foundation + corpse persistence.
+5. ~~Commit + push~~ this milestone (pushed to `podkarpacie/Forgotten-Engine`).
 
 ---
 

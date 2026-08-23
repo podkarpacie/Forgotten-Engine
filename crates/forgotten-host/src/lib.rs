@@ -31,7 +31,8 @@ use forgotten_core::{
 use forgotten_persistence::{
     EngineDatabase, MapItemCountOverrideRecord, MapItemRemovalJournal,
     PlayerExperienceVitalsUpdate, PlayerFixedDeathLossSnapshot, PlayerOutfit,
-    PlayerVitals as PersistedPlayerVitals, StaticCreatureRuntimeRecord,
+    PlayerVitals as PersistedPlayerVitals, RuntimeMapItemChildRecord, RuntimeMapItemRecord,
+    StaticCreatureRuntimeRecord,
 };
 use forgotten_protocol::{
     decode, decode_fe_otclient_capability_ack, decode_fe_otclient_move_request,
@@ -1193,6 +1194,7 @@ pub struct SharedNativeMap {
     source_item_indices: Arc<Mutex<BTreeMap<Position, Vec<u8>>>>,
     removed_source_items: Arc<Mutex<BTreeSet<WorldMapItemSourceIdentity>>>,
     source_item_count_overrides: Arc<Mutex<BTreeMap<WorldMapItemSourceIdentity, u16>>>,
+    runtime_tile_items: Arc<Mutex<Vec<RuntimeMapItemRecord>>>,
     revision: Arc<AtomicU64>,
 }
 
@@ -1217,6 +1219,72 @@ pub struct SourceMapItemToContainerTransferOutcome {
     pub item: ItemInstance,
     pub container_id: u8,
     pub map_revision: u64,
+}
+
+/// Converts one durable runtime tile-item record into its renderable map form. Runtime content
+/// carries no imported client mapping, action metadata, text, or nested trees in this boundary.
+fn runtime_record_to_world_map_item(record: &RuntimeMapItemRecord) -> WorldMapItem {
+    WorldMapItem {
+        server_id: record.server_id,
+        client_thing_id: None,
+        count: record.count,
+        action_id: None,
+        unique_id: None,
+        text: None,
+        description: None,
+        teleport_destination: None,
+        duration: None,
+        charges: None,
+        children: record
+            .children
+            .iter()
+            .map(|child| WorldMapItem {
+                server_id: child.server_id,
+                client_thing_id: None,
+                count: child.count,
+                action_id: None,
+                unique_id: None,
+                text: None,
+                description: None,
+                teleport_destination: None,
+                duration: None,
+                charges: None,
+                children: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+/// Converts one spawned runtime corpse item into its durable registry record form.
+fn runtime_world_map_item_to_record(
+    position: Position,
+    ordinal: u8,
+    item: &WorldMapItem,
+) -> Option<RuntimeMapItemRecord> {
+    if item.server_id == 0
+        || item.count == 0
+        || item.children.len() > forgotten_persistence::MAX_RUNTIME_MAP_ITEM_CHILDREN
+        || item
+            .children
+            .iter()
+            .any(|child| child.server_id == 0 || child.count == 0 || !child.children.is_empty())
+    {
+        return None;
+    }
+    Some(RuntimeMapItemRecord {
+        position,
+        ordinal,
+        server_id: item.server_id,
+        count: item.count,
+        children: item
+            .children
+            .iter()
+            .map(|child| RuntimeMapItemChildRecord {
+                server_id: child.server_id,
+                count: child.count,
+            })
+            .collect(),
+    })
 }
 
 impl SharedNativeMap {
@@ -1244,6 +1312,19 @@ impl SharedNativeMap {
         source_map: WorldMap,
         journal: Option<&MapItemRemovalJournal>,
         count_overrides: Option<&(WorldMapSourceRevision, Vec<MapItemCountOverrideRecord>)>,
+    ) -> Result<Self, HostError> {
+        Self::recover_complete_map_item_state(source_map, journal, count_overrides, None)
+    }
+
+    /// Restores a mutable runtime map from every durable boundary: immutable source content,
+    /// optional complete removals, optional remaining-count overrides, and the optional durable
+    /// runtime tile-item registry (spawned corpses). Every record must match the loaded source
+    /// revision; any inconsistency fails closed without constructing an owner.
+    pub fn recover_complete_map_item_state(
+        source_map: WorldMap,
+        journal: Option<&MapItemRemovalJournal>,
+        count_overrides: Option<&(WorldMapSourceRevision, Vec<MapItemCountOverrideRecord>)>,
+        runtime_items: Option<&(WorldMapSourceRevision, Vec<RuntimeMapItemRecord>)>,
     ) -> Result<Self, HostError> {
         let source = Arc::new(source_map);
         let mut map = (*source).clone();
@@ -1316,6 +1397,67 @@ impl SharedNativeMap {
             map.apply_source_item_removals(&journal.removed_items)
                 .map_err(HostError::Core)?;
         }
+        let runtime_tile_items = runtime_items
+            .map(|(map_revision, records)| {
+                if *map_revision != source.source_revision() {
+                    return Err(HostError::Core(forgotten_core::CoreError::InvalidMap(
+                        "runtime tile-item registry revision does not match the loaded map".into(),
+                    )));
+                }
+                let mut ordered: BTreeMap<Position, Vec<RuntimeMapItemRecord>> = BTreeMap::new();
+                for record in records {
+                    if record.server_id == 0 || record.count == 0 {
+                        return Err(HostError::Core(forgotten_core::CoreError::InvalidMap(
+                            "runtime tile-item record needs a nonzero server id and count".into(),
+                        )));
+                    }
+                    if record.children.len() > forgotten_persistence::MAX_RUNTIME_MAP_ITEM_CHILDREN
+                    {
+                        return Err(HostError::Core(forgotten_core::CoreError::InvalidMap(
+                            "runtime tile-item record exceeds the supported child bound".into(),
+                        )));
+                    }
+                    if source.tile(record.position).is_none() {
+                        return Err(HostError::Core(forgotten_core::CoreError::InvalidMap(
+                            "runtime tile-item record references a missing source tile".into(),
+                        )));
+                    }
+                    let entries = ordered.entry(record.position).or_default();
+                    if usize::from(record.ordinal) != entries.len() {
+                        return Err(HostError::Core(forgotten_core::CoreError::InvalidMap(
+                            "runtime tile-item ordinals must form one contiguous list per tile"
+                                .into(),
+                        )));
+                    }
+                    entries.push(record.clone());
+                }
+                for (position, position_records) in &ordered {
+                    let existing = map
+                        .tile_items(*position)
+                        .map(<[WorldMapItem]>::len)
+                        .unwrap_or(0);
+                    if existing + position_records.len()
+                        > forgotten_core::MAX_WORLD_MAP_ITEMS_PER_TILE
+                    {
+                        return Err(HostError::Core(forgotten_core::CoreError::InvalidMap(
+                            "runtime tile-item recovery would exceed the per-tile item limit"
+                                .into(),
+                        )));
+                    }
+                    let mut items = map
+                        .tile_items(*position)
+                        .map(<[WorldMapItem]>::to_vec)
+                        .unwrap_or_default();
+                    for record in position_records.iter() {
+                        items.push(runtime_record_to_world_map_item(record));
+                    }
+                    map.set_tile_items(*position, items)
+                        .map_err(HostError::Core)?;
+                }
+                Ok(records.clone())
+            })
+            .transpose()?
+            .unwrap_or_default();
         let mut source_item_indices = BTreeMap::new();
         for (position, items) in source.tile_item_entries() {
             source_item_indices.insert(
@@ -1339,6 +1481,7 @@ impl SharedNativeMap {
             source_item_indices: Arc::new(Mutex::new(source_item_indices)),
             removed_source_items: Arc::new(Mutex::new(removed_source_items)),
             source_item_count_overrides: Arc::new(Mutex::new(source_item_count_overrides)),
+            runtime_tile_items: Arc::new(Mutex::new(runtime_tile_items)),
             revision: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -1392,6 +1535,73 @@ impl SharedNativeMap {
                 },
             )
             .collect())
+    }
+
+    /// Returns a detached copy of the complete durable runtime tile-item registry. It never reads
+    /// SQLite; callers persist it through the composite placement boundary.
+    pub fn runtime_tile_items(&self) -> Result<Vec<RuntimeMapItemRecord>, HostError> {
+        Ok(self
+            .runtime_tile_items
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?
+            .clone())
+    }
+
+    /// Places one spawned runtime corpse item on one tile, persists the complete registry in one
+    /// SQLite transaction while every authoritative lock is held, then commits the staged map
+    /// state. A bounded-limit rejection or failed persistence leaves both memory and disk
+    /// unchanged. Returns the new map revision only when a corpse was actually placed.
+    pub fn add_runtime_tile_item(
+        &self,
+        database: &mut EngineDatabase,
+        position: Position,
+        item: WorldMapItem,
+    ) -> Result<Option<u64>, HostError> {
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut registry = self
+            .runtime_tile_items
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let current_items = map
+            .tile_items(position)
+            .map(<[WorldMapItem]>::to_vec)
+            .unwrap_or_default();
+        if current_items.len() + 1 > forgotten_core::MAX_WORLD_MAP_ITEMS_PER_TILE {
+            return Ok(None);
+        }
+        if registry.len() >= forgotten_persistence::MAX_RUNTIME_MAP_ITEMS {
+            return Ok(None);
+        }
+        let ordinal = u8::try_from(
+            registry
+                .iter()
+                .filter(|record| record.position == position)
+                .count(),
+        )
+        .map_err(|_| {
+            HostError::Core(forgotten_core::CoreError::InvalidMap(
+                "runtime tile-item ordinals exhausted for this tile".into(),
+            ))
+        })?;
+        let Some(record) = runtime_world_map_item_to_record(position, ordinal, &item) else {
+            return Ok(None);
+        };
+        let mut next_map = map.clone();
+        let mut next_items = current_items;
+        next_items.push(item);
+        next_map
+            .set_tile_items(position, next_items)
+            .map_err(HostError::Core)?;
+        let mut next_registry = registry.clone();
+        next_registry.push(record);
+        database.replace_runtime_map_items(self.source_revision(), &next_registry)?;
+        *map = next_map;
+        *registry = next_registry;
+        let revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(Some(revision))
     }
 
     /// Replaces one imported tile's complete ordered item list after `WorldMap` validates its
@@ -3291,6 +3501,18 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)
     }
 
+    /// Rolls one deterministic loot result for one authoritatively defeated static monster under
+    /// the shared-world lock. This stays valid for the deactivated post-defeat creature state.
+    pub fn roll_defeated_static_creature_loot(
+        &self,
+        creature_id: u32,
+        seed: u64,
+    ) -> Result<forgotten_core::StaticCreatureLootRoll, HostError> {
+        self.lock()?
+            .roll_defeated_static_creature_loot(creature_id, seed)
+            .map_err(HostError::Core)
+    }
+
     pub fn static_creature_runtime_snapshot(
         &self,
     ) -> Result<Vec<StaticCreatureRuntimeSnapshot>, HostError> {
@@ -4307,10 +4529,12 @@ pub fn start_native_otclient_game(
             let database = EngineDatabase::open(&database_path)?;
             let journal = database.map_item_removal_journal()?;
             let count_overrides = database.map_item_count_overrides()?;
-            SharedNativeMap::recover_from_map_item_state(
+            let runtime_items = database.runtime_map_items()?;
+            SharedNativeMap::recover_complete_map_item_state(
                 world_map.clone(),
                 journal.as_ref(),
                 count_overrides.as_ref(),
+                runtime_items.as_ref(),
             )
         })
         .transpose()?
@@ -5507,6 +5731,7 @@ fn handle_native_otclient_game(
                             if let Some(corpse_position) = spawn_native_static_defeat_corpse(
                                 shared_world,
                                 map_owner,
+                                &mut database,
                                 outcome.target_id,
                                 shared_world.tick()?,
                                 NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
@@ -9045,11 +9270,12 @@ fn apply_and_persist_native_fixed_death_loss(
 fn spawn_native_static_defeat_corpse(
     shared_world: &SharedNativeWorld,
     map_owner: &SharedNativeMap,
+    database: &mut EngineDatabase,
     creature_id: u32,
     seed: u64,
     corpse_server_id: u16,
 ) -> Result<Option<Position>, HostError> {
-    let roll = shared_world.roll_static_creature_loot(creature_id, seed)?;
+    let roll = shared_world.roll_defeated_static_creature_loot(creature_id, seed)?;
     if roll.items.is_empty() {
         return Ok(None);
     }
@@ -9078,15 +9304,7 @@ fn spawn_native_static_defeat_corpse(
             children: Vec::new(),
         })
         .collect();
-    let mut items = map_owner
-        .render_snapshot()?
-        .tile_items(position)
-        .map(<[WorldMapItem]>::to_vec)
-        .unwrap_or_default();
-    if items.len() + 1 > forgotten_core::MAX_WORLD_MAP_ITEMS_PER_TILE {
-        return Ok(None);
-    }
-    items.push(WorldMapItem {
+    let corpse = WorldMapItem {
         server_id: corpse_server_id,
         client_thing_id: None,
         count: 1,
@@ -9098,10 +9316,14 @@ fn spawn_native_static_defeat_corpse(
         duration: None,
         charges: None,
         children,
-    });
-    map_owner.replace_tile_items(position, items)?;
-    shared_world.mark_visibility_changed();
-    Ok(Some(position))
+    };
+    let placed = map_owner.add_runtime_tile_item(database, position, corpse)?;
+    if placed.is_some() {
+        shared_world.mark_visibility_changed();
+        Ok(Some(position))
+    } else {
+        Ok(None)
+    }
 }
 
 fn apply_native_selected_static_creature_melee(
@@ -10298,6 +10520,458 @@ mod tests {
             SharedNativeMap::recover_from_map_item_state(source_map, None, Some(&invalid)),
             Err(HostError::Core(forgotten_core::CoreError::InvalidMap(_)))
         ));
+    }
+
+    #[test]
+    fn runtime_corpse_registry_places_persists_and_recovers_across_owners() {
+        let database_path = database_path("runtime-corpse-registry");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let source_map = (*native_world_map()).clone();
+        let position = Position {
+            x: 103,
+            y: 102,
+            z: 7,
+        };
+        let owner =
+            SharedNativeMap::recover_complete_map_item_state(source_map.clone(), None, None, None)
+                .unwrap();
+        assert_eq!(owner.runtime_tile_items().unwrap(), Vec::new());
+
+        let corpse = WorldMapItem {
+            server_id: 3065,
+            client_thing_id: None,
+            count: 1,
+            action_id: None,
+            unique_id: None,
+            text: None,
+            description: None,
+            teleport_destination: None,
+            duration: None,
+            charges: None,
+            children: vec![
+                WorldMapItem {
+                    server_id: 2148,
+                    client_thing_id: None,
+                    count: 12,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                },
+                WorldMapItem {
+                    server_id: 2681,
+                    client_thing_id: None,
+                    count: 2,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                },
+            ],
+        };
+        let placed_revision = owner
+            .add_runtime_tile_item(&mut database, position, corpse.clone())
+            .unwrap()
+            .expect("a bounded corpse is placed");
+        assert_eq!(placed_revision, 1);
+        let snapshot = owner.render_snapshot().unwrap();
+        let placed_items = snapshot.tile_items(position).unwrap();
+        assert_eq!(placed_items.len(), 1);
+        assert_eq!(placed_items[0].server_id, 3065);
+        assert_eq!(
+            placed_items[0]
+                .children
+                .iter()
+                .map(|child| (child.server_id, child.count))
+                .collect::<Vec<_>>(),
+            vec![(2148, 12), (2681, 2)]
+        );
+
+        // A second corpse on the same tile appends with the next ordinal and advances revision.
+        let second = WorldMapItem {
+            server_id: 3058,
+            client_thing_id: None,
+            count: 1,
+            action_id: None,
+            unique_id: None,
+            text: None,
+            description: None,
+            teleport_destination: None,
+            duration: None,
+            charges: None,
+            children: Vec::new(),
+        };
+        assert_eq!(
+            owner
+                .add_runtime_tile_item(&mut database, position, second)
+                .unwrap()
+                .expect("a second corpse is placed"),
+            2
+        );
+        assert_eq!(
+            owner
+                .render_snapshot()
+                .unwrap()
+                .tile_items(position)
+                .unwrap()
+                .len(),
+            2
+        );
+        let registry = owner.runtime_tile_items().unwrap();
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry[0].ordinal, 0);
+        assert_eq!(registry[1].ordinal, 1);
+
+        // A fresh owner recovers both corpses with their loot children from durable state.
+        let recovered_state = database.runtime_map_items().unwrap().expect("registry");
+        let recovered = SharedNativeMap::recover_complete_map_item_state(
+            source_map.clone(),
+            None,
+            None,
+            Some(&recovered_state),
+        )
+        .unwrap();
+        let recovered_snapshot = recovered.render_snapshot().unwrap();
+        let recovered_items = recovered_snapshot.tile_items(position).unwrap();
+        assert_eq!(recovered_items.len(), 2);
+        assert_eq!(recovered_items[0].server_id, 3065);
+        assert_eq!(
+            recovered_items[0]
+                .children
+                .iter()
+                .map(|child| (child.server_id, child.count))
+                .collect::<Vec<_>>(),
+            vec![(2148, 12), (2681, 2)]
+        );
+        assert_eq!(recovered.runtime_tile_items().unwrap(), registry);
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn runtime_corpse_registry_fails_closed_on_incompatible_durable_state() {
+        let source_map = (*native_world_map()).clone();
+        let position = Position {
+            x: 104,
+            y: 102,
+            z: 7,
+        };
+        let incompatible_revision =
+            WorldMapSourceRevision(source_map.source_revision().0 ^ 0xdead_beef);
+        let stale = (
+            incompatible_revision,
+            vec![RuntimeMapItemRecord {
+                position,
+                ordinal: 0,
+                server_id: 3065,
+                count: 1,
+                children: Vec::new(),
+            }],
+        );
+        assert!(matches!(
+            SharedNativeMap::recover_complete_map_item_state(
+                source_map.clone(),
+                None,
+                None,
+                Some(&stale)
+            ),
+            Err(HostError::Core(forgotten_core::CoreError::InvalidMap(message)))
+                if message.contains("revision")
+        ));
+
+        let missing_tile = (
+            source_map.source_revision(),
+            vec![RuntimeMapItemRecord {
+                position: Position {
+                    x: 200,
+                    y: 200,
+                    z: 7,
+                },
+                ordinal: 0,
+                server_id: 3065,
+                count: 1,
+                children: Vec::new(),
+            }],
+        );
+        assert!(matches!(
+            SharedNativeMap::recover_complete_map_item_state(
+                source_map.clone(),
+                None,
+                None,
+                Some(&missing_tile)
+            ),
+            Err(HostError::Core(forgotten_core::CoreError::InvalidMap(message)))
+                if message.contains("missing source tile")
+        ));
+
+        let gapped_ordinals = (
+            source_map.source_revision(),
+            vec![
+                RuntimeMapItemRecord {
+                    position,
+                    ordinal: 0,
+                    server_id: 3065,
+                    count: 1,
+                    children: Vec::new(),
+                },
+                RuntimeMapItemRecord {
+                    position,
+                    ordinal: 2,
+                    server_id: 3065,
+                    count: 1,
+                    children: Vec::new(),
+                },
+            ],
+        );
+        assert!(matches!(
+            SharedNativeMap::recover_complete_map_item_state(
+                source_map,
+                None,
+                None,
+                Some(&gapped_ordinals)
+            ),
+            Err(HostError::Core(forgotten_core::CoreError::InvalidMap(message)))
+                if message.contains("contiguous")
+        ));
+    }
+
+    #[test]
+    fn static_defeat_corpse_spawn_persists_the_durable_runtime_registry() {
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let static_spawns = FeTfsStaticSpawnCollection::with_loot_tables(
+            vec![forgotten_core::FeTfsStaticEntity {
+                id: creature_id,
+                name: "Rat".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 15,
+                direction: 2,
+            }],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::from([(
+                creature_id,
+                vec![forgotten_core::StaticCreatureLootEntry {
+                    item_id: 2148,
+                    chance: 100_000,
+                    min_count: 3,
+                    max_count: 3,
+                }],
+            )]),
+        )
+        .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        let source_map = (*native_world_map()).clone();
+        let map_owner =
+            SharedNativeMap::recover_complete_map_item_state(source_map, None, None, None).unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &native_world_map(),
+            )
+            .unwrap();
+        shared
+            .set_player_static_target(101, Some(creature_id))
+            .unwrap();
+
+        let database_path = database_path("static-defeat-corpse-registry");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        assert_eq!(map_owner.runtime_tile_items().unwrap(), Vec::new());
+        assert_eq!(database.runtime_map_items().unwrap(), None);
+
+        let first = apply_native_selected_static_creature_melee(&shared, 101, &native_world_map())
+            .unwrap()
+            .unwrap();
+        assert!(!first.deactivated);
+        advance_native_shared_world_heartbeat(&shared, 1).unwrap();
+        let final_hit =
+            apply_native_selected_static_creature_melee(&shared, 101, &native_world_map())
+                .unwrap()
+                .unwrap();
+        assert!(final_hit.deactivated);
+
+        let corpse_position = spawn_native_static_defeat_corpse(
+            &shared,
+            &map_owner,
+            &mut database,
+            creature_id,
+            1,
+            NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
+        )
+        .unwrap()
+        .expect("a deterministic always-chance loot roll spawns a corpse");
+        assert_eq!(
+            corpse_position,
+            Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            }
+        );
+        let snapshot = map_owner.render_snapshot().unwrap();
+        let tile_items = snapshot.tile_items(corpse_position).unwrap();
+        assert_eq!(tile_items.len(), 1);
+        assert_eq!(
+            tile_items[0].server_id,
+            NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID
+        );
+        assert_eq!(
+            tile_items[0]
+                .children
+                .iter()
+                .map(|child| (child.server_id, child.count))
+                .collect::<Vec<_>>(),
+            vec![(2148, 3)]
+        );
+
+        let (revision, records) = database.runtime_map_items().unwrap().expect("registry");
+        assert_eq!(revision, map_owner.source_revision());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].position, corpse_position);
+        assert_eq!(
+            records[0].server_id,
+            NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID
+        );
+        assert_eq!(
+            records[0]
+                .children
+                .iter()
+                .map(|child| (child.server_id, child.count))
+                .collect::<Vec<_>>(),
+            vec![(2148, 3)]
+        );
+
+        // An equal defeat seed reproduces the exact same durable corpse content deterministically.
+        let repeat_roll = shared
+            .roll_defeated_static_creature_loot(creature_id, 1)
+            .unwrap();
+        assert_eq!(
+            repeat_roll.items,
+            vec![(2148_u16, 3_u16)],
+            "equal seeds must produce equal loot"
+        );
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_game_startup_rematerializes_persisted_corpses_into_the_initial_viewport() {
+        let database_path = database_path("native-corpse-restart");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let mut source_map = (*native_world_map()).clone();
+        let corpse_position = Position {
+            x: 102,
+            y: 101,
+            z: 7,
+        };
+        // One imported item keeps the runtime corpse at a rendered tile index.
+        source_map
+            .set_tile_items(
+                corpse_position,
+                vec![WorldMapItem {
+                    server_id: 1988,
+                    client_thing_id: Some(1988),
+                    count: 1,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
+        database
+            .replace_runtime_map_items(
+                source_map.source_revision(),
+                &[RuntimeMapItemRecord {
+                    position: corpse_position,
+                    ordinal: 0,
+                    server_id: NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
+                    count: 1,
+                    children: vec![RuntimeMapItemChildRecord {
+                        server_id: 2148,
+                        count: 7,
+                    }],
+                }],
+            )
+            .unwrap();
+        drop(database);
+
+        let mut config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        config.world_map = Some(Arc::new(source_map));
+        let game = start_native_otclient_game(config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let initialization = read_frame(&mut stream).unwrap();
+        // The recovered corpse is encoded as its server item id (3065 = 0x0BF9 little-endian)
+        // on its tile next to the imported item.
+        assert!(initialization
+            .0
+            .windows(2)
+            .any(|window| window == [0xf9, 0x0b]));
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
     }
 
     #[test]

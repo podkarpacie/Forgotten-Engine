@@ -3864,7 +3864,29 @@ impl WorldState {
             .static_creatures
             .get(&id)
             .ok_or(CoreError::UnknownStaticCreature(id))?;
-        if !runtime.active || runtime.is_npc || runtime.loot.is_empty() {
+        if !runtime.active {
+            return Ok(StaticCreatureLootRoll {
+                creature_id: id,
+                items: Vec::new(),
+            });
+        }
+        self.roll_defeated_static_creature_loot(id, seed)
+    }
+
+    /// Rolls one deterministic bounded loot result for one authoritatively defeated static
+    /// monster. Unlike `roll_static_creature_loot`, this transition stays valid for the
+    /// deactivated creature in its immediate post-defeat state, which is the only moment a
+    /// corpse can be populated. Unknown ids, NPCs, and empty loot tables yield no items.
+    pub fn roll_defeated_static_creature_loot(
+        &self,
+        id: u32,
+        seed: u64,
+    ) -> Result<StaticCreatureLootRoll, CoreError> {
+        let runtime = self
+            .static_creatures
+            .get(&id)
+            .ok_or(CoreError::UnknownStaticCreature(id))?;
+        if runtime.is_npc || runtime.loot.is_empty() {
             return Ok(StaticCreatureLootRoll {
                 creature_id: id,
                 items: Vec::new(),
@@ -6711,6 +6733,54 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn defeated_creature_loot_roll_stays_valid_for_the_deactivated_monster_only() {
+        let npc_id = 0x4000_0001;
+        let monster_id = 0x4000_0002;
+        let mut npc = loot_test_creature(npc_id);
+        npc.name = "Guide".into();
+        let collection = FeTfsStaticSpawnCollection::with_loot_tables(
+            vec![npc, loot_test_creature(monster_id)],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::from([npc_id]),
+            BTreeMap::from([(monster_id, vec![always_loot(2148)])]),
+        )
+        .unwrap();
+        let mut world = WorldState::default();
+        world.install_static_creatures(&collection).unwrap();
+
+        // The deactivated post-defeat monster still rolls its table for corpse population,
+        // while an NPC never does.
+        world.deactivate_static_creature(monster_id).unwrap();
+        let defeated = world
+            .roll_defeated_static_creature_loot(monster_id, 7)
+            .unwrap();
+        assert_eq!(defeated.items.len(), 1);
+        assert_eq!(
+            defeated.items,
+            world
+                .roll_defeated_static_creature_loot(monster_id, 7)
+                .unwrap()
+                .items,
+            "equal seeds must produce equal loot"
+        );
+        assert_eq!(
+            world
+                .roll_defeated_static_creature_loot(npc_id, 7)
+                .unwrap()
+                .items
+                .len(),
+            0
+        );
+        assert!(matches!(
+            world.roll_defeated_static_creature_loot(999, 7),
+            Err(CoreError::UnknownStaticCreature(999))
+        ));
     }
 
     #[test]

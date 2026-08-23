@@ -13,7 +13,7 @@ use forgotten_core::{
 };
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -41,7 +41,8 @@ const SCHEMA_VERSION_PLAYER_INBOX: i64 = 22;
 const SCHEMA_VERSION_HOUSE_OWNERSHIP: i64 = 23;
 const SCHEMA_VERSION_HOUSE_ACCESS_LISTS: i64 = 24;
 const SCHEMA_VERSION_MAP_ITEM_COUNT_OVERRIDES: i64 = 25;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_MAP_ITEM_COUNT_OVERRIDES;
+const SCHEMA_VERSION_RUNTIME_MAP_ITEMS: i64 = 26;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_RUNTIME_MAP_ITEMS;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
 pub const MAX_VIP_DESCRIPTION_BYTES: usize = 128;
@@ -96,6 +97,31 @@ pub struct MapItemCountOverrideRecord {
     pub source_identity: WorldMapItemSourceIdentity,
     pub remaining_count: u16,
 }
+
+/// One bounded durable runtime tile-item addition bound to one immutable source-map revision.
+/// It retains only the flat ordered content FE itself spawned (a defeated-creature corpse with
+/// its rolled loot children); imported source items, decay policy, and client windows remain
+/// outside this storage boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeMapItemRecord {
+    pub position: Position,
+    pub ordinal: u8,
+    pub server_id: u16,
+    pub count: u8,
+    pub children: Vec<RuntimeMapItemChildRecord>,
+}
+
+/// One ordered flat child of a durable runtime tile item. Nested trees, attributes, and text
+/// metadata remain outside the first registry boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeMapItemChildRecord {
+    pub server_id: u16,
+    pub count: u8,
+}
+
+pub const MAX_RUNTIME_MAP_ITEMS: usize = 4_096;
+/// Matches the bounded flat `<loot>` import limit so every rollable corpse can persist.
+pub const MAX_RUNTIME_MAP_ITEM_CHILDREN: usize = 32;
 
 /// One bounded account-owned VIP entry. It retains only validated persisted-player identity and
 /// metadata; online status, notifications, quotas, client delivery, and policy remain separate.
@@ -3415,6 +3441,277 @@ impl EngineDatabase {
         Ok(map_revision.map(|revision| (revision, overrides)))
     }
 
+    /// Replaces the complete durable runtime tile-item registry in one SQLite transaction. Every
+    /// record must use the requested map revision, stay within the bounded global item and child
+    /// limits, and carry unique ordered positions; a rejected record leaves prior state unchanged.
+    pub fn replace_runtime_map_items(
+        &mut self,
+        map_revision: WorldMapSourceRevision,
+        items: &[RuntimeMapItemRecord],
+    ) -> Result<(), PersistenceError> {
+        if items.len() > MAX_RUNTIME_MAP_ITEMS {
+            return Err(PersistenceError::InvalidMapItemJournal(
+                "runtime map-item registry exceeds the supported bound".into(),
+            ));
+        }
+        let mut seen_items = BTreeSet::new();
+        for item in items {
+            if item.server_id == 0 {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "runtime map item server id must be nonzero".into(),
+                ));
+            }
+            if !(1..=u8::MAX).contains(&item.count) {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "runtime map item count must stay within the bounded stack range".into(),
+                ));
+            }
+            if !seen_items.insert((item.position, item.ordinal)) {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "duplicate runtime map item position and ordinal".into(),
+                ));
+            }
+            if item.children.len() > MAX_RUNTIME_MAP_ITEM_CHILDREN {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "runtime map item children exceed the supported bound".into(),
+                ));
+            }
+            for child in &item.children {
+                if child.server_id == 0 || child.count == 0 {
+                    return Err(PersistenceError::InvalidMapItemJournal(
+                        "runtime map item children need a nonzero server id and count".into(),
+                    ));
+                }
+            }
+        }
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM runtime_map_item_children", [])?;
+        transaction.execute("DELETE FROM runtime_map_items", [])?;
+        for item in items {
+            transaction.execute(
+                "INSERT INTO runtime_map_items (map_revision, x, y, z, ordinal, server_id, count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    format!("{:016x}", map_revision.0),
+                    i64::from(item.position.x),
+                    i64::from(item.position.y),
+                    i64::from(item.position.z),
+                    i64::from(item.ordinal),
+                    i64::from(item.server_id),
+                    i64::from(item.count),
+                ],
+            )?;
+            for (child_index, child) in item.children.iter().enumerate() {
+                transaction.execute(
+                    "INSERT INTO runtime_map_item_children (x, y, z, ordinal, child_index, server_id, count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        i64::from(item.position.x),
+                        i64::from(item.position.y),
+                        i64::from(item.position.z),
+                        i64::from(item.ordinal),
+                        i64::try_from(child_index).expect("bounded child index fits i64"),
+                        i64::from(child.server_id),
+                        i64::from(child.count),
+                    ],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Loads the complete durable runtime tile-item registry without applying it to any map.
+    /// Callers must validate it against the current immutable source-map revision before
+    /// recovering a runtime map owner.
+    pub fn runtime_map_items(
+        &self,
+    ) -> Result<Option<(WorldMapSourceRevision, Vec<RuntimeMapItemRecord>)>, PersistenceError> {
+        let mut item_statement = self.connection.prepare(
+            "SELECT map_revision, x, y, z, ordinal, server_id, count FROM runtime_map_items ORDER BY x, y, z, ordinal",
+        )?;
+        let item_rows = item_statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut map_revision: Option<WorldMapSourceRevision> = None;
+        let mut items = Vec::new();
+        for row in item_rows {
+            let (revision, x, y, z, ordinal, server_id, count) = row?;
+            let parsed_revision = u64::from_str_radix(&revision, 16).map_err(|_| {
+                PersistenceError::InvalidMapItemJournal(
+                    "runtime map item revision must be hexadecimal u64".into(),
+                )
+            })?;
+            let parsed_revision = WorldMapSourceRevision(parsed_revision);
+            match map_revision {
+                Some(existing) if existing != parsed_revision => {
+                    return Err(PersistenceError::InvalidMapItemJournal(
+                        "runtime map items contain multiple map revisions".into(),
+                    ))
+                }
+                None => map_revision = Some(parsed_revision),
+                Some(_) => {}
+            }
+            let position = Position {
+                x: u16::try_from(x).map_err(|_| {
+                    PersistenceError::InvalidMapItemJournal(
+                        "runtime map item x does not fit u16".into(),
+                    )
+                })?,
+                y: u16::try_from(y).map_err(|_| {
+                    PersistenceError::InvalidMapItemJournal(
+                        "runtime map item y does not fit u16".into(),
+                    )
+                })?,
+                z: u8::try_from(z).map_err(|_| {
+                    PersistenceError::InvalidMapItemJournal(
+                        "runtime map item z does not fit u8".into(),
+                    )
+                })?,
+            };
+            let ordinal = u8::try_from(ordinal).map_err(|_| {
+                PersistenceError::InvalidMapItemJournal(
+                    "runtime map item ordinal does not fit u8".into(),
+                )
+            })?;
+            let server_id = u16::try_from(server_id).map_err(|_| {
+                PersistenceError::InvalidMapItemJournal(
+                    "runtime map item server id does not fit u16".into(),
+                )
+            })?;
+            if server_id == 0 {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "runtime map item server id must be nonzero".into(),
+                ));
+            }
+            let count = u8::try_from(count).map_err(|_| {
+                PersistenceError::InvalidMapItemJournal(
+                    "runtime map item count does not fit u8".into(),
+                )
+            })?;
+            if count == 0 {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "runtime map item count must be positive".into(),
+                ));
+            }
+            items.push(RuntimeMapItemRecord {
+                position,
+                ordinal,
+                server_id,
+                count,
+                children: Vec::new(),
+            });
+        }
+        if items.len() > MAX_RUNTIME_MAP_ITEMS {
+            return Err(PersistenceError::InvalidMapItemJournal(
+                "runtime map-item registry exceeds the supported bound".into(),
+            ));
+        }
+        let mut child_statement = self.connection.prepare(
+            "SELECT x, y, z, ordinal, child_index, server_id, count FROM runtime_map_item_children ORDER BY x, y, z, ordinal, child_index",
+        )?;
+        let child_rows = child_statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut expected_key: Option<(Position, u8)> = None;
+        let mut expected_child_index = 0_u8;
+        for row in child_rows {
+            let (x, y, z, ordinal, child_index, server_id, count) = row?;
+            let position = Position {
+                x: u16::try_from(x).map_err(|_| {
+                    PersistenceError::InvalidMapItemJournal(
+                        "runtime map child x does not fit u16".into(),
+                    )
+                })?,
+                y: u16::try_from(y).map_err(|_| {
+                    PersistenceError::InvalidMapItemJournal(
+                        "runtime map child y does not fit u16".into(),
+                    )
+                })?,
+                z: u8::try_from(z).map_err(|_| {
+                    PersistenceError::InvalidMapItemJournal(
+                        "runtime map child z does not fit u8".into(),
+                    )
+                })?,
+            };
+            let ordinal = u8::try_from(ordinal).map_err(|_| {
+                PersistenceError::InvalidMapItemJournal(
+                    "runtime map child ordinal does not fit u8".into(),
+                )
+            })?;
+            let key = (position, ordinal);
+            match expected_key {
+                Some(existing) if existing == key => {}
+                _ => {
+                    expected_key = Some(key);
+                    expected_child_index = 0;
+                }
+            }
+            let parsed_child_index = u8::try_from(child_index).map_err(|_| {
+                PersistenceError::InvalidMapItemJournal(
+                    "runtime map child index does not fit u8".into(),
+                )
+            })?;
+            if parsed_child_index != expected_child_index {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "runtime map children must form one contiguous ordered list per item".into(),
+                ));
+            }
+            expected_child_index += 1;
+            let server_id = u16::try_from(server_id).map_err(|_| {
+                PersistenceError::InvalidMapItemJournal(
+                    "runtime map child server id does not fit u16".into(),
+                )
+            })?;
+            if server_id == 0 {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "runtime map child server id must be nonzero".into(),
+                ));
+            }
+            let count = u8::try_from(count).map_err(|_| {
+                PersistenceError::InvalidMapItemJournal(
+                    "runtime map child count does not fit u8".into(),
+                )
+            })?;
+            if count == 0 {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "runtime map child count must be positive".into(),
+                ));
+            }
+            let parent = items
+                .iter_mut()
+                .find(|item| item.position == position && item.ordinal == ordinal)
+                .ok_or_else(|| {
+                    PersistenceError::InvalidMapItemJournal(
+                        "runtime map child references a missing runtime item".into(),
+                    )
+                })?;
+            if parent.children.len() >= MAX_RUNTIME_MAP_ITEM_CHILDREN {
+                return Err(PersistenceError::InvalidMapItemJournal(
+                    "runtime map item children exceed the supported bound".into(),
+                ));
+            }
+            parent
+                .children
+                .push(RuntimeMapItemChildRecord { server_id, count });
+        }
+        Ok(map_revision.map(|revision| (revision, items)))
+    }
+
     /// Replaces a player's complete bounded inventory, the complete revision-bound removal journal,
     /// and the complete remaining-count override collection in one SQLite transaction. A failed
     /// commit leaves all durable inventory and map-source recovery state unchanged.
@@ -3822,6 +4119,18 @@ impl EngineDatabase {
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![SCHEMA_VERSION_MAP_ITEM_COUNT_OVERRIDES, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < SCHEMA_VERSION_RUNTIME_MAP_ITEMS {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS runtime_map_items (map_revision TEXT NOT NULL, x INTEGER NOT NULL, y INTEGER NOT NULL, z INTEGER NOT NULL, ordinal INTEGER NOT NULL, server_id INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (x, y, z, ordinal));",
+            )?;
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS runtime_map_item_children (x INTEGER NOT NULL, y INTEGER NOT NULL, z INTEGER NOT NULL, ordinal INTEGER NOT NULL, child_index INTEGER NOT NULL, server_id INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY (x, y, z, ordinal, child_index));",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_RUNTIME_MAP_ITEMS, unix_seconds()],
             )?;
         }
         Ok(())
@@ -4397,6 +4706,139 @@ mod tests {
         let path = temporary_path("migration");
         let database = EngineDatabase::open(&path).unwrap();
         assert_eq!(database.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn runtime_map_item_registry_round_trips_bounded_records() {
+        let path = temporary_path("runtime-map-items");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        assert_eq!(database.runtime_map_items().unwrap(), None);
+        let revision = WorldMapSourceRevision(0x1234_abcd);
+        let records = vec![
+            RuntimeMapItemRecord {
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                ordinal: 0,
+                server_id: 3065,
+                count: 1,
+                children: vec![
+                    RuntimeMapItemChildRecord {
+                        server_id: 2148,
+                        count: 12,
+                    },
+                    RuntimeMapItemChildRecord {
+                        server_id: 2681,
+                        count: 3,
+                    },
+                ],
+            },
+            RuntimeMapItemRecord {
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                ordinal: 1,
+                server_id: 3065,
+                count: 1,
+                children: Vec::new(),
+            },
+            RuntimeMapItemRecord {
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                ordinal: 0,
+                server_id: 3058,
+                count: 1,
+                children: vec![RuntimeMapItemChildRecord {
+                    server_id: 2398,
+                    count: 1,
+                }],
+            },
+        ];
+        database
+            .replace_runtime_map_items(revision, &records)
+            .unwrap();
+        assert_eq!(
+            database.runtime_map_items().unwrap(),
+            Some((revision, records.clone()))
+        );
+        let emptied: Vec<RuntimeMapItemRecord> = Vec::new();
+        database
+            .replace_runtime_map_items(revision, &emptied)
+            .unwrap();
+        assert_eq!(database.runtime_map_items().unwrap(), None);
+
+        let duplicates = vec![
+            RuntimeMapItemRecord {
+                position: Position { x: 9, y: 9, z: 7 },
+                ordinal: 0,
+                server_id: 3065,
+                count: 1,
+                children: Vec::new(),
+            },
+            RuntimeMapItemRecord {
+                position: Position { x: 9, y: 9, z: 7 },
+                ordinal: 0,
+                server_id: 3065,
+                count: 1,
+                children: Vec::new(),
+            },
+        ];
+        assert!(matches!(
+            database.replace_runtime_map_items(revision, &duplicates),
+            Err(PersistenceError::InvalidMapItemJournal(message))
+                if message.contains("duplicate")
+        ));
+        let zero_id = vec![RuntimeMapItemRecord {
+            position: Position { x: 9, y: 9, z: 7 },
+            ordinal: 0,
+            server_id: 0,
+            count: 1,
+            children: Vec::new(),
+        }];
+        assert!(database
+            .replace_runtime_map_items(revision, &zero_id)
+            .is_err());
+        let too_many_children = vec![RuntimeMapItemRecord {
+            position: Position { x: 9, y: 9, z: 7 },
+            ordinal: 0,
+            server_id: 3065,
+            count: 1,
+            children: vec![
+                RuntimeMapItemChildRecord {
+                    server_id: 2148,
+                    count: 1,
+                };
+                MAX_RUNTIME_MAP_ITEM_CHILDREN + 1
+            ],
+        }];
+        assert!(matches!(
+            database.replace_runtime_map_items(revision, &too_many_children),
+            Err(PersistenceError::InvalidMapItemJournal(message))
+                if message.contains("children exceed")
+        ));
+        let zero_child_count = vec![RuntimeMapItemRecord {
+            position: Position { x: 9, y: 9, z: 7 },
+            ordinal: 0,
+            server_id: 3065,
+            count: 1,
+            children: vec![RuntimeMapItemChildRecord {
+                server_id: 2148,
+                count: 0,
+            }],
+        }];
+        assert!(matches!(
+            database.replace_runtime_map_items(revision, &zero_child_count),
+            Err(PersistenceError::InvalidMapItemJournal(message))
+                if message.contains("nonzero")
+        ));
         let _ = fs::remove_file(path);
     }
 
