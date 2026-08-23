@@ -640,17 +640,22 @@ fn native_container_item_inspection_message(
 }
 
 /// Derives FE's explicit armor-only physical reduction from the six armor slots used by the
-/// legacy reference boundary. This intentionally excludes hands, shields, weapons, skills,
-/// vocation multipliers, random blocking, resistance, and any claim of TFS formula parity.
-/// The sum is capped at the existing bounded combat-event maximum.
+/// legacy reference boundary, plus the bounded legacy defense value of the equipped left-hand
+/// (shield-hand) item when operator metadata supplies one. This intentionally excludes the right
+/// hand, skills, random blocking, resistance, and any claim of TFS formula parity. The sum is
+/// capped at the existing bounded combat-event maximum.
 fn native_equipment_armor_defense(
     armor_by_server_id: Option<&BTreeMap<u16, u16>>,
+    shield_defense_by_server_id: Option<&BTreeMap<u16, u16>>,
     equipment: &PlayerEquipment,
     armor_multiplier_milli: u32,
 ) -> PlayerCombatDefense {
-    let Some(armor_by_server_id) = armor_by_server_id else {
+    if armor_by_server_id.is_none() && shield_defense_by_server_id.is_none() {
         return PlayerCombatDefense::default();
-    };
+    }
+    let empty = BTreeMap::new();
+    let armor_by_server_id = armor_by_server_id.unwrap_or(&empty);
+    let shield_defense_by_server_id = shield_defense_by_server_id.unwrap_or(&empty);
     let armor_slots = [
         EquipmentSlot::Head,
         EquipmentSlot::Neck,
@@ -659,7 +664,7 @@ fn native_equipment_armor_defense(
         EquipmentSlot::Feet,
         EquipmentSlot::Ring,
     ];
-    let unscaled_armor = armor_slots.into_iter().fold(0_u16, |total, slot| {
+    let mut unscaled_armor = armor_slots.into_iter().fold(0_u16, |total, slot| {
         let armor = equipment
             .item(slot)
             .and_then(|item| armor_by_server_id.get(&item.server_id))
@@ -667,6 +672,16 @@ fn native_equipment_armor_defense(
             .unwrap_or_default();
         total.saturating_add(armor).min(MAX_COMBAT_EVENT_DAMAGE)
     });
+    // Only the left hand contributes legacy defense; shields and defensive weapons alike must
+    // sit there for this bounded extension to count them.
+    let shield_hand_defense = equipment
+        .item(EquipmentSlot::LeftHand)
+        .and_then(|item| shield_defense_by_server_id.get(&item.server_id))
+        .copied()
+        .unwrap_or_default();
+    unscaled_armor = unscaled_armor
+        .saturating_add(shield_hand_defense)
+        .min(MAX_COMBAT_EVENT_DAMAGE);
     PlayerCombatDefense {
         physical_flat_reduction: ((u64::from(unscaled_armor) * u64::from(armor_multiplier_milli))
             / u64::from(DEFAULT_NATIVE_ARMOR_MULTIPLIER_MILLI))
@@ -680,6 +695,7 @@ fn sync_native_equipment_armor_defense(
     shared_world: &SharedNativeWorld,
     player_id: u64,
     armor_by_server_id: Option<&BTreeMap<u16, u16>>,
+    shield_defense_by_server_id: Option<&BTreeMap<u16, u16>>,
     armor_multiplier_by_vocation: Option<&BTreeMap<VocationId, u32>>,
     equipment: &PlayerEquipment,
 ) -> Result<bool, HostError> {
@@ -690,7 +706,12 @@ fn sync_native_equipment_armor_defense(
         .unwrap_or(DEFAULT_NATIVE_ARMOR_MULTIPLIER_MILLI);
     shared_world.replace_player_combat_defense(
         player_id,
-        native_equipment_armor_defense(armor_by_server_id, equipment, armor_multiplier_milli),
+        native_equipment_armor_defense(
+            armor_by_server_id,
+            shield_defense_by_server_id,
+            equipment,
+            armor_multiplier_milli,
+        ),
     )
 }
 
@@ -1167,6 +1188,10 @@ pub struct NativeOtClientHostConfig {
     /// Shielding, weapon defense, vocation multipliers, random armor, and TFS formula parity are
     /// deliberately excluded.
     pub item_armor_by_server_id: Option<Arc<BTreeMap<u16, u16>>>,
+    /// Immutable validated legacy \items.xml\ defense values applied only to the equipped
+    /// left-hand (shield-hand) item inside the bounded physical mitigation bridge. Weapon-hand
+    /// defense, blocking chance, and TFS formula parity remain excluded.
+    pub item_shield_defense_by_server_id: Option<Arc<BTreeMap<u16, u16>>>,
     /// Immutable validated legacy `items.xml` slot types. They are used only by the bounded
     /// native map-source-to-empty-equipment route; generic inventories, stacks, swaps, and
     /// two-handed placement remain outside this policy.
@@ -5858,6 +5883,7 @@ fn handle_native_otclient_game(
         shared_world,
         character.id,
         config.item_armor_by_server_id.as_deref(),
+        config.item_shield_defense_by_server_id.as_deref(),
         config.armor_multiplier_by_vocation.as_deref(),
         &bootstrap_equipment,
     )?;
@@ -5868,6 +5894,7 @@ fn handle_native_otclient_game(
             "combat=equipment-armor-hydration physical-flat-reduction={} changed={hydrated_armor_defense}",
             native_equipment_armor_defense(
                 config.item_armor_by_server_id.as_deref(),
+                config.item_shield_defense_by_server_id.as_deref(),
                 &bootstrap_equipment,
                 config
                     .armor_multiplier_by_vocation
@@ -6303,6 +6330,9 @@ fn handle_native_otclient_game(
                                 skill_rate: config.skill_rate,
                                 death_loss_policy: config.death_loss_policy,
                                 armor_by_server_id: config.item_armor_by_server_id.as_deref(),
+                                shield_defense_by_server_id: config
+                                    .item_shield_defense_by_server_id
+                                    .as_deref(),
                                 armor_multiplier_by_vocation: config
                                     .armor_multiplier_by_vocation
                                     .as_deref(),
@@ -10224,6 +10254,7 @@ struct NativeSelectedPlayerMeleePolicy<'a> {
     skill_rate: u32,
     death_loss_policy: DeathLossPolicy,
     armor_by_server_id: Option<&'a BTreeMap<u16, u16>>,
+    shield_defense_by_server_id: Option<&'a BTreeMap<u16, u16>>,
     armor_multiplier_by_vocation: Option<&'a BTreeMap<VocationId, u32>>,
     declarative_weapon_catalog: Option<&'a DeclarativeWeaponCatalog>,
 }
@@ -10253,6 +10284,7 @@ fn apply_native_selected_player_melee(
         shared_world,
         target_id,
         policy.armor_by_server_id,
+        policy.shield_defense_by_server_id,
         policy.armor_multiplier_by_vocation,
         &target_equipment,
     )?;
@@ -11216,6 +11248,7 @@ mod tests {
             item_presentation_catalog: None,
             public_channel_catalog: None,
             item_armor_by_server_id: None,
+            item_shield_defense_by_server_id: None,
             item_slot_types_by_server_id: None,
             item_weight_by_server_id: None,
             item_name_by_server_id: None,
@@ -13823,15 +13856,15 @@ mod tests {
         ]);
 
         assert_eq!(
-            native_equipment_armor_defense(Some(&armor_by_server_id), &equipment, 1_000),
+            native_equipment_armor_defense(Some(&armor_by_server_id), None, &equipment, 1_000),
             PlayerCombatDefense::new(21).unwrap()
         );
         assert_eq!(
-            native_equipment_armor_defense(Some(&armor_by_server_id), &equipment, 1_200),
+            native_equipment_armor_defense(Some(&armor_by_server_id), None, &equipment, 1_200),
             PlayerCombatDefense::new(25).unwrap()
         );
         assert_eq!(
-            native_equipment_armor_defense(None, &equipment, 1_000),
+            native_equipment_armor_defense(None, None, &equipment, 1_000),
             PlayerCombatDefense::default()
         );
     }
@@ -16797,6 +16830,7 @@ mod tests {
                 skill_rate: 1,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
                 armor_by_server_id: Some(&armor_by_server_id),
+                shield_defense_by_server_id: None,
                 armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: None,
             },
@@ -16831,6 +16865,7 @@ mod tests {
                 skill_rate: 1,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
                 armor_by_server_id: Some(&armor_by_server_id),
+                shield_defense_by_server_id: None,
                 armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: None,
             },
@@ -16839,6 +16874,49 @@ mod tests {
         .is_none());
         assert_eq!(shared.vitals_epoch(), 1);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn shield_hand_legacy_defense_extends_the_bounded_physical_reduction() {
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(EquipmentSlot::Armor, ItemInstance::new(2463, 1).unwrap());
+        equipment.equip(EquipmentSlot::LeftHand, ItemInstance::new(2511, 1).unwrap());
+        let armor_by_server_id = BTreeMap::from([(2463_u16, 3_u16)]);
+        let defense_by_server_id = BTreeMap::from([(2511_u16, 5_u16)]);
+
+        // Without shield metadata the reduction stays the armor-only value.
+        assert_eq!(
+            native_equipment_armor_defense(Some(&armor_by_server_id), None, &equipment, 1_000)
+                .physical_flat_reduction,
+            3
+        );
+        // The left-hand item's legacy defense adds to the same capped sum.
+        assert_eq!(
+            native_equipment_armor_defense(
+                Some(&armor_by_server_id),
+                Some(&defense_by_server_id),
+                &equipment,
+                1_000
+            )
+            .physical_flat_reduction,
+            8
+        );
+        // Defense in the right hand never counts: only the shield hand is interpreted.
+        let mut right_hand_defense = PlayerEquipment::default();
+        right_hand_defense.equip(
+            EquipmentSlot::RightHand,
+            ItemInstance::new(2511, 1).unwrap(),
+        );
+        assert_eq!(
+            native_equipment_armor_defense(
+                None,
+                Some(&defense_by_server_id),
+                &right_hand_defense,
+                1_000
+            )
+            .physical_flat_reduction,
+            0
+        );
     }
 
     #[test]
@@ -16914,6 +16992,7 @@ mod tests {
                 skill_rate: 1,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
                 armor_by_server_id: None,
+                shield_defense_by_server_id: None,
                 armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: None,
             },
@@ -17039,6 +17118,7 @@ mod tests {
                 skill_rate: 1,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
                 armor_by_server_id: None,
+                shield_defense_by_server_id: None,
                 armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: Some(&catalog),
             },
@@ -17069,6 +17149,7 @@ mod tests {
                 skill_rate: 2,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
                 armor_by_server_id: Some(&armor_by_server_id),
+                shield_defense_by_server_id: None,
                 armor_multiplier_by_vocation: Some(&armor_multiplier_by_vocation),
                 declarative_weapon_catalog: Some(&catalog),
             },
@@ -17237,6 +17318,7 @@ mod tests {
                     skill_rate: 3,
                     death_loss_policy: DeathLossPolicy::DefaultFormula,
                     armor_by_server_id: None,
+                    shield_defense_by_server_id: None,
                     armor_multiplier_by_vocation: None,
                     declarative_weapon_catalog: Some(&catalog),
                 },
@@ -17337,6 +17419,7 @@ mod tests {
                 skill_rate: 2,
                 death_loss_policy: DeathLossPolicy::DefaultFormula,
                 armor_by_server_id: None,
+                shield_defense_by_server_id: None,
                 armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: None,
             },
@@ -17446,6 +17529,7 @@ mod tests {
                 skill_rate: 1,
                 death_loss_policy: DeathLossPolicy::FixedPercent(10),
                 armor_by_server_id: None,
+                shield_defense_by_server_id: None,
                 armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: None,
             },

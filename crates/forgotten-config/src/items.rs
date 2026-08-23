@@ -221,6 +221,21 @@ impl LegacyItemCatalog {
             .collect()
     }
 
+    /// Returns bounded legacy XML defense values keyed by their authoritative server IDs. The
+    /// result is immutable input for FE's bounded left-hand (shield-hand) mitigation extension;
+    /// weapon-hand defense, blocking chance, and TFS formula semantics stay outside this map.
+    pub fn native_xml_defense_by_server_id(&self) -> BTreeMap<u16, u16> {
+        self.definitions
+            .iter()
+            .filter_map(|(&server_id, definition)| {
+                definition
+                    .xml_defense
+                    .filter(|defense| *defense > 0)
+                    .map(|defense| (server_id, defense))
+            })
+            .collect()
+    }
+
     /// Returns only sword, club, and axe legacy weapon classifications that FE's existing
     /// adjacent declarative melee route can map to a typed skill-try award. This does not enable
     /// ranged, shielding, wand, ammunition, quiver, or generic TFS weapon behavior.

@@ -461,6 +461,9 @@ fn run_host(
     let item_armor_by_server_id = item_catalog
         .as_ref()
         .map(|catalog| catalog.native_xml_armor_by_server_id());
+    let item_shield_defense_by_server_id = item_catalog
+        .as_ref()
+        .map(|catalog| catalog.native_xml_defense_by_server_id());
     let item_adjacent_melee_skill_by_server_id = item_catalog
         .as_ref()
         .map(|catalog| catalog.adjacent_melee_skill_by_server_id());
@@ -714,6 +717,7 @@ fn run_host(
             item_presentation_catalog: item_presentation_catalog.map(Arc::new),
             public_channel_catalog,
             item_armor_by_server_id: item_armor_by_server_id.map(Arc::new),
+            item_shield_defense_by_server_id: item_shield_defense_by_server_id.map(Arc::new),
             item_slot_types_by_server_id: item_slot_types_by_server_id.map(Arc::new),
             item_weight_by_server_id: item_weight_by_server_id.map(Arc::new),
             item_name_by_server_id: item_name_by_server_id.map(Arc::new),
