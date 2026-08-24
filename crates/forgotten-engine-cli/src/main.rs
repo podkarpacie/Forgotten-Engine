@@ -197,16 +197,15 @@ fn selected_profile(
     index: usize,
 ) -> Result<CompatibilityProfile, Box<dyn std::error::Error>> {
     let selector = match arguments.get(index).map(String::as_str) {
-        None => "fe-1.2",
+        None => "fe-7.4",
         Some("--profile") => arguments
             .get(index + 1)
             .map(String::as_str)
             .ok_or("a compatibility profile is required after --profile")?,
         Some(value) => value,
     };
-    profile_by_id(selector).ok_or_else(|| {
-        format!("unknown compatibility profile `{selector}`; use fe-7.4, fe-8.0, or fe-1.2").into()
-    })
+    profile_by_id(selector)
+        .ok_or_else(|| format!("unknown compatibility profile `{selector}`; use fe-7.4").into())
 }
 
 fn init(
@@ -2252,12 +2251,10 @@ fn help_text() -> &'static str {
     r#"Forgotten Engine
 
 Compatibility profiles:
-  fe-7.4  — Tibia 7.4 (experimental native OTCv8 empty-world fixture)
-  fe-8.0  — Tibia 8.0 (protocol foundation)
-  fe-1.2  — TFS 1.2 / Tibia 10.98 (protocol foundation)
+  fe-7.4  - Tibia 7.4 (native OTCv8 path; runnable classic profiles 740 and 760)
 
 Commands:
-  init <directory> [--profile fe-7.4|fe-8.0|fe-1.2]
+  init <directory> [--profile fe-7.4]
   validate <directory>
   tfs-audit <directory>
   run <directory> [--ed]
@@ -2486,8 +2483,6 @@ mod tests {
         let matrix = capability_matrix_json();
         assert!(matrix.contains("\"schemaVersion\": 1"));
         assert!(matrix.contains("\"id\": \"fe-7.4\""));
-        assert!(matrix.contains("\"id\": \"fe-8.0\""));
-        assert!(matrix.contains("\"id\": \"fe-1.2\""));
         assert!(compatibility(&["compatibility".into(), "--json".into()]).is_ok());
         assert!(compatibility(&["compatibility".into(), "--unknown".into()]).is_err());
     }

@@ -19,8 +19,6 @@ use std::{
 };
 
 pub const MAX_FRAME_SIZE: usize = 8 * 1024;
-pub const FE_1_2_RELEASE: &str = "1.2.0";
-pub const FE_8_0_RELEASE: &str = "8.0.0";
 pub const FE_7_4_RELEASE: &str = "7.4.0";
 pub const LEGACY_RSA_BLOCK_SIZE: usize = 128;
 pub const MAX_LOGIN_STRING_BYTES: usize = 128;
@@ -34,20 +32,6 @@ pub struct CompatibilityProfile {
     pub complete_protocol_emulation: bool,
 }
 
-pub const FE_1_2_PROFILE: CompatibilityProfile = CompatibilityProfile {
-    id: "fe-1.2",
-    fe_release: FE_1_2_RELEASE,
-    compatibility_reference: "TFS 1.2",
-    tibia_protocol: "10.98",
-    complete_protocol_emulation: false,
-};
-pub const FE_8_0_PROFILE: CompatibilityProfile = CompatibilityProfile {
-    id: "fe-8.0",
-    fe_release: FE_8_0_RELEASE,
-    compatibility_reference: "Tibia 8.0 protocol",
-    tibia_protocol: "8.0",
-    complete_protocol_emulation: false,
-};
 pub const FE_7_4_PROFILE: CompatibilityProfile = CompatibilityProfile {
     id: "fe-7.4",
     fe_release: FE_7_4_RELEASE,
@@ -55,8 +39,7 @@ pub const FE_7_4_PROFILE: CompatibilityProfile = CompatibilityProfile {
     tibia_protocol: "7.4",
     complete_protocol_emulation: false,
 };
-pub const COMPATIBILITY_PROFILES: [CompatibilityProfile; 3] =
-    [FE_7_4_PROFILE, FE_8_0_PROFILE, FE_1_2_PROFILE];
+pub const COMPATIBILITY_PROFILES: [CompatibilityProfile; 1] = [FE_7_4_PROFILE];
 
 pub fn profile_by_id(id: &str) -> Option<CompatibilityProfile> {
     COMPATIBILITY_PROFILES
@@ -3528,12 +3511,14 @@ mod tests {
     }
     #[test]
     fn profiles_remain_explicit_and_limited() {
-        assert_eq!(profile_by_id("fe-8.0"), Some(FE_8_0_PROFILE));
-        assert!(!profile_by_id("fe-1.2").unwrap().complete_protocol_emulation);
+        assert_eq!(profile_by_id("fe-7.4"), Some(FE_7_4_PROFILE));
+        assert_eq!(profile_by_id("fe-8.0"), None);
+        assert_eq!(profile_by_id("fe-1.2"), None);
+        assert!(!FE_7_4_PROFILE.complete_protocol_emulation);
     }
 
     #[test]
-    fn native_profile_foundations_distinguish_runnable_740_from_encrypted_800() {
+    fn native_profile_foundations_distinguish_runnable_classic_from_encrypted_800() {
         let plain_740 = NativeOtClientProfile {
             protocol_version: 740,
             numeric_account_ids: true,

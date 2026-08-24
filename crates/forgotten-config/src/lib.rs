@@ -1667,7 +1667,7 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forgotten_protocol::{FE_7_4_PROFILE, FE_8_0_PROFILE};
+    use forgotten_protocol::FE_7_4_PROFILE;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_world(name: &str) -> PathBuf {
@@ -2079,22 +2079,21 @@ experienceStages = {
     }
 
     #[test]
-    fn reports_the_unimplemented_encrypted_transport_for_enabled_protocol_800() {
+    fn rejects_unsupported_protocol_800_as_not_runnable() {
         let world = temporary_world("native-800-transport-boundary");
         fs::create_dir_all(&world).unwrap();
         fs::write(
             world.join(CONFIG_FILE_NAME),
             format!(
                 "{}otclientV8NativeEnabled = true\notclientV8ProtocolVersion = 800\notclientV8LoginPacketEncryption = true\n",
-                template(FE_8_0_PROFILE)
+                template(FE_7_4_PROFILE)
             ),
         )
         .unwrap();
 
         assert!(matches!(
             load(&world),
-            Err(ConfigError::InvalidValue { key: "otclientV8NativeEnabled", message })
-                if message.contains("RSA/XTEA")
+            Err(ConfigError::InvalidValue { key: "otclientV8NativeEnabled", .. })
         ));
         let _ = fs::remove_dir_all(world);
     }
