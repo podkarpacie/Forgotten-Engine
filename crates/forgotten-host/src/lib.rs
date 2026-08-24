@@ -54,10 +54,12 @@ use forgotten_protocol::{
     encode_native_otclient_creature_health, encode_native_otclient_creature_outfit,
     encode_native_otclient_creature_party_shield, encode_native_otclient_delete_inventory,
     encode_native_otclient_empty_quest_log, encode_native_otclient_failure_message,
-    encode_native_otclient_game_cancel_walk_facing, encode_native_otclient_game_death,
+    encode_native_otclient_game_announcement, encode_native_otclient_game_cancel_walk_facing,
+    encode_native_otclient_game_death,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
+    encode_native_otclient_look_message,
     encode_native_otclient_map_step_with_static_spawns_and_players,
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
@@ -1335,6 +1337,9 @@ pub struct NativeOtClientHostConfig {
     /// Immutable source OTB stackability identifiers paired with the inspection-only weight map.
     /// They do not alter FE item-stack transfer behavior.
     pub stackable_item_server_ids: Option<Arc<BTreeSet<u16>>>,
+    /// Immutable legacy `speed` bonuses (BoH-style) keyed by authoritative server ID. They feed
+    /// the dynamic per-player walk-speed computation for equipped boots and similar items.
+    pub item_speed_bonus_by_server_id: Option<Arc<BTreeMap<u16, u16>>>,
     /// Immutable validated armor multiplier thousandths keyed by vocation. Missing vocation
     /// entries retain the deterministic `1.000` default; shielding and defense formulas remain
     /// outside this bridge.
@@ -5834,6 +5839,17 @@ impl SharedNativeWorld {
         Ok(true)
     }
 
+    /// Consumes a pending kick for one player: returns true exactly once per requested kick.
+    /// The native session loop calls this every iteration so operator kicks disconnect the
+    /// target within roughly one heartbeat.
+    pub fn take_pending_kick(&self, player_id: u64) -> Result<bool, HostError> {
+        let mut kicks = self
+            .pending_kicks
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        Ok(kicks.remove(&player_id).is_some())
+    }
+
     pub fn register_player_at_available_position(
         &self,
         player: Player,
@@ -7185,7 +7201,20 @@ fn handle_native_otclient_game(
         character.outfit,
     );
     shared_world.update_player_outfit(character.id, player_outfit)?;
-    shared_world.update_player_facing(character.id, NativeOtClientCardinalDirection::South)?;
+    // Characters created before starter provisioning get their backpack on first login so
+    // operator /give and loot pickup always have a destination.
+    database
+        .provision_starter_backpack(character.id)
+        .map_err(HostError::Persistence)?;
+    // Restore the persisted cardinal rotation so relog keeps the character facing the same
+    // way it was left; south remains the fallback for legacy rows.
+    let persisted_facing = NativeOtClientCardinalDirection::from_protocol_direction(
+        database
+            .player_facing(character.id)
+            .map_err(HostError::Persistence)?,
+    )
+    .unwrap_or(NativeOtClientCardinalDirection::South);
+    shared_world.update_player_facing(character.id, persisted_facing)?;
     let player_id = native_player_id(character.id)?;
     let (authoritative_player, authoritative_vitals) =
         shared_world.player_and_vitals(character.id)?;
@@ -7199,7 +7228,7 @@ fn handle_native_otclient_game(
         player_skills: character.progression.skills,
         ground_thing_id: empty_world.ground_thing_id,
         player_look_type: player_outfit.look_type,
-        player_direction: NativeOtClientCardinalDirection::South.protocol_direction(),
+        player_direction: persisted_facing.protocol_direction(),
         player_speed: empty_world.player_speed,
         server_beat: empty_world.server_beat,
     };
@@ -7401,6 +7430,24 @@ fn handle_native_otclient_game(
                 peer,
                 "lifecycle=death-notification profile=740 fields=none source=shared-world-transition",
             );
+        }
+        // Operator kicks: an entry in pending_kicks ends this session at the next loop pass.
+        // Returning drops the SharedNativePlayerRegistration guard, which unregisters the
+        // chat/VIP recipients and removes the player from the shared world before the socket
+        // closes, so the disconnect is authoritative and the vitals/position stay persisted.
+        if shared_world.take_pending_kick(character.id)? {
+            let rejection = encode_native_otclient_failure_message(
+                &config.client_profile,
+                "You were disconnected by a gamemaster.",
+            )
+            .map_err(HostError::Protocol)?;
+            let _ = write_frame(stream, &rejection);
+            native_diagnostic(
+                config.extended_diagnostics,
+                peer,
+                "lifecycle=kicked-by-operator",
+            );
+            break;
         }
         let read_timeout = active_click_walk
             .as_ref()
@@ -7893,9 +7940,15 @@ fn handle_native_otclient_game(
                             );
                             observed_visibility_epoch = shared_world.visibility_epoch();
                             if let Some(task) = active_click_walk.as_mut() {
+                                let equipment = shared_world.player_equipment(character.id)?;
+                                let effective_speed = native_effective_player_speed(
+                                    snapshot.player_speed,
+                                    &equipment,
+                                    config.item_speed_bonus_by_server_id.as_deref(),
+                                );
                                 task.next_step_deadline = Instant::now()
                                     + native_autowalk_step_delay(
-                                        snapshot.player_speed,
+                                        effective_speed,
                                         snapshot.server_beat,
                                     );
                             }
@@ -10237,7 +10290,7 @@ fn handle_native_otclient_game(
                     thing_id,
                     stack_position,
                 ) {
-                    let response = encode_native_otclient_status_message(
+                    let response = encode_native_otclient_look_message(
                         &config.client_profile,
                         &native_equipment_item_inspection_message(
                             slot,
@@ -10269,7 +10322,7 @@ fn handle_native_otclient_game(
                     thing_id,
                     stack_position,
                 ) {
-                    let response = encode_native_otclient_status_message(
+                    let response = encode_native_otclient_look_message(
                         &config.client_profile,
                         &native_container_item_inspection_message(
                             container_id,
@@ -10333,14 +10386,14 @@ fn handle_native_otclient_game(
                     config.stackable_item_server_ids.as_deref(),
                 );
                 let response =
-                    encode_native_otclient_status_message(&config.client_profile, &message)
+                    encode_native_otclient_look_message(&config.client_profile, &message)
                         .map_err(HostError::Protocol)?;
                 write_frame(stream, &response)?;
                 native_diagnostic(
                     config.extended_diagnostics,
                     peer,
                     &format!(
-                        "outbound=status-message opcode=0xb4 bytes={} action=look-map server-id={} count={}",
+                        "outbound=look-message opcode=0xb4 class=0x16 bytes={} action=look-map server-id={} count={}",
                         response.0.len(), item.server_id, item.count
                     ),
                 );
@@ -10357,14 +10410,14 @@ fn handle_native_otclient_game(
                     continue;
                 };
                 let response =
-                    encode_native_otclient_status_message(&config.client_profile, &message)
+                    encode_native_otclient_look_message(&config.client_profile, &message)
                         .map_err(HostError::Protocol)?;
                 write_frame(stream, &response)?;
                 native_diagnostic(
                     config.extended_diagnostics,
                     peer,
                     &format!(
-                        "outbound=status-message opcode=0xb4 bytes={} action=look-creature native-id={creature_id}",
+                        "outbound=look-message opcode=0xb4 class=0x16 bytes={} action=look-creature native-id={creature_id}",
                         response.0.len()
                     ),
                 );
@@ -10945,8 +10998,14 @@ fn handle_native_otclient_game(
                         ),
                     );
                 } else {
+                    let equipment = shared_world.player_equipment(character.id)?;
+                    let effective_speed = native_effective_player_speed(
+                        snapshot.player_speed,
+                        &equipment,
+                        config.item_speed_bonus_by_server_id.as_deref(),
+                    );
                     let step_delay =
-                        native_autowalk_step_delay(snapshot.player_speed, snapshot.server_beat);
+                        native_autowalk_step_delay(effective_speed, snapshot.server_beat);
                     let mut task =
                         NativeActiveClickWalk::from_path(path, Instant::now() + step_delay);
                     native_diagnostic(
@@ -11294,6 +11353,18 @@ fn drain_shared_public_chat(
                                 3,
                                 "yell-chat",
                             )),
+                            NATIVE_OTCLIENT_MESSAGE_GM_BROADCAST => Some((
+                                // Console broadcasts ride the 0xB4/0x13 game-announcement
+                                // class: white center-screen text mirrored into the Server
+                                // Log tab. The mode-9 GM talk record renders console-red only.
+                                encode_native_otclient_game_announcement(
+                                    profile,
+                                    format!("{}: {}", event.speaker_name, event.text).as_str(),
+                                )
+                                .map_err(HostError::Protocol)?,
+                                9,
+                                "console-broadcast",
+                            )),
                             _ => Some((
                                 encode_native_otclient_public_say(
                                     profile,
@@ -11618,7 +11689,11 @@ fn move_native_map_player(
         }
     }
     shared_world.mark_visibility_changed();
-    database.update_player_position(character_id, destination)?;
+    database.update_player_position_and_facing(
+        character_id,
+        destination,
+        facing.protocol_direction(),
+    )?;
     write_frame(
         stream,
         &encode_native_otclient_move_creature_at(
@@ -11710,7 +11785,11 @@ fn activate_native_map_teleport_item(
     };
 
     shared_world.mark_visibility_changed();
-    database.update_player_position(character_id, destination)?;
+    database.update_player_position_and_facing(
+        character_id,
+        destination,
+        facing.protocol_direction(),
+    )?;
     let mut refreshed_snapshot = snapshot.clone();
     refreshed_snapshot.player_position = native_position(destination);
     refreshed_snapshot.player_direction = facing.protocol_direction();
@@ -11800,7 +11879,11 @@ fn move_native_map_player_diagonal(
         }
     }
     shared_world.mark_visibility_changed();
-    database.update_player_position(character_id, destination)?;
+    database.update_player_position_and_facing(
+        character_id,
+        destination,
+        facing.protocol_direction(),
+    )?;
     write_frame(
         stream,
         &encode_native_otclient_move_creature_at(
@@ -11844,6 +11927,28 @@ fn native_autowalk_step_delay(player_speed: u16, server_beat: u16) -> Duration {
         .max(server_beat)
         .min(NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY.as_millis() as u64);
     Duration::from_millis(interval_millis)
+}
+
+/// Classic-style effective walk speed: configured base speed plus the `speed` bonus of
+/// equipped boots (BoH-style items). Bonuses add directly to the base; there is no stacking
+/// across multiple slots because only the feet slot contributes.
+pub fn native_effective_player_speed(
+    base_speed: u16,
+    equipment: &PlayerEquipment,
+    speed_bonus_by_server_id: Option<&BTreeMap<u16, u16>>,
+) -> u16 {
+    let mut speed = base_speed;
+    if let Some(bonuses) = speed_bonus_by_server_id {
+        for slot in [EquipmentSlot::Feet] {
+            if let Some(item) = equipment.item(slot) {
+                if let Some(bonus) = bonuses.get(&item.server_id) {
+                    speed = speed.saturating_add(*bonus);
+                }
+            }
+        }
+    }
+    // Classic clients treat 0 or absurd speeds badly; keep a sane ceiling.
+    speed.clamp(1, 2_000)
 }
 
 fn native_player_id(character_id: u64) -> Result<u32, HostError> {
@@ -13187,6 +13292,7 @@ mod tests {
             item_weight_by_server_id: None,
             item_name_by_server_id: None,
             stackable_item_server_ids: None,
+            item_speed_bonus_by_server_id: None,
             armor_multiplier_by_vocation: None,
             static_spawns: None,
             static_target_attack_policy: StaticTargetAttackPolicy::Disabled,
@@ -21496,7 +21602,7 @@ mod tests {
         );
         assert_eq!(
             response.0[1],
-            forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT
+            forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_LOOK
         );
         assert_eq!(
             u16::from_le_bytes([response.0[2], response.0[3]]) as usize,
@@ -21596,7 +21702,7 @@ mod tests {
         );
         assert_eq!(
             response.0[1],
-            forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT
+            forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_LOOK
         );
         assert_eq!(
             u16::from_le_bytes([response.0[2], response.0[3]]) as usize,
@@ -25708,7 +25814,7 @@ mod tests {
             read_data_frame(&mut stream).0,
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
-                forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT,
+                forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_LOOK,
                 81,
                 0,
                 b'Y',
@@ -25810,7 +25916,7 @@ mod tests {
             read_data_frame(&mut stream).0,
             vec![
                 forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
-                forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT,
+                forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_LOOK,
                 12,
                 0,
                 b'Y',
@@ -27923,5 +28029,49 @@ mod gm_talkaction_tests {
         assert!(line.contains("players-online=0"));
         shutdown.store(true, Ordering::SeqCst);
         let _ = fs::remove_file(&path);
+    }
+}
+
+/// Dynamic per-player speed coverage: boots-slot speed bonuses stack onto the configured base,
+/// non-boot items never contribute, and unknown item IDs leave the base unchanged.
+#[cfg(test)]
+mod effective_speed_tests {
+    use super::*;
+
+    #[test]
+    fn boots_speed_bonus_stacks_onto_base_and_unknown_items_do_not() {
+        let base = 220_u16;
+        let mut equipment = PlayerEquipment::default();
+        let empty_map: Option<&BTreeMap<u16, u16>> = None;
+        assert_eq!(
+            native_effective_player_speed(base, &equipment, empty_map),
+            base
+        );
+
+        // Boots of haste style bonus on the feet slot.
+        equipment.equip(EquipmentSlot::Feet, ItemInstance::new(2195, 1).unwrap());
+        let bonuses = BTreeMap::from([(2195_u16, 40_u16)]);
+        assert_eq!(
+            native_effective_player_speed(base, &equipment, Some(&bonuses)),
+            260
+        );
+
+        // A sword in the right hand with a speed attribute must not contribute.
+        let mut wrong_slot = PlayerEquipment::default();
+        wrong_slot.equip(
+            EquipmentSlot::RightHand,
+            ItemInstance::new(2195, 1).unwrap(),
+        );
+        assert_eq!(
+            native_effective_player_speed(base, &wrong_slot, Some(&bonuses)),
+            base
+        );
+
+        // Unknown server ids contribute nothing.
+        let other_bonuses = BTreeMap::from([(9999_u16, 100_u16)]);
+        assert_eq!(
+            native_effective_player_speed(base, &equipment, Some(&other_bonuses)),
+            base
+        );
     }
 }

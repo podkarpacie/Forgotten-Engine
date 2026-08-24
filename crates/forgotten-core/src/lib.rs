@@ -182,6 +182,45 @@ impl FeTfsStaticSpawnCollection {
         Self::with_respawn_intervals(entities, BTreeMap::new())
     }
 
+    /// Merges summon-template entities into this collection, keeping only templates whose IDs
+    /// and names do not collide with existing entries. Imported spawns always win; this is
+    /// used at startup to add operator-summon templates alongside imported world spawns.
+    pub fn extend_templates(
+        &mut self,
+        templates: FeTfsStaticSpawnCollection,
+    ) -> Result<(), CoreError> {
+        let existing_ids: BTreeSet<u32> = self.entities.iter().map(|entity| entity.id).collect();
+        let existing_names: BTreeSet<String> = self
+            .entities
+            .iter()
+            .map(|entity| entity.name.to_lowercase())
+            .collect();
+        for template in templates.entities {
+            if existing_ids.contains(&template.id)
+                || existing_names.contains(&template.name.to_lowercase())
+            {
+                continue;
+            }
+            if let Some(experience) = templates.experience_rewards.get(&template.id) {
+                self.experience_rewards.insert(template.id, *experience);
+            }
+            if let Some(melee_interval) = templates.direct_melee_intervals_millis.get(&template.id)
+            {
+                self.direct_melee_intervals_millis
+                    .insert(template.id, *melee_interval);
+            }
+            if let Some(damage_range) = templates.direct_melee_damage_ranges.get(&template.id) {
+                self.direct_melee_damage_ranges
+                    .insert(template.id, *damage_range);
+            }
+            if let Some(loot_table) = templates.loot_tables.get(&template.id) {
+                self.loot_tables.insert(template.id, loot_table.clone());
+            }
+            self.entities.push(template);
+        }
+        Ok(())
+    }
+
     pub fn with_respawn_intervals(
         entities: Vec<FeTfsStaticEntity>,
         respawn_intervals_seconds: BTreeMap<u32, u32>,

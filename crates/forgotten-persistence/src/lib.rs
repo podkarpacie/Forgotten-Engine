@@ -48,11 +48,16 @@ const SCHEMA_VERSION_ITEM_CONTENTS: i64 = 31;
 const SCHEMA_VERSION_PLAYER_PARTIES: i64 = 30;
 const SCHEMA_VERSION_CORPSE_DESPAWN_TICKS: i64 = 27;
 const SCHEMA_VERSION_PLAYER_GM_LEVEL: i64 = 32;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_GM_LEVEL;
+const SCHEMA_VERSION_PLAYER_FACING: i64 = 33;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_FACING;
 /// Classic blessing count ceiling; the audited default death-loss reduction consumes this.
 pub const MAX_PLAYER_BLESSINGS: u8 = 5;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PROVISIONED_PLAYER_LEVEL: u32 = 8;
+/// Classic brown backpack server item id provisioned to every new character.
+const NATIVE_STARTER_BACKPACK_ITEM_ID: u16 = 2854;
+/// Starter backpack slot count; matches the classic 20-slot container.
+const NATIVE_STARTER_BACKPACK_CAPACITY: u16 = 20;
 pub const MAX_VIP_DESCRIPTION_BYTES: usize = 128;
 pub const MAX_GUILD_NAME_BYTES: usize = 64;
 pub const MAX_GUILD_MOTD_BYTES: usize = 255;
@@ -1824,6 +1829,30 @@ impl EngineDatabase {
         })
     }
 
+    /// Gives a newly created character its classic starter backpack so operator item delivery
+    /// and loot pickup have a destination from the first login.
+    pub fn provision_starter_backpack(&mut self, player_id: u64) -> Result<(), PersistenceError> {
+        let containers = self.player_containers(player_id)?;
+        if !containers.is_empty() {
+            return Ok(());
+        }
+        let container_item = ItemInstance::new(NATIVE_STARTER_BACKPACK_ITEM_ID, 1)
+            .map_err(|_| PersistenceError::InvalidPlayerName)?;
+        let backpack = PlayerContainer::new(
+            0_u8,
+            container_item,
+            "Backpack",
+            false,
+            NATIVE_STARTER_BACKPACK_CAPACITY,
+        )
+        .map_err(|_| PersistenceError::InvalidPlayerName)?;
+        let mut staged = PlayerContainers::default();
+        staged
+            .insert(backpack)
+            .map_err(|_| PersistenceError::InvalidPlayerName)?;
+        self.replace_player_containers(player_id, &staged)
+    }
+
     /// Persists an accepted classic outfit. A zero look type is reserved for the migration
     /// fallback, so live native sessions may only save a concrete appearance.
     pub fn update_player_outfit(
@@ -2593,6 +2622,43 @@ impl EngineDatabase {
             return Err(PersistenceError::UnknownPlayer(player_id));
         }
         Ok(())
+    }
+
+    /// Persists position and cardinal facing together so a relog restores the character's
+    /// rotation exactly as it was left. `facing` uses classic direction bytes (0-3).
+    pub fn update_player_position_and_facing(
+        &self,
+        player_id: u64,
+        position: Position,
+        facing: u8,
+    ) -> Result<(), PersistenceError> {
+        if facing > 3 {
+            return Err(PersistenceError::InvalidPlayerName);
+        }
+        let affected = self.connection.execute(
+            "UPDATE players SET x = ?1, y = ?2, z = ?3, facing = ?4 WHERE id = ?5",
+            params![
+                position.x as i64,
+                position.y as i64,
+                position.z as i64,
+                facing as i64,
+                player_id as i64,
+            ],
+        )?;
+        if affected == 0 {
+            return Err(PersistenceError::UnknownPlayer(player_id));
+        }
+        Ok(())
+    }
+
+    /// Reads one character's persisted facing byte (0 north, 1 east, 2 south, 3 west).
+    pub fn player_facing(&self, player_id: u64) -> Result<u8, PersistenceError> {
+        let facing = self.connection.query_row(
+            "SELECT facing FROM players WHERE id = ?1",
+            params![player_id as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(u8::try_from(facing).unwrap_or(2))
     }
 
     /// Replaces the player's fixed equipment set in one SQLite transaction. Containers, depot,
@@ -4522,6 +4588,18 @@ impl EngineDatabase {
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![SCHEMA_VERSION_PLAYER_GM_LEVEL, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < SCHEMA_VERSION_PLAYER_FACING {
+            // Persisted cardinal facing so relog restores the character's rotation together
+            // with the saved position. Classic direction bytes: 0 north, 1 east, 2 south,
+            // 3 west; two (south) matches the historical login-facing default.
+            self.connection.execute_batch(
+                "ALTER TABLE players ADD COLUMN facing INTEGER NOT NULL DEFAULT 2;",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_PLAYER_FACING, unix_seconds()],
             )?;
         }
         Ok(())

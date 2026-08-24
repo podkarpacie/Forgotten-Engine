@@ -4,12 +4,12 @@ use forgotten_config::{
     load_declarative_spell_catalog, load_declarative_weapon_catalog, load_legacy_item_catalog,
     load_quest_catalog, load_tfs_content_inventory, load_tfs_entity_catalog,
     load_tfs_public_channel_catalog, load_tfs_vocation_registry, load_world_companions,
-    load_world_map, materialize_tfs_static_spawns, resolve_tfs_registry_script_reference,
-    resolve_tfs_spawn_references, validate_content, world_map_path, write_template,
-    ConsumableCatalog, DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog,
-    DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig, LegacyPublicChannelCatalog,
-    LegacyWorldCompanionData, QuestCatalog, TfsEntityCatalog, TfsRegistryCategory,
-    TfsVocationRegistry,
+    load_world_map, materialize_tfs_spawn_templates, materialize_tfs_static_spawns,
+    resolve_tfs_registry_script_reference, resolve_tfs_spawn_references, validate_content,
+    world_map_path, write_template, ConsumableCatalog, DeclarativeNpcDialogueCatalog,
+    DeclarativeShopCatalog, DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig,
+    LegacyPublicChannelCatalog, LegacyWorldCompanionData, QuestCatalog, TfsEntityCatalog,
+    TfsRegistryCategory, TfsVocationRegistry,
 };
 use forgotten_core::{
     DeathLossPolicy, EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
@@ -498,6 +498,9 @@ fn run_host(
     let stackable_item_server_ids = item_catalog
         .as_ref()
         .map(|catalog| catalog.stackable_server_ids());
+    let item_speed_bonus_by_server_id = item_catalog
+        .as_ref()
+        .map(|catalog| catalog.xml_speed_bonus_by_server_id());
     let world_map = Arc::new(match &item_catalog {
         Some(catalog) => apply_legacy_item_metadata(&raw_world_map, catalog)?,
         None => raw_world_map,
@@ -609,34 +612,34 @@ fn run_host(
                 config.otclient_v8_empty_world_ground_thing_id
             };
             let player_look_type: u16 = config.otclient_v8_player_look_type;
-            let (player_look_type, outfit_first_look_type, outfit_last_look_type): (
-                u16,
-                u8,
-                u8,
-            ) = if player_look_type == 0 && !asset_free_fixture {
-                // Operator never chose an appearance for a real world; zero renders as the
-                // clientside invisibility effect, so default the citizen set.
-                (
-                    u16::from(forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_PLAYER_LOOK_TYPE),
-                    forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_OUTFIT_FIRST_LOOK_TYPE,
-                    forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_OUTFIT_LAST_LOOK_TYPE,
-                )
-            } else {
-                let first = config.otclient_v8_outfit_first_look_type;
-                let last = config.otclient_v8_outfit_last_look_type;
-                if first == 0 || last == 0 {
-                    return Err(
-                        "otclientV8OutfitFirstLookType/LastLookType must be configured when \
+            let (player_look_type, outfit_first_look_type, outfit_last_look_type): (u16, u8, u8) =
+                if player_look_type == 0 && !asset_free_fixture {
+                    // Operator never chose an appearance for a real world; zero renders as the
+                    // clientside invisibility effect, so default the citizen set.
+                    (
+                        u16::from(forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_PLAYER_LOOK_TYPE),
+                        forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_OUTFIT_FIRST_LOOK_TYPE,
+                        forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_OUTFIT_LAST_LOOK_TYPE,
+                    )
+                } else {
+                    let first = config.otclient_v8_outfit_first_look_type;
+                    let last = config.otclient_v8_outfit_last_look_type;
+                    if first == 0 || last == 0 {
+                        return Err(
+                            "otclientV8OutfitFirstLookType/LastLookType must be configured when \
                          otclientV8PlayerLookType is set"
-                            .into(),
-                    );
-                }
-                (
-                    player_look_type,
-                    first.try_into().map_err(|_| "otclientV8OutfitFirstLookType must fit u8")?,
-                    last.try_into().map_err(|_| "otclientV8OutfitLastLookType must fit u8")?,
-                )
-            };
+                                .into(),
+                        );
+                    }
+                    (
+                        player_look_type,
+                        first
+                            .try_into()
+                            .map_err(|_| "otclientV8OutfitFirstLookType must fit u8")?,
+                        last.try_into()
+                            .map_err(|_| "otclientV8OutfitLastLookType must fit u8")?,
+                    )
+                };
             Some(NativeOtClientEmptyWorldConfig {
                 ground_thing_id: effective_ground_thing_id,
                 player_look_type: player_look_type
@@ -761,6 +764,24 @@ fn run_host(
                 static_spawns.entities.len()
             );
         }
+        // Summon templates: one per catalog monster with a client appearance so operator
+        // /spawn works even in worlds that import zero creature spawns.
+        let mut combined_spawns = static_spawns;
+        match materialize_tfs_spawn_templates(&entity_catalog) {
+            Ok(templates) => {
+                let template_count = templates.entities.len();
+                if template_count > 0 {
+                    combined_spawns
+                        .extend_templates(templates)
+                        .map_err(|error| format!("spawn template merge failed: {error}"))?;
+                    println!(
+                        "> Loaded {template_count} summonable creature templates for the /spawn command."
+                    );
+                }
+            }
+            Err(error) => eprintln!("> warning: spawn templates unavailable: {error}"),
+        }
+        let static_spawns = combined_spawns;
         Some(NativeOtClientHostConfig {
             bind_addr: config.otclient_v8_login_socket_addr(),
             client_profile: config.otclient_v8_native_profile(),
@@ -783,6 +804,7 @@ fn run_host(
             item_weight_by_server_id: item_weight_by_server_id.map(Arc::new),
             item_name_by_server_id: item_name_by_server_id.map(Arc::new),
             stackable_item_server_ids: stackable_item_server_ids.map(Arc::new),
+            item_speed_bonus_by_server_id: item_speed_bonus_by_server_id.map(Arc::new),
             armor_multiplier_by_vocation,
             static_spawns: (!static_spawns.entities.is_empty()).then(|| Arc::new(static_spawns)),
             static_target_attack_policy: match config.static_creature_target_attack_damage {
@@ -1417,14 +1439,15 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                 .transpose()?
                 .unwrap_or_default();
             let config = load(&directory)?;
-            let database = EngineDatabase::open(&config.database_path)?;
+            let mut database = EngineDatabase::open(&config.database_path)?;
             let player = database.create_player_for_account_with_vocation(
                 account_id,
                 player_name,
                 vocation,
             )?;
+            database.provision_starter_backpack(player.id)?;
             println!(
-                "created character name={} player-id={} account-id={} position={},{},{} level={} vocation-id={}",
+                "created character name={} player-id={} account-id={} position={},{},{} level={} vocation-id={} starter-backpack=yes",
                 player.name,
                 player.id,
                 account_id,
@@ -2745,17 +2768,6 @@ experienceStages = {
             "right".into(),
             "2148".into(),
             "40".into(),
-        ])
-        .unwrap();
-        player_command(&[
-            "player".into(),
-            "container-create".into(),
-            directory.display().to_string(),
-            "1".into(),
-            "0".into(),
-            "1988".into(),
-            "5".into(),
-            "Backpack".into(),
         ])
         .unwrap();
         player_command(&[

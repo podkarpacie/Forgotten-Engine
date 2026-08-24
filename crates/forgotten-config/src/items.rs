@@ -57,6 +57,9 @@ pub struct LegacyItemDefinition {
     pub xml_extra_defense: Option<u16>,
     pub xml_attack_speed_millis: Option<u32>,
     pub xml_weapon_type: Option<LegacyWeaponType>,
+    /// Operator-supplied legacy `speed` attribute (e.g. Boots of Haste). Retained for the
+    /// dynamic per-player speed system; parsing it changes nothing by itself.
+    pub xml_speed_bonus: Option<u16>,
 }
 
 /// The verified legacy XML weapon-type labels needed by a future item-combat adapter. This is
@@ -258,6 +261,20 @@ impl LegacyItemCatalog {
             .iter()
             .filter_map(|(&server_id, definition)| {
                 definition.xml_weight.map(|weight| (server_id, weight))
+            })
+            .collect()
+    }
+
+    /// Returns legacy `speed` bonuses (BoH-style movement boosts) keyed by authoritative
+    /// server ID for the dynamic per-player speed system.
+    pub fn xml_speed_bonus_by_server_id(&self) -> BTreeMap<u16, u16> {
+        self.definitions
+            .iter()
+            .filter_map(|(&server_id, definition)| {
+                definition
+                    .xml_speed_bonus
+                    .filter(|bonus| *bonus > 0)
+                    .map(|bonus| (server_id, bonus))
             })
             .collect()
     }
@@ -540,6 +557,7 @@ fn parse_item_node(group: u8, props: &[u8]) -> Result<Option<LegacyItemDefinitio
                 xml_extra_defense: None,
                 xml_attack_speed_millis: None,
                 xml_weapon_type: None,
+                xml_speed_bonus: None,
             }))
         }
         (None, None) => Ok(None),
@@ -615,12 +633,32 @@ fn apply_xml_attribute(
         ),
         "slotType" | "slottype" => set_slot_type_attribute(catalog, ids, &value),
         "name" => set_name_attribute(catalog, ids, &value),
+        "speed" => set_speed_attribute(catalog, ids, &value),
         "armor" | "weight" | "defense" | "extraDef" | "extradef" | "attackSpeed"
         | "attackspeed" | "weaponType" | "weapontype" => {
             set_legacy_numeric_attribute(catalog, ids, key.as_bytes(), &value)
         }
         _ => Ok(()),
     }
+}
+
+/// Parses the legacy `speed` attribute (BoH-style movement bonus) into bounded metadata.
+fn set_speed_attribute(
+    catalog: &mut LegacyItemCatalog,
+    ids: &[u16],
+    value: &str,
+) -> Result<(), ConfigError> {
+    let bonus = value.parse::<u16>().map_err(|_| {
+        invalid(format!(
+            "items.xml speed attribute must be a u16, got `{value}`"
+        ))
+    })?;
+    for id in ids {
+        if let Some(definition) = catalog.definitions.get_mut(id) {
+            definition.xml_speed_bonus = Some(bonus);
+        }
+    }
+    Ok(())
 }
 
 fn set_block_attribute(
@@ -939,6 +977,7 @@ mod tests {
             xml_extra_defense: None,
             xml_attack_speed_millis: None,
             xml_weapon_type: None,
+            xml_speed_bonus: None,
         };
         let fluid = LegacyItemDefinition {
             group: OTB_ITEM_GROUP_FLUID,
@@ -993,6 +1032,7 @@ mod tests {
                     xml_extra_defense: None,
                     xml_attack_speed_millis: None,
                     xml_weapon_type: None,
+                    xml_speed_bonus: None,
                 },
             )]),
         }
@@ -1222,5 +1262,58 @@ mod tests {
         let normalized = crate::apply_legacy_item_metadata(&map, &catalog).unwrap();
         assert_eq!(normalized.tile(position).unwrap().ground_thing_id, 102);
         assert!(!normalized.is_walkable(position));
+    }
+}
+
+#[cfg(test)]
+mod speed_bonus_tests {
+    use super::*;
+
+    #[test]
+    fn parses_speed_attribute_into_bounded_metadata() {
+        let mut catalog = LegacyItemCatalog {
+            otb_major_version: 3,
+            client_version: 57,
+            build_number: 1,
+            definitions: BTreeMap::new(),
+        };
+        let definition = LegacyItemDefinition {
+            server_id: 2195,
+            client_id: 2195,
+            group: 1,
+            flags: 0,
+            xml_blocks_solid: None,
+            xml_blocks_pathfind: None,
+            xml_armor: None,
+            xml_weight: None,
+            xml_name: None,
+            xml_slot_types: std::collections::BTreeSet::new(),
+            xml_defense: None,
+            xml_extra_defense: None,
+            xml_attack_speed_millis: None,
+            xml_weapon_type: None,
+            xml_speed_bonus: None,
+        };
+        catalog.definitions.insert(2195, definition);
+
+        set_speed_attribute(&mut catalog, &[2195], "40").unwrap();
+        assert_eq!(
+            catalog.definitions.get(&2195).unwrap().xml_speed_bonus,
+            Some(40)
+        );
+        assert_eq!(catalog.xml_speed_bonus_by_server_id().get(&2195), Some(&40));
+        assert!(catalog.xml_speed_bonus_by_server_id().get(&9999).is_none());
+
+        // Zero bonuses are filtered from the delivery map but retained verbatim on the row.
+        set_speed_attribute(&mut catalog, &[2195], "0").unwrap();
+        assert_eq!(
+            catalog.definitions.get(&2195).unwrap().xml_speed_bonus,
+            Some(0)
+        );
+        assert!(catalog.xml_speed_bonus_by_server_id().is_empty());
+
+        // Non-numeric values are rejected with the attribute name in the message.
+        let error = set_speed_attribute(&mut catalog, &[2195], "fast").unwrap_err();
+        assert!(format!("{error}").contains("speed"));
     }
 }

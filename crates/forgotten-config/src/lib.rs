@@ -59,8 +59,8 @@ pub use stages::{
     ExperienceStages,
 };
 pub use tfs_entities::{
-    materialize_tfs_static_spawns, TfsEntityAppearance, TfsEntityCatalog, TfsEntityDefinition,
-    TfsEntityKind, TfsSpawnResolution,
+    materialize_tfs_spawn_templates, materialize_tfs_static_spawns, TfsEntityAppearance,
+    TfsEntityCatalog, TfsEntityDefinition, TfsEntityKind, TfsSpawnResolution,
 };
 pub use tfs_registry::{
     resolve_tfs_registry_script_reference, TfsContentInventory, TfsRegistryCategory,
@@ -2098,7 +2098,10 @@ experienceStages = {
 
         assert!(matches!(
             load(&world),
-            Err(ConfigError::InvalidValue { key: "otclientV8NativeEnabled", .. })
+            Err(ConfigError::InvalidValue {
+                key: "otclientV8NativeEnabled",
+                ..
+            })
         ));
         let _ = fs::remove_dir_all(world);
     }

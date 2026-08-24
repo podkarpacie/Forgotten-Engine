@@ -947,6 +947,9 @@ pub const NATIVE_OTCLIENT_MESSAGE_LOOK: u8 = 0x16;
 pub const NATIVE_OTCLIENT_MESSAGE_FAILURE: u8 = 0x17;
 /// Classic text-message class rendered in the console for login/welcome information.
 pub const NATIVE_OTCLIENT_MESSAGE_LOGIN: u8 = 0x14;
+/// Classic text-message class rendered as white center-screen text and mirrored into the
+/// Server Log console tab - the channel for server-wide announcements on classic profiles.
+pub const NATIVE_OTCLIENT_MESSAGE_GAME: u8 = 0x13;
 /// Classic server-talk mode for a gamemaster broadcast delivered to every connected player.
 pub const NATIVE_OTCLIENT_MESSAGE_GM_BROADCAST: u8 = 0x09;
 /// Classic citizen look type used when an operator enables a real world without configuring a
@@ -1305,6 +1308,18 @@ impl NativeOtClientCardinalDirection {
             Self::East => 1,
             Self::South => 2,
             Self::West => 3,
+        }
+    }
+
+    /// Restores a direction from its classic protocol byte (0 north, 1 east, 2 south, 3 west).
+    /// Returns None for unknown bytes so callers can fall back to their default facing.
+    pub fn from_protocol_direction(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::North),
+            1 => Some(Self::East),
+            2 => Some(Self::South),
+            3 => Some(Self::West),
+            _ => None,
         }
     }
 }
@@ -1849,6 +1864,16 @@ pub fn encode_native_otclient_login_message(
     message: &str,
 ) -> Result<Frame, ProtocolError> {
     encode_native_otclient_typed_text_message(profile, NATIVE_OTCLIENT_MESSAGE_LOGIN, message)
+}
+
+/// Encodes one classic game (`0xB4/0x13`) announcement record: white center-screen text
+/// mirrored into the Server Log console tab. This is the correct channel for server-wide
+/// broadcasts on classic profiles - the GM-broadcast talk mode renders console-red only.
+pub fn encode_native_otclient_game_announcement(
+    profile: &NativeOtClientProfile,
+    message: &str,
+) -> Result<Frame, ProtocolError> {
+    encode_native_otclient_typed_text_message(profile, NATIVE_OTCLIENT_MESSAGE_GAME, message)
 }
 
 fn encode_native_otclient_typed_text_message(

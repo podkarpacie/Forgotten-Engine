@@ -1,7 +1,7 @@
 use crate::legacy_xml::{LegacySpawnKind, LegacyWorldCompanionData};
 use crate::{ConfigError, EngineConfig};
 use forgotten_core::{
-    FeTfsStaticEntity, FeTfsStaticSpawnCollection, StaticCreatureDirectMeleeDamageRange,
+    FeTfsStaticEntity, FeTfsStaticSpawnCollection, Position, StaticCreatureDirectMeleeDamageRange,
     StaticCreatureLootEntry, StaticCreatureSpawnArea,
 };
 use quick_xml::events::{BytesStart, Event};
@@ -274,6 +274,97 @@ pub fn materialize_tfs_static_spawns(
     )
     .and_then(|collection| collection.with_monster_spawn_areas(monster_spawn_areas))
     .map_err(|error| invalid(format!("invalid static TFS spawn collection: {error}")))
+}
+
+/// Builds one summonable template per catalog monster definition that has a client appearance.
+/// Templates carry the same combat, experience, and loot metadata as imported spawns but no
+/// positions or spawn areas: they exist so operator `/spawn` works even in worlds whose map
+/// imports zero creature spawns. Template IDs live below the dynamic range and above imported
+/// IDs, keeping all three id spaces disjoint.
+pub fn materialize_tfs_spawn_templates(
+    catalog: &TfsEntityCatalog,
+) -> Result<FeTfsStaticSpawnCollection, ConfigError> {
+    const TEMPLATE_ID_START: u32 = 0x5000_0001;
+    let mut entities = Vec::new();
+    let mut experience_rewards = BTreeMap::new();
+    let mut direct_melee_intervals_millis = BTreeMap::new();
+    let direct_melee_damage_ranges = BTreeMap::new();
+    let mut loot_tables = BTreeMap::new();
+    let mut next_id = TEMPLATE_ID_START;
+    // Deterministic order: catalog monsters are already file-sorted; deduplicate by name so a
+    // name summons exactly one canonical template.
+    let mut seen_names = BTreeSet::new();
+    for definition in &catalog.monsters {
+        if !seen_names.insert(definition.name.to_lowercase()) {
+            continue;
+        }
+        let Some(appearance) = &definition.appearance else {
+            continue;
+        };
+        if appearance.look_type == 0 {
+            continue;
+        }
+        if entities.len() >= MAX_ENTITY_DEFINITIONS {
+            break;
+        }
+        let health_percent = match appearance.current_health {
+            Some(current_health) => {
+                u8::try_from(u32::from(current_health) * 100 / u32::from(appearance.max_health))
+                    .unwrap_or(100)
+            }
+            None => 100,
+        };
+        if definition.experience > 0 {
+            experience_rewards.insert(next_id, definition.experience);
+        }
+        if let Some(direct_melee) = &definition.direct_melee {
+            direct_melee_intervals_millis.insert(next_id, direct_melee.interval_millis);
+        }
+        if !definition.loot.is_empty() {
+            loot_tables.insert(
+                next_id,
+                definition
+                    .loot
+                    .iter()
+                    .map(|entry| StaticCreatureLootEntry {
+                        item_id: entry.item_id,
+                        chance: entry.chance,
+                        min_count: entry.min_count,
+                        max_count: entry.max_count,
+                    })
+                    .collect(),
+            );
+        }
+        entities.push(FeTfsStaticEntity {
+            id: next_id,
+            name: definition.name.clone(),
+            position: Position { x: 0, y: 0, z: 0 },
+            look_type: appearance.look_type,
+            head: appearance.head,
+            body: appearance.body,
+            legs: appearance.legs,
+            feet: appearance.feet,
+            addons: appearance.addons,
+            speed: if appearance.speed == 0 {
+                DEFAULT_STATIC_ENTITY_SPEED
+            } else {
+                appearance.speed
+            },
+            health_percent,
+            direction: 2,
+        });
+        next_id += 1;
+    }
+    FeTfsStaticSpawnCollection::with_loot_tables(
+        entities,
+        BTreeMap::new(),
+        experience_rewards,
+        direct_melee_intervals_millis,
+        direct_melee_damage_ranges,
+        BTreeSet::new(),
+        loot_tables,
+    )
+    .map_err(|error| invalid(format!("invalid TFS spawn template collection: {error}")))
 }
 
 pub(crate) fn load_tfs_entity_catalog(
