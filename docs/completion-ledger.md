@@ -8,7 +8,7 @@ This ledger measures **declared replacement scope**. It is not a schedule, marke
 
 ## Current weighted position
 
-The current conservative estimate is **54% of the declared replacement scope** (also correcting a prior row-sum slip: the previously published 47% summed to 45%). Recent advances: NPC shop buy/sell keywords through durable balances; quest log v1 listing started persisted quests via an operator catalog (schema v28); capacity-weight gating on every runtime movement; heartbeat auto-save capping hard-kill static-runtime loss at thirty seconds. It does not credit the merchant window UI, mission-line packets, trade between players, nested containers, or real-client evidence.
+The current conservative estimate is **55% of the declared replacement scope** (also correcting a prior row-sum slip: the previously published 47% summed to 45%). Recent advances: NPC shop buy/sell keywords through durable balances; quest log v1 listing started persisted quests via an operator catalog (schema v28); capacity-weight gating on every runtime movement; heartbeat auto-save capping hard-kill static-runtime loss at thirty seconds. It does not credit the merchant window UI, mission-line packets, trade between players, nested containers, or real-client evidence.
 
 | System category | Weight | Current credited scope | Why it is not higher |
 |---|---:|---:|---|
@@ -18,12 +18,14 @@ The current conservative estimate is **54% of the declared replacement scope** (
 | Items and world interaction | 17% | 9% | Runtime items, equipment, owned containers, transfers across equipment/containers/source-map/ground in both directions, capacity-weight gating on every runtime movement, and instant consumables from own inventory. Nested containers, depot/inbox client windows, doors, generic slot semantics, and map interactions are not complete. |
 | Creatures, NPCs, spawns, loot, and corpses | 13% | 5% | Catalog parsing, materialization, occupancy, bounded movement, reactivation, defeat loot rolls valid post-deactivation, restart-surviving corpses with decay, live client corpse windows, NPC identity safety, and now shop-trading NPCs keyed by display name. AI, timed respawn parity, corpse bulk transfers, special loot formulas, and scripted behavior are incomplete. |
 | Lua, social systems, economy, housing, and administration | 12% | 6% | Bounded Lua helpers, channel/VIP/guild/party foundations, and a working keyword economy: NPC banking plus NPC buy/sell converting carried coins and durable balances atomically; parties now survive restarts via validated schema-v30 snapshots with leader-online hydration on relog. Lua execution, merchant window UI, player trading, housing runtime, and moderation remain absent. |
-| Production operations and compatibility evidence | 15% | 5% | Auto-save cadence plus releases, checksums, validation scripts, concurrency documentation, Docker packaging, brute-force protection, chat flood suppression, and an operator metrics endpoint exist. Load, soak, fuzzing, migration, cross-platform, and independent real-client evidence are incomplete. |
-| **Total** | **100%** | **54%** | **Bounded playable-loop stage; not production-ready.** |
+| Production operations and compatibility evidence | 15% | 6% | Auto-save cadence plus releases, checksums, validation scripts, concurrency documentation, Docker packaging, brute-force protection, chat flood suppression, an operator metrics endpoint now reporting live players-online through a lock-free shared counter exist. Load, soak, fuzzing, migration, cross-platform, and independent real-client evidence are incomplete. |
+| **Total** | **100%** | **55%** | **Bounded playable-loop stage; not production-ready.** |
 
 ## Session-to-session trajectory
 
 50% -> 53% this stretch: typed persisted blessing-count and promotion state (schema v29) with validated accessors plus player bless / player promote CLI commands, and an all-player heartbeat auto-save flush covering position and vitals alongside the static runtime snapshot.
+
+54% -> 55% this stretch: fe-metrics gained a live players-online figure through an Arc<AtomicU64> registration counter shared lock-free with the status listener, and HostHandle exposes online_players_counter() so the run path wires the game host's counter directly - the integration gap Forgotten Cloud's supervisor model recorded against fe-metrics.
 
 53% -> 54% this stretch: parties became restart-surviving end-to-end — core snapshot/restore plus direct-attach APIs, schema v30 player_parties with validated wholesale replace, native-login hydration that reattaches to an online stored leader, and heartbeat-cadence snapshot flushes.
 
