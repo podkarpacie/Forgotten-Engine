@@ -835,6 +835,44 @@ fn native_classic_container_frame(
     Ok(Some(frame))
 }
 
+fn native_nested_content_window_frame(
+    profile: &NativeOtClientProfile,
+    catalog: Option<&NativeItemPresentationCatalog>,
+    window_id: u8,
+    parent_container_id: u8,
+    item: &ItemInstance,
+) -> Result<Option<Frame>, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() || item.contents().is_empty() {
+        return Ok(None);
+    }
+    let Some(container_item) = native_classic_item_record(catalog, item) else {
+        return Ok(None);
+    };
+    let Some(items) = item
+        .contents()
+        .iter()
+        .map(|child| native_classic_item_record(catalog, child))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let mut name = format!("{} contents", item.server_id);
+    name.truncate(MAX_LOGIN_STRING_BYTES);
+    let frame = encode_native_otclient_open_container(
+        profile,
+        &NativeOtClientClassicOpenContainer {
+            container_id: window_id,
+            container_item,
+            name,
+            capacity: ItemInstance::MAX_CONTENT_SLOTS as u8,
+            // Marked as a child so classic clients render the up-arrow back to the parent.
+            has_parent: true,
+            items,
+        },
+    )?;
+    Ok(Some(frame))
+}
+
 fn native_classic_container_frames(
     profile: &NativeOtClientProfile,
     catalog: Option<&NativeItemPresentationCatalog>,
@@ -6757,6 +6795,9 @@ fn handle_native_otclient_game(
     let mut last_condition_tick = Instant::now();
     let mut closed_container_ids = BTreeSet::new();
     let mut open_corpse_windows: BTreeMap<u8, (Position, usize)> = BTreeMap::new();
+    // Ephemeral windows presenting depth-one nested content: window id -> (parent
+    // container id, parent item index).
+    let mut open_content_windows: BTreeMap<u8, (u8, usize)> = BTreeMap::new();
     let mut open_public_channel_ids = BTreeSet::new();
     let mut talk_windows: VecDeque<Instant> = VecDeque::new();
     loop {
@@ -8039,6 +8080,7 @@ fn handle_native_otclient_game(
                                     }
                                 } else {
                                     open_corpse_windows.remove(&container_id);
+                                    open_content_windows.remove(&container_id);
                                 }
                                 if let forgotten_core::PlayerGroundDropSource::EquipmentSlot(_) =
                                     outcome.source
@@ -8622,6 +8664,7 @@ fn handle_native_otclient_game(
             NativeOtClientGameAction::CloseContainer(container_id) => {
                 closed_container_ids.insert(container_id);
                 open_corpse_windows.remove(&container_id);
+                open_content_windows.remove(&container_id);
                 let close =
                     encode_native_otclient_close_container(&config.client_profile, container_id)
                         .map_err(HostError::Protocol)?;
@@ -8877,6 +8920,52 @@ fn handle_native_otclient_game(
                                     "action=use-item outcome=backpack-window-opened container-id={container_id}"
                                 ),
                             );
+                        }
+                    }
+                    continue;
+                }
+                // Nested content window: using an item inside an owned-container window that
+                // itself holds content presents those contents as a child window. Movement out
+                // of these windows lands with the next nested-container slice.
+                if position.x == 0xffff && position.y & 0x40 != 0 {
+                    let parent_container_id = (position.y & 0x0f) as u8;
+                    let item_index = usize::from(position.z);
+                    let containers = shared_world.player_containers(character.id)?;
+                    if let Some(item) = containers
+                        .container(parent_container_id)
+                        .and_then(|container| container.items.item(item_index))
+                        .filter(|item| !item.contents().is_empty())
+                        .cloned()
+                    {
+                        let mut busy: BTreeSet<u8> = containers
+                            .iter()
+                            .map(|(_, container)| container.container_id)
+                            .collect();
+                        busy.extend(open_corpse_windows.keys().copied());
+                        busy.extend(open_content_windows.keys().copied());
+                        if let Some(window_id) = (0..=15u8).find(|id| !busy.contains(id)) {
+                            if let Some(frame) = native_nested_content_window_frame(
+                                &config.client_profile,
+                                config.item_presentation_catalog.as_deref(),
+                                window_id,
+                                parent_container_id,
+                                &item,
+                            )
+                            .map_err(HostError::Protocol)?
+                            {
+                                write_frame(stream, &frame)?;
+                                open_content_windows
+                                    .insert(window_id, (parent_container_id, item_index));
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    &format!(
+                                        "action=use-item outcome=content-window-opened parent={} item-index={item_index} window-id={window_id} contents={}",
+                                        parent_container_id,
+                                        item.contents().len()
+                                    ),
+                                );
+                            }
                         }
                     }
                     continue;
