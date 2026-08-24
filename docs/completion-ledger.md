@@ -27,6 +27,8 @@ The current conservative estimate is **56% of the declared replacement scope** (
 
 55% -> 56% this stretch: nested containers reached open-view-drop end to end - bounded depth-one ItemInstance contents (core), schema-v31 parent_slot persistence, UseItem opening content windows with has_parent linkage, and ThrowItem translating ephemeral window addresses into validated ContainerContent ground drops.
 
+56% (unchanged, release 7.4.45): the nested slice gained its live socket regression — a real TCP session opens the parent backpack window via UseItem and then a has_parent child window over the nested bag, asserting the exact classic 740 frame layout (name, capacity, has_parent flag, item count). The regression exposed and fixed a routing bug where container-source UseItems without contents were swallowed before consumable handling; non-content items now fall through correctly.
+
 54% -> 55% this stretch: fe-metrics gained a live players-online figure through an Arc<AtomicU64> registration counter shared lock-free with the status listener, and HostHandle exposes online_players_counter() so the run path wires the game host's counter directly - the integration gap Forgotten Cloud's supervisor model recorded against fe-metrics.
 
 53% -> 54% this stretch: parties became restart-surviving end-to-end — core snapshot/restore plus direct-attach APIs, schema v30 player_parties with validated wholesale replace, native-login hydration that reattaches to an online stored leader, and heartbeat-cadence snapshot flushes.

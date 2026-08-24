@@ -839,7 +839,7 @@ fn native_nested_content_window_frame(
     profile: &NativeOtClientProfile,
     catalog: Option<&NativeItemPresentationCatalog>,
     window_id: u8,
-    parent_container_id: u8,
+    _parent_container_id: u8,
     item: &ItemInstance,
 ) -> Result<Option<Frame>, ProtocolError> {
     if !profile.supports_classic_740_inventory_records() || item.contents().is_empty() {
@@ -8931,6 +8931,56 @@ fn handle_native_otclient_game(
                 stack_position,
                 index,
             } => {
+                // Nested content window: using an item inside an owned-container window that
+                // itself holds content presents those contents as a child window. Items without
+                // contents fall through to the consumable handler below.
+                if position.x == 0xffff && position.y & 0x40 != 0 {
+                    let parent_container_id = (position.y & 0x0f) as u8;
+                    let item_index = usize::from(position.z);
+                    let containers = shared_world.player_containers(character.id)?;
+                    if let Some(item) = containers
+                        .container(parent_container_id)
+                        .and_then(|container| container.items.item(item_index))
+                        .filter(|item| !item.contents().is_empty())
+                        .cloned()
+                    {
+                        let mut busy: BTreeSet<u8> = containers
+                            .iter()
+                            .map(|(_, container)| container.container_id)
+                            .collect();
+                        busy.extend(open_corpse_windows.keys().copied());
+                        busy.extend(open_content_windows.keys().copied());
+                        if let Some(window_id) = (0..=15u8).find(|id| !busy.contains(id)) {
+                            if let Some(frame) = native_nested_content_window_frame(
+                                &config.client_profile,
+                                config.item_presentation_catalog.as_deref(),
+                                window_id,
+                                parent_container_id,
+                                &item,
+                            )
+                            .map_err(HostError::Protocol)?
+                            {
+                                write_frame(stream, &frame)?;
+                                open_content_windows
+                                    .insert(window_id, (parent_container_id, item_index));
+                                native_diagnostic(
+                                    config.extended_diagnostics,
+                                    peer,
+                                    &format!(
+                                        "action=use-item outcome=content-window-opened parent={} item-index={item_index} window-id={window_id} contents={}",
+                                        parent_container_id,
+                                        item.contents().len()
+                                    ),
+                                );
+                            }
+                        }
+                        // A content-bearing item is a container-open action, never a consumable:
+                        // stop here so the consumable handler does not also process it.
+                        continue;
+                    }
+                    // No contents on this item: fall through to consumable handling.
+                }
+
                 let source_is_own_inventory = position.x == 0xffff;
                 // Owned-inventory consumable use runs before map-item routing: classic clients
                 // address own equipment with x=0xFFFF and a plain slot code in y, and own
@@ -9127,52 +9177,6 @@ fn handle_native_otclient_game(
                                     "action=use-item outcome=backpack-window-opened container-id={container_id}"
                                 ),
                             );
-                        }
-                    }
-                    continue;
-                }
-                // Nested content window: using an item inside an owned-container window that
-                // itself holds content presents those contents as a child window. Movement out
-                // of these windows lands with the next nested-container slice.
-                if position.x == 0xffff && position.y & 0x40 != 0 {
-                    let parent_container_id = (position.y & 0x0f) as u8;
-                    let item_index = usize::from(position.z);
-                    let containers = shared_world.player_containers(character.id)?;
-                    if let Some(item) = containers
-                        .container(parent_container_id)
-                        .and_then(|container| container.items.item(item_index))
-                        .filter(|item| !item.contents().is_empty())
-                        .cloned()
-                    {
-                        let mut busy: BTreeSet<u8> = containers
-                            .iter()
-                            .map(|(_, container)| container.container_id)
-                            .collect();
-                        busy.extend(open_corpse_windows.keys().copied());
-                        busy.extend(open_content_windows.keys().copied());
-                        if let Some(window_id) = (0..=15u8).find(|id| !busy.contains(id)) {
-                            if let Some(frame) = native_nested_content_window_frame(
-                                &config.client_profile,
-                                config.item_presentation_catalog.as_deref(),
-                                window_id,
-                                parent_container_id,
-                                &item,
-                            )
-                            .map_err(HostError::Protocol)?
-                            {
-                                write_frame(stream, &frame)?;
-                                open_content_windows
-                                    .insert(window_id, (parent_container_id, item_index));
-                                native_diagnostic(
-                                    config.extended_diagnostics,
-                                    peer,
-                                    &format!(
-                                        "action=use-item outcome=content-window-opened parent={} item-index={item_index} window-id={window_id} contents={}",
-                                        parent_container_id,
-                                        item.contents().len()
-                                    ),
-                                );
-                            }
                         }
                     }
                     continue;
@@ -18731,7 +18735,7 @@ mod tests {
 
         drop(stream);
         game.shutdown().unwrap();
-        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let database = EngineDatabase::open(&database_path).unwrap();
         assert_eq!(database.player_bank_balance(1).unwrap(), 500 + 400);
         let drained = database.player_containers(1).unwrap();
         assert!(drained
@@ -18928,6 +18932,139 @@ mod tests {
         assert_eq!(window.0[1], 2);
         assert_eq!(&window.0[6..14], b"Backpack");
         assert_eq!(window.0[16], 1);
+
+        drop(stream);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_use_item_inside_container_window_opens_nested_content_window() {
+        let database_path = database_path("native-nested-content-window");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        // Equipped backpack holding one nested bag with content.
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(EquipmentSlot::Backpack, ItemInstance::new(1988, 1).unwrap());
+        database.replace_player_equipment(1, &equipment).unwrap();
+        let mut containers = PlayerContainers::default();
+        let mut backpack = PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        let mut inner_bag = ItemInstance::new(1988, 1).unwrap();
+        inner_bag
+            .insert_content(ItemInstance::new(2148, 5).unwrap())
+            .unwrap();
+        backpack.items.merge_or_insert_stack(inner_bag).unwrap();
+        containers.insert(backpack).unwrap();
+        database.replace_player_containers(1, &containers).unwrap();
+
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for server_id in [1988, 2148] {
+            catalog
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id: server_id,
+                        requires_classic_740_subtype: false,
+                    },
+                )
+                .unwrap();
+        }
+        native_config.item_presentation_catalog = Some(Arc::new(catalog));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+        assert_eq!(
+            read_data_frame(&mut stream).0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_SET_INVENTORY
+        );
+
+        // Open the owned backpack window (container id 2).
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_USE_ITEM,
+                0xff,
+                0xff,
+                3,
+                0x00,
+                0x00,
+                0xc4,
+                0x07,
+                0x00,
+                0x00,
+            ]),
+        )
+        .unwrap();
+        let parent_window = read_data_frame(&mut stream);
+        assert_eq!(
+            parent_window.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER
+        );
+        assert_eq!(parent_window.0[1], 2);
+
+        // Use the nested bag at index 0 inside window 2: a has_parent child window opens.
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_USE_ITEM,
+                0xff,
+                0xff,
+                0x42,
+                0x00,
+                0x00,
+                0xc4,
+                0x07,
+                0x00,
+                0x00,
+            ]),
+        )
+        .unwrap();
+        let child_window = read_data_frame(&mut stream);
+        assert_eq!(
+            child_window.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER
+        );
+        // Ephemeral window ids avoid owned container ids, so 0 or 1 is expected.
+        assert!(child_window.0[1] <= 1);
+        assert_eq!(&child_window.0[6..19], b"1988 contents");
+        assert_eq!(child_window.0[19], ItemInstance::MAX_CONTENT_SLOTS as u8);
+        // has_parent flag set so classic clients render the up-arrow back to the parent.
+        assert_eq!(child_window.0[20], 1);
+        assert_eq!(child_window.0[21], 1);
 
         drop(stream);
         game.shutdown().unwrap();
