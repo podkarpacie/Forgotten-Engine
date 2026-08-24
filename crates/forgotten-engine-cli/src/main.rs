@@ -554,6 +554,7 @@ fn run_host(
             session_timeout: Duration::from_secs(5),
         },
         &config.database_path,
+        host.online_players_counter(),
     ) {
         Ok(status) => status,
         Err(error) => {

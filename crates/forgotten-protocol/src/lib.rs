@@ -218,16 +218,18 @@ pub struct StatusMetrics {
     pub registered_accounts: u32,
     pub registered_characters: u32,
     pub schema_version: i64,
+    pub players_online: u32,
     pub players_online_cap: u32,
 }
 
 pub fn encode_status_metrics(metrics: &StatusMetrics) -> Vec<u8> {
     format!(
-        "{{\"uptime_seconds\":{},\"registered_accounts\":{},\"registered_characters\":{},\"schema_version\":{},\"players_online_cap\":{}}}\n",
+        "{{\"uptime_seconds\":{},\"registered_accounts\":{},\"registered_characters\":{},\"schema_version\":{},\"players_online\":{},\"players_online_cap\":{}}}\n",
         metrics.uptime_seconds,
         metrics.registered_accounts,
         metrics.registered_characters,
         metrics.schema_version,
+        metrics.players_online,
         metrics.players_online_cap
     )
     .into_bytes()
@@ -3460,10 +3462,11 @@ mod tests {
                 registered_accounts: 3,
                 registered_characters: 7,
                 schema_version: 27,
+                players_online: 2,
                 players_online_cap: 100,
             }))
             .unwrap(),
-            "{\"uptime_seconds\":12,\"registered_accounts\":3,\"registered_characters\":7,\"schema_version\":27,\"players_online_cap\":100}\n"
+            "{\"uptime_seconds\":12,\"registered_accounts\":3,\"registered_characters\":7,\"schema_version\":27,\"players_online\":2,\"players_online_cap\":100}\n"
         );
         assert!(String::from_utf8(encode_status_xml(&snapshot()))
             .unwrap()

@@ -1352,6 +1352,7 @@ pub struct SharedNativeWorld {
     equipment_epoch: Arc<AtomicU64>,
     containers_epoch: Arc<AtomicU64>,
     party_epoch: Arc<AtomicU64>,
+    online_players: Arc<AtomicU64>,
     chat_recipients: Arc<Mutex<BTreeMap<u64, SharedChatRecipient>>>,
     vip_presence_recipients: Arc<Mutex<BTreeMap<u64, SharedVipPresenceRecipient>>>,
 }
@@ -3674,6 +3675,7 @@ impl SharedNativeWorld {
             equipment_epoch: Arc::new(AtomicU64::new(0)),
             containers_epoch: Arc::new(AtomicU64::new(0)),
             party_epoch: Arc::new(AtomicU64::new(0)),
+            online_players: Arc::new(AtomicU64::new(0)),
             chat_recipients: Arc::new(Mutex::new(BTreeMap::new())),
             vip_presence_recipients: Arc::new(Mutex::new(BTreeMap::new())),
         })
@@ -3761,6 +3763,16 @@ impl SharedNativeWorld {
 
     pub fn party_epoch(&self) -> u64 {
         self.party_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Live registered-player count for lock-free status/metrics consumers.
+    pub fn online_players(&self) -> u32 {
+        u32::try_from(self.online_players.load(Ordering::SeqCst)).unwrap_or(u32::MAX)
+    }
+
+    /// Cloneable counter handle shared with the status listener thread.
+    pub fn online_players_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.online_players)
     }
 
     fn party_display_frames(
@@ -5309,6 +5321,7 @@ impl SharedNativeWorld {
             .add_player_with_vitals_and_progression(player, vitals, progression)
             .map_err(HostError::Core)?;
         self.mark_visibility_changed();
+        self.online_players.fetch_add(1, Ordering::SeqCst);
         Ok(position)
     }
 
@@ -5389,6 +5402,7 @@ impl SharedNativeWorld {
 
     pub fn remove_player(&self, id: u64) -> Result<(), HostError> {
         self.lock()?.remove_player(id).map_err(HostError::Core)?;
+        self.online_players.fetch_sub(1, Ordering::SeqCst);
         self.player_outfits
             .lock()
             .map_err(|_| HostError::SharedWorldUnavailable)?
@@ -5556,12 +5570,19 @@ impl NativeOtClientHostConfig {
 pub struct HostHandle {
     local_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
+    online_players: Arc<AtomicU64>,
     thread: Option<JoinHandle<Result<(), HostError>>>,
 }
 
 impl HostHandle {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Live registered-player counter shared with the running world; feed this to
+    /// `start_status` so fe-metrics reports the real players-online figure.
+    pub fn online_players_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.online_players)
     }
 
     pub fn shutdown_signal(&self) -> Arc<AtomicBool> {
@@ -5584,8 +5605,10 @@ pub fn start(config: HostConfig, database_path: impl AsRef<Path>) -> Result<Host
     let local_addr = listener.local_addr()?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let active_connections = Arc::new(AtomicUsize::new(0));
+    let online_players = Arc::new(AtomicU64::new(0));
     let database_path = database_path.as_ref().to_path_buf();
     let thread_shutdown = Arc::clone(&shutdown);
+    let thread_online_players = Arc::clone(&online_players);
     let thread = thread::spawn(move || {
         serve(
             listener,
@@ -5593,12 +5616,14 @@ pub fn start(config: HostConfig, database_path: impl AsRef<Path>) -> Result<Host
             database_path,
             thread_shutdown,
             active_connections,
+            thread_online_players,
         )
     });
 
     Ok(HostHandle {
         local_addr,
         shutdown,
+        online_players,
         thread: Some(thread),
     })
 }
@@ -5606,6 +5631,7 @@ pub fn start(config: HostConfig, database_path: impl AsRef<Path>) -> Result<Host
 pub fn start_status(
     config: StatusHostConfig,
     database_path: impl AsRef<Path>,
+    online_players: Arc<AtomicU64>,
 ) -> Result<HostHandle, HostError> {
     config.validate()?;
     let listener = TcpListener::bind(config.bind_addr)?;
@@ -5615,6 +5641,7 @@ pub fn start_status(
     let active_connections = Arc::new(AtomicUsize::new(0));
     let database_path = database_path.as_ref().to_path_buf();
     let thread_shutdown = Arc::clone(&shutdown);
+    let handle_online = Arc::clone(&online_players);
     let thread = thread::spawn(move || {
         serve_status(
             listener,
@@ -5622,12 +5649,14 @@ pub fn start_status(
             database_path,
             thread_shutdown,
             active_connections,
+            online_players,
             Instant::now(),
         )
     });
     Ok(HostHandle {
         local_addr,
         shutdown,
+        online_players: handle_online,
         thread: Some(thread),
     })
 }
@@ -5656,6 +5685,7 @@ pub fn start_game_session(
     Ok(HostHandle {
         local_addr,
         shutdown,
+        online_players: Arc::new(AtomicU64::new(0)),
         thread: Some(thread),
     })
 }
@@ -5684,6 +5714,7 @@ pub fn start_native_otclient_login(
     Ok(HostHandle {
         local_addr,
         shutdown,
+        online_players: Arc::new(AtomicU64::new(0)),
         thread: Some(thread),
     })
 }
@@ -5719,6 +5750,7 @@ pub fn start_native_otclient_game(
         .transpose()?
         .map(Arc::new);
     let thread_shutdown = Arc::clone(&shutdown);
+    let thread_online_players = shared_world.online_players_counter();
     let thread = thread::spawn(move || {
         serve_native_otclient_game(
             listener,
@@ -5733,6 +5765,7 @@ pub fn start_native_otclient_game(
     Ok(HostHandle {
         local_addr,
         shutdown,
+        online_players: thread_online_players,
         thread: Some(thread),
     })
 }
@@ -5743,6 +5776,7 @@ fn serve(
     database_path: PathBuf,
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
+    _online_players: Arc<AtomicU64>,
 ) -> Result<(), HostError> {
     record_event(
         &database_path,
@@ -5802,6 +5836,7 @@ fn serve_status(
     database_path: PathBuf,
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
+    online_players: Arc<AtomicU64>,
     started_at: Instant,
 ) -> Result<(), HostError> {
     record_event(
@@ -5824,12 +5859,14 @@ fn serve_status(
                 let session_config = config.clone();
                 let session_database_path = database_path.clone();
                 let session_connections = Arc::clone(&active_connections);
+                let session_online = Arc::clone(&online_players);
                 thread::spawn(move || {
                     let result = handle_status_session(
                         &mut stream,
                         peer,
                         &session_config,
                         &session_database_path,
+                        &session_online,
                         started_at,
                     );
                     if let Err(error) = result {
@@ -11946,6 +11983,7 @@ fn handle_status_session(
     peer: SocketAddr,
     config: &StatusHostConfig,
     database_path: &Path,
+    online_players: &AtomicU64,
     started_at: Instant,
 ) -> Result<(), HostError> {
     stream.set_read_timeout(Some(config.session_timeout))?;
@@ -11986,6 +12024,8 @@ fn handle_status_session(
                 registered_accounts,
                 registered_characters,
                 schema_version,
+                players_online: u32::try_from(online_players.load(Ordering::SeqCst))
+                    .unwrap_or(u32::MAX),
                 players_online_cap: config.max_players,
             };
             stream.write_all(&encode_status_metrics(&metrics))?;
@@ -23730,6 +23770,7 @@ mod tests {
         Ok(HostHandle {
             local_addr,
             shutdown,
+            online_players: Arc::new(AtomicU64::new(0)),
             thread: Some(thread),
         })
     }
@@ -23896,7 +23937,7 @@ mod tests {
     #[test]
     fn answers_a_raw_xml_status_request() {
         let database = database_path("status-xml");
-        let status = start_status(status_config(), &database).unwrap();
+        let status = start_status(status_config(), &database, Arc::new(AtomicU64::new(0))).unwrap();
         let mut stream = TcpStream::connect(status.local_addr()).unwrap();
         write_frame(
             &mut stream,
@@ -23936,7 +23977,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let status = start_status(status_config(), &database).unwrap();
+        let status = start_status(status_config(), &database, Arc::new(AtomicU64::new(0))).unwrap();
         let mut stream = TcpStream::connect(status.local_addr()).unwrap();
         write_frame(
             &mut stream,
@@ -23954,6 +23995,7 @@ mod tests {
         assert!(response.contains("\"registered_accounts\":1"));
         assert!(response.contains("\"registered_characters\":1"));
         assert!(response.contains("\"players_online_cap\":100"));
+        assert!(response.contains("\"players_online\":"));
         assert!(response.contains("\"schema_version\":"));
         status.shutdown().unwrap();
         let _ = fs::remove_file(database);
@@ -23962,7 +24004,7 @@ mod tests {
     #[test]
     fn answers_a_binary_status_request() {
         let database = database_path("status-binary");
-        let status = start_status(status_config(), &database).unwrap();
+        let status = start_status(status_config(), &database, Arc::new(AtomicU64::new(0))).unwrap();
         let mut stream = TcpStream::connect(status.local_addr()).unwrap();
         write_frame(&mut stream, &Frame(vec![0x01, 0x88, 0x00])).unwrap();
         let response = read_frame(&mut stream).unwrap();
