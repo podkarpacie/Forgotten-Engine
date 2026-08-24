@@ -1,4 +1,4 @@
-//! Bounded transport contracts for Forgotten Engine profiles.
+﻿//! Bounded transport contracts for Forgotten Engine profiles.
 //!
 //! The legacy 7.4 types below are a tested foundation, not a claim of official-client support.
 
@@ -1996,7 +1996,7 @@ pub fn encode_native_otclient_empty_world_map(
     Ok(frame)
 }
 
-/// Encodes an 18×14×8 classic viewport using original operator-supplied map data.
+/// Encodes an 18Ă—14Ă—8 classic viewport using original operator-supplied map data.
 /// A map tile with `ground_thing_id = 0` inherits the profile-configured fallback so a world
 /// document can remain portable across lawful client asset sets.
 pub fn encode_native_otclient_map_viewport(
@@ -3284,6 +3284,49 @@ fn xml(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_decoders_survive_deterministic_garbage_and_truncation() {
+        // Fuzz-lite robustness sweep on stable tooling: a seeded LCG drives both random
+        // payloads and every truncation of a valid frame through the public decoders. The
+        // contract is no panic and no hang - any outcome must be a typed ProtocolError.
+        let profile = NativeOtClientProfile {
+            protocol_version: 740,
+            numeric_account_ids: true,
+            login_packet_encryption: false,
+            protocol_checksum: false,
+            challenge_on_login: false,
+            max_padding_bytes: 128,
+        };
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..256_u32 {
+            let len = (next() % 96) as usize;
+            let payload: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+            let garbage = Frame(payload);
+            let _ = decode_status_request(&garbage);
+            let _ = decode_legacy_74_envelope(&garbage);
+            let _ = decode_native_otclient_game_request(&garbage, &profile);
+            let _ = decode_native_otclient_game_action(&garbage, &profile);
+            let _ = decode_native_otclient_cardinal_move_request(&garbage, &profile);
+
+            if round == 0 {
+                continue;
+            }
+            // Truncation sweep of a well-formed game-action prefix.
+            let mut valid = vec![NATIVE_OTCLIENT_CLIENT_AUTO_WALK];
+            valid.extend_from_slice(&(next() as u16).to_be_bytes());
+            for cut in 0..valid.len() {
+                let truncated = Frame(valid[..cut].to_vec());
+                let _ = decode_native_otclient_game_action(&truncated, &profile);
+                let _ = decode_native_otclient_cardinal_move_request(&truncated, &profile);
+            }
+        }
+    }
     fn snapshot() -> StatusSnapshot {
         StatusSnapshot {
             server_name: "Forgotten & Engine".into(),
