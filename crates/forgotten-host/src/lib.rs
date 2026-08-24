@@ -2679,6 +2679,9 @@ impl SharedNativeMap {
                     .map_err(HostError::Core)?;
                 true
             }
+            // Content items drop out of nested storage; destination admission is decided by
+            // the ground-tile checks below, not by inventory topology.
+            forgotten_core::PlayerGroundDropSource::ContainerContent { .. } => true,
         };
         if !destination_admission {
             return Ok(None);
@@ -7525,10 +7528,22 @@ fn handle_native_otclient_game(
                             );
                             continue;
                         }
-                        Some(forgotten_core::PlayerGroundDropSource::ContainerItem {
-                            container_id,
-                            item_index,
-                        })
+                        // Nested content window: translate the ephemeral window address back
+                        // to its parent container item and content index.
+                        if let Some(&(parent_container_id, parent_item_index)) =
+                            open_content_windows.get(&container_id)
+                        {
+                            Some(forgotten_core::PlayerGroundDropSource::ContainerContent {
+                                container_id: parent_container_id,
+                                item_index: parent_item_index,
+                                content_index: item_index,
+                            })
+                        } else {
+                            Some(forgotten_core::PlayerGroundDropSource::ContainerItem {
+                                container_id,
+                                item_index,
+                            })
+                        }
                     } else {
                         None
                     };
@@ -7559,6 +7574,21 @@ fn handle_native_otclient_game(
                             .ok()
                             .and_then(|containers| containers.container(*container_id).cloned())
                             .and_then(|container| container.items.item(*item_index).cloned())
+                            .is_some_and(|item| {
+                                native_classic_item_record(Some(catalog), &item).is_some_and(
+                                    |record| record.client_thing_id == source_client_thing_id,
+                                )
+                            }),
+                        forgotten_core::PlayerGroundDropSource::ContainerContent {
+                            container_id,
+                            item_index,
+                            content_index,
+                        } => shared_world
+                            .player_containers(character.id)
+                            .ok()
+                            .and_then(|containers| containers.container(*container_id).cloned())
+                            .and_then(|container| container.items.item(*item_index).cloned())
+                            .and_then(|item| item.contents().get(*content_index).cloned())
                             .is_some_and(|item| {
                                 native_classic_item_record(Some(catalog), &item).is_some_and(
                                     |record| record.client_thing_id == source_client_thing_id,
