@@ -2269,9 +2269,14 @@ impl PlayerContainers {
     pub fn is_empty(&self) -> bool {
         self.containers.is_empty()
     }
-
     pub fn container(&self, container_id: u8) -> Option<&PlayerContainer> {
         self.containers.get(&container_id)
+    }
+
+    /// Mutable lookup for one owned container; used by persistence round-trip tests and
+    /// bounded hydration paths.
+    pub fn container_mut(&mut self, container_id: u8) -> Option<&mut PlayerContainer> {
+        self.containers.get_mut(&container_id)
     }
 
     pub fn insert(

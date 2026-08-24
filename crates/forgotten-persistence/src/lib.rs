@@ -44,9 +44,10 @@ const SCHEMA_VERSION_MAP_ITEM_COUNT_OVERRIDES: i64 = 25;
 const SCHEMA_VERSION_RUNTIME_MAP_ITEMS: i64 = 26;
 const SCHEMA_VERSION_PLAYER_QUESTS: i64 = 28;
 const SCHEMA_VERSION_BLESS_PROMOTION: i64 = 29;
+const SCHEMA_VERSION_ITEM_CONTENTS: i64 = 31;
 const SCHEMA_VERSION_PLAYER_PARTIES: i64 = 30;
 const SCHEMA_VERSION_CORPSE_DESPAWN_TICKS: i64 = 27;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_PARTIES;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_ITEM_CONTENTS;
 /// Classic blessing count ceiling; the audited default death-loss reduction consumes this.
 pub const MAX_PLAYER_BLESSINGS: u8 = 5;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2625,6 +2626,34 @@ impl EngineDatabase {
     /// Replaces a player's bounded non-recursive containers and their ordered contents in one
     /// SQLite transaction. Item-use, nested containers, depot, and inbox semantics remain outside
     /// this storage slice.
+    /// Writes one item's nested content rows (depth-one children) inside an open container
+    /// transaction. Children reuse the same row table with a non-null `parent_slot`; child slots
+    /// are contiguous from zero per parent.
+    fn insert_item_content_rows(
+        transaction: &rusqlite::Transaction<'_>,
+        player_id: u64,
+        container_id: u8,
+        parent_slot: usize,
+        item: &ItemInstance,
+    ) -> Result<(), PersistenceError> {
+        for (child_slot, child) in item.contents().iter().enumerate() {
+            transaction.execute(
+            "INSERT INTO player_container_items (player_id, container_id, slot, parent_slot, server_id, count, action_id, unique_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                player_id as i64,
+                i64::from(container_id),
+                child_slot as i64,
+                Some(parent_slot as i64),
+                i64::from(child.server_id),
+                i64::from(child.count),
+                child.action_id.map(i64::from),
+                child.unique_id.map(i64::from),
+            ],
+        )?;
+        }
+        Ok(())
+    }
+
     pub fn replace_player_containers(
         &mut self,
         player_id: u64,
@@ -2666,6 +2695,7 @@ impl EngineDatabase {
                         item.unique_id.map(i64::from),
                     ],
                 )?;
+                Self::insert_item_content_rows(&transaction, player_id, container_id, slot, item)?;
             }
         }
         transaction.commit()?;
@@ -2734,6 +2764,7 @@ impl EngineDatabase {
                         item.unique_id.map(i64::from),
                     ],
                 )?;
+                Self::insert_item_content_rows(&transaction, player_id, container_id, slot, item)?;
             }
         }
         transaction.commit()?;
@@ -2884,7 +2915,7 @@ impl EngineDatabase {
             )
             .map_err(|error| PersistenceError::InvalidContainerRecord(error.to_string()))?;
             let mut item_statement = self.connection.prepare(
-                "SELECT slot, server_id, count, action_id, unique_id FROM player_container_items WHERE player_id = ?1 AND container_id = ?2 ORDER BY slot",
+                "SELECT slot, server_id, count, action_id, unique_id, parent_slot FROM player_container_items WHERE player_id = ?1 AND container_id = ?2 AND parent_slot IS NULL ORDER BY slot",
             )?;
             let item_records = item_statement
                 .query_map(params![player_id as i64, i64::from(container_id)], |row| {
@@ -2911,6 +2942,35 @@ impl EngineDatabase {
                 let mut item = container_item_from_record(server_id, count)?;
                 item.action_id = optional_u16_container_attribute(action_id, "action ID")?;
                 item.unique_id = optional_u16_container_attribute(unique_id, "unique ID")?;
+                // Depth-one content hydration: children rows are contiguous from zero per
+                // parent slot and revalidated through the bounded core accessors.
+                let parent_slot = i64::try_from(slot).map_err(|_| {
+                    PersistenceError::InvalidContainerRecord("item slot does not fit i64".into())
+                })?;
+                let mut child_statement = self.connection.prepare(
+                    "SELECT server_id, count, action_id, unique_id FROM player_container_items WHERE player_id = ?1 AND container_id = ?2 AND parent_slot = ?3 ORDER BY slot",
+                )?;
+                let child_records = child_statement
+                    .query_map(
+                        params![player_id as i64, i64::from(container_id), parent_slot],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Option<i64>>(2)?,
+                                row.get::<_, Option<i64>>(3)?,
+                            ))
+                        },
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (child_server_id, child_count, child_action, child_unique) in child_records {
+                    let mut child = container_item_from_record(child_server_id, child_count)?;
+                    child.action_id = optional_u16_container_attribute(child_action, "action ID")?;
+                    child.unique_id = optional_u16_container_attribute(child_unique, "unique ID")?;
+                    item.insert_content(child).map_err(|error| {
+                        PersistenceError::InvalidContainerRecord(error.to_string())
+                    })?;
+                }
                 container
                     .items
                     .insert(item)
@@ -4390,6 +4450,21 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_PLAYER_PARTIES, unix_seconds()],
             )?;
         }
+        if self.schema_version()? < SCHEMA_VERSION_ITEM_CONTENTS {
+            // The old primary key could not host child rows alongside top-level slots, so
+            // this migration rebuilds the table with parent_slot inside the key. Existing
+            // rows keep their identity as top-level items (parent_slot NULL).
+            self.connection.execute_batch(
+                "ALTER TABLE player_container_items RENAME TO player_container_items_v30;
+                 CREATE TABLE IF NOT EXISTS player_container_items (player_id INTEGER NOT NULL, container_id INTEGER NOT NULL, slot INTEGER NOT NULL, parent_slot INTEGER, server_id INTEGER NOT NULL, count INTEGER NOT NULL, action_id INTEGER, unique_id INTEGER, PRIMARY KEY (player_id, container_id, parent_slot, slot));
+                 INSERT INTO player_container_items (player_id, container_id, slot, parent_slot, server_id, count, action_id, unique_id) SELECT player_id, container_id, slot, NULL, server_id, count, action_id, unique_id FROM player_container_items_v30;
+                 DROP TABLE player_container_items_v30;",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_ITEM_CONTENTS, unix_seconds()],
+            )?;
+        }
         Ok(())
     }
 
@@ -5210,6 +5285,38 @@ mod tests {
             .replace_player_quests(5, &[(101_u16, true)])
             .unwrap();
         assert_eq!(database.player_quests(5).unwrap(), vec![(101_u16, true)]);
+
+        // Nested content round-trips through schema-v31 parent_slot rows.
+        let mut bag = ItemInstance::new(1988, 1).unwrap();
+        bag.insert_content(ItemInstance::new(2666, 3).unwrap())
+            .unwrap();
+        let mut single: PlayerContainers = PlayerContainers::default();
+        let holder = PlayerContainer::new(
+            0_u8,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Bag",
+            false,
+            20_u16,
+        )
+        .unwrap();
+        single.insert(holder).unwrap();
+        database.replace_player_containers(5, &single).unwrap();
+        // Add the nested bag through the container's item list before re-reading.
+        {
+            let mut containers = database.player_containers(5).unwrap();
+            let holder = containers.container_mut(0).unwrap();
+            holder.items.insert(bag).unwrap();
+            database.replace_player_containers(5, &containers).unwrap();
+        }
+        let reloaded = database.player_containers(5).unwrap();
+        let holder = reloaded.container(0).unwrap();
+        let nested = holder
+            .items
+            .iter()
+            .map(|item| item.contents().len())
+            .max()
+            .unwrap_or_default();
+        assert_eq!(nested, 1);
 
         assert!(database.set_player_blessings(5, 6).is_err());
         assert!(matches!(
