@@ -5481,6 +5481,54 @@ impl WorldState {
         })
     }
 
+    /// Moves one depth-one content item out of a container item into an empty equipment slot.
+    /// Cloned-state preparation keeps every error path atomic, matching the container-item
+    /// equipment transfer semantics.
+    pub fn move_content_item_to_equipment(
+        &mut self,
+        player_id: u64,
+        container_id: u8,
+        item_index: usize,
+        content_index: usize,
+        to_slot: EquipmentSlot,
+    ) -> Result<PlayerContainerToEquipmentOutcome, CoreError> {
+        let mut equipment = self.player_equipment(player_id)?.clone();
+        if equipment.item(to_slot).is_some() {
+            return Err(CoreError::OccupiedEquipmentSlot {
+                player_id,
+                slot: to_slot,
+            });
+        }
+        let mut containers = self.player_containers(player_id)?.clone();
+        let mut container =
+            containers
+                .remove(container_id)
+                .ok_or(CoreError::UnknownPlayerContainer {
+                    player_id,
+                    container_id,
+                })?;
+        let item = container
+            .items
+            .take_content(item_index, content_index)
+            .ok_or(CoreError::UnknownPlayerContainerItem {
+                player_id,
+                container_id,
+                item_index,
+            })?;
+        equipment.equip(to_slot, item.clone());
+        containers.insert(container)?;
+        self.player_equipments.insert(player_id, equipment);
+        self.player_containers.insert(player_id, containers);
+        self.mark_changed();
+        Ok(PlayerContainerToEquipmentOutcome {
+            player_id,
+            container_id,
+            item_index,
+            to_slot,
+            item,
+        })
+    }
+
     /// Exchanges one complete item in an existing non-recursive owned container with an occupied
     /// equipment slot. Both values are prepared on cloned state, keeping all error paths atomic.
     pub fn swap_container_item_with_equipment(

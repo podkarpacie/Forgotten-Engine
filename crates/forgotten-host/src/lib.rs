@@ -4269,6 +4269,30 @@ impl SharedNativeWorld {
     /// Applies one bounded partial top-level-container stack movement under the shared world
     /// lock. It shares the established inventory refresh contract with full-item transfers and
     /// deliberately does not claim native client request or general inventory semantics.
+    /// Moves one depth-one content item into an empty equipment slot (nested-window takes).
+    pub fn move_content_item_to_equipment(
+        &self,
+        player_id: u64,
+        container_id: u8,
+        item_index: usize,
+        content_index: usize,
+        to_slot: EquipmentSlot,
+    ) -> Result<PlayerContainerToEquipmentOutcome, HostError> {
+        let outcome = self
+            .lock()?
+            .move_content_item_to_equipment(
+                player_id,
+                container_id,
+                item_index,
+                content_index,
+                to_slot,
+            )
+            .map_err(HostError::Core)?;
+        self.equipment_epoch.fetch_add(1, Ordering::SeqCst);
+        self.containers_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(outcome)
+    }
+
     pub fn move_container_stack_to_equipment(
         &self,
         player_id: u64,
@@ -8283,6 +8307,38 @@ fn handle_native_otclient_game(
                         );
                         continue;
                     };
+                    // Nested content window source: translate the ephemeral window address and
+                    // move the whole content item into an empty equipment slot.
+                    if let Some(&(parent_container_id, parent_item_index)) =
+                        open_content_windows.get(&container_id)
+                    {
+                        shared_world.move_content_item_to_equipment(
+                            character.id,
+                            parent_container_id,
+                            parent_item_index,
+                            item_index,
+                            target_slot,
+                        )?;
+                        let next_equipment = shared_world.player_equipment(character.id)?;
+                        let next_containers = shared_world.player_containers(character.id)?;
+                        database.replace_player_inventory(
+                            character.id,
+                            &next_equipment,
+                            &next_containers,
+                        )?;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "action=throw-item outcome=content-item-to-equipment parent-container-id={} parent-item-index={} content-index={item_index} target-slot={} client-thing-id={}",
+                                parent_container_id,
+                                parent_item_index,
+                                target_slot.code(),
+                                source_client_thing_id
+                            ),
+                        );
+                        continue;
+                    }
                     let equipment = shared_world.player_equipment(character.id)?;
                     let containers = shared_world.player_containers(character.id)?;
                     let Some(container) = containers.container(container_id) else {
