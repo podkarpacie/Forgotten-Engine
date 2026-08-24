@@ -220,19 +220,38 @@ pub struct StatusMetrics {
     pub schema_version: i64,
     pub players_online: u32,
     pub players_online_cap: u32,
+    /// Resident set size in KiB when the platform exposes it; serialized as null otherwise.
+    pub process_memory_kib: Option<u32>,
 }
 
 pub fn encode_status_metrics(metrics: &StatusMetrics) -> Vec<u8> {
+    let memory = match metrics.process_memory_kib {
+        Some(kib) => kib.to_string(),
+        None => "null".into(),
+    };
     format!(
-        "{{\"uptime_seconds\":{},\"registered_accounts\":{},\"registered_characters\":{},\"schema_version\":{},\"players_online\":{},\"players_online_cap\":{}}}\n",
+        "{{\"uptime_seconds\":{},\"registered_accounts\":{},\"registered_characters\":{},\"schema_version\":{},\"players_online\":{},\"players_online_cap\":{},\"process_memory_kib\":{}}}\n",
         metrics.uptime_seconds,
         metrics.registered_accounts,
         metrics.registered_characters,
         metrics.schema_version,
         metrics.players_online,
-        metrics.players_online_cap
+        metrics.players_online_cap,
+        memory
     )
     .into_bytes()
+}
+
+/// Resident set size in KiB from the Linux status interface; `None` on platforms without it.
+/// Cloud panels scrape this for the server_metrics model.
+pub fn process_memory_kib() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest.trim().split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
 }
 
 pub fn encode_status_binary(
@@ -3464,9 +3483,10 @@ mod tests {
                 schema_version: 27,
                 players_online: 2,
                 players_online_cap: 100,
+                process_memory_kib: Some(4096),
             }))
             .unwrap(),
-            "{\"uptime_seconds\":12,\"registered_accounts\":3,\"registered_characters\":7,\"schema_version\":27,\"players_online\":2,\"players_online_cap\":100}\n"
+            "{\"uptime_seconds\":12,\"registered_accounts\":3,\"registered_characters\":7,\"schema_version\":27,\"players_online\":2,\"players_online_cap\":100,\"process_memory_kib\":4096}\n"
         );
         assert!(String::from_utf8(encode_status_xml(&snapshot()))
             .unwrap()

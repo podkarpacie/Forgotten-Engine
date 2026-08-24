@@ -12027,6 +12027,7 @@ fn handle_status_session(
                 players_online: u32::try_from(online_players.load(Ordering::SeqCst))
                     .unwrap_or(u32::MAX),
                 players_online_cap: config.max_players,
+                process_memory_kib: forgotten_protocol::process_memory_kib(),
             };
             stream.write_all(&encode_status_metrics(&metrics))?;
             stream.flush()?;
