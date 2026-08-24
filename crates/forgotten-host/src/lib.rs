@@ -873,6 +873,46 @@ fn native_nested_content_window_frame(
     Ok(Some(frame))
 }
 
+/// Re-sends every open nested content window whose parent container was touched. Windows whose
+/// parent item vanished (or lost its last content) get an explicit close frame instead.
+fn native_refresh_open_content_windows(
+    stream: &mut TcpStream,
+    profile: &NativeOtClientProfile,
+    catalog: Option<&NativeItemPresentationCatalog>,
+    containers: &PlayerContainers,
+    open_content_windows: &mut BTreeMap<u8, (u8, usize)>,
+) -> Result<(), HostError> {
+    let mut stale: Vec<u8> = Vec::new();
+    let ids: Vec<u8> = open_content_windows.keys().copied().collect();
+    for window_id in ids {
+        let &(parent_container_id, parent_item_index) = &open_content_windows[&window_id];
+        let Some(item) = containers
+            .container(parent_container_id)
+            .and_then(|container| container.items.item(parent_item_index))
+        else {
+            stale.push(window_id);
+            if let Ok(frame) = encode_native_otclient_close_container(profile, window_id) {
+                write_frame(stream, &frame)?;
+            }
+            continue;
+        };
+        match native_nested_content_window_frame(
+            profile,
+            catalog,
+            window_id,
+            parent_container_id,
+            item,
+        ) {
+            Ok(Some(frame)) => write_frame(stream, &frame)?,
+            _ => stale.push(window_id),
+        }
+    }
+    for window_id in stale {
+        open_content_windows.remove(&window_id);
+    }
+    Ok(())
+}
+
 fn native_classic_container_frames(
     profile: &NativeOtClientProfile,
     catalog: Option<&NativeItemPresentationCatalog>,
@@ -7660,6 +7700,18 @@ fn handle_native_otclient_game(
                         config.item_weight_by_server_id.as_deref(),
                     ) {
                         Ok(Some(outcome)) => {
+                            if matches!(
+                                outcome.source,
+                                forgotten_core::PlayerGroundDropSource::ContainerContent { .. }
+                            ) {
+                                native_refresh_open_content_windows(
+                                    stream,
+                                    &config.client_profile,
+                                    config.item_presentation_catalog.as_deref(),
+                                    &shared_world.player_containers(character.id)?,
+                                    &mut open_content_windows,
+                                )?;
+                            }
                             if let forgotten_core::PlayerGroundDropSource::EquipmentSlot(_) =
                                 outcome.source
                             {
@@ -8277,6 +8329,13 @@ fn handle_native_otclient_game(
                                     source_client_thing_id
                                 ),
                             );
+                            native_refresh_open_content_windows(
+                                stream,
+                                &config.client_profile,
+                                config.item_presentation_catalog.as_deref(),
+                                &shared_world.player_containers(character.id)?,
+                                &mut open_content_windows,
+                            )?;
                             continue;
                         }
                         let containers = shared_world.player_containers(character.id)?;
@@ -8392,6 +8451,13 @@ fn handle_native_otclient_game(
                                 source_client_thing_id
                             ),
                         );
+                        native_refresh_open_content_windows(
+                            stream,
+                            &config.client_profile,
+                            config.item_presentation_catalog.as_deref(),
+                            &shared_world.player_containers(character.id)?,
+                            &mut open_content_windows,
+                        )?;
                         continue;
                     }
                     let equipment = shared_world.player_equipment(character.id)?;
