@@ -5529,6 +5529,54 @@ impl WorldState {
         })
     }
 
+    /// Moves one depth-one content item out of a container item into another top-level owned
+    /// container. Cloned-state preparation keeps every error path atomic.
+    pub fn move_content_item_to_container(
+        &mut self,
+        player_id: u64,
+        container_id: u8,
+        item_index: usize,
+        content_index: usize,
+        to_container_id: u8,
+    ) -> Result<(), CoreError> {
+        let mut containers = self.player_containers(player_id)?.clone();
+        let mut source =
+            containers
+                .remove(container_id)
+                .ok_or(CoreError::UnknownPlayerContainer {
+                    player_id,
+                    container_id,
+                })?;
+        let moved = source.items.take_content(item_index, content_index).ok_or(
+            CoreError::UnknownPlayerContainerItem {
+                player_id,
+                container_id,
+                item_index,
+            },
+        )?;
+        containers.insert(source)?;
+        let mut target =
+            containers
+                .remove(to_container_id)
+                .ok_or(CoreError::UnknownPlayerContainer {
+                    player_id,
+                    container_id: to_container_id,
+                })?;
+        if target.has_parent {
+            containers.insert(target)?;
+            self.player_containers.insert(player_id, containers);
+            return Err(CoreError::UnknownPlayerContainer {
+                player_id,
+                container_id: to_container_id,
+            });
+        }
+        target.items.merge_or_insert_stack(moved)?;
+        containers.insert(target)?;
+        self.player_containers.insert(player_id, containers);
+        self.mark_changed();
+        Ok(())
+    }
+
     /// Exchanges one complete item in an existing non-recursive owned container with an occupied
     /// equipment slot. Both values are prepared on cloned state, keeping all error paths atomic.
     pub fn swap_container_item_with_equipment(
