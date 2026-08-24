@@ -17,6 +17,7 @@ forgotten-persistence = { path = "../forgotten-persistence" }
 forgotten-protocol = { path = "../forgotten-protocol" }
 forgotten-scripting = { path = "../forgotten-scripting" }
 ctrlc = "3.4"
+serde_json = "1"
 
 [lints]
 workspace = true

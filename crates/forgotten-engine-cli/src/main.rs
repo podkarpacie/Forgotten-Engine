@@ -17,7 +17,7 @@ use forgotten_core::{
     WorldMap, WorldMapSource, WorldState,
 };
 use forgotten_host::{
-    start, start_game_session, start_native_otclient_game, start_native_otclient_login,
+    start, start_game_session, start_native_otclient_game_with_bridge, start_native_otclient_login,
     start_status, GameSessionHostConfig, HostConfig, LegacyLoginConfig,
     NativeOtClientEmptyWorldConfig, NativeOtClientHostConfig, StaticTargetAttackPolicy,
     StaticTargetPursuitPolicy, StatusHostConfig,
@@ -801,7 +801,11 @@ fn run_host(
     let native_game = if let Some(native_config) = native_config {
         let mut native_game_config = native_config;
         native_game_config.bind_addr = config.otclient_v8_game_socket_addr();
-        match start_native_otclient_game(native_game_config, &config.database_path) {
+        match start_native_otclient_game_with_bridge(
+            native_game_config,
+            &config.database_path,
+            true,
+        ) {
             Ok(listener) => Some(listener),
             Err(error) => {
                 if let Some(native_login) = native_login {
@@ -874,6 +878,11 @@ fn run_host(
             native_game.local_addr(),
             config.otclient_v8_native_empty_world_enabled,
         );
+        if let Some(bridge_port) = native_game.operator_bridge_port() {
+            println!(
+                "> Live operator bridge listening on 127.0.0.1:{bridge_port} (JSON-line: broadcast/gm/give/tp/spawn/kick/status)"
+            );
+        }
     }
     if config.legacy_login_enabled {
         println!("> Bounded 7.4 login/character-list foundation is enabled; official-client acceptance remains unverified.");
@@ -883,6 +892,17 @@ fn run_host(
         );
     }
     println!("> Server host online. Press Ctrl+C for an orderly shutdown.");
+
+    // Publish the live operator-bridge port for CLI/Cloud discovery; removed on exit.
+    let operator_port_file = directory.join(".fe-operator-port");
+    if let Some(bridge_port) = native_game
+        .as_ref()
+        .and_then(|game| game.operator_bridge_port())
+    {
+        if let Err(error) = std::fs::write(&operator_port_file, bridge_port.to_string()) {
+            eprintln!("> warning: could not publish operator bridge port file: {error}");
+        }
+    }
 
     while !game_shutdown.load(Ordering::SeqCst)
         && !status_shutdown.load(Ordering::SeqCst)
@@ -912,6 +932,7 @@ fn run_host(
     }
     status.shutdown()?;
     host.shutdown()?;
+    let _ = std::fs::remove_file(directory.join(".fe-operator-port"));
     println!("> Server host stopped.");
     Ok(())
 }
@@ -972,20 +993,164 @@ fn command_line(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         .get(2)
         .map(String::as_str)
         .ok_or("a command action is required")?;
+    // Live-world commands are routed through the running server's operator bridge when it is
+    // up; otherwise they fall back to direct database effects so offline administration still
+    // works from the CLI.
     match action {
         "broadcast" => {
             let message = arguments.get(3..).unwrap_or_default().join(" ");
             if message.trim().is_empty() {
                 return Err("broadcast message is required".into());
             }
+            if let Some(response) = try_live_operator_command(
+                &directory,
+                &serde_json::json!({ "op": "broadcast", "message": message }),
+            )? {
+                println!("{response}");
+                return Ok(());
+            }
             let config = load(&directory)?;
             let database = EngineDatabase::open(&config.database_path)?;
             database.record_event("command", &format!("broadcast: {message}"))?;
-            println!("recorded Forgotten Engine broadcast command");
+            println!("recorded Forgotten Engine broadcast command (server not running)");
             Ok(())
+        }
+        "give" => {
+            let player = required_argument(&arguments, 3, "player name")?;
+            let item_id: u16 = arguments
+                .get(4)
+                .and_then(|value| value.parse().ok())
+                .ok_or("item id must be a number")?;
+            let count: u16 = arguments
+                .get(5)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1);
+            if let Some(response) = try_live_operator_command(
+                &directory,
+                &serde_json::json!({
+                    "op": "give", "player": player, "item_id": item_id, "count": count
+                }),
+            )? {
+                println!("{response}");
+                return Ok(());
+            }
+            Err(format!(
+                "live give requires a running server (start `forgotten-engine run {directory:?}` or use `player give` provisioning)"
+            )
+            .into())
+        }
+        "tp" => {
+            let from = required_argument(&arguments, 3, "source player name")?;
+            let to = required_argument(&arguments, 4, "target player name")?;
+            let scope = arguments.get(5).map(String::as_str).unwrap_or("");
+            if let Some(response) = try_live_operator_command(
+                &directory,
+                &serde_json::json!({
+                    "op": "tp", "from": from, "to": to, "scope": scope
+                }),
+            )? {
+                println!("{response}");
+                return Ok(());
+            }
+            Err(format!(
+                "live teleport requires a running server (start `forgotten-engine run {directory:?}`)"
+            )
+            .into())
+        }
+        "gm" => {
+            let player = required_argument(&arguments, 3, "player name")?;
+            let scope = arguments.get(4).map(String::as_str).unwrap_or("");
+            let level: u8 = arguments
+                .get(5)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1);
+            if let Some(response) = try_live_operator_command(
+                &directory,
+                &serde_json::json!({
+                    "op": "gm", "player": player, "scope": scope, "level": level
+                }),
+            )? {
+                println!("{response}");
+                return Ok(());
+            }
+            let config = load(&directory)?;
+            let database = EngineDatabase::open(&config.database_path)?;
+            let player_id = database
+                .player_id_by_name(&player)?
+                .ok_or_else(|| format!("player `{player}` does not exist"))?;
+            database.update_player_gm_level(player_id, level)?;
+            println!("set gm level {level} for {player} (player-id={player_id})");
+            Ok(())
+        }
+        "spawn" => {
+            let entity = required_argument(&arguments, 3, "entity name")?;
+            let player = arguments.get(4).cloned().unwrap_or_default();
+            if let Some(response) = try_live_operator_command(
+                &directory,
+                &serde_json::json!({ "op": "spawn", "entity": entity, "player": player }),
+            )? {
+                println!("{response}");
+                return Ok(());
+            }
+            Err(format!(
+                "live spawn requires a running server (start `forgotten-engine run {directory:?}`)"
+            )
+            .into())
+        }
+        "kick" => {
+            let player = required_argument(&arguments, 3, "player name")?;
+            if let Some(response) = try_live_operator_command(
+                &directory,
+                &serde_json::json!({ "op": "kick", "player": player }),
+            )? {
+                println!("{response}");
+                return Ok(());
+            }
+            Err(format!("player `{player}` is not online on this machine's running world").into())
         }
         unsupported => Err(format!("unsupported command action `{unsupported}`").into()),
     }
+}
+
+fn required_argument<'a>(
+    arguments: &'a [String],
+    index: usize,
+    label: &str,
+) -> Result<&'a str, Box<dyn std::error::Error>> {
+    arguments
+        .get(index)
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{label} is required").into())
+}
+
+/// Reads the live operator-bridge port recorded by a running host and sends one JSON request.
+/// Returns None when no live server is reachable. The port file lives in the world directory.
+fn try_live_operator_command(
+    directory: &PathBuf,
+    payload: &serde_json::Value,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let port_file = directory.join(".fe-operator-port");
+    let Ok(port_text) = std::fs::read_to_string(&port_file) else {
+        return Ok(None);
+    };
+    let port: u16 = match port_text.trim().parse() {
+        Ok(port) => port,
+        Err(_) => return Ok(None),
+    };
+    let mut stream = match std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)) {
+        Ok(stream) => stream,
+        Err(_) => return Ok(None),
+    };
+    use std::io::{BufRead, BufReader, Write};
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    writeln!(stream, "{payload}")?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(Some("operator bridge closed without a response".into()));
+    }
+    Ok(Some(line.trim().to_string()))
 }
 
 /// Executes one operator-requested callback only when the exact relative file path is already

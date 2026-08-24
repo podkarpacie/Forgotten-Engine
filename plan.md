@@ -5,10 +5,11 @@
 > milestone lands. Companion documents: `docs/capability-matrix.md` (per-feature truth),
 > `todo.md` (short-term checklist), `docs/completion-ledger.md` (landed-work ledger).
 >
-> **Last updated:** ledger re-weighted to **40%** — the owned-inventory movement loop is closed
-> in both directions (drops, pickups, corpse-window loot taking with live window refreshes),
-> left-hand shield defense joined the mitigation bridge, brute-force/flood limiting and an
-> operator metrics endpoint landed, and official Docker packaging shipped.
+> **Last updated:** ledger re-weighted to **57%** — the runnable plain-classic-760 native profile
+> landed after OTCv8 source evidence proved an unmodified 740-selected client discards every
+> chat/look/status record (empty message-mode map below 760). Visible-text encoders, operator
+> gamemaster tiers (schema v32) with live talkactions and a loopback operator bridge, dynamic
+> entity summons, default citizen outfits, and session-safe outfit rejection all shipped.
 > (schema v26), defeated-creature roll fix, whisper/yell delivery, and socket-test
 > stabilization; pushed to `podkarpacie/Forgotten-Engine`.
 

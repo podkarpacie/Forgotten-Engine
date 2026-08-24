@@ -47,7 +47,8 @@ const SCHEMA_VERSION_BLESS_PROMOTION: i64 = 29;
 const SCHEMA_VERSION_ITEM_CONTENTS: i64 = 31;
 const SCHEMA_VERSION_PLAYER_PARTIES: i64 = 30;
 const SCHEMA_VERSION_CORPSE_DESPAWN_TICKS: i64 = 27;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_ITEM_CONTENTS;
+const SCHEMA_VERSION_PLAYER_GM_LEVEL: i64 = 32;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_GM_LEVEL;
 /// Classic blessing count ceiling; the audited default death-loss reduction consumes this.
 pub const MAX_PLAYER_BLESSINGS: u8 = 5;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1704,6 +1705,53 @@ impl EngineDatabase {
             return Err(PersistenceError::UnknownPlayer(player_id));
         }
         Ok(())
+    }
+
+    /// Reads one character's persisted gamemaster tier (0 = plain player).
+    pub fn player_gm_level(&self, player_id: u64) -> Result<u8, PersistenceError> {
+        let level = self.connection.query_row(
+            "SELECT gm_level FROM players WHERE id = ?1",
+            params![player_id as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(u8::try_from(level).unwrap_or(0))
+    }
+
+    /// Persists one character's gamemaster tier. Valid tiers are 0-3; the caller owns the
+    /// operator-policy meaning of each tier.
+    pub fn update_player_gm_level(
+        &self,
+        player_id: u64,
+        gm_level: u8,
+    ) -> Result<(), PersistenceError> {
+        if gm_level > 3 {
+            return Err(PersistenceError::InvalidPlayerName);
+        }
+        let affected = self.connection.execute(
+            "UPDATE players SET gm_level = ?1 WHERE id = ?2",
+            params![gm_level as i64, player_id as i64],
+        )?;
+        if affected == 0 {
+            return Err(PersistenceError::UnknownPlayer(player_id));
+        }
+        Ok(())
+    }
+
+    /// Resolves one character row by exact case-insensitive name for operator commands.
+    /// Returns the durable player ID when found.
+    pub fn player_id_by_name(&self, name: &str) -> Result<Option<u64>, PersistenceError> {
+        let lowered = name.trim().to_lowercase();
+        if lowered.is_empty() {
+            return Ok(None);
+        }
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM players WHERE lower(name) = ?1")?;
+        let mut rows = statement.query(params![lowered])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get::<_, i64>(0)? as u64)),
+            None => Ok(None),
+        }
     }
 
     pub fn create_player_for_account(
@@ -4463,6 +4511,17 @@ impl EngineDatabase {
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![SCHEMA_VERSION_ITEM_CONTENTS, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < SCHEMA_VERSION_PLAYER_GM_LEVEL {
+            // Operator-granted gamemaster tier per character. Zero stays the plain-player
+            // default so existing worlds upgrade without behavior changes.
+            self.connection.execute_batch(
+                "ALTER TABLE players ADD COLUMN gm_level INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_PLAYER_GM_LEVEL, unix_seconds()],
             )?;
         }
         Ok(())

@@ -2,6 +2,8 @@
 //!
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
+pub mod operator;
+
 use forgotten_config::{
     DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog, DeclarativeSpellCatalog,
     DeclarativeWeaponCatalog, LegacyItemSlotType, LegacyPublicChannelCatalog, QuestCatalog,
@@ -51,8 +53,8 @@ use forgotten_protocol::{
     encode_native_otclient_clear_target, encode_native_otclient_close_container,
     encode_native_otclient_creature_health, encode_native_otclient_creature_outfit,
     encode_native_otclient_creature_party_shield, encode_native_otclient_delete_inventory,
-    encode_native_otclient_empty_quest_log, encode_native_otclient_game_cancel_walk_facing,
-    encode_native_otclient_game_death,
+    encode_native_otclient_empty_quest_log, encode_native_otclient_failure_message,
+    encode_native_otclient_game_cancel_walk_facing, encode_native_otclient_game_death,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
@@ -77,9 +79,9 @@ use forgotten_protocol::{
     NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
     NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
     StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE, MAX_LOGIN_STRING_BYTES,
-    NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_MESSAGE_SAY,
-    NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL, NATIVE_OTCLIENT_PLAYER_ID_END,
-    NATIVE_OTCLIENT_PLAYER_ID_START,
+    NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_MESSAGE_GM_BROADCAST,
+    NATIVE_OTCLIENT_MESSAGE_SAY, NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL,
+    NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
@@ -1433,6 +1435,8 @@ pub struct SharedNativeWorld {
     online_players: Arc<AtomicU64>,
     chat_recipients: Arc<Mutex<BTreeMap<u64, SharedChatRecipient>>>,
     vip_presence_recipients: Arc<Mutex<BTreeMap<u64, SharedVipPresenceRecipient>>>,
+    /// Operator-requested disconnects awaiting session pickup, stamped for expiry.
+    pending_kicks: Arc<Mutex<BTreeMap<u64, std::time::SystemTime>>>,
 }
 
 /// Synchronized owner for a mutable native world map. The live listener and heartbeat obtain only
@@ -1760,6 +1764,241 @@ fn handle_native_bank_keyword(
 /// near an active static NPC whose declared shop matches. Payments and proceeds flow through the
 /// durable bank balance; bought stacks chunk into free owned container slots, sold units leave
 /// carried equipment and containers. `Ok(None)` falls through to ordinary routing.
+/// Handles one gamemaster talkaction from live chat. Returns Some(reply text) when the message
+/// was a recognized GM command (whether or not it succeeded), None when the message is not a GM
+/// command and should fall through to ordinary chat routing.
+fn handle_native_gm_talkaction(
+    shared_world: &SharedNativeWorld,
+    database: &mut EngineDatabase,
+    player_id: u64,
+    message: &str,
+    _gm_level: u8,
+) -> Result<Option<String>, HostError> {
+    let trimmed = message.trim();
+    if !trimmed.starts_with('/') {
+        return Ok(None);
+    }
+    let mut parts = trimmed[1..].split_whitespace();
+    let verb = parts.next().unwrap_or("").to_ascii_lowercase();
+    match verb.as_str() {
+        "spawn" => {
+            let entity = parts.next().unwrap_or("");
+            if entity.is_empty() {
+                return Ok(Some("Usage: /spawn <entity>".into()));
+            }
+            match shared_world.spawn_dynamic_entity_in_front_of_player(player_id, entity) {
+                Ok(spawned_id) => Ok(Some(format!(
+                    "Summoned {entity} ahead (creature {spawned_id})."
+                ))),
+                Err(HostError::Core(forgotten_core::CoreError::UnknownEntityName(_))) => {
+                    Ok(Some(format!(
+                        "Unknown entity `{entity}`; only imported creature names can be summoned."
+                    )))
+                }
+                Err(_) => Ok(Some("The target tile is blocked.".into())),
+            }
+        }
+        "give" => {
+            let target_name = parts.next().unwrap_or("");
+            let item_id: u16 = match parts.next().and_then(|value| value.parse().ok()) {
+                Some(value) => value,
+                None => return Ok(Some("Usage: /give <player> <item-id> [count]".into())),
+            };
+            let count: u16 = parts
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1);
+            if item_id == 0 || count == 0 || count > 100 {
+                return Ok(Some(
+                    "Item id must be nonzero and count between 1 and 100.".into(),
+                ));
+            }
+            let Some(target_id) = database
+                .player_id_by_name(target_name)
+                .map_err(HostError::Persistence)?
+            else {
+                return Ok(Some(format!("Player `{target_name}` does not exist.")));
+            };
+            give_items_to_player(shared_world, database, target_id, item_id, u64::from(count))
+        }
+        "tp" => {
+            let from_name = parts.next().unwrap_or("");
+            let to_name = parts.next().unwrap_or("");
+            if to_name.is_empty() {
+                return Ok(Some(
+                    "Usage: /tp <player> <player>   ('me' = yourself)".into(),
+                ));
+            }
+            let resolve = |name: &str| -> Result<Option<u64>, HostError> {
+                if name.eq_ignore_ascii_case("me") {
+                    return Ok(Some(player_id));
+                }
+                database
+                    .player_id_by_name(name)
+                    .map_err(HostError::Persistence)
+            };
+            let Some(from_target) = resolve(from_name)? else {
+                return Ok(Some(format!("Player `{from_name}` does not exist.")));
+            };
+            let Some(to_target) = resolve(to_name)? else {
+                return Ok(Some(format!("Player `{to_name}` does not exist.")));
+            };
+            if !shared_world.has_player(from_target)? {
+                return Ok(Some(format!("`{from_name}` must be online to teleport.")));
+            }
+            let destination = if shared_world.has_player(to_target)? {
+                shared_world.player_position(to_target)?
+            } else {
+                database
+                    .player_by_id(to_target)
+                    .map_err(HostError::Persistence)?
+                    .position
+            };
+            match shared_world.teleport_player_for_operator(from_target, destination) {
+                Ok(()) => Ok(Some(format!(
+                    "Teleported {} to {} {} {}.",
+                    from_name, destination.x, destination.y, destination.z
+                ))),
+                Err(_) => Ok(Some("That destination is blocked.".into())),
+            }
+        }
+        "kick" => {
+            let target_name = parts.next().unwrap_or("");
+            let Some(target_id) = database
+                .player_id_by_name(target_name)
+                .map_err(HostError::Persistence)?
+            else {
+                return Ok(Some(format!("Player `{target_name}` does not exist.")));
+            };
+            match shared_world.request_kick(target_id) {
+                Ok(true) => Ok(Some(format!("Kicked {target_name}."))),
+                Ok(false) => Ok(Some(format!("`{target_name}` is not online."))),
+                Err(_) => Ok(Some("Kick failed; try again.".into())),
+            }
+        }
+        "gm" => {
+            // /gm <online|offline> <player> [level] promotes another character.
+            let scope = parts.next().unwrap_or("").to_ascii_lowercase();
+            let target_name = parts.next().unwrap_or("");
+            let level: u8 = parts
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1);
+            if scope != "online" && scope != "offline" {
+                return Ok(Some(
+                    "Usage: /gm <online|offline> <player> [level 0-3]".into(),
+                ));
+            }
+            if level > 3 {
+                return Ok(Some("GM levels run 0-3.".into()));
+            }
+            let Some(target_id) = database
+                .player_id_by_name(target_name)
+                .map_err(HostError::Persistence)?
+            else {
+                return Ok(Some(format!("Player `{target_name}` does not exist.")));
+            };
+            if scope == "online" && !shared_world.has_player(target_id)? {
+                return Ok(Some(format!("`{target_name}` is not online.")));
+            }
+            database
+                .update_player_gm_level(target_id, level)
+                .map_err(HostError::Persistence)?;
+            Ok(Some(format!(
+                "Set gamemaster level {level} for {target_name}."
+            )))
+        }
+        "broadcast" => {
+            let body: String = parts.collect::<Vec<_>>().join(" ");
+            if body.is_empty() {
+                return Ok(Some("Usage: /broadcast <message>".into()));
+            }
+            match shared_world.broadcast_console_message("Console", &body) {
+                Ok(delivered) => Ok(Some(format!("Broadcast queued for {delivered} players."))),
+                Err(_) => Ok(Some("Broadcast failed; try again.".into())),
+            }
+        }
+        _ => Ok(Some(format!(
+            "Unknown GM command `/{verb}`; available: spawn, give, tp, kick, gm, broadcast."
+        ))),
+    }
+}
+
+/// Inserts bounded single units of one server item into the target's top-level containers,
+/// returning `(containers, unplaced_units)`.
+fn insert_units_into_containers(
+    mut containers: PlayerContainers,
+    item_id: u16,
+    count: u64,
+) -> (PlayerContainers, u64) {
+    let mut unplaced = 0_u64;
+    for _ in 0..count {
+        let Ok(item) = ItemInstance::new(item_id, 1) else {
+            break;
+        };
+        let container_ids: Vec<u8> = containers.iter().map(|(id, _)| id).collect();
+        let mut placed = false;
+        for container_id in container_ids {
+            let Some(mut container) = containers.remove(container_id) else {
+                continue;
+            };
+            let merged = container.items.merge_or_insert_stack(item.clone()).is_ok();
+            if containers.insert(container).is_err() && !merged {
+                break;
+            }
+            if merged {
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            unplaced += 1;
+        }
+    }
+    (containers, unplaced)
+}
+
+/// Delivers items to an online or offline character's first container with space. Shared by the
+/// GM `/give` talkaction and the operator bridge.
+fn give_items_to_player(
+    shared_world: &SharedNativeWorld,
+    database: &mut EngineDatabase,
+    target_id: u64,
+    item_id: u16,
+    count: u64,
+) -> Result<Option<String>, HostError> {
+    let online = shared_world.has_player(target_id)?;
+    if online {
+        let containers = shared_world.player_containers(target_id)?;
+        let (staged, unplaced) = insert_units_into_containers(containers.clone(), item_id, count);
+        if unplaced > 0 {
+            return Ok(Some("Target has no container space.".into()));
+        }
+        database
+            .replace_player_containers(target_id, &staged)
+            .map_err(HostError::Persistence)?;
+        shared_world.replace_player_containers(target_id, staged)?;
+        shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+        return Ok(Some(format!(
+            "Delivered {} x item {item_id}.",
+            count - unplaced
+        )));
+    }
+    let containers = database
+        .player_containers(target_id)
+        .map_err(HostError::Persistence)?;
+    let (staged, unplaced) = insert_units_into_containers(containers, item_id, count);
+    if unplaced > 0 {
+        return Ok(Some("Target has no container space.".into()));
+    }
+    database
+        .replace_player_containers(target_id, &staged)
+        .map_err(HostError::Persistence)?;
+    Ok(Some(format!(
+        "Delivered {count} x item {item_id} to offline inventory."
+    )))
+}
+
 fn handle_native_shop_keyword(
     shared_world: &SharedNativeWorld,
     database: &mut EngineDatabase,
@@ -3759,6 +3998,7 @@ impl SharedNativeWorld {
             online_players: Arc::new(AtomicU64::new(0)),
             chat_recipients: Arc::new(Mutex::new(BTreeMap::new())),
             vip_presence_recipients: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_kicks: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -5389,6 +5629,211 @@ impl SharedNativeWorld {
         Ok(delivered)
     }
 
+    /// Delivers one console-originated GM broadcast to every connected session through the
+    /// classic mode-9 talk record. Returns the number of queued recipients.
+    pub fn broadcast_console_message(
+        &self,
+        speaker_name: &str,
+        message: &str,
+    ) -> Result<usize, HostError> {
+        let body = message.split_whitespace().collect::<Vec<_>>().join(" ");
+        if body.is_empty() {
+            return Ok(0);
+        }
+        let event = SharedPublicChatEvent {
+            speaker_name: speaker_name.to_string(),
+            speaker_position: NativeOtClientPosition { x: 0, y: 0, z: 0 },
+            channel_id: None,
+            private: false,
+            talk_mode: NATIVE_OTCLIENT_MESSAGE_GM_BROADCAST,
+            text: truncate_native_chat_text(&body),
+        };
+        self.fan_out_chat_event(event)
+    }
+
+    /// Queues one prebuilt chat event for every live recipient.
+    fn fan_out_chat_event(&self, event: SharedPublicChatEvent) -> Result<usize, HostError> {
+        let mut recipients = self
+            .chat_recipients
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut delivered = 0;
+        recipients.retain(
+            |_, recipient| match recipient.sender.try_send(event.clone()) {
+                Ok(()) => {
+                    delivered += 1;
+                    true
+                }
+                Err(mpsc::TrySendError::Full(_)) => true,
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            },
+        );
+        Ok(delivered)
+    }
+
+    /// Resolves one connected player ID by exact case-insensitive name.
+    pub fn online_player_id_by_name(&self, name: &str) -> Result<Option<u64>, HostError> {
+        let lowered = name.trim().to_lowercase();
+        if lowered.is_empty() {
+            return Ok(None);
+        }
+        let snapshots = self.lock()?.player_render_snapshots();
+        Ok(snapshots
+            .into_iter()
+            .find(|player| player.name.to_lowercase() == lowered)
+            .map(|player| player.id))
+    }
+
+    /// True when the player is currently registered in the shared world.
+    pub fn has_player(&self, player_id: u64) -> Result<bool, HostError> {
+        Ok(self
+            .lock()?
+            .player_render_snapshots()
+            .iter()
+            .any(|player| player.id == player_id))
+    }
+
+    /// Reads one connected player's authoritative position.
+    pub fn player_position(&self, player_id: u64) -> Result<forgotten_core::Position, HostError> {
+        self.lock()?
+            .player_render_snapshots()
+            .into_iter()
+            .find(|player| player.id == player_id)
+            .map(|player| player.position)
+            .ok_or(forgotten_core::CoreError::UnknownPlayer(player_id))
+            .map_err(HostError::Core)
+    }
+
+    /// Reads one connected player's position and facing direction byte for summon anchoring.
+    pub fn player_position_and_facing(
+        &self,
+        player_id: u64,
+    ) -> Result<Option<(forgotten_core::Position, u8)>, HostError> {
+        let position = self.player_position(player_id)?;
+        let direction = self
+            .player_directions
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?
+            .get(&player_id)
+            .copied()
+            .unwrap_or(2);
+        Ok(Some((position, direction)))
+    }
+
+    /// Any connected player's anchor for console spawns that omit an explicit character.
+    pub fn any_online_player_anchor(
+        &self,
+    ) -> Result<Option<(forgotten_core::Position, u8)>, HostError> {
+        let first_id = self.lock()?.registered_player_ids().into_iter().next();
+        match first_id {
+            Some(player_id) => self.player_position_and_facing(player_id),
+            None => Ok(None),
+        }
+    }
+
+    /// Applies an operator gamemaster tier to a connected player's live state. Persistence is
+    /// the caller's responsibility; this only keeps sessions consistent.
+    pub fn update_player_gm_level(&self, _player_id: u64, _level: u8) -> Result<(), HostError> {
+        // GM tier currently lives only in SQLite plus command authorization at request time;
+        // no per-session cached copy exists yet. Kept as an explicit boundary so future
+        // client-visible GM indicators have one integration point.
+        Ok(())
+    }
+
+    /// Operator teleport for a connected player with full map validation and persistence
+    /// handled by the bridge caller.
+    pub fn teleport_player_for_operator(
+        &self,
+        player_id: u64,
+        destination: forgotten_core::Position,
+    ) -> Result<(), HostError> {
+        {
+            let mut world = self.lock()?;
+            world
+                .teleport_player(player_id, destination)
+                .map_err(HostError::Core)?;
+        }
+        self.mark_visibility_changed();
+        Ok(())
+    }
+
+    /// Summons an entity clone one tile in front of the named player's facing, validating
+    /// walkability and occupancy through the core transition.
+    pub fn spawn_dynamic_entity_in_front_of_player(
+        &self,
+        player_id: u64,
+        entity_name: &str,
+    ) -> Result<u32, HostError> {
+        let Some((anchor, direction_byte)) = self.player_position_and_facing(player_id)? else {
+            return Err(HostError::Core(forgotten_core::CoreError::UnknownPlayer(
+                player_id,
+            )));
+        };
+        let delta = match direction_byte {
+            0 => (0_i32, -1_i32), // north
+            1 => (1, 0),          // east
+            2 => (0, 1),          // south
+            3 => (-1, 0),         // west
+            _ => (0, 1),
+        };
+        let target = forgotten_core::Position {
+            x: (anchor.x as i32 + delta.0).max(0) as u16,
+            y: (anchor.y as i32 + delta.1).max(0) as u16,
+            z: anchor.z,
+        };
+        let spawned = {
+            let mut world = self.lock()?;
+            world
+                .spawn_dynamic_entity(entity_name, target, direction_byte)
+                .map_err(HostError::Core)?
+        };
+        self.mark_visibility_changed();
+        Ok(spawned)
+    }
+
+    /// Summons an entity one tile in front of an explicit anchor position.
+    pub fn spawn_dynamic_entity_in_front(
+        &self,
+        entity_name: &str,
+        anchor: forgotten_core::Position,
+        direction_byte: u8,
+    ) -> Result<u32, HostError> {
+        let delta = match direction_byte {
+            0 => (0_i32, -1_i32), // north
+            1 => (1, 0),          // east
+            2 => (0, 1),          // south
+            3 => (-1, 0),         // west
+            _ => (0, 1),
+        };
+        let target = forgotten_core::Position {
+            x: (anchor.x as i32 + delta.0).max(0) as u16,
+            y: (anchor.y as i32 + delta.1).max(0) as u16,
+            z: anchor.z,
+        };
+        let spawned = {
+            let mut world = self.lock()?;
+            world
+                .spawn_dynamic_entity(entity_name, target, direction_byte)
+                .map_err(HostError::Core)?
+        };
+        self.mark_visibility_changed();
+        Ok(spawned)
+    }
+
+    /// Requests an orderly disconnect of one connected player at the next session drain.
+    /// Returns false when the player is not online.
+    pub fn request_kick(&self, player_id: u64) -> Result<bool, HostError> {
+        let online = self.has_player(player_id)?;
+        if !online {
+            return Ok(false);
+        }
+        self.pending_kicks
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?
+            .insert(player_id, std::time::SystemTime::now());
+        Ok(true)
+    }
+
     pub fn register_player_at_available_position(
         &self,
         player: Player,
@@ -5699,12 +6144,19 @@ pub struct HostHandle {
     local_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
     online_players: Arc<AtomicU64>,
+    /// Bound loopback port of the optional live operator bridge, if started.
+    operator_bridge_port: Option<u16>,
     thread: Option<JoinHandle<Result<(), HostError>>>,
 }
 
 impl HostHandle {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Loopback port of the live operator bridge when this listener runs with one enabled.
+    pub fn operator_bridge_port(&self) -> Option<u16> {
+        self.operator_bridge_port
     }
 
     /// Live registered-player counter shared with the running world; feed this to
@@ -5751,7 +6203,8 @@ pub fn start(config: HostConfig, database_path: impl AsRef<Path>) -> Result<Host
     Ok(HostHandle {
         local_addr,
         shutdown,
-        online_players,
+        online_players: Arc::new(AtomicU64::new(0)),
+        operator_bridge_port: None,
         thread: Some(thread),
     })
 }
@@ -5769,7 +6222,6 @@ pub fn start_status(
     let active_connections = Arc::new(AtomicUsize::new(0));
     let database_path = database_path.as_ref().to_path_buf();
     let thread_shutdown = Arc::clone(&shutdown);
-    let handle_online = Arc::clone(&online_players);
     let thread = thread::spawn(move || {
         serve_status(
             listener,
@@ -5784,7 +6236,8 @@ pub fn start_status(
     Ok(HostHandle {
         local_addr,
         shutdown,
-        online_players: handle_online,
+        online_players: Arc::new(AtomicU64::new(0)),
+        operator_bridge_port: None, // placeholder-fix
         thread: Some(thread),
     })
 }
@@ -5814,6 +6267,7 @@ pub fn start_game_session(
         local_addr,
         shutdown,
         online_players: Arc::new(AtomicU64::new(0)),
+        operator_bridge_port: None,
         thread: Some(thread),
     })
 }
@@ -5843,6 +6297,7 @@ pub fn start_native_otclient_login(
         local_addr,
         shutdown,
         online_players: Arc::new(AtomicU64::new(0)),
+        operator_bridge_port: None,
         thread: Some(thread),
     })
 }
@@ -5850,6 +6305,17 @@ pub fn start_native_otclient_login(
 pub fn start_native_otclient_game(
     config: NativeOtClientHostConfig,
     database_path: impl AsRef<Path>,
+) -> Result<HostHandle, HostError> {
+    start_native_otclient_game_with_bridge(config, database_path, false)
+}
+
+/// Starts the native game listener and optionally the loopback operator bridge. The bridge is
+/// enabled for normal server runs so operators and Forgotten Cloud can act on the live world;
+/// focused protocol tests disable it to keep port usage minimal.
+pub fn start_native_otclient_game_with_bridge(
+    config: NativeOtClientHostConfig,
+    database_path: impl AsRef<Path>,
+    enable_operator_bridge: bool,
 ) -> Result<HostHandle, HostError> {
     config.validate()?;
     let listener = TcpListener::bind(config.bind_addr)?;
@@ -5879,6 +6345,16 @@ pub fn start_native_otclient_game(
         .map(Arc::new);
     let thread_shutdown = Arc::clone(&shutdown);
     let thread_online_players = shared_world.online_players_counter();
+    let bridge_port = if enable_operator_bridge {
+        let (port, _bridge_shutdown) =
+            operator::start_operator_bridge(operator::OperatorBridgeConfig {
+                shared_world: shared_world.clone(),
+                database_path: database_path.clone(),
+            })?;
+        Some(port)
+    } else {
+        None
+    };
     let thread = thread::spawn(move || {
         serve_native_otclient_game(
             listener,
@@ -5894,6 +6370,7 @@ pub fn start_native_otclient_game(
         local_addr,
         shutdown,
         online_players: thread_online_players,
+        operator_bridge_port: bridge_port,
         thread: Some(thread),
     })
 }
@@ -9535,23 +10012,40 @@ fn handle_native_otclient_game(
                 }
             }
             NativeOtClientGameAction::RequestOutfit => {
-                let outfit_window = encode_native_otclient_choose_outfit(
+                // A missing or misconfigured chooser range must degrade to a client-visible
+                // rejection instead of tearing down the session.
+                match encode_native_otclient_choose_outfit(
                     &config.client_profile,
                     player_outfit,
                     empty_world.outfit_first_look_type,
                     empty_world.outfit_last_look_type,
-                )
-                .map_err(HostError::Protocol)?;
-                write_frame(stream, &outfit_window)?;
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "outbound=choose-outfit opcode=0xc8 bytes={} look-type={}",
-                        outfit_window.0.len(),
-                        player_outfit.look_type
-                    ),
-                );
+                ) {
+                    Ok(outfit_window) => {
+                        write_frame(stream, &outfit_window)?;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "outbound=choose-outfit opcode=0xc8 bytes={} look-type={}",
+                                outfit_window.0.len(),
+                                player_outfit.look_type
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        let rejection = encode_native_otclient_failure_message(
+                            &config.client_profile,
+                            "The outfit window is not configured on this server.",
+                        )
+                        .map_err(HostError::Protocol)?;
+                        write_frame(stream, &rejection)?;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!("action=request-outfit outcome=rejected reason={error}"),
+                        );
+                    }
+                }
             }
             NativeOtClientGameAction::LeaveChannel(channel_id) => {
                 let removed = open_public_channel_ids.remove(&channel_id);
@@ -9697,21 +10191,36 @@ fn handle_native_otclient_game(
                     shared_world.update_player_outfit(character.id, player_outfit)?;
                     observed_visibility_epoch = shared_world.visibility_epoch();
                 }
-                let applied_outfit = encode_native_otclient_creature_outfit(
+                // The applied-outfit echo must never fail the session; a rejected or
+                // unencodable change degrades to a client-visible failure text.
+                match encode_native_otclient_creature_outfit(
                     &config.client_profile,
                     snapshot.player_id,
                     player_outfit,
-                )
-                .map_err(HostError::Protocol)?;
-                write_frame(stream, &applied_outfit)?;
+                ) {
+                    Ok(applied_outfit) => {
+                        write_frame(stream, &applied_outfit)?;
+                    }
+                    Err(error) => {
+                        let rejection = encode_native_otclient_failure_message(
+                            &config.client_profile,
+                            "The selected outfit could not be applied on this server.",
+                        )
+                        .map_err(HostError::Protocol)?;
+                        write_frame(stream, &rejection)?;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!("action=change-outfit outcome=echo-rejected reason={error}"),
+                        );
+                    }
+                }
                 native_diagnostic(
                     config.extended_diagnostics,
                     peer,
                     &format!(
-                        "outbound=creature-outfit opcode=0x8e bytes={} accepted={} look-type={}",
-                        applied_outfit.0.len(),
-                        accepted,
-                        player_outfit.look_type
+                        "outbound=creature-outfit opcode=0x8e accepted={} look-type={}",
+                        accepted, player_outfit.look_type
                     ),
                 );
             }
@@ -10043,6 +10552,43 @@ fn handle_native_otclient_game(
                     continue;
                 }
                 talk_windows.push_back(now);
+                // Gamemaster talkactions ("/give", "/tp", "/spawn", ...) run before every other
+                // keyword router and are only available to characters with a persisted GM tier.
+                if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
+                    && request.channel_id.is_none()
+                    && request.recipient.is_none()
+                {
+                    let gm_level = database
+                        .player_gm_level(character.id)
+                        .map_err(HostError::Persistence)?;
+                    if gm_level > 0 {
+                        if let Some(reply) = handle_native_gm_talkaction(
+                            shared_world,
+                            &mut database,
+                            character.id,
+                            &request.message,
+                            gm_level,
+                        )? {
+                            let reply_frame = encode_native_otclient_status_message(
+                                &config.client_profile,
+                                &reply,
+                            )
+                            .map_err(HostError::Protocol)?;
+                            write_frame(stream, &reply_frame)?;
+                            shared_world.mark_visibility_changed();
+                            observed_visibility_epoch = shared_world.visibility_epoch();
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "action=talk outcome=gm-talkaction reply-bytes={}",
+                                    reply.len()
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+                }
                 if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
                     && request.channel_id.is_none()
                     && request.recipient.is_none()
@@ -24205,6 +24751,7 @@ mod tests {
             local_addr,
             shutdown,
             online_players: Arc::new(AtomicU64::new(0)),
+            operator_bridge_port: None,
             thread: Some(thread),
         })
     }
@@ -27180,5 +27727,201 @@ mod native_diagnostics_tests {
                 z: 6,
             }
         ));
+    }
+}
+/// Gamemaster talkaction and dynamic-spawn coverage: command recognition, GM promotion
+/// persistence, spawn authorization against imported templates, and the operator bridge.
+#[cfg(test)]
+mod gm_talkaction_tests {
+    use super::*;
+    use forgotten_core::WorldMapTile;
+    use std::fs;
+    use std::io::{BufRead, BufReader, Write};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn database_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("forgotten-engine-gm-{name}-{nonce}.db"))
+    }
+
+    #[test]
+    fn non_slash_messages_are_not_gm_commands() {
+        let path = database_path("non-slash");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let reply =
+            handle_native_gm_talkaction(&shared, &mut database, 1, "hello everyone", 2).unwrap();
+        assert!(reply.is_none());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unknown_gm_verbs_get_an_available_command_list() {
+        let path = database_path("unknown-verb");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let reply =
+            handle_native_gm_talkaction(&shared, &mut database, 1, "/frobnicate", 1).unwrap();
+        assert!(reply.unwrap().contains("Unknown GM command"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gm_promotion_persists_and_reports_scope_errors() {
+        let path = database_path("gm-promote");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id: i64 = database.create_account("gm-owner", "password").unwrap();
+        let character = database
+            .create_player_for_account(account_id as u32, "Target")
+            .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+
+        let missing_scope = handle_native_gm_talkaction(&shared, &mut database, 1, "/gm Target", 1)
+            .unwrap()
+            .unwrap();
+        assert!(missing_scope.contains("Usage"));
+
+        let offline_scope =
+            handle_native_gm_talkaction(&shared, &mut database, 1, "/gm online Target", 1)
+                .unwrap()
+                .unwrap();
+        assert!(offline_scope.contains("not online"));
+
+        let promoted =
+            handle_native_gm_talkaction(&shared, &mut database, 1, "/gm offline Target 2", 1)
+                .unwrap()
+                .unwrap();
+        assert!(promoted.contains("level 2"));
+        assert_eq!(
+            database.player_gm_level(u64::from(character.id)).unwrap(),
+            2
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn spawn_rejects_unknown_entities_and_summons_known_ones_in_front() {
+        let path = database_path("spawn");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id: i64 = database.create_account("spawner", "password").unwrap();
+        let character = database
+            .create_player_for_account(account_id as u32, "Summoner")
+            .unwrap();
+        let player_id = u64::from(character.id);
+        let monster_id = 0x4000_0001_u32;
+        let collection = FeTfsStaticSpawnCollection::with_combat_metadata_and_npc_ids(
+            vec![forgotten_core::FeTfsStaticEntity {
+                id: monster_id,
+                name: "Rat".into(),
+                position: Position { x: 90, y: 90, z: 7 },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 100,
+                direction: 2,
+            }],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let spawn = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let mut map = WorldMap::new("gm-spawn-test", spawn);
+        for x in 80..=120u16 {
+            for y in 80..=120u16 {
+                map.set_tile(
+                    Position { x, y, z: 7 },
+                    WorldMapTile {
+                        ground_thing_id: 102,
+                        walkable: true,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        map.set_town(forgotten_core::WorldMapTown {
+            id: 1,
+            name: "Gm Temple".into(),
+            temple_position: spawn,
+        })
+        .unwrap();
+        map.validate().unwrap();
+        let map = std::sync::Arc::new(map);
+        let shared = SharedNativeWorld::from_static_spawns(Some(&collection)).unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: player_id,
+                    account_id: account_id as u64,
+                    name: "Summoner".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .update_player_facing(player_id, NativeOtClientCardinalDirection::South)
+            .unwrap();
+
+        let unknown =
+            handle_native_gm_talkaction(&shared, &mut database, player_id, "/spawn Dragon", 1)
+                .unwrap()
+                .unwrap();
+        assert!(unknown.contains("Unknown entity"));
+
+        let summoned =
+            handle_native_gm_talkaction(&shared, &mut database, player_id, "/spawn Rat", 1)
+                .unwrap()
+                .unwrap();
+        assert!(summoned.contains("Summoned"));
+        let records = {
+            let world = shared.lock().unwrap();
+            world.dynamic_spawn_records()
+        };
+        assert_eq!(records.len(), 1);
+        assert!(records[0].0 >= 0x7000_0000);
+        // The summon lands one tile south of the spawn facing.
+        assert_eq!(records[0].2.y, map.spawn().y + 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn operator_bridge_answers_status_over_tcp() {
+        let path = database_path("bridge-tcp");
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let (port, shutdown) = operator::start_operator_bridge(operator::OperatorBridgeConfig {
+            shared_world: shared,
+            database_path: path.clone(),
+        })
+        .unwrap();
+        let mut stream =
+            std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        writeln!(stream, r#"{{"op":"status"}}"#).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"ok\":true"));
+        assert!(line.contains("players-online=0"));
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = fs::remove_file(&path);
     }
 }

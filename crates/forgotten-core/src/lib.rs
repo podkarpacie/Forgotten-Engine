@@ -3842,6 +3842,101 @@ impl WorldState {
         self.static_creatures.len()
     }
 
+    /// Summons one operator-requested entity in front of a player. The entity clones the
+    /// appearance, health, experience, melee, and loot metadata of an installed static creature
+    /// with a case-insensitive matching name; its durable ID is allocated above the imported
+    /// range so restart snapshots and persistence never collide. The target tile must be
+    /// walkable and free of players and active creatures.
+    pub fn spawn_dynamic_entity(
+        &mut self,
+        name: &str,
+        position: Position,
+        direction: u8,
+    ) -> Result<u32, CoreError> {
+        const DYNAMIC_ID_BASE: u32 = 0x7000_0000;
+        if self.static_creatures.len() >= MAX_TFS_STATIC_SPAWNS {
+            return Err(CoreError::StaticSpawnLimit(MAX_TFS_STATIC_SPAWNS));
+        }
+        let lowered = name.trim().to_lowercase();
+        if lowered.is_empty() {
+            return Err(CoreError::EmptyStaticSpawnName);
+        }
+        let template = self
+            .static_creatures
+            .values()
+            .find(|runtime| runtime.entity.name.to_lowercase() == lowered)
+            .ok_or_else(|| CoreError::UnknownEntityName(name.trim().to_string()))?
+            .clone();
+        if self
+            .players
+            .values()
+            .any(|player| player.position == position)
+            || self
+                .static_creatures
+                .values()
+                .any(|runtime| runtime.active && runtime.entity.position == position)
+        {
+            return Err(CoreError::SpawnPositionRejected(position));
+        }
+        let next_slot = (DYNAMIC_ID_BASE..)
+            .find(|candidate| !self.static_creatures.contains_key(candidate))
+            .ok_or(CoreError::DynamicSpawnLimit(MAX_TFS_STATIC_SPAWNS))?;
+        let mut entity = template.entity.clone();
+        entity.id = next_slot;
+        entity.position = position;
+        entity.direction = direction;
+        let runtime = StaticCreatureRuntime {
+            entity,
+            is_npc: false,
+            experience_reward: template.experience_reward,
+            loot: template.loot,
+            spawn_position: position,
+            // Dynamic summons have no import spawn area: they despawn on deactivation instead
+            // of reactivating at an imported pad.
+            monster_spawn_area: None,
+            active: true,
+            health_percent: template.health_percent,
+            activated_at_tick: self.tick,
+            inactive_since_tick: None,
+            reactivation_due_tick: None,
+            respawn_interval_seconds: 0,
+            melee_cooldown_ticks: template.melee_cooldown_ticks,
+            next_melee_due_tick: self.tick,
+            direct_melee_damage_range: template.direct_melee_damage_range,
+            direct_melee_damage_sequence: 0,
+            target_player_id: None,
+        };
+        self.static_creatures.insert(next_slot, runtime);
+        self.refresh_static_creature_occupancy();
+        self.mark_changed();
+        Ok(next_slot)
+    }
+
+    /// Removes one dynamic operator summon. Imported entities are protected: only IDs from the
+    /// dynamic range can be despawned.
+    pub fn despawn_dynamic_entity(&mut self, id: u32) -> Result<(), CoreError> {
+        const DYNAMIC_ID_BASE: u32 = 0x7000_0000;
+        if id < DYNAMIC_ID_BASE {
+            return Err(CoreError::UnknownStaticCreature(id));
+        }
+        if self.static_creatures.remove(&id).is_none() {
+            return Err(CoreError::UnknownStaticCreature(id));
+        }
+        self.refresh_static_creature_occupancy();
+        self.mark_changed();
+        Ok(())
+    }
+
+    /// Lists every dynamic summon as (id, name, position) records.
+    pub fn dynamic_spawn_records(&self) -> Vec<(u32, String, Position)> {
+        const DYNAMIC_ID_BASE: u32 = 0x7000_0000;
+        self.static_creatures
+            .iter()
+            .filter(|(id, _)| **id >= DYNAMIC_ID_BASE)
+            .map(|(id, runtime)| (*id, runtime.entity.name.clone(), runtime.entity.position))
+            .collect()
+    }
+
     pub fn static_creature(&self, id: u32) -> Option<&FeTfsStaticEntity> {
         self.static_creatures
             .get(&id)
@@ -6910,6 +7005,13 @@ pub enum CoreError {
     StaticSpawnLimit(usize),
     DuplicateStaticSpawnId(u32),
     EmptyStaticSpawnName,
+    /// A dynamic operator spawn request named an entity that no installed static creature or
+    /// imported catalog definition can satisfy.
+    UnknownEntityName(String),
+    /// A dynamic spawn target tile was rejected by walkability or occupancy validation.
+    SpawnPositionRejected(Position),
+    /// The dynamic spawn registry is exhausted; operators must despawn before summoning more.
+    DynamicSpawnLimit(usize),
     InvalidStaticCreatureHealthPercent(u8),
     InvalidStaticCreatureReactivationDelay {
         id: u32,

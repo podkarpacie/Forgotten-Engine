@@ -1,4 +1,4 @@
-﻿//! Bounded transport contracts for Forgotten Engine profiles.
+//! Bounded transport contracts for Forgotten Engine profiles.
 //!
 //! The legacy 7.4 types below are a tested foundation, not a claim of official-client support.
 
@@ -958,6 +958,27 @@ pub const NATIVE_OTCLIENT_MESSAGE_SAY: u8 = 0x01;
 pub const NATIVE_OTCLIENT_MESSAGE_WHISPER: u8 = 0x02;
 /// Classic server-talk mode for a yelled message delivered to a wider same-floor audience.
 pub const NATIVE_OTCLIENT_MESSAGE_YELL: u8 = 0x03;
+/// Classic text-message class rendered as green center-screen inspection text (Look replies).
+pub const NATIVE_OTCLIENT_MESSAGE_LOOK: u8 = 0x16;
+/// Classic text-message class rendered in the console and status area for rejected actions.
+pub const NATIVE_OTCLIENT_MESSAGE_FAILURE: u8 = 0x17;
+/// Classic text-message class rendered in the console for login/welcome information.
+pub const NATIVE_OTCLIENT_MESSAGE_LOGIN: u8 = 0x14;
+/// Classic server-talk mode for a gamemaster broadcast delivered to every connected player.
+pub const NATIVE_OTCLIENT_MESSAGE_GM_BROADCAST: u8 = 0x09;
+/// Classic citizen look type used when an operator enables a real world without configuring a
+/// player appearance. Look type zero renders clientside as the invisible effect, so FE never
+/// emits it for players outside the deliberate asset-free diagnostic fixture.
+pub const NATIVE_OTCLIENT_DEFAULT_PLAYER_LOOK_TYPE: u8 = 128;
+/// Inclusive classic chooser range offered when no explicit outfit range is configured. Covers
+/// the standard citizen appearances so the outfit window works out of the box.
+pub const NATIVE_OTCLIENT_DEFAULT_OUTFIT_FIRST_LOOK_TYPE: u8 = 128;
+pub const NATIVE_OTCLIENT_DEFAULT_OUTFIT_LAST_LOOK_TYPE: u8 = 134;
+/// Server opcode `0x84`: floating colored text over one tile, parsed without any message-mode
+/// translation, so it stays client-visible even on mode-map-less classic profiles.
+pub const NATIVE_OTCLIENT_GAME_ANIMATED_TEXT: u8 = 0x84;
+/// Server opcode `0x83`: one tile graphical effect.
+pub const NATIVE_OTCLIENT_GAME_MAGIC_EFFECT: u8 = 0x83;
 pub const NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT: u8 = 0xc8;
 pub const NATIVE_OTCLIENT_GAME_VIP_ADD: u8 = 0xd2;
 pub const NATIVE_OTCLIENT_GAME_VIP_STATE: u8 = 0xd3;
@@ -1041,11 +1062,13 @@ pub struct NativeOtClientProfile {
 }
 
 /// The native transport boundary selected by a protocol profile. This is intentionally narrower
-/// than a claim of full protocol compatibility: FE currently has one runnable plain 7.4
-/// foundation and recognizes the distinct encrypted transport required by classic 8.0.
+/// than a claim of full protocol compatibility: FE currently runs plain classic 7.4 and 7.6
+/// foundations (byte-identical login, framing, and record layouts) and recognizes the distinct
+/// encrypted transport required by classic 8.0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeOtClientFoundation {
     PlainClassic740,
+    PlainClassic760,
     Classic800RequiresRsaXtea,
     Unsupported,
 }
@@ -1054,6 +1077,7 @@ impl NativeOtClientFoundation {
     pub fn label(self) -> &'static str {
         match self {
             Self::PlainClassic740 => "plain-classic-740",
+            Self::PlainClassic760 => "plain-classic-760",
             Self::Classic800RequiresRsaXtea => "classic-800-requires-rsa-xtea",
             Self::Unsupported => "unsupported",
         }
@@ -1069,11 +1093,16 @@ impl NativeOtClientProfile {
             return NativeOtClientFoundation::Unsupported;
         }
         match self.protocol_version {
-            740 if !self.login_packet_encryption
-                && !self.protocol_checksum
-                && !self.challenge_on_login =>
+            740 | 760
+                if !self.login_packet_encryption
+                    && !self.protocol_checksum
+                    && !self.challenge_on_login =>
             {
-                NativeOtClientFoundation::PlainClassic740
+                if self.protocol_version == 740 {
+                    NativeOtClientFoundation::PlainClassic740
+                } else {
+                    NativeOtClientFoundation::PlainClassic760
+                }
             }
             800 => NativeOtClientFoundation::Classic800RequiresRsaXtea,
             _ => NativeOtClientFoundation::Unsupported,
@@ -1081,13 +1110,27 @@ impl NativeOtClientProfile {
     }
 
     pub fn supports_current_native_foundation(&self) -> bool {
-        self.foundation() == NativeOtClientFoundation::PlainClassic740
+        matches!(
+            self.foundation(),
+            NativeOtClientFoundation::PlainClassic740 | NativeOtClientFoundation::PlainClassic760
+        )
     }
 
-    /// Classic equipment records have been verified only for the selected 740 native profile.
-    /// Other configured protocol versions must add their own parser-backed layout before reuse.
+    /// Classic equipment/container/outfit records were verified on the 740 native profile and are
+    /// byte-identical on the 760 profile: no OTCv8 feature flag differs between the two versions,
+    /// so every record layout FE emits is unchanged. Only the client-side message-mode translation
+    /// differs (the reason the 760 profile exists). Other configured protocol versions must add
+    /// their own parser-backed layout before reuse.
     pub fn supports_classic_740_inventory_records(&self) -> bool {
-        self.supports_current_native_foundation() && self.protocol_version == 740
+        self.supports_current_native_foundation()
+            && (self.protocol_version == 740 || self.protocol_version == 760)
+    }
+
+    /// True when this profile's client actually translates message-mode bytes for talk and
+    /// text-message records. An unmodified OTCv8 selecting protocol 740 keeps an empty mode map
+    /// and discards every `0xAA`/`0xB4` record, so visible-text features must gate on this.
+    pub fn supports_visible_text_messages(&self) -> bool {
+        self.foundation() == NativeOtClientFoundation::PlainClassic760
     }
 }
 
@@ -1755,6 +1798,123 @@ pub fn encode_native_otclient_private_message_from(
     writer.string(speaker_name);
     writer.byte(4);
     writer.string(text);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes one classic GM-broadcast Talk record. The 760 message-mode map translates server mode
+/// `9` to `MessageGamemasterBroadcast`, which the client parser reads as name + text with no
+/// position or channel field, rendering in every console tab.
+pub fn encode_native_otclient_gm_broadcast(
+    profile: &NativeOtClientProfile,
+    speaker_name: &str,
+    text: &str,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    if speaker_name.is_empty()
+        || text.is_empty()
+        || text.len() > NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES
+    {
+        return Err(ProtocolError::StringTooLong(text.len()));
+    }
+    let fixed_bytes = 6usize;
+    if speaker_name.len() + text.len() + fixed_bytes > MAX_FRAME_SIZE {
+        return Err(ProtocolError::StringTooLong(
+            speaker_name.len().saturating_add(text.len()),
+        ));
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_TALK);
+    writer.string(speaker_name);
+    writer.byte(NATIVE_OTCLIENT_MESSAGE_GM_BROADCAST);
+    writer.string(text);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes one classic look (`0xB4/0x16`) inspection record. The 760 client maps class `22` to
+/// `MessageLook`, rendering green center-screen text and a Server Log console entry.
+pub fn encode_native_otclient_look_message(
+    profile: &NativeOtClientProfile,
+    message: &str,
+) -> Result<Frame, ProtocolError> {
+    encode_native_otclient_typed_text_message(profile, NATIVE_OTCLIENT_MESSAGE_LOOK, message)
+}
+
+/// Encodes one classic failure (`0xB4/0x17`) rejection record rendered in the status area.
+pub fn encode_native_otclient_failure_message(
+    profile: &NativeOtClientProfile,
+    message: &str,
+) -> Result<Frame, ProtocolError> {
+    encode_native_otclient_typed_text_message(profile, NATIVE_OTCLIENT_MESSAGE_FAILURE, message)
+}
+
+/// Encodes one classic login (`0xB4/0x14`) welcome record rendered in the console.
+pub fn encode_native_otclient_login_message(
+    profile: &NativeOtClientProfile,
+    message: &str,
+) -> Result<Frame, ProtocolError> {
+    encode_native_otclient_typed_text_message(profile, NATIVE_OTCLIENT_MESSAGE_LOGIN, message)
+}
+
+fn encode_native_otclient_typed_text_message(
+    profile: &NativeOtClientProfile,
+    class: u8,
+    message: &str,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    if message.is_empty() || message.len() > NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES {
+        return Err(ProtocolError::StringTooLong(message.len()));
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_TEXT_MESSAGE);
+    writer.byte(class);
+    writer.string(message);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes the classic floating colored-text record over one tile. This opcode is parsed without
+/// any message-mode translation on every classic protocol, so it remains visible even where
+/// `0xAA`/`0xB4` records are discarded; the host uses it for spatial chat feedback.
+pub fn encode_native_otclient_animated_text(
+    profile: &NativeOtClientProfile,
+    position: NativeOtClientPosition,
+    color: u8,
+    text: &str,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    if text.is_empty() || text.len() > NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES {
+        return Err(ProtocolError::StringTooLong(text.len()));
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_ANIMATED_TEXT);
+    writer.u16(position.x);
+    writer.u16(position.y);
+    writer.byte(position.z);
+    writer.byte(color);
+    writer.string(text);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes one classic tile graphical-effect record with a bounded effect id.
+pub fn encode_native_otclient_magic_effect(
+    profile: &NativeOtClientProfile,
+    position: NativeOtClientPosition,
+    effect_id: u8,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() || effect_id == 0 {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_MAGIC_EFFECT);
+    writer.u16(position.x);
+    writer.u16(position.y);
+    writer.byte(position.z);
+    writer.byte(effect_id);
     Ok(Frame(writer.finish()))
 }
 
@@ -5581,5 +5741,120 @@ mod tests {
         let frame = encode_native_otclient_map_viewport(&profile, &snapshot, &world_map).unwrap();
         assert_eq!(frame.0[0], NATIVE_OTCLIENT_GAME_FULL_MAP);
         assert!(frame.0.len() <= MAX_FRAME_SIZE);
+    }
+}
+
+/// Tests for the classic-760 runnable profile and the visible-text encoder set. The 760
+/// foundation exists because an unmodified OTCv8 at protocol 740 keeps an empty message-mode
+/// map and discards every 0xAA/0xB4 record; 760 is byte-identical on the wire but renders.
+#[cfg(test)]
+mod classic_760_visible_text_tests {
+    use super::*;
+
+    fn profile_740() -> NativeOtClientProfile {
+        NativeOtClientProfile {
+            protocol_version: 740,
+            numeric_account_ids: true,
+            login_packet_encryption: false,
+            protocol_checksum: false,
+            challenge_on_login: false,
+            max_padding_bytes: 128,
+        }
+    }
+
+    fn profile_760() -> NativeOtClientProfile {
+        NativeOtClientProfile {
+            protocol_version: 760,
+            numeric_account_ids: true,
+            login_packet_encryption: false,
+            protocol_checksum: false,
+            challenge_on_login: false,
+            max_padding_bytes: 128,
+        }
+    }
+
+    #[test]
+    fn seven_sixty_is_a_runnable_classic_foundation_with_visible_text() {
+        assert!(profile_740().supports_current_native_foundation());
+        assert!(!profile_740().supports_visible_text_messages());
+        assert_eq!(
+            profile_760().foundation(),
+            NativeOtClientFoundation::PlainClassic760
+        );
+        assert!(profile_760().supports_current_native_foundation());
+        assert!(profile_760().supports_classic_740_inventory_records());
+        assert!(profile_760().supports_visible_text_messages());
+    }
+
+    #[test]
+    fn gm_broadcast_record_matches_the_classic_mode_nine_layout() {
+        let frame =
+            encode_native_otclient_gm_broadcast(&profile_760(), "Console", "server restart")
+                .unwrap();
+        let mut expected = vec![NATIVE_OTCLIENT_GAME_TALK, 7, 0];
+        expected.extend_from_slice(b"Console");
+        expected.push(NATIVE_OTCLIENT_MESSAGE_GM_BROADCAST);
+        expected.extend_from_slice(&[14, 0]);
+        expected.extend_from_slice(b"server restart");
+        assert_eq!(frame.0, expected);
+    }
+
+    #[test]
+    fn look_failure_login_records_carry_their_classes() {
+        let look = encode_native_otclient_look_message(&profile_760(), "You see a rat.").unwrap();
+        assert_eq!(look.0[0], NATIVE_OTCLIENT_GAME_TEXT_MESSAGE);
+        assert_eq!(look.0[1], NATIVE_OTCLIENT_MESSAGE_LOOK);
+        let failure =
+            encode_native_otclient_failure_message(&profile_760(), "Not possible.").unwrap();
+        assert_eq!(failure.0[1], NATIVE_OTCLIENT_MESSAGE_FAILURE);
+        let login = encode_native_otclient_login_message(&profile_760(), "Welcome.").unwrap();
+        assert_eq!(login.0[1], NATIVE_OTCLIENT_MESSAGE_LOGIN);
+    }
+
+    #[test]
+    fn animated_text_and_magic_effect_match_parser_layouts() {
+        let position = NativeOtClientPosition {
+            x: 100,
+            y: 200,
+            z: 7,
+        };
+        let animated =
+            encode_native_otclient_animated_text(&profile_760(), position, 180, "12").unwrap();
+        assert_eq!(
+            animated.0,
+            vec![
+                NATIVE_OTCLIENT_GAME_ANIMATED_TEXT,
+                100,
+                0,
+                200,
+                0,
+                7,
+                180,
+                2,
+                0,
+                b'1',
+                b'2'
+            ]
+        );
+        let effect = encode_native_otclient_magic_effect(&profile_760(), position, 3).unwrap();
+        assert_eq!(
+            effect.0,
+            vec![NATIVE_OTCLIENT_GAME_MAGIC_EFFECT, 100, 0, 200, 0, 7, 3]
+        );
+    }
+
+    #[test]
+    fn encoders_still_reject_profiles_without_a_runnable_foundation() {
+        let mut unsupported = profile_740();
+        unsupported.numeric_account_ids = false;
+        assert!(encode_native_otclient_gm_broadcast(&unsupported, "A", "b").is_err());
+        assert!(encode_native_otclient_look_message(&unsupported, "x").is_err());
+        assert!(encode_native_otclient_animated_text(
+            &unsupported,
+            NativeOtClientPosition { x: 0, y: 0, z: 0 },
+            1,
+            "t"
+        )
+        .is_err());
     }
 }
