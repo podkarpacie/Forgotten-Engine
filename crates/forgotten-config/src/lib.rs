@@ -407,34 +407,16 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         optional_boolean(&values, "otclientV8NativeEmptyWorldEnabled", false)?;
     let otclient_v8_empty_world_ground_thing_id =
         optional_u16(&values, "otclientV8EmptyWorldGroundThingId", 0)?;
-    let mut otclient_v8_player_look_type = optional_u16(&values, "otclientV8PlayerLookType", 0)?;
+    // Appearance and ground-id defaults are applied by the host at startup, where the loaded
+    // world map distinguishes a real world from the deliberate asset-free diagnostic fixture.
+    // This layer only validates explicit operator choices.
+    let otclient_v8_player_look_type = optional_u16(&values, "otclientV8PlayerLookType", 0)?;
     let configured_otclient_v8_outfit_first_look_type =
         optional_u16(&values, "otclientV8OutfitFirstLookType", 0)?;
     let configured_otclient_v8_outfit_last_look_type =
         optional_u16(&values, "otclientV8OutfitLastLookType", 0)?;
-    // A zero look type with an enabled native client means the operator never chose an
-    // appearance. Outside the deliberate asset-free diagnostic fixture that renders clientside
-    // as the invisible effect and breaks the outfit chooser, so real worlds get the classic
-    // citizen default with a standard chooser range.
-    let asset_free_fixture =
-        otclient_v8_native_empty_world_enabled && otclient_v8_empty_world_ground_thing_id == 0;
-    if otclient_v8_player_look_type == 0 && !asset_free_fixture {
-        otclient_v8_player_look_type =
-            u16::from(forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_PLAYER_LOOK_TYPE);
-    }
-    let otclient_v8_outfit_first_look_type = if otclient_v8_player_look_type != 0
-        && configured_otclient_v8_outfit_first_look_type == 0
-    {
-        u16::from(forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_OUTFIT_FIRST_LOOK_TYPE)
-    } else {
-        configured_otclient_v8_outfit_first_look_type
-    };
-    let otclient_v8_outfit_last_look_type =
-        if otclient_v8_player_look_type != 0 && configured_otclient_v8_outfit_last_look_type == 0 {
-            u16::from(forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_OUTFIT_LAST_LOOK_TYPE)
-        } else {
-            configured_otclient_v8_outfit_last_look_type
-        };
+    let otclient_v8_outfit_first_look_type = configured_otclient_v8_outfit_first_look_type;
+    let otclient_v8_outfit_last_look_type = configured_otclient_v8_outfit_last_look_type;
     let otclient_v8_player_speed = optional_u16(&values, "otclientV8PlayerSpeed", 220)?;
     let otclient_v8_server_beat = optional_u16(&values, "otclientV8ServerBeat", 50)?;
     let native_profile = NativeOtClientProfile {
@@ -1715,6 +1697,29 @@ mod tests {
         assert_eq!(config.game_session_port, 7183);
         assert_eq!(config.advertised_game_session_host, "fe.example.test");
         assert_eq!(config.advertised_game_session_port, 443);
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn preserves_zero_appearance_values_in_config_for_host_side_defaulting() {
+        let world = temporary_world("native-defaults-real-world");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}otclientV8NativeEnabled = true\notclientV8ProtocolVersion = 760\notclientV8NativeEmptyWorldEnabled = true\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+
+        let config = load(&world).unwrap();
+        // The config layer preserves operator zeros verbatim; the host applies the citizen and
+        // ground defaults at startup once it knows whether a real map was loaded.
+        assert_eq!(config.otclient_v8_player_look_type, 0);
+        assert_eq!(config.otclient_v8_outfit_first_look_type, 0);
+        assert_eq!(config.otclient_v8_outfit_last_look_type, 0);
+        assert_eq!(config.otclient_v8_empty_world_ground_thing_id, 0);
         let _ = fs::remove_dir_all(world);
     }
 

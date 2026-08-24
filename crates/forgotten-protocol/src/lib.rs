@@ -953,6 +953,9 @@ pub const NATIVE_OTCLIENT_MESSAGE_GM_BROADCAST: u8 = 0x09;
 /// player appearance. Look type zero renders clientside as the invisible effect, so FE never
 /// emits it for players outside the deliberate asset-free diagnostic fixture.
 pub const NATIVE_OTCLIENT_DEFAULT_PLAYER_LOOK_TYPE: u8 = 128;
+/// Classic ground tile sprite used when a real world runs native clients without an explicit
+/// ground id; zero floors render clientside as nothing.
+pub const NATIVE_OTCLIENT_DEFAULT_GROUND_THING_ID: u16 = 102;
 /// Inclusive classic chooser range offered when no explicit outfit range is configured. Covers
 /// the standard citizen appearances so the outfit window works out of the box.
 pub const NATIVE_OTCLIENT_DEFAULT_OUTFIT_FIRST_LOOK_TYPE: u8 = 128;
@@ -1521,7 +1524,7 @@ pub fn decode_native_otclient_login_request(
         client_tag: reader.string(MAX_LOGIN_STRING_BYTES)?,
         client_build: reader.u16()?,
     };
-    if request.protocol_version != profile.protocol_version
+    if !classic_protocol_version_is_accepted(request.protocol_version)
         || reader.remaining() > profile.max_padding_bytes
     {
         return Err(ProtocolError::InvalidNativeLoginRequest);
@@ -1554,12 +1557,20 @@ pub fn decode_native_otclient_game_request(
         client_tag: reader.string(MAX_LOGIN_STRING_BYTES)?,
         client_build: reader.u16()?,
     };
-    if request.protocol_version != profile.protocol_version
+    if !classic_protocol_version_is_accepted(request.protocol_version)
         || reader.remaining() > profile.max_padding_bytes
     {
         return Err(ProtocolError::InvalidNativeGameRequest);
     }
     Ok(request)
+}
+
+/// Classic 740 and 760 login packets are byte-identical apart from the advertised version, and
+/// OTCv8 clients may select either in their version dropdown. A classic-profile server therefore
+/// accepts both so a client configured for a different-but-compatible protocol still connects;
+/// visible-text behavior keeps following the server's own profile.
+fn classic_protocol_version_is_accepted(version: u16) -> bool {
+    version == 740 || version == 760
 }
 
 pub fn encode_native_otclient_character_list(

@@ -596,24 +596,54 @@ fn run_host(
             "advertisedOtClientV8Host must be an IPv4 or IPv6 address for the native client path"
         })?;
         let empty_world = if config.otclient_v8_native_empty_world_enabled {
+            // The asset-free diagnostic fixture is exactly "empty-world enabled with zero
+            // everything". Any world that actually loaded map content defaults its ground id so
+            // floors never render as nothing.
+            let asset_free_fixture =
+                config.otclient_v8_empty_world_ground_thing_id == 0 && world_map.tile_count() == 0;
+            let effective_ground_thing_id = if asset_free_fixture {
+                0
+            } else if config.otclient_v8_empty_world_ground_thing_id == 0 {
+                forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_GROUND_THING_ID
+            } else {
+                config.otclient_v8_empty_world_ground_thing_id
+            };
+            let player_look_type: u16 = config.otclient_v8_player_look_type;
+            let (player_look_type, outfit_first_look_type, outfit_last_look_type): (
+                u16,
+                u8,
+                u8,
+            ) = if player_look_type == 0 && !asset_free_fixture {
+                // Operator never chose an appearance for a real world; zero renders as the
+                // clientside invisibility effect, so default the citizen set.
+                (
+                    u16::from(forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_PLAYER_LOOK_TYPE),
+                    forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_OUTFIT_FIRST_LOOK_TYPE,
+                    forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_OUTFIT_LAST_LOOK_TYPE,
+                )
+            } else {
+                let first = config.otclient_v8_outfit_first_look_type;
+                let last = config.otclient_v8_outfit_last_look_type;
+                if first == 0 || last == 0 {
+                    return Err(
+                        "otclientV8OutfitFirstLookType/LastLookType must be configured when \
+                         otclientV8PlayerLookType is set"
+                            .into(),
+                    );
+                }
+                (
+                    player_look_type,
+                    first.try_into().map_err(|_| "otclientV8OutfitFirstLookType must fit u8")?,
+                    last.try_into().map_err(|_| "otclientV8OutfitLastLookType must fit u8")?,
+                )
+            };
             Some(NativeOtClientEmptyWorldConfig {
-                ground_thing_id: config.otclient_v8_empty_world_ground_thing_id,
-                player_look_type: config
-                    .otclient_v8_player_look_type
+                ground_thing_id: effective_ground_thing_id,
+                player_look_type: player_look_type
                     .try_into()
                     .map_err(|_| "otclientV8PlayerLookType must fit the selected native profile")?,
-                outfit_first_look_type: config
-                    .otclient_v8_outfit_first_look_type
-                    .try_into()
-                    .map_err(|_| {
-                        "otclientV8OutfitFirstLookType must fit the selected native profile"
-                    })?,
-                outfit_last_look_type: config
-                    .otclient_v8_outfit_last_look_type
-                    .try_into()
-                    .map_err(|_| {
-                        "otclientV8OutfitLastLookType must fit the selected native profile"
-                    })?,
+                outfit_first_look_type,
+                outfit_last_look_type,
                 player_speed: config.otclient_v8_player_speed,
                 server_beat: config.otclient_v8_server_beat,
             })
