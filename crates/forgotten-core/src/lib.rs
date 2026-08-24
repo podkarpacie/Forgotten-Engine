@@ -1743,6 +1743,9 @@ pub struct ItemInstance {
     pub count: u16,
     pub action_id: Option<u16>,
     pub unique_id: Option<u16>,
+    /// Nested content when this instance is used as a container. Bounded depth; see
+    /// `insert_content`.
+    contents: Vec<ItemInstance>,
 }
 
 impl ItemInstance {
@@ -1758,7 +1761,57 @@ impl ItemInstance {
             count,
             action_id: None,
             unique_id: None,
+            contents: Vec::new(),
         })
+    }
+
+    /// Maximum nested container depth accepted by `insert_content`. Depth one means a bag
+    /// inside a bag; deeper nesting stays closed until persistence and protocol support land.
+    pub const MAX_CONTENT_DEPTH: u8 = 1;
+
+    /// Maximum number of direct content slots per container instance.
+    pub const MAX_CONTENT_SLOTS: usize = 20;
+
+    /// Immutable view of this instance's direct contents.
+    pub fn contents(&self) -> &[ItemInstance] {
+        &self.contents
+    }
+
+    /// Inserts one item as direct content of this container instance. Rejects zero IDs,
+    /// exhausted slots, and content deeper than `MAX_CONTENT_DEPTH` (measured from the
+    /// inserted subtree's own root).
+    pub fn insert_content(&mut self, item: ItemInstance) -> Result<(), CoreError> {
+        if item.server_id == 0 {
+            return Err(CoreError::InvalidItemId(item.server_id));
+        }
+        if self.contents.len() >= Self::MAX_CONTENT_SLOTS {
+            return Err(CoreError::ContainerFull {
+                capacity: Self::MAX_CONTENT_SLOTS as u16,
+            });
+        }
+        if Self::content_depth(&item) >= Self::MAX_CONTENT_DEPTH {
+            return Err(CoreError::InvalidItemContentDepth);
+        }
+        self.contents.push(item);
+        Ok(())
+    }
+
+    /// Removes and returns one direct content item by index.
+    pub fn take_content(&mut self, index: usize) -> Option<ItemInstance> {
+        if index < self.contents.len() {
+            Some(self.contents.remove(index))
+        } else {
+            None
+        }
+    }
+
+    /// Height of an item's content subtree; empty items have depth zero.
+    fn content_depth(item: &ItemInstance) -> u8 {
+        item.contents
+            .iter()
+            .map(|child| Self::content_depth(child).saturating_add(1))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Returns true only when two runtime instances have the same type and persistent attributes.
@@ -6660,6 +6713,8 @@ pub enum CoreError {
     ContainerFull {
         capacity: u16,
     },
+    /// Nested item content would exceed the bounded container depth.
+    InvalidItemContentDepth,
     InvalidItemId(u16),
     InvalidClientThingId(u16),
     InvalidStaticCreatureTargetRange(u8),
@@ -7768,6 +7823,46 @@ mod tests {
             ItemInstance::new(2376, MAX_ITEM_STACK_COUNT + 1),
             Err(CoreError::InvalidItemStackCount(MAX_ITEM_STACK_COUNT + 1))
         );
+
+        // Nested content foundation: insert/take with bounded slots and depth.
+        let mut bag = ItemInstance::new(1988, 1).unwrap();
+        assert!(bag.contents().is_empty());
+        bag.insert_content(ItemInstance::new(2376, 1).unwrap())
+            .unwrap();
+        // One nesting level: an EMPTY container may sit inside the bag...
+        let inner = ItemInstance::new(1987, 1).unwrap();
+        bag.insert_content(inner.clone()).unwrap();
+        assert_eq!(bag.contents().len(), 2);
+        let mut filled_inner = inner;
+        filled_inner
+            .insert_content(ItemInstance::new(2666, 1).unwrap())
+            .unwrap();
+        // ...but a container that already holds content would deepen past level one.
+        assert_eq!(
+            bag.insert_content(filled_inner),
+            Err(CoreError::InvalidItemContentDepth)
+        );
+        let mut invalid = ItemInstance::new(2376, 1).unwrap();
+        invalid.server_id = 0;
+        assert_eq!(
+            bag.insert_content(invalid),
+            Err(CoreError::InvalidItemId(0))
+        );
+        for _ in 0..ItemInstance::MAX_CONTENT_SLOTS {
+            let _ = bag.take_content(0);
+        }
+        let filler = ItemInstance::new(2376, 1).unwrap();
+        for _ in 0..ItemInstance::MAX_CONTENT_SLOTS {
+            bag.insert_content(filler.clone()).unwrap();
+        }
+        assert_eq!(
+            bag.insert_content(filler.clone()),
+            Err(CoreError::ContainerFull {
+                capacity: ItemInstance::MAX_CONTENT_SLOTS as u16,
+            })
+        );
+        assert!(bag.take_content(0).is_some());
+        assert!(bag.take_content(usize::MAX).is_none());
 
         let sword = ItemInstance::new(2376, 1).unwrap();
         let shield = ItemInstance::new(2512, 1).unwrap();
