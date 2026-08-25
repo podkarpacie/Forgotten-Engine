@@ -930,6 +930,12 @@ pub const NATIVE_OTCLIENT_GAME_CLEAR_TARGET: u8 = 0xa3;
 pub const NATIVE_OTCLIENT_GAME_PLAYER_MODES: u8 = 0xa7;
 pub const NATIVE_OTCLIENT_GAME_TALK: u8 = 0xaa;
 pub const NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER: u8 = 0x6f;
+/// Classic CreateInContainer (0x70): one appended thing in an open container window.
+pub const NATIVE_OTCLIENT_GAME_CREATE_IN_CONTAINER: u8 = 0x70;
+/// Classic ChangeInContainer (0x71): one rewritten thing at an existing container slot.
+pub const NATIVE_OTCLIENT_GAME_CHANGE_IN_CONTAINER: u8 = 0x71;
+/// Classic DeleteInContainer (0x72): one removed thing from an open container window.
+pub const NATIVE_OTCLIENT_GAME_DELETE_IN_CONTAINER: u8 = 0x72;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_HEALTH: u8 = 0x8c;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT: u8 = 0x8e;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_PARTY: u8 = 0x91;
@@ -3176,6 +3182,67 @@ pub fn encode_native_otclient_close_container(
     ]))
 }
 
+/// Encodes classic `CreateInContainer` (`0x70`) for the parser-verified native 740 layout with
+/// container pagination off (no slot u16). The caller must obtain `client_thing_id` and subtype
+/// semantics from a validated operator-supplied item catalog.
+pub fn encode_native_otclient_create_in_container(
+    profile: &NativeOtClientProfile,
+    container_id: u8,
+    item: NativeOtClientClassicItemRecord,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() || item.client_thing_id == 0 {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_CREATE_IN_CONTAINER);
+    writer.byte(container_id);
+    write_native_otclient_classic_item_record(&mut writer, item);
+    let frame = Frame(writer.finish());
+    if frame.0.len() > MAX_FRAME_SIZE {
+        return Err(ProtocolError::InvalidLength(frame.0.len()));
+    }
+    Ok(frame)
+}
+
+/// Encodes classic `ChangeInContainer` (`0x71`): rewrites one existing slot's thing in an open
+/// container window.
+pub fn encode_native_otclient_change_in_container(
+    profile: &NativeOtClientProfile,
+    container_id: u8,
+    slot: u8,
+    item: NativeOtClientClassicItemRecord,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() || item.client_thing_id == 0 {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_CHANGE_IN_CONTAINER);
+    writer.byte(container_id);
+    writer.byte(slot);
+    write_native_otclient_classic_item_record(&mut writer, item);
+    let frame = Frame(writer.finish());
+    if frame.0.len() > MAX_FRAME_SIZE {
+        return Err(ProtocolError::InvalidLength(frame.0.len()));
+    }
+    Ok(frame)
+}
+
+/// Encodes classic `DeleteInContainer` (`0x72`): removes one thing from an open container window.
+pub fn encode_native_otclient_delete_in_container(
+    profile: &NativeOtClientProfile,
+    container_id: u8,
+    slot: u8,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    Ok(Frame(vec![
+        NATIVE_OTCLIENT_GAME_DELETE_IN_CONTAINER,
+        container_id,
+        slot,
+    ]))
+}
+
 /// Encodes the classic native death notification. The supported 7.4 profile admits only the
 /// opcode: death type and penalty fields belong to later client feature sets and are not emitted.
 pub fn encode_native_otclient_game_death(
@@ -4772,6 +4839,72 @@ mod tests {
                 .0,
             vec![NATIVE_OTCLIENT_GAME_CLOSE_CONTAINER, 2]
         );
+        assert_eq!(
+            encode_native_otclient_create_in_container(
+                &profile,
+                3,
+                NativeOtClientClassicItemRecord {
+                    client_thing_id: 3584,
+                    subtype: None,
+                },
+            )
+            .unwrap()
+            .0,
+            vec![NATIVE_OTCLIENT_GAME_CREATE_IN_CONTAINER, 3, 0x00, 0x0e,]
+        );
+        assert_eq!(
+            encode_native_otclient_change_in_container(
+                &profile,
+                1,
+                4,
+                NativeOtClientClassicItemRecord {
+                    client_thing_id: 3577,
+                    subtype: Some(37),
+                },
+            )
+            .unwrap()
+            .0,
+            vec![
+                NATIVE_OTCLIENT_GAME_CHANGE_IN_CONTAINER,
+                1,
+                4,
+                0xf9,
+                0x0d,
+                37,
+            ]
+        );
+        assert_eq!(
+            encode_native_otclient_delete_in_container(&profile, 2, 6)
+                .unwrap()
+                .0,
+            vec![NATIVE_OTCLIENT_GAME_DELETE_IN_CONTAINER, 2, 6]
+        );
+        assert!(encode_native_otclient_create_in_container(
+            &NativeOtClientProfile {
+                protocol_version: 860,
+                numeric_account_ids: true,
+                login_packet_encryption: false,
+                protocol_checksum: false,
+                challenge_on_login: false,
+                max_padding_bytes: 128,
+            },
+            3,
+            NativeOtClientClassicItemRecord {
+                client_thing_id: 3584,
+                subtype: None,
+            },
+        )
+        .is_err());
+        assert!(encode_native_otclient_change_in_container(
+            &profile,
+            1,
+            0,
+            NativeOtClientClassicItemRecord {
+                client_thing_id: 0,
+                subtype: None,
+            },
+        )
+        .is_err());
         assert_eq!(
             encode_native_otclient_read_only_text_window(&profile, 42, 1988, "Read me")
                 .unwrap()

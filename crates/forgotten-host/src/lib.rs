@@ -47,13 +47,15 @@ use forgotten_protocol::{
     encode_fe_otclient_initial_world, encode_fe_otclient_movement_ack,
     encode_fe_otclient_world_tick, encode_legacy_74_character_list,
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
-    encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_channel_list,
+    encode_legacy_74_game_session_ready, encode_login_error,
+    encode_native_otclient_change_in_container, encode_native_otclient_channel_list,
     encode_native_otclient_character_list, encode_native_otclient_choose_outfit,
     encode_native_otclient_classic_vip_entry, encode_native_otclient_classic_vip_presence,
     encode_native_otclient_clear_target, encode_native_otclient_close_container,
     encode_native_otclient_close_trade, encode_native_otclient_counter_trade,
-    encode_native_otclient_creature_health, encode_native_otclient_creature_outfit,
-    encode_native_otclient_creature_party_shield, encode_native_otclient_delete_inventory,
+    encode_native_otclient_create_in_container, encode_native_otclient_creature_health,
+    encode_native_otclient_creature_outfit, encode_native_otclient_creature_party_shield,
+    encode_native_otclient_delete_in_container, encode_native_otclient_delete_inventory,
     encode_native_otclient_empty_quest_log, encode_native_otclient_failure_message,
     encode_native_otclient_game_announcement, encode_native_otclient_game_cancel_walk_facing,
     encode_native_otclient_game_death,
@@ -936,6 +938,187 @@ fn native_classic_container_frames(
         .map(|(_, container)| native_classic_container_frame(profile, catalog, container))
         .collect::<Result<Vec<_>, _>>()
         .map(|frames| frames.into_iter().flatten().collect::<Vec<_>>())
+}
+
+/// One client-visible slot rendering inside an open top-level container window, exactly as the
+/// classic record encoder puts it on the wire. Deltas compare this rendered form, never runtime
+/// identity, because the client can only see what the catalog mapped.
+type NativeRenderedContainerWindow = Option<(u8, Vec<NativeOtClientClassicItemRecord>)>;
+
+/// Renders one owned top-level container the way the classic encoder presents it. Containers
+/// with any unmapped item render as `None` (the classic encoder omits them wholesale), which
+/// always forces a fresh full-frame attempt.
+fn native_rendered_container_window(
+    profile: &NativeOtClientProfile,
+    catalog: Option<&NativeItemPresentationCatalog>,
+    container: &PlayerContainer,
+) -> NativeRenderedContainerWindow {
+    if !profile.supports_classic_740_inventory_records() || container.has_parent {
+        return None;
+    }
+    let items = container
+        .items
+        .iter()
+        .map(|item| native_classic_item_record(catalog, item))
+        .collect::<Option<Vec<_>>>()
+        .map(|items| (container.items.capacity() as u8, items));
+    items
+}
+
+/// Builds the per-session baseline of what the client currently displays for every open
+/// top-level owned container.
+fn native_rendered_container_windows(
+    profile: &NativeOtClientProfile,
+    catalog: Option<&NativeItemPresentationCatalog>,
+    containers: &PlayerContainers,
+    closed_container_ids: &BTreeSet<u8>,
+) -> BTreeMap<u8, NativeRenderedContainerWindow> {
+    let mut windows = BTreeMap::new();
+    for (_, container) in containers.iter() {
+        if closed_container_ids.contains(&container.container_id) {
+            continue;
+        }
+        windows.insert(
+            container.container_id,
+            native_rendered_container_window(profile, catalog, container),
+        );
+    }
+    windows
+}
+
+/// Emits the minimal classic CreateInContainer / ChangeInContainer / DeleteInContainer records
+/// transforming what the client currently shows (`sent`) into the authoritative rendering
+/// (`current`). Windows the session never sent, whose capacity changed, or whose mutation is not
+/// representable as bounded slot deltas fall back to one full OpenContainer resend — the exact
+/// frame the previous blanket refresh emitted. Closed and vanished windows drop their baseline.
+/// Slot-index semantics respect classic client behavior: DeleteInContainer removes the slot and
+/// shifts the remainder, so a contiguous removed block is emitted as descending deletes.
+#[allow(clippy::too_many_lines)]
+fn native_container_delta_frames(
+    profile: &NativeOtClientProfile,
+    catalog: Option<&NativeItemPresentationCatalog>,
+    containers: &PlayerContainers,
+    closed_container_ids: &BTreeSet<u8>,
+    sent: &mut BTreeMap<u8, NativeRenderedContainerWindow>,
+) -> Result<Vec<Frame>, ProtocolError> {
+    let current =
+        native_rendered_container_windows(profile, catalog, containers, closed_container_ids);
+    let mut frames = Vec::new();
+    let stale: Vec<u8> = sent
+        .keys()
+        .filter(|id| !current.contains_key(id))
+        .copied()
+        .collect();
+    for id in stale {
+        sent.remove(&id);
+    }
+    for (container_id, current_window) in current.clone() {
+        let container_id = container_id;
+        let Some(sent_window) = sent.get(&container_id).cloned() else {
+            // Newly opened window (or previously unmapped): one full OpenContainer record.
+            if let Some((capacity, items)) = current_window.as_ref() {
+                if let Some(container) = containers.container(container_id) {
+                    if let Some(frame) =
+                        native_classic_container_frame(profile, catalog, container)?
+                    {
+                        frames.push(frame);
+                    }
+                    sent.insert(container_id, Some((*capacity, items.clone())));
+                    continue;
+                }
+            }
+            sent.insert(container_id, current_window);
+            continue;
+        };
+        let (Some((previous_capacity, previous_slots)), Some((capacity, slots))) =
+            (sent_window.as_ref(), current_window.as_ref())
+        else {
+            // Either side unrenderable: nothing expressible as deltas; keep the last known
+            // client-visible state untouched and adopt the new baseline.
+            sent.insert(container_id, current_window);
+            continue;
+        };
+        if previous_capacity != capacity {
+            if let Some(container) = containers.container(container_id) {
+                if let Some(frame) = native_classic_container_frame(profile, catalog, container)? {
+                    frames.push(frame);
+                }
+            }
+            sent.insert(container_id, current_window);
+            continue;
+        }
+        let mut start = 0;
+        while start < previous_slots.len()
+            && start < slots.len()
+            && previous_slots[start] == slots[start]
+        {
+            start += 1;
+        }
+        let mut previous_end = previous_slots.len();
+        let mut current_end = slots.len();
+        while previous_end > start
+            && current_end > start
+            && previous_slots[previous_end - 1] == slots[current_end - 1]
+        {
+            previous_end -= 1;
+            current_end -= 1;
+        }
+        let previous_middle = &previous_slots[start..previous_end];
+        let current_middle = &slots[start..current_end];
+        if previous_middle.is_empty() && current_middle.is_empty() {
+            sent.insert(container_id, current_window);
+            continue;
+        }
+        if current_middle.is_empty() {
+            // Contiguous removal block: descending deletes let the client's own slot-shifting
+            // converge without touching the preserved prefix or suffix.
+            for slot in (start..previous_end).rev() {
+                frames.push(encode_native_otclient_delete_in_container(
+                    profile,
+                    container_id,
+                    slot as u8,
+                )?);
+            }
+            sent.insert(container_id, current_window);
+            continue;
+        }
+        if previous_middle.is_empty() {
+            // Pure append block after the shared suffix trim: ascending creates.
+            for item in current_middle.iter() {
+                frames.push(encode_native_otclient_create_in_container(
+                    profile,
+                    container_id,
+                    *item,
+                )?);
+            }
+            sent.insert(container_id, current_window);
+            continue;
+        }
+        if previous_middle.len() == current_middle.len() {
+            // Same-length rewrite (stack merges, swaps): targeted changes only.
+            for slot in 0..previous_middle.len() {
+                if previous_middle[slot] != current_middle[slot] {
+                    frames.push(encode_native_otclient_change_in_container(
+                        profile,
+                        container_id,
+                        (start + slot) as u8,
+                        current_middle[slot],
+                    )?);
+                }
+            }
+            sent.insert(container_id, current_window);
+            continue;
+        }
+        // Mixed insert-and-remove inside one window is not representable as bounded slot
+        // deltas under classic shift semantics: fall back to the exact full resend.
+        if let Some(container) = containers.container(container_id) {
+            if let Some(frame) = native_classic_container_frame(profile, catalog, container)? {
+                frames.push(frame);
+            }
+        }
+        sent.insert(container_id, current_window);
+    }
+    Ok(frames)
 }
 
 /// Encodes one read-only native 740 container window for one validated runtime corpse. The
@@ -7942,6 +8125,12 @@ fn handle_native_otclient_game(
         &BTreeSet::new(),
     )
     .map_err(HostError::Protocol)?;
+    let mut sent_container_windows = native_rendered_container_windows(
+        &config.client_profile,
+        config.item_presentation_catalog.as_deref(),
+        &bootstrap_containers,
+        &BTreeSet::new(),
+    );
     let static_health_frames =
         native_static_creature_health_frames(&config.client_profile, &active_static_spawns)?;
     // Establish all shared-state baselines before any initialization frame becomes observable by
@@ -8516,11 +8705,16 @@ fn handle_native_otclient_game(
                     let containers_epoch = shared_world.containers_epoch();
                     if containers_epoch != observed_containers_epoch {
                         let containers = shared_world.player_containers(character.id)?;
-                        let container_updates = native_classic_container_frames(
+                        // Bounded slot deltas replace the blanket full refresh: only windows
+                        // whose client-visible rendering changed emit records, and windows
+                        // that cannot be expressed as deltas fall back to one exact
+                        // OpenContainer resend.
+                        let container_updates = native_container_delta_frames(
                             &config.client_profile,
                             config.item_presentation_catalog.as_deref(),
                             &containers,
                             &closed_container_ids,
+                            &mut sent_container_windows,
                         )
                         .map_err(HostError::Protocol)?;
                         for frame in &container_updates {
@@ -8936,16 +9130,23 @@ fn handle_native_otclient_game(
                                     let containers =
                                         shared_world.player_containers(character.id)?;
                                     if let Some(container) = containers.container(container_id) {
-                                        if let Some(container_frame) =
-                                            native_classic_container_frame(
+                                        if let Some(frame) = native_classic_container_frame(
+                                            &config.client_profile,
+                                            Some(catalog),
+                                            container,
+                                        )
+                                        .map_err(HostError::Protocol)?
+                                        {
+                                            write_frame(stream, &frame)?;
+                                        }
+                                        sent_container_windows.insert(
+                                            container_id,
+                                            native_rendered_container_window(
                                                 &config.client_profile,
                                                 Some(catalog),
                                                 container,
-                                            )
-                                            .map_err(HostError::Protocol)?
-                                        {
-                                            write_frame(stream, &container_frame)?;
-                                        }
+                                            ),
+                                        );
                                     }
                                 }
                                 observed_containers_epoch = shared_world.containers_epoch();
@@ -9097,6 +9298,14 @@ fn handle_native_otclient_game(
                                             {
                                                 write_frame(stream, &frame)?;
                                             }
+                                            sent_container_windows.insert(
+                                                container_id,
+                                                native_rendered_container_window(
+                                                    &config.client_profile,
+                                                    Some(catalog),
+                                                    container,
+                                                ),
+                                            );
                                         }
                                     }
                                     observed_containers_epoch = shared_world.containers_epoch();
@@ -9229,6 +9438,14 @@ fn handle_native_otclient_game(
                             ));
                         };
                         write_frame(stream, &container_frame)?;
+                        sent_container_windows.insert(
+                            container_id,
+                            native_rendered_container_window(
+                                &config.client_profile,
+                                Some(catalog),
+                                container,
+                            ),
+                        );
                         observed_containers_epoch = shared_world.containers_epoch();
                         let mut refreshed_snapshot = snapshot.clone();
                         refreshed_snapshot.player_position = native_position(player_position);
@@ -9446,6 +9663,14 @@ fn handle_native_otclient_game(
                                             {
                                                 write_frame(stream, &frame)?;
                                             }
+                                            sent_container_windows.insert(
+                                                target_container,
+                                                native_rendered_container_window(
+                                                    &config.client_profile,
+                                                    Some(catalog),
+                                                    container,
+                                                ),
+                                            );
                                         }
                                     }
                                     observed_containers_epoch = shared_world.containers_epoch();
@@ -10366,6 +10591,14 @@ fn handle_native_otclient_game(
                         .map_err(HostError::Protocol)?
                         {
                             write_frame(stream, &frame)?;
+                            sent_container_windows.insert(
+                                container_id,
+                                native_rendered_container_window(
+                                    &config.client_profile,
+                                    config.item_presentation_catalog.as_deref(),
+                                    container,
+                                ),
+                            );
                             observed_containers_epoch = shared_world.containers_epoch();
                             native_diagnostic(
                                 config.extended_diagnostics,
@@ -17264,6 +17497,176 @@ mod tests {
     }
 
     #[test]
+    fn native_container_deltas_emit_minimal_records_with_exact_fallbacks() {
+        let config = native_otclient_config("127.0.0.1:0".parse().unwrap());
+        let profile = &config.client_profile;
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for (server_id, client_thing_id, subtype) in
+            [(1988, 1988, false), (2376, 2376, false), (2544, 100, true)]
+        {
+            catalog
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id,
+                        requires_classic_740_subtype: subtype,
+                    },
+                )
+                .unwrap();
+        }
+        let backpack_with = |items: &[ItemInstance], capacity: u16| {
+            let mut container = forgotten_core::PlayerContainer::new(
+                2,
+                ItemInstance::new(1988, 1).unwrap(),
+                "Backpack",
+                false,
+                capacity,
+            )
+            .unwrap();
+            for item in items {
+                container.items.insert(item.clone()).unwrap();
+            }
+            let mut containers = PlayerContainers::default();
+            containers.insert(container).unwrap();
+            containers
+        };
+        let empty_ids = BTreeSet::new();
+        let rendered = |containers: &PlayerContainers| {
+            native_rendered_container_windows(profile, Some(&catalog), containers, &empty_ids)
+        };
+
+        // Pure append: one CreateInContainer for the added stack.
+        let sent = rendered(&backpack_with(&[ItemInstance::new(2376, 1).unwrap()], 20));
+        let grown = backpack_with(
+            &[
+                ItemInstance::new(2376, 1).unwrap(),
+                ItemInstance::new(2544, 30).unwrap(),
+            ],
+            20,
+        );
+        let frames = native_container_delta_frames(
+            profile,
+            Some(&catalog),
+            &grown,
+            &empty_ids,
+            &mut sent.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            frames,
+            vec![Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATE_IN_CONTAINER,
+                2,
+                0x64,
+                0x00,
+                30,
+            ])]
+        );
+
+        // Contiguous middle removal: descending deletes only.
+        let sent = rendered(&backpack_with(
+            &[
+                ItemInstance::new(2376, 1).unwrap(),
+                ItemInstance::new(2544, 5).unwrap(),
+                ItemInstance::new(1988, 2).unwrap(),
+            ],
+            20,
+        ));
+        let removed = backpack_with(
+            &[
+                ItemInstance::new(2376, 1).unwrap(),
+                ItemInstance::new(1988, 2).unwrap(),
+            ],
+            20,
+        );
+        let frames = native_container_delta_frames(
+            profile,
+            Some(&catalog),
+            &removed,
+            &empty_ids,
+            &mut sent.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            frames,
+            vec![Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_DELETE_IN_CONTAINER,
+                2,
+                1,
+            ])]
+        );
+
+        // Same-slot stack rewrite: one ChangeInContainer at the touched index.
+        let sent = rendered(&backpack_with(&[ItemInstance::new(2544, 10).unwrap()], 20));
+        let merged = backpack_with(&[ItemInstance::new(2544, 47).unwrap()], 20);
+        let frames = native_container_delta_frames(
+            profile,
+            Some(&catalog),
+            &merged,
+            &empty_ids,
+            &mut sent.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            frames,
+            vec![Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CHANGE_IN_CONTAINER,
+                2,
+                0,
+                0x64,
+                0x00,
+                47,
+            ])]
+        );
+
+        // Capacity change is not expressible as deltas: exact full resend.
+        let sent = rendered(&backpack_with(&[ItemInstance::new(2376, 1).unwrap()], 20));
+        let resized = backpack_with(&[ItemInstance::new(2376, 1).unwrap()], 19);
+        let frames = native_container_delta_frames(
+            profile,
+            Some(&catalog),
+            &resized,
+            &empty_ids,
+            &mut sent.clone(),
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER
+        );
+
+        // Window unknown to the baseline (freshly opened): full OpenContainer resend.
+        let fresh_sent: BTreeMap<u8, NativeRenderedContainerWindow> = BTreeMap::new();
+        let frames = native_container_delta_frames(
+            profile,
+            Some(&catalog),
+            &backpack_with(&[], 20),
+            &empty_ids,
+            &mut fresh_sent.clone(),
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER
+        );
+
+        // No visible change: zero records.
+        let unchanged = backpack_with(&[ItemInstance::new(2376, 1).unwrap()], 20);
+        let sent = rendered(&unchanged);
+        let frames = native_container_delta_frames(
+            profile,
+            Some(&catalog),
+            &unchanged,
+            &empty_ids,
+            &mut sent.clone(),
+        )
+        .unwrap();
+        assert!(frames.is_empty());
+    }
+
+    #[test]
     fn shared_complete_item_transfers_advance_both_native_refresh_epochs() {
         let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
         let map = native_world_map();
@@ -23063,8 +23466,11 @@ mod tests {
         assert!(updates.iter().any(|frame| {
             frame
                 == &vec![
-                    0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0,
-                    1, 102, 0, 1,
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATE_IN_CONTAINER,
+                    2,
+                    102,
+                    0,
+                    1,
                 ]
         }));
         drop(client);
@@ -23216,8 +23622,12 @@ mod tests {
         assert!(updates.iter().any(|frame| {
             frame
                 == &vec![
-                    0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0,
-                    1, 102, 0, 50,
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_CHANGE_IN_CONTAINER,
+                    2,
+                    0,
+                    102,
+                    0,
+                    50,
                 ]
         }));
 
@@ -23282,11 +23692,15 @@ mod tests {
             full_merge_updates.iter().any(|frame| {
                 frame
                     == &vec![
-                        0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20,
-                        0, 1, 102, 0, 65,
+                        forgotten_protocol::NATIVE_OTCLIENT_GAME_CHANGE_IN_CONTAINER,
+                        2,
+                        0,
+                        102,
+                        0,
+                        65,
                     ]
             }),
-            "missing full stack container refresh: {full_merge_updates:?}"
+            "missing merged-stack container change: {full_merge_updates:?}"
         );
         drop(client);
         game.shutdown().unwrap();
@@ -23436,7 +23850,9 @@ mod tests {
         assert!(updates.iter().any(|frame| {
             frame
                 == &vec![
-                    0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0, 0,
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_DELETE_IN_CONTAINER,
+                    2,
+                    0,
                 ]
         }));
         drop(client);
@@ -23588,8 +24004,12 @@ mod tests {
         assert!(updates.iter().any(|frame| {
             frame
                 == &vec![
-                    0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0,
-                    1, 102, 0, 30,
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_CHANGE_IN_CONTAINER,
+                    2,
+                    0,
+                    102,
+                    0,
+                    30,
                 ]
         }));
 
@@ -23657,7 +24077,9 @@ mod tests {
         assert!(full_merge_updates.iter().any(|frame| {
             frame
                 == &vec![
-                    0x6e, 2, 196, 7, 8, 0, b'B', b'a', b'c', b'k', b'p', b'a', b'c', b'k', 20, 0, 0,
+                    forgotten_protocol::NATIVE_OTCLIENT_GAME_DELETE_IN_CONTAINER,
+                    2,
+                    0,
                 ]
         }));
         drop(client);
