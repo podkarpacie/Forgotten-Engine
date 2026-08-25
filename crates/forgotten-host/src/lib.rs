@@ -238,6 +238,7 @@ fn advance_native_shared_world_heartbeat_with_target_policy(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn advance_native_shared_world_heartbeat_with_static_target_policies(
     shared_world: &SharedNativeWorld,
     elapsed_seconds: u16,
