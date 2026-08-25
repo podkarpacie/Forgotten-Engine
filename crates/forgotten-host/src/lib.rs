@@ -2508,7 +2508,14 @@ fn give_items_to_player(
         database
             .replace_player_containers(target_id, &staged)
             .map_err(HostError::Persistence)?;
-        shared_world.replace_player_containers(target_id, staged)?;
+        // Quiet replace + containers-epoch bump: the client refreshes open container windows
+        // without a full viewport resend, so avatar colors and rotation stay untouched.
+        {
+            let mut world = shared_world.lock()?;
+            world
+                .replace_player_containers_quiet(target_id, staged)
+                .map_err(HostError::Core)?;
+        }
         shared_world.mark_containers_changed();
         return Ok(Some(format!(
             "Delivered {} x item {item_id}.",
@@ -12945,12 +12952,14 @@ fn native_creature_inspection_message(
         let Some(target) = world.player(player_id) else {
             return Ok(None);
         };
-        native_classic_viewport_contains(observer.position, target.position)
-            .then(|| format!("You see {}.", target.name))
-    } else {
-        let Some(lifecycle) = world.static_creature_lifecycle(native_creature_id) else {
-            return Ok(None);
-        };
+        let level = target.level;
+        native_classic_viewport_contains(observer.position, target.position).then(|| {
+            format!(
+                "You see {target_name}. (Level {level})",
+                target_name = target.name
+            )
+        })
+    } else if let Some(lifecycle) = world.static_creature_lifecycle(native_creature_id) {
         if !lifecycle.active
             || !native_classic_viewport_contains(observer.position, lifecycle.position)
         {
@@ -12959,6 +12968,10 @@ fn native_creature_inspection_message(
         world
             .static_creature(native_creature_id)
             .map(|creature| format!("You see {}.", creature.name))
+    } else {
+        // Unresolved creature ids (stale client cache, unmapped ranges) still get an answer:
+        // classic servers never leave a look unanswered.
+        Some(format!("You see a creature (id {native_creature_id})."))
     };
     Ok(message.filter(|message| message.len() <= NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES))
 }
@@ -14027,6 +14040,17 @@ pub fn read_frame(stream: &mut TcpStream) -> Result<Frame, HostError> {
     stream.read_exact(&mut header)?;
     let declared = u16::from_le_bytes(header) as usize;
     if declared == 0 || declared > MAX_FRAME_SIZE {
+        // Oversized inbound frames happen legitimately when a stale client connection from a
+        // previous session dumps buffered data (e.g. after an ERROR-2 kick). Drain exactly the
+        // declared payload so the stream stays framed for the next real request, then report
+        // the failure without leaving partial bytes in the socket.
+        let mut drained = vec![0_u8; declared.min(1 << 20)];
+        let mut remaining = declared;
+        while remaining > 0 {
+            let chunk = remaining.min(drained.len());
+            stream.read_exact(&mut drained[..chunk])?;
+            remaining -= chunk;
+        }
         return Err(HostError::Protocol(ProtocolError::InvalidLength(declared)));
     }
     let mut encoded = Vec::with_capacity(declared + 2);

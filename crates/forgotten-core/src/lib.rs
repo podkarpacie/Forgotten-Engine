@@ -3974,17 +3974,45 @@ impl WorldState {
             .find(|runtime| runtime.entity.name.to_lowercase() == lowered)
             .ok_or_else(|| CoreError::UnknownEntityName(name.trim().to_string()))?
             .clone();
-        if self
-            .players
-            .values()
-            .any(|player| player.position == position)
-            || self
-                .static_creatures
+
+        // Tile acceptance: prefer the requested tile, then the 8 surrounding tiles, so a
+        // blocked primary spot never traps the summoner against their own summon.
+        let offsets: [(i32, i32); 9] = [
+            (0, 0),
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (-1, -1),
+            (1, -1),
+            (-1, 1),
+        ];
+        let mut spawn_position: Option<Position> = None;
+        for (dx, dy) in offsets {
+            let candidate = Position {
+                x: (position.x as i32 + dx).max(0) as u16,
+                y: (position.y as i32 + dy).max(0) as u16,
+                z: position.z,
+            };
+            if self
+                .players
                 .values()
-                .any(|runtime| runtime.active && runtime.entity.position == position)
-        {
-            return Err(CoreError::SpawnPositionRejected(position));
+                .any(|player| player.position == candidate)
+                || self
+                    .static_creatures
+                    .values()
+                    .any(|runtime| runtime.active && runtime.entity.position == candidate)
+            {
+                continue;
+            }
+            spawn_position = Some(candidate);
+            break;
         }
+        let Some(spawn_position) = spawn_position else {
+            return Err(CoreError::SpawnPositionRejected(position));
+        };
+        let position = spawn_position;
         let next_slot = (DYNAMIC_ID_BASE..)
             .find(|candidate| !self.static_creatures.contains_key(candidate))
             .ok_or(CoreError::DynamicSpawnLimit(MAX_TFS_STATIC_SPAWNS))?;
@@ -5969,6 +5997,24 @@ impl WorldState {
         }
         self.player_containers.insert(player_id, containers);
         self.mark_changed();
+        Ok(true)
+    }
+
+    /// Replaces one player's containers WITHOUT bumping world visibility. Used for operator
+    /// item delivery where a full viewport resend would visually reset the client avatar; the
+    /// caller signals the change through the dedicated containers epoch instead.
+    pub fn replace_player_containers_quiet(
+        &mut self,
+        player_id: u64,
+        containers: PlayerContainers,
+    ) -> Result<bool, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        if self.player_containers(player_id)? == &containers {
+            return Ok(false);
+        }
+        self.player_containers.insert(player_id, containers);
         Ok(true)
     }
 
