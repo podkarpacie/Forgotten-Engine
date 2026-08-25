@@ -12682,6 +12682,14 @@ fn apply_native_selected_player_melee(
     else {
         return Ok(None);
     };
+    // Protection-zone gate: PvP is blocked when either participant stands on an imported
+    // protection-zone tile. The target selection itself stays allowed; only damage is gated.
+    {
+        let world = shared_world.lock()?;
+        if world.either_player_in_protection_zone(world_map, attacker_id, target_id) {
+            return Ok(None);
+        }
+    }
     let target_equipment = shared_world.player_equipment(target_id)?;
     sync_native_equipment_armor_defense(
         shared_world,

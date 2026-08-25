@@ -963,6 +963,17 @@ impl WorldMap {
         Ok(())
     }
 
+    /// Classic OTBM tile-flag bit 0x01 marks a protection zone. FE treats the flag as
+    /// authoritative import metadata for PvP blocking and logout safety.
+    pub const OTBM_TILE_FLAG_PROTECTION_ZONE: u32 = 0x01;
+
+    /// True when this tile carries the imported protection-zone flag.
+    pub fn is_protection_zone(&self, position: Position) -> bool {
+        self.tile_flags
+            .get(&position)
+            .is_some_and(|flags| flags & Self::OTBM_TILE_FLAG_PROTECTION_ZONE != 0)
+    }
+
     pub fn tile_flags(&self, position: Position) -> u32 {
         self.tile_flags.get(&position).copied().unwrap_or_default()
     }
@@ -2930,6 +2941,20 @@ pub struct TradeItemReference {
 }
 
 impl WorldState {
+    /// True when either player stands on an imported protection-zone tile (OTBM flag 0x01).
+    /// Used to block PvP interactions before any combat transition.
+    pub fn either_player_in_protection_zone(
+        &self,
+        world_map: &WorldMap,
+        attacker: u64,
+        defender: u64,
+    ) -> bool {
+        self.players
+            .values()
+            .filter(|player| player.id == attacker || player.id == defender)
+            .any(|player| world_map.is_protection_zone(player.position))
+    }
+
     pub fn tick(&self) -> u64 {
         self.tick
     }
@@ -13256,6 +13281,90 @@ mod tests {
             DeathLossPolicy::from_config(101),
             Err(CoreError::InvalidDeathLossPolicy)
         );
+    }
+}
+
+/// Protection-zone flag semantics: OTBM bit 0x01 detection and the two-player PvP gate.
+#[cfg(test)]
+mod protection_zone_tests {
+    use super::*;
+
+    fn world_with_two_players() -> WorldState {
+        let mut world = WorldState::default();
+        for (id, x, name) in [(1_u64, 100_u16, "Alice"), (2, 104, "Bob")] {
+            world
+                .add_player_with_vitals(
+                    Player {
+                        id,
+                        account_id: id,
+                        name: name.into(),
+                        position: Position { x, y: 100, z: 7 },
+                        level: 8,
+                        experience: 4200,
+                        skill_points: 0,
+                    },
+                    PlayerVitals::default(),
+                )
+                .unwrap();
+        }
+        world
+    }
+
+    #[test]
+    fn protection_zone_flag_blocks_pvp_when_either_side_stands_in_it() {
+        let mut world = world_with_two_players();
+        let mut map = WorldMap::new(
+            "pz-test",
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+        );
+        // Alice's tile is a protection zone; Bob's tile is not.
+        map.set_tile_flags(
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+            WorldMap::OTBM_TILE_FLAG_PROTECTION_ZONE,
+        );
+        assert!(map.is_protection_zone(Position {
+            x: 100,
+            y: 100,
+            z: 7
+        }));
+        assert!(!map.is_protection_zone(Position {
+            x: 104,
+            y: 100,
+            z: 7
+        }));
+
+        // Attacker inside PZ -> blocked.
+        assert!(world.either_player_in_protection_zone(&map, 1, 2));
+
+        // Both outside PZ -> allowed.
+        {
+            let alice = world.players.get_mut(&1).unwrap();
+            alice.position = Position {
+                x: 102,
+                y: 100,
+                z: 7,
+            };
+        }
+        assert!(!world.either_player_in_protection_zone(&map, 1, 2));
+
+        // Defender inside PZ -> also blocked.
+        {
+            let bob = world.players.get_mut(&2).unwrap();
+            bob.position = Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            };
+        }
+        assert!(world.either_player_in_protection_zone(&map, 1, 2));
     }
 }
 
