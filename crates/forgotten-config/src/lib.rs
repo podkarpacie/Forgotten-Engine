@@ -112,6 +112,9 @@ pub struct EngineConfig {
     pub magic_rate: u32,
     pub static_creature_target_attack_damage: u16,
     pub static_creature_target_pursuit_range: u8,
+    /// Deterministic wander cadence for active static creatures, in world-tick seconds
+    /// (plan v49 slice 4). Defaults to `4`; `0` opts out entirely.
+    pub static_creature_wander_interval_ticks: u32,
     /// Configured corpse despawn delay in seconds. `0` disables decay; a positive value expires
     /// each spawned runtime corpse on a later native heartbeat.
     pub corpse_despawn_seconds: u32,
@@ -308,6 +311,14 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         });
     }
     let static_creature_target_pursuit_range = static_creature_target_pursuit_range as u8;
+    let static_creature_wander_interval_ticks =
+        optional_u32(&values, "staticCreatureWanderIntervalTicks", 4)?;
+    if static_creature_wander_interval_ticks > 3_600 {
+        return Err(ConfigError::InvalidValue {
+            key: "staticCreatureWanderIntervalTicks",
+            message: "must stay between 0 and 3600 seconds".into(),
+        });
+    }
     let corpse_despawn_seconds = optional_u32(&values, "corpseDespawnSeconds", 0)?;
     if corpse_despawn_seconds > 86_400 {
         return Err(ConfigError::InvalidValue {
@@ -480,6 +491,7 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         magic_rate,
         static_creature_target_attack_damage,
         static_creature_target_pursuit_range,
+        static_creature_wander_interval_ticks,
         corpse_despawn_seconds,
         party_shared_experience_rules,
         experience_stages,

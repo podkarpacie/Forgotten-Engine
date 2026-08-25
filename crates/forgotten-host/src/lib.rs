@@ -122,11 +122,16 @@ struct NativeWorldHeartbeatOutcome {
     static_target_attacks: usize,
     static_target_attack_player_ids: BTreeSet<u64>,
     followed_player_ids: BTreeSet<u64>,
+    wandered_static_creatures: usize,
 }
 
 struct NativeHeartbeatConfig {
     pursuit_policy: StaticTargetPursuitPolicy,
     attack_policy: StaticTargetAttackPolicy,
+    /// Opt-out deterministic wander movement for active static creatures (plan v49 slice 4).
+    wander_policy: StaticCreatureDecisionPolicy,
+    /// Wander cadence in world ticks; `0` disables wandering entirely.
+    wander_every_ticks: u64,
     map_owner: Option<Arc<SharedNativeMap>>,
     database_path: PathBuf,
     death_loss_policy: DeathLossPolicy,
@@ -227,6 +232,8 @@ fn advance_native_shared_world_heartbeat_with_target_policy(
         target_policy,
         StaticTargetPursuitPolicy::Disabled,
         StaticTargetAttackPolicy::Disabled,
+        forgotten_core::StaticCreatureDecisionPolicy::Disabled,
+        0,
         None,
     )
 }
@@ -237,6 +244,8 @@ fn advance_native_shared_world_heartbeat_with_static_target_policies(
     target_policy: StaticTargetAcquisitionPolicy,
     pursuit_policy: StaticTargetPursuitPolicy,
     attack_policy: StaticTargetAttackPolicy,
+    wander_policy: StaticCreatureDecisionPolicy,
+    wander_every_ticks: u64,
     world_map: Option<&WorldMap>,
 ) -> Result<NativeWorldHeartbeatOutcome, HostError> {
     let tick = shared_world.advance_ticks(elapsed_seconds)?;
@@ -273,6 +282,32 @@ fn advance_native_shared_world_heartbeat_with_static_target_policies(
         .map(|map| shared_world.follow_player_targets_once(map))
         .transpose()?
         .unwrap_or_default();
+    // Deterministic wander (plan v49 slice 4): every configured tick interval each active
+    // creature may take one safe adjacent step via the existing occupancy-validated policy.
+    // No targets, pathfinding, or randomness; movement bumps visibility so sessions refresh.
+    let wandered_static_creatures = match (
+        wander_policy,
+        world_map,
+        wander_every_ticks > 0 && tick % wander_every_ticks == 0,
+    ) {
+        (StaticCreatureDecisionPolicy::Disabled, _, _) => 0,
+        (_, None, _) => 0,
+        (_, Some(_), false) => 0,
+        (policy, Some(map), true) => {
+            let moved = {
+                let mut world = shared_world.lock()?;
+                world
+                    .apply_static_creature_policy(policy, map)
+                    .map_err(HostError::Core)?
+            }
+            .decisions
+            .len();
+            if moved > 0 {
+                shared_world.mark_visibility_changed();
+            }
+            moved
+        }
+    };
     Ok(NativeWorldHeartbeatOutcome {
         tick,
         reactivated_static_creatures,
@@ -280,6 +315,7 @@ fn advance_native_shared_world_heartbeat_with_static_target_policies(
         static_target_attacks: static_target_attack_summary.applied_attacks,
         static_target_attack_player_ids: static_target_attack_summary.affected_player_ids,
         followed_player_ids,
+        wandered_static_creatures,
     })
 }
 
@@ -316,6 +352,8 @@ fn run_native_shared_world_heartbeat(
             target_policy,
             config.pursuit_policy,
             config.attack_policy,
+            config.wander_policy,
+            config.wander_every_ticks,
             world_map.as_deref(),
         )?;
         if !outcome.static_target_attack_player_ids.is_empty() {
@@ -1551,6 +1589,12 @@ pub struct NativeOtClientHostConfig {
     /// nearest-living-player one-step pursuit primitive. It does not add general pathfinding,
     /// attack, loot, scripts, or NPC behavior.
     pub static_target_pursuit_policy: StaticTargetPursuitPolicy,
+    /// On by default (`ClockwiseAdjacent`, plan v49 slice 4): heartbeat-driven deterministic
+    /// wander where each active static creature may take one safe adjacent step per configured
+    /// interval. Occupancy-validated, no targets, pathfinding, randomness, or scripts.
+    pub static_creature_wander_policy: StaticCreatureDecisionPolicy,
+    /// Wander cadence in world ticks (default 4); `0` disables wandering entirely.
+    pub static_creature_wander_every_ticks: u64,
     /// Optional validated vocation recovery rules. Without this catalog automatic recovery is
     /// disabled; soul, condition client effects, death activation from conditions, and scripted
     /// lifecycle hooks remain deferred.
@@ -7526,6 +7570,8 @@ fn serve_native_otclient_game(
     let heartbeat_world = shared_world.clone();
     let heartbeat_pursuit_policy = config.static_target_pursuit_policy;
     let heartbeat_attack_policy = config.static_target_attack_policy;
+    let heartbeat_wander_policy = config.static_creature_wander_policy;
+    let heartbeat_wander_every_ticks = config.static_creature_wander_every_ticks;
     let heartbeat_map_owner = shared_map.clone();
     let heartbeat_database_path = database_path.clone();
     let heartbeat_death_loss_policy = config.death_loss_policy;
@@ -7539,6 +7585,8 @@ fn serve_native_otclient_game(
             NativeHeartbeatConfig {
                 pursuit_policy: heartbeat_pursuit_policy,
                 attack_policy: heartbeat_attack_policy,
+                wander_policy: heartbeat_wander_policy,
+                wander_every_ticks: heartbeat_wander_every_ticks,
                 map_owner: heartbeat_map_owner,
                 database_path: heartbeat_database_path,
                 death_loss_policy: heartbeat_death_loss_policy,
@@ -14546,6 +14594,9 @@ mod tests {
             static_spawns: None,
             static_target_attack_policy: StaticTargetAttackPolicy::Disabled,
             static_target_pursuit_policy: StaticTargetPursuitPolicy::Disabled,
+            static_creature_wander_policy:
+                forgotten_core::StaticCreatureDecisionPolicy::ClockwiseAdjacent,
+            static_creature_wander_every_ticks: 4,
             regeneration_rules: None,
             progression_rules: None,
             vocation_level_up_gains: None,
@@ -18573,6 +18624,8 @@ mod tests {
                 StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 },
                 StaticTargetPursuitPolicy::Disabled,
                 StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage },
+                forgotten_core::StaticCreatureDecisionPolicy::Disabled,
+                0,
                 Some(&map),
             )
             .unwrap();
@@ -18679,6 +18732,8 @@ mod tests {
             StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 },
             StaticTargetPursuitPolicy::Disabled,
             StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage: 10 },
+            forgotten_core::StaticCreatureDecisionPolicy::Disabled,
+            0,
             Some(&map),
         )
         .unwrap();
@@ -28756,6 +28811,121 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_wander_moves_active_creatures_on_configured_ticks_and_bumps_visibility() {
+        let creature_id = 0x4000_0001;
+        let mut map = WorldMap::new(
+            "wander",
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+        );
+        for x in 99..=103 {
+            map.set_tile(
+                Position { x, y: 100, z: 7 },
+                WorldMapTile {
+                    ground_thing_id: 102,
+                    walkable: true,
+                },
+            )
+            .unwrap();
+        }
+        let static_spawns =
+            FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
+                id: creature_id,
+                name: "Rat".into(),
+                name_description: String::new(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 100,
+                direction: 2,
+            }])
+            .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        let visibility_before = shared.visibility_epoch();
+        let position_before = shared
+            .lock()
+            .unwrap()
+            .static_creature(creature_id)
+            .unwrap()
+            .position;
+
+        // Non-due tick (tick 1 with every 4): no movement, no visibility bump.
+        let outcome = advance_native_shared_world_heartbeat_with_static_target_policies(
+            &shared,
+            1,
+            StaticTargetAcquisitionPolicy::Disabled,
+            StaticTargetPursuitPolicy::Disabled,
+            StaticTargetAttackPolicy::Disabled,
+            forgotten_core::StaticCreatureDecisionPolicy::ClockwiseAdjacent,
+            4,
+            Some(&map),
+        )
+        .unwrap();
+        assert_eq!(outcome.wandered_static_creatures, 0);
+        assert_eq!(shared.visibility_epoch(), visibility_before);
+        assert_eq!(
+            shared
+                .lock()
+                .unwrap()
+                .static_creature(creature_id)
+                .unwrap()
+                .position,
+            position_before
+        );
+
+        // Due tick (cumulative tick 4): exactly one occupancy-validated wander step and a
+        // visibility bump so open sessions refresh their viewports.
+        let outcome = advance_native_shared_world_heartbeat_with_static_target_policies(
+            &shared,
+            3,
+            StaticTargetAcquisitionPolicy::Disabled,
+            StaticTargetPursuitPolicy::Disabled,
+            StaticTargetAttackPolicy::Disabled,
+            forgotten_core::StaticCreatureDecisionPolicy::ClockwiseAdjacent,
+            4,
+            Some(&map),
+        )
+        .unwrap();
+        assert_eq!(outcome.wandered_static_creatures, 1);
+        assert_eq!(shared.visibility_epoch(), visibility_before + 1);
+        let position_after = shared
+            .lock()
+            .unwrap()
+            .static_creature(creature_id)
+            .unwrap()
+            .position;
+        assert_ne!(position_after, position_before);
+
+        // Disabled policy keeps the world frozen even on due ticks.
+        let visibility_now = shared.visibility_epoch();
+        let outcome = advance_native_shared_world_heartbeat_with_static_target_policies(
+            &shared,
+            4,
+            StaticTargetAcquisitionPolicy::Disabled,
+            StaticTargetPursuitPolicy::Disabled,
+            StaticTargetAttackPolicy::Disabled,
+            forgotten_core::StaticCreatureDecisionPolicy::Disabled,
+            4,
+            Some(&map),
+        )
+        .unwrap();
+        assert_eq!(outcome.wandered_static_creatures, 0);
+        assert_eq!(shared.visibility_epoch(), visibility_now);
+    }
+
+    #[test]
     fn opt_in_shared_heartbeat_acquires_static_targets_without_visibility_or_behavior() {
         let map = native_world_map();
         let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
@@ -28809,6 +28979,7 @@ mod tests {
                 static_target_attacks: 0,
                 static_target_attack_player_ids: BTreeSet::new(),
                 followed_player_ids: BTreeSet::new(),
+                wandered_static_creatures: 0,
             }
         );
         assert_eq!(
@@ -28833,6 +29004,7 @@ mod tests {
                 static_target_attacks: 0,
                 static_target_attack_player_ids: BTreeSet::new(),
                 followed_player_ids: BTreeSet::new(),
+                wandered_static_creatures: 0,
             }
         );
         assert_eq!(
@@ -28872,6 +29044,8 @@ mod tests {
                 StaticTargetAcquisitionPolicy::Disabled,
                 StaticTargetPursuitPolicy::NearestLivingPlayerOneStep { max_range: 4 },
                 StaticTargetAttackPolicy::Disabled,
+                forgotten_core::StaticCreatureDecisionPolicy::Disabled,
+                0,
                 Some(map.as_ref()),
             )
             .unwrap(),
@@ -28882,6 +29056,7 @@ mod tests {
                 static_target_attacks: 0,
                 static_target_attack_player_ids: BTreeSet::new(),
                 followed_player_ids: BTreeSet::new(),
+                wandered_static_creatures: 0,
             }
         );
         assert_eq!(shared.visibility_epoch(), visibility_epoch + 1);
@@ -28954,6 +29129,8 @@ mod tests {
                 StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 },
                 StaticTargetPursuitPolicy::Disabled,
                 StaticTargetAttackPolicy::Disabled,
+                forgotten_core::StaticCreatureDecisionPolicy::Disabled,
+                0,
                 Some(&map),
             )
             .unwrap(),
@@ -28964,6 +29141,7 @@ mod tests {
                 static_target_attacks: 0,
                 static_target_attack_player_ids: BTreeSet::new(),
                 followed_player_ids: BTreeSet::new(),
+                wandered_static_creatures: 0,
             }
         );
         assert_eq!(shared.player_vitals(101).unwrap().health, 5);
@@ -28976,6 +29154,8 @@ mod tests {
                 StaticTargetAcquisitionPolicy::Disabled,
                 StaticTargetPursuitPolicy::Disabled,
                 StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage: 2 },
+                forgotten_core::StaticCreatureDecisionPolicy::Disabled,
+                0,
                 Some(&map),
             )
             .unwrap(),
@@ -28986,6 +29166,7 @@ mod tests {
                 static_target_attacks: 1,
                 static_target_attack_player_ids: BTreeSet::from([101]),
                 followed_player_ids: BTreeSet::new(),
+                wandered_static_creatures: 0,
             }
         );
         assert_eq!(shared.player_vitals(101).unwrap().health, 3);
@@ -29040,6 +29221,8 @@ mod tests {
                 StaticTargetAcquisitionPolicy::Disabled,
                 StaticTargetPursuitPolicy::Disabled,
                 StaticTargetAttackPolicy::Disabled,
+                forgotten_core::StaticCreatureDecisionPolicy::Disabled,
+                0,
                 Some(&map),
             )
             .unwrap(),
@@ -29050,6 +29233,7 @@ mod tests {
                 static_target_attacks: 0,
                 static_target_attack_player_ids: BTreeSet::new(),
                 followed_player_ids: BTreeSet::from([101]),
+                wandered_static_creatures: 0,
             }
         );
         assert_eq!(shared.visibility_epoch(), visibility_epoch + 1);
@@ -29105,6 +29289,7 @@ mod tests {
                 static_target_attacks: 0,
                 static_target_attack_player_ids: BTreeSet::new(),
                 followed_player_ids: BTreeSet::new(),
+                wandered_static_creatures: 0,
             }
         );
         assert_eq!(shared.visibility_epoch(), epoch_before);
@@ -29117,6 +29302,7 @@ mod tests {
                 static_target_attacks: 0,
                 static_target_attack_player_ids: BTreeSet::new(),
                 followed_player_ids: BTreeSet::new(),
+                wandered_static_creatures: 0,
             }
         );
         assert_eq!(shared.visibility_epoch(), epoch_before + 1);

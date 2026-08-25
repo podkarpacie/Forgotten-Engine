@@ -815,6 +815,14 @@ fn run_host(
                 0 => StaticTargetPursuitPolicy::Disabled,
                 max_range => StaticTargetPursuitPolicy::NearestLivingPlayerOneStep { max_range },
             },
+            static_creature_wander_policy: if config.static_creature_wander_interval_ticks == 0 {
+                forgotten_core::StaticCreatureDecisionPolicy::Disabled
+            } else {
+                forgotten_core::StaticCreatureDecisionPolicy::ClockwiseAdjacent
+            },
+            static_creature_wander_every_ticks: u64::from(
+                config.static_creature_wander_interval_ticks,
+            ),
             regeneration_rules,
             progression_rules,
             vocation_level_up_gains,
