@@ -2509,7 +2509,7 @@ fn give_items_to_player(
             .replace_player_containers(target_id, &staged)
             .map_err(HostError::Persistence)?;
         shared_world.replace_player_containers(target_id, staged)?;
-        shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+        shared_world.mark_containers_changed();
         return Ok(Some(format!(
             "Delivered {} x item {item_id}.",
             count - unplaced
@@ -6462,8 +6462,7 @@ impl SharedNativeWorld {
     /// Restores a connected player's health and mana to their maximums. Used by operator
     /// `/heal`; returns false when the player is offline.
     pub fn restore_player_vitals(&self, player_id: u64) -> Result<bool, HostError> {
-        let current = self.player_and_vitals(player_id);
-        let Ok((_, vitals)) = current else {
+        let Ok((_, vitals)) = self.player_and_vitals(player_id) else {
             return Ok(false);
         };
         let restored = PlayerVitals {
@@ -6479,6 +6478,12 @@ impl SharedNativeWorld {
         }
         self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
         Ok(true)
+    }
+
+    /// Bumps the containers epoch so every session re-emits open-container deltas. Operator
+    /// item delivery must call this or clients never learn a container changed.
+    pub fn mark_containers_changed(&self) {
+        self.containers_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Flags both participants' sessions to close their trade windows after a successful swap
@@ -11067,20 +11072,35 @@ fn handle_native_otclient_game(
                     thing_id,
                     stack_position,
                 ) else {
+                    // Universal Look fallback: TFS always answers a look. When the client thing
+                    // id is not uniquely mapped (bare ground, unmapped decorations), reply with
+                    // a bounded generic description instead of silence.
+                    let message = format!("You see {thing_id}.");
+                    let response =
+                        encode_native_otclient_look_message(&config.client_profile, &message)
+                            .map_err(HostError::Protocol)?;
+                    write_frame(stream, &response)?;
                     native_diagnostic(
                         config.extended_diagnostics,
                         peer,
-                        "action=look-map outcome=deferred-unmapped-or-ambiguous-client-thing-id",
+                        "action=look-map outcome=generic-fallback",
                     );
                     continue;
                 };
                 let item = match shared_world.validate_player_item_use(world_map, intent) {
                     Ok(item) => item,
                     Err(HostError::Core(_)) => {
+                        // Tile exists but the item reference did not resolve (moved, out of
+                        // range, or stale stackpos). Answer generically like TFS does.
+                        let message = format!("You see {thing_id}.");
+                        let response =
+                            encode_native_otclient_look_message(&config.client_profile, &message)
+                                .map_err(HostError::Protocol)?;
+                        write_frame(stream, &response)?;
                         native_diagnostic(
                             config.extended_diagnostics,
                             peer,
-                            "action=look-map outcome=deferred-invalid-server-owned-map-item",
+                            "action=look-map outcome=generic-fallback-stale-reference",
                         );
                         continue;
                     }
