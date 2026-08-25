@@ -2359,6 +2359,7 @@ pub fn handle_native_depot_open(
 /// player trading with a named NPC whose declarative shop exists. Returns false when the NPC
 /// has no shop or the presentation mapping is unavailable, so callers can fall through to the
 /// keyword path.
+#[allow(clippy::too_many_arguments)]
 fn deliver_native_npc_shop_windows(
     stream: &mut TcpStream,
     profile: &NativeOtClientProfile,
@@ -3399,6 +3400,7 @@ impl SharedNativeMap {
     /// tile adjacent to (or under) the player, appending it to the durable runtime registry. The
     /// inventory change and registry persist in one SQLite transaction while authoritative locks
     /// are held; staged memory commits only after a successful commit.
+    #[allow(clippy::too_many_arguments)]
     pub fn move_player_stack_to_ground(
         &self,
         shared_world: &SharedNativeWorld,
