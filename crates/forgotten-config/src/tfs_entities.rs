@@ -243,6 +243,7 @@ pub fn materialize_tfs_static_spawns(
             entities.push(FeTfsStaticEntity {
                 id: next_id,
                 name: definition.name.clone(),
+                name_description: String::new(),
                 position: creature.position,
                 look_type: appearance.look_type,
                 head: appearance.head,
@@ -338,6 +339,7 @@ pub fn materialize_tfs_spawn_templates(
         entities.push(FeTfsStaticEntity {
             id: next_id,
             name: definition.name.clone(),
+            name_description: String::new(),
             position: Position { x: 0, y: 0, z: 0 },
             look_type: appearance.look_type,
             head: appearance.head,

@@ -113,6 +113,7 @@ pub const MAX_STATIC_LOOT_ENTRIES: usize = 32;
 pub struct FeTfsStaticEntity {
     pub id: u32,
     pub name: String,
+    pub name_description: String,
     pub position: Position,
     pub look_type: u8,
     pub head: u8,
@@ -1877,7 +1878,7 @@ impl ItemInstance {
             && self.unique_id == other.unique_id
     }
 
-    fn split_off(&mut self, count: u16) -> Result<Self, CoreError> {
+    pub fn split_off(&mut self, count: u16) -> Result<Self, CoreError> {
         if count == 0 || count > self.count {
             return Err(CoreError::InvalidItemTransferCount {
                 requested: count,
@@ -2148,6 +2149,10 @@ impl PlayerEquipment {
         self.items.get(&slot)
     }
 
+    pub fn item_mut(&mut self, slot: EquipmentSlot) -> Option<&mut ItemInstance> {
+        self.items.get_mut(&slot)
+    }
+
     pub fn equip(&mut self, slot: EquipmentSlot, item: ItemInstance) -> Option<ItemInstance> {
         self.items.insert(slot, item)
     }
@@ -2182,6 +2187,10 @@ pub struct ItemContainer {
 }
 
 impl ItemContainer {
+    pub fn item_mut(&mut self, index: usize) -> Option<&mut ItemInstance> {
+        self.items.get_mut(index)
+    }
+
     pub fn new(capacity: u16) -> Result<Self, CoreError> {
         if capacity == 0 || capacity > MAX_CONTAINER_CAPACITY {
             return Err(CoreError::InvalidContainerCapacity(capacity));
@@ -2871,6 +2880,58 @@ pub enum PartySharedExperienceEligibility {
 pub struct PartySharedExperienceState {
     pub requested: bool,
     pub eligibility: PartySharedExperienceEligibility,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericMoveSource {
+    pub kind: GenericMoveSourceKind,
+    /// Whole-stack moves leave this None; partial moves specify the exact unit count.
+    pub count: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenericMoveSourceKind {
+    Equipment { slot: EquipmentSlot },
+    Container { container_id: u8, index: usize },
+}
+
+/// Destination descriptor for a generic inventory move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenericMoveTargetKind {
+    /// `allow_swap` permits displacing an occupied slot back into the vacated source.
+    Equipment {
+        slot: EquipmentSlot,
+        allow_swap: bool,
+    },
+    Container {
+        container_id: u8,
+    },
+}
+
+/// Fully resolved one-shot inventory move plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenericInventoryMove {
+    pub source_kind: GenericMoveSourceKind,
+    pub source_count: Option<u16>,
+    pub target: GenericMoveTargetKind,
+}
+
+/// How the destination handled the moved item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenericPlacement {
+    Placed,
+    MergedOrInserted,
+    Swapped { displaced: ItemInstance },
+}
+
+/// Outcome of a successful generic inventory move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericInventoryMoveOutcome {
+    pub player_id: u64,
+    pub moved_item: ItemInstance,
+    pub placement: GenericPlacement,
+    /// Units left at the source after a partial stack split (zero for whole moves).
+    pub remaining_source_count: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4287,8 +4348,8 @@ impl WorldState {
 
         // Pass 1 - resolve every staged reference to a concrete item snapshot. Any failure
         // aborts before a single inventory mutates.
-        let mut resolve = |owner: u64,
-                           refs: &[TradeItemReference]|
+        let resolve = |owner: u64,
+                       refs: &[TradeItemReference]|
          -> Result<Vec<(TradeItemReference, ItemInstance)>, CoreError> {
             refs.iter()
                 .map(|reference| {
@@ -4409,16 +4470,14 @@ impl WorldState {
                 }
                 Ok(())
             };
-        if let Err(error) = deliver(
+        deliver(
             self,
             initiator,
             counterparty_removed
                 .iter()
                 .map(|(_, item)| item.clone())
                 .collect(),
-        ) {
-            return Err(error);
-        }
+        )?;
         deliver(
             self,
             counterparty,
@@ -7079,6 +7138,218 @@ impl WorldState {
         self.apply_player_damage(attacker_id, target_id, requested_damage)
     }
 
+    /// The single generic inventory-move primitive. Every public transfer function
+    /// (equipment↔container, container↔container, stacks, swaps) resolves to a
+    /// `GenericInventoryMove` describing source and destination, and this method executes it
+    /// atomically on cloned state: any validation failure leaves the world untouched.
+    pub fn execute_generic_inventory_move(
+        &mut self,
+        player_id: u64,
+        plan: GenericInventoryMove,
+    ) -> Result<GenericInventoryMoveOutcome, CoreError> {
+        use GenericMoveSourceKind as Src;
+        use GenericMoveTargetKind as Dst;
+
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        if let (
+            GenericMoveSourceKind::Equipment { slot: source_slot },
+            GenericMoveTargetKind::Equipment {
+                slot: target_slot, ..
+            },
+        ) = (plan.source_kind, plan.target)
+        {
+            if source_slot == target_slot {
+                return Err(CoreError::SameEquipmentSlotTransfer {
+                    player_id,
+                    slot: source_slot,
+                });
+            }
+        }
+        let mut equipment = self.player_equipment(player_id)?.clone();
+        let mut containers = self.player_containers(player_id)?.clone();
+
+        // ---- Resolve + detach the moved item from its source -------------------------
+        let (moved_item, remaining_source_count) = match plan.source_kind {
+            Src::Equipment { slot } => {
+                let Some(item) = equipment.item(slot).cloned() else {
+                    return Err(CoreError::EmptyEquipmentSlot { player_id, slot });
+                };
+                let take = plan.source_count.unwrap_or(item.count);
+                if take == 0 || take > item.count {
+                    return Err(CoreError::InvalidItemTransferCount {
+                        requested: take,
+                        available: item.count,
+                    });
+                }
+                let original_count = item.count;
+                let moved = if take == item.count {
+                    equipment.unequip(slot);
+                    item
+                } else {
+                    let mut whole = item;
+                    let split = whole.split_off(take)?;
+                    // remainder stays equipped
+                    if let Some(remaining) = equipment.item_mut(slot) {
+                        *remaining = whole;
+                    }
+                    split
+                };
+                (moved, u32::from(original_count.saturating_sub(take)))
+            }
+            Src::Container {
+                container_id,
+                index,
+            } => {
+                let Some(container) = containers.container_mut(container_id) else {
+                    return Err(CoreError::UnknownPlayerContainer {
+                        player_id,
+                        container_id,
+                    });
+                };
+                let Some(item) = container.items.item(index).cloned() else {
+                    return Err(CoreError::UnknownPlayerContainerItem {
+                        player_id,
+                        container_id,
+                        item_index: index,
+                    });
+                };
+                let take = plan.source_count.unwrap_or(item.count);
+                if take == 0 || take > item.count {
+                    return Err(CoreError::InvalidItemTransferCount {
+                        requested: take,
+                        available: item.count,
+                    });
+                }
+                let original_count = item.count;
+                let moved = if take == item.count {
+                    container
+                        .items
+                        .remove(index)
+                        .ok_or(CoreError::UnknownPlayerContainerItem {
+                            player_id,
+                            container_id,
+                            item_index: index,
+                        })?
+                } else {
+                    let mut whole = item;
+                    let split = whole.split_off(take)?;
+                    if let Some(remaining) = container.items.item_mut(index) {
+                        *remaining = whole;
+                    }
+                    split
+                };
+                (moved, u32::from(original_count.saturating_sub(take)))
+            }
+        };
+
+        // ---- Place the item at the destination ---------------------------------------
+        let placement = match plan.target {
+            Dst::Equipment { slot, allow_swap } => {
+                let existing = equipment.item(slot).cloned();
+                match existing {
+                    None => {
+                        equipment.equip(slot, moved_item.clone());
+                        GenericPlacement::Placed
+                    }
+                    Some(current) if allow_swap && plan.source_kind != Src::Equipment { slot } => {
+                        equipment.equip(slot, moved_item.clone());
+                        // The displaced item returns to the source location.
+                        if let Src::Container { container_id, .. } = plan.source_kind {
+                            let insert_result =
+                                if let Some(container) = containers.container_mut(container_id) {
+                                    container.items.insert(current.clone())
+                                } else {
+                                    Ok(())
+                                };
+                            insert_result?;
+                        }
+                        GenericPlacement::Swapped { displaced: current }
+                    }
+                    Some(_) => {
+                        // Restore source before failing (atomicity).
+                        Self::restore_moved_item(
+                            player_id,
+                            &mut equipment,
+                            &mut containers,
+                            plan.source_kind,
+                            &moved_item,
+                        )?;
+                        return Err(CoreError::OccupiedEquipmentSlot { player_id, slot });
+                    }
+                }
+            }
+            Dst::Container { container_id } => {
+                let Some(container) = containers.container_mut(container_id) else {
+                    Self::restore_moved_item(
+                        player_id,
+                        &mut equipment,
+                        &mut containers,
+                        plan.source_kind,
+                        &moved_item,
+                    )?;
+                    return Err(CoreError::UnknownPlayerContainer {
+                        player_id,
+                        container_id,
+                    });
+                };
+                match container.items.merge_or_insert_stack(moved_item.clone()) {
+                    Ok(_slot) => GenericPlacement::MergedOrInserted,
+                    Err(error) => {
+                        Self::restore_moved_item(
+                            player_id,
+                            &mut equipment,
+                            &mut containers,
+                            plan.source_kind,
+                            &moved_item,
+                        )?;
+                        return Err(error);
+                    }
+                }
+            }
+        };
+
+        self.player_equipments.insert(player_id, equipment);
+        self.player_containers.insert(player_id, containers);
+        self.mark_changed();
+        Ok(GenericInventoryMoveOutcome {
+            player_id,
+            moved_item,
+            placement,
+            remaining_source_count,
+        })
+    }
+
+    fn restore_moved_item(
+        player_id: u64,
+        equipment: &mut PlayerEquipment,
+        containers: &mut PlayerContainers,
+        source: GenericMoveSourceKind,
+        item: &ItemInstance,
+    ) -> Result<(), CoreError> {
+        match source {
+            GenericMoveSourceKind::Equipment { slot } => {
+                equipment.equip(slot, item.clone());
+                Ok(())
+            }
+            GenericMoveSourceKind::Container {
+                container_id,
+                index: _,
+            } => {
+                let Some(container) = containers.container_mut(container_id) else {
+                    return Err(CoreError::UnknownPlayerContainer {
+                        player_id,
+                        container_id,
+                    });
+                };
+                // Best-effort reinsert at the original index position semantics.
+                container.items.insert(item.clone())?;
+                Ok(())
+            }
+        }
+    }
+
     pub fn move_player(&mut self, id: u64, destination: Position) -> Result<(), CoreError> {
         if self.player_respawn_state(id)?.dead {
             return Err(CoreError::PlayerIsDead(id));
@@ -7678,6 +7949,7 @@ mod tests {
         FeTfsStaticEntity {
             id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 104,
                 y: 100,
@@ -8077,6 +8349,7 @@ mod tests {
             vec![FeTfsStaticEntity {
                 id: npc_id,
                 name: "Guide".into(),
+                name_description: String::new(),
                 position: npc_position,
                 look_type: 128,
                 head: 0,
@@ -8947,6 +9220,236 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_generic_inventory_move_covers_splits_swaps_and_atomic_rejection() {
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+
+        let sword = ItemInstance::new(2376, 1).unwrap();
+        let shield = ItemInstance::new(2512, 1).unwrap();
+        let mut backpack = PlayerContainer::new(
+            0,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        backpack
+            .items
+            .insert(ItemInstance::new(2544, 60).unwrap())
+            .unwrap();
+        backpack.items.insert(sword.clone()).unwrap();
+        let mut bag =
+            PlayerContainer::new(1, ItemInstance::new(1988, 1).unwrap(), "Bag", false, 20).unwrap();
+        bag.items
+            .insert(ItemInstance::new(2544, 30).unwrap())
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(backpack).unwrap();
+        containers.insert(bag).unwrap();
+        world.replace_player_containers(7, containers).unwrap();
+
+        let revision_before_transfer = world.revision();
+        let outcome = world
+            .execute_generic_inventory_move(
+                7,
+                GenericInventoryMove {
+                    source_kind: GenericMoveSourceKind::Container {
+                        container_id: 0,
+                        index: 1,
+                    },
+                    source_count: None,
+                    target: GenericMoveTargetKind::Equipment {
+                        slot: EquipmentSlot::RightHand,
+                        allow_swap: false,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.placement, GenericPlacement::Placed);
+        assert_eq!(outcome.moved_item, sword);
+        assert_eq!(outcome.remaining_source_count, 0);
+        assert_eq!(
+            world
+                .player_equipment(7)
+                .unwrap()
+                .item(EquipmentSlot::RightHand),
+            Some(&sword)
+        );
+        assert_eq!(world.revision(), revision_before_transfer + 1);
+
+        let revision_before_split = world.revision();
+        let outcome = world
+            .execute_generic_inventory_move(
+                7,
+                GenericInventoryMove {
+                    source_kind: GenericMoveSourceKind::Container {
+                        container_id: 0,
+                        index: 0,
+                    },
+                    source_count: Some(10),
+                    target: GenericMoveTargetKind::Container { container_id: 1 },
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.placement, GenericPlacement::MergedOrInserted);
+        assert_eq!(outcome.moved_item.count, 10);
+        assert_eq!(outcome.remaining_source_count, 50);
+        assert_eq!(
+            world
+                .player_containers(7)
+                .unwrap()
+                .container(0)
+                .unwrap()
+                .items
+                .item(0),
+            Some(&ItemInstance::new(2544, 50).unwrap())
+        );
+        assert_eq!(
+            world
+                .player_containers(7)
+                .unwrap()
+                .container(1)
+                .unwrap()
+                .items
+                .item(0),
+            Some(&ItemInstance::new(2544, 40).unwrap())
+        );
+        assert_eq!(world.revision(), revision_before_split + 1);
+
+        let mut equipment = world.player_equipment(7).unwrap().clone();
+        equipment.equip(EquipmentSlot::LeftHand, shield.clone());
+        world.replace_player_equipment(7, equipment).unwrap();
+        let mut containers = world.player_containers(7).unwrap().clone();
+        containers
+            .container_mut(0)
+            .unwrap()
+            .items
+            .insert(sword.clone())
+            .unwrap();
+        world.replace_player_containers(7, containers).unwrap();
+        let outcome = world
+            .execute_generic_inventory_move(
+                7,
+                GenericInventoryMove {
+                    source_kind: GenericMoveSourceKind::Container {
+                        container_id: 0,
+                        index: 1,
+                    },
+                    source_count: None,
+                    target: GenericMoveTargetKind::Equipment {
+                        slot: EquipmentSlot::LeftHand,
+                        allow_swap: true,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            outcome.placement,
+            GenericPlacement::Swapped {
+                displaced: shield.clone()
+            }
+        );
+        assert_eq!(
+            world
+                .player_equipment(7)
+                .unwrap()
+                .item(EquipmentSlot::LeftHand),
+            Some(&sword)
+        );
+        assert_eq!(
+            world
+                .player_containers(7)
+                .unwrap()
+                .container(0)
+                .unwrap()
+                .items
+                .item(1),
+            Some(&shield)
+        );
+
+        let revision_before_rejection = world.revision();
+        assert_eq!(
+            world.execute_generic_inventory_move(
+                7,
+                GenericInventoryMove {
+                    source_kind: GenericMoveSourceKind::Container {
+                        container_id: 0,
+                        index: 1,
+                    },
+                    source_count: None,
+                    target: GenericMoveTargetKind::Equipment {
+                        slot: EquipmentSlot::RightHand,
+                        allow_swap: false,
+                    },
+                },
+            ),
+            Err(CoreError::OccupiedEquipmentSlot {
+                player_id: 7,
+                slot: EquipmentSlot::RightHand,
+            })
+        );
+        assert_eq!(
+            world.execute_generic_inventory_move(
+                7,
+                GenericInventoryMove {
+                    source_kind: GenericMoveSourceKind::Equipment {
+                        slot: EquipmentSlot::RightHand,
+                    },
+                    source_count: None,
+                    target: GenericMoveTargetKind::Equipment {
+                        slot: EquipmentSlot::RightHand,
+                        allow_swap: true,
+                    },
+                },
+            ),
+            Err(CoreError::SameEquipmentSlotTransfer {
+                player_id: 7,
+                slot: EquipmentSlot::RightHand,
+            })
+        );
+        assert_eq!(
+            world.execute_generic_inventory_move(
+                99,
+                GenericInventoryMove {
+                    source_kind: GenericMoveSourceKind::Container {
+                        container_id: 0,
+                        index: 0,
+                    },
+                    source_count: None,
+                    target: GenericMoveTargetKind::Container { container_id: 1 },
+                },
+            ),
+            Err(CoreError::UnknownPlayer(99))
+        );
+        assert!(matches!(
+            world.execute_generic_inventory_move(
+                7,
+                GenericInventoryMove {
+                    source_kind: GenericMoveSourceKind::Container {
+                        container_id: 0,
+                        index: 0,
+                    },
+                    source_count: Some(0),
+                    target: GenericMoveTargetKind::Container { container_id: 1 },
+                },
+            ),
+            Err(CoreError::InvalidItemTransferCount { .. })
+        ));
+        assert_eq!(world.revision(), revision_before_rejection);
+        assert_eq!(
+            world
+                .player_containers(7)
+                .unwrap()
+                .container(0)
+                .unwrap()
+                .items
+                .item(0),
+            Some(&ItemInstance::new(2544, 50).unwrap())
+        );
+    }
+
+    #[test]
     fn authoritative_container_stack_transfer_merges_between_distinct_containers() {
         let gold = 2148;
         let mut world = WorldState::default();
@@ -9708,6 +10211,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 101,
                 y: 100,
@@ -9764,6 +10268,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 101,
                 y: 100,
@@ -9830,6 +10335,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 101,
                 y: 100,
@@ -10139,6 +10645,7 @@ mod tests {
                     FeTfsStaticEntity {
                         id: near_static_id,
                         name: "Rat".into(),
+                        name_description: String::new(),
                         position: adjacent,
                         look_type: 21,
                         head: 0,
@@ -10153,6 +10660,7 @@ mod tests {
                     FeTfsStaticEntity {
                         id: far_static_id,
                         name: "Snake".into(),
+                        name_description: String::new(),
                         position: far,
                         look_type: 21,
                         head: 0,
@@ -10704,6 +11212,7 @@ mod tests {
         let collection = FeTfsStaticSpawnCollection::new(vec![FeTfsStaticEntity {
             id: 0x4000_0001,
             name: "Rat".into(),
+            name_description: String::new(),
             position,
             look_type: 21,
             head: 0,
@@ -10736,6 +11245,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: 0x4000_0001,
             name: "Rat".into(),
+            name_description: String::new(),
             position,
             look_type: 21,
             head: 0,
@@ -10780,6 +11290,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: 0x4000_0001,
             name: "Rat".into(),
+            name_description: String::new(),
             position: spawn_position,
             look_type: 21,
             head: 0,
@@ -10878,6 +11389,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: spawn_position,
             look_type: 21,
             head: 0,
@@ -10986,6 +11498,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: spawn_position,
             look_type: 21,
             head: 0,
@@ -11045,6 +11558,7 @@ mod tests {
             vec![FeTfsStaticEntity {
                 id: creature_id,
                 name: "Rat".into(),
+                name_description: String::new(),
                 position,
                 look_type: 21,
                 head: 0,
@@ -11131,6 +11645,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 104,
                 y: 100,
@@ -11239,6 +11754,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: creature_position,
             look_type: 21,
             head: 0,
@@ -11380,6 +11896,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: creature_position,
             look_type: 21,
             head: 0,
@@ -11502,6 +12019,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: creature_position,
             look_type: 21,
             head: 0,
@@ -11576,6 +12094,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: creature_position,
             look_type: 21,
             head: 0,
@@ -11677,6 +12196,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: creature_position,
             look_type: 21,
             head: 0,
@@ -11734,6 +12254,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 100,
                 y: 100,
@@ -11891,6 +12412,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 100,
                 y: 100,
@@ -12013,6 +12535,7 @@ mod tests {
         let first = FeTfsStaticEntity {
             id: 0x4000_0001,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 101,
                 y: 100,
@@ -12031,6 +12554,7 @@ mod tests {
         let second = FeTfsStaticEntity {
             id: 0x4000_0002,
             name: "Snake".into(),
+            name_description: String::new(),
             position: Position {
                 x: 102,
                 y: 100,
@@ -12094,6 +12618,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: initial_position,
             look_type: 21,
             head: 0,
@@ -12232,6 +12757,7 @@ mod tests {
         let creature = FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 101,
                 y: 100,
@@ -12314,6 +12840,7 @@ mod tests {
         let collection = FeTfsStaticSpawnCollection::new(vec![FeTfsStaticEntity {
             id: 0x4000_0001,
             name: "Rat".into(),
+            name_description: String::new(),
             position,
             look_type: 21,
             head: 0,

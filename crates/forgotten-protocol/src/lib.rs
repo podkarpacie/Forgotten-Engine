@@ -4402,6 +4402,7 @@ mod tests {
         let static_spawns = FeTfsStaticSpawnCollection::new(vec![FeTfsStaticEntity {
             id: NATIVE_OTCLIENT_PLAYER_ID_END + 1,
             name: "Rat".into(),
+            name_description: String::new(),
             position: static_position,
             look_type: 21,
             head: 0,

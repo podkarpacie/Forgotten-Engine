@@ -14259,6 +14259,7 @@ mod tests {
                 forgotten_core::FeTfsStaticEntity {
                     id: monster_id,
                     name: "Guide".into(),
+                    name_description: String::new(),
                     position: Position {
                         x: 102,
                         y: 100,
@@ -14277,6 +14278,7 @@ mod tests {
                 forgotten_core::FeTfsStaticEntity {
                     id: npc_id,
                     name: "Guide".into(),
+                    name_description: String::new(),
                     position: Position {
                         x: 101,
                         y: 100,
@@ -14974,6 +14976,7 @@ mod tests {
             vec![forgotten_core::FeTfsStaticEntity {
                 id: creature_id,
                 name: "Rat".into(),
+                name_description: String::new(),
                 position: Position {
                     x: 101,
                     y: 100,
@@ -18041,6 +18044,7 @@ mod tests {
             let static_creature = forgotten_core::FeTfsStaticEntity {
                 id: NATIVE_OTCLIENT_PLAYER_ID_END + 1,
                 name: "Rat".into(),
+                name_description: String::new(),
                 position: Position {
                     x: 101,
                     y: 100,
@@ -18137,6 +18141,7 @@ mod tests {
             &FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
                 id: NATIVE_OTCLIENT_PLAYER_ID_END + 1,
                 name: "Rat".into(),
+                name_description: String::new(),
                 position: Position {
                     x: 101,
                     y: 100,
@@ -18976,6 +18981,7 @@ mod tests {
             FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
                 id: creature_id,
                 name: "Rat".into(),
+                name_description: String::new(),
                 position: Position {
                     x: 101,
                     y: 100,
@@ -19049,6 +19055,7 @@ mod tests {
             FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
                 id: creature_id,
                 name: "Rat".into(),
+                name_description: String::new(),
                 position: Position {
                     x: 101,
                     y: 100,
@@ -19135,6 +19142,7 @@ mod tests {
             vec![forgotten_core::FeTfsStaticEntity {
                 id: creature_id,
                 name: "Rat".into(),
+                name_description: String::new(),
                 position: Position {
                     x: 101,
                     y: 100,
@@ -19199,6 +19207,7 @@ mod tests {
             vec![forgotten_core::FeTfsStaticEntity {
                 id: creature_id,
                 name: "Rat".into(),
+                name_description: String::new(),
                 position: Position {
                     x: 101,
                     y: 100,
@@ -19312,6 +19321,7 @@ mod tests {
                 vec![forgotten_core::FeTfsStaticEntity {
                     id: creature_id,
                     name: "Rat".into(),
+                    name_description: String::new(),
                     position: Position {
                         x: 101,
                         y: 100,
@@ -19477,6 +19487,7 @@ mod tests {
         let creature = forgotten_core::FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 101,
                 y: 100,
@@ -19572,6 +19583,7 @@ mod tests {
         let creature = forgotten_core::FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 101,
                 y: 100,
@@ -19649,6 +19661,7 @@ mod tests {
         let creature = forgotten_core::FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 101,
                 y: 100,
@@ -20037,6 +20050,7 @@ mod tests {
                 vec![forgotten_core::FeTfsStaticEntity {
                     id: NATIVE_OTCLIENT_PLAYER_ID_END + 2,
                     name: "Banker".into(),
+                    name_description: String::new(),
                     position: Position {
                         x: 101,
                         y: 100,
@@ -20267,6 +20281,7 @@ mod tests {
                 vec![forgotten_core::FeTfsStaticEntity {
                     id: NATIVE_OTCLIENT_PLAYER_ID_END + 3,
                     name: "Trader".into(),
+                    name_description: String::new(),
                     position: Position {
                         x: 101,
                         y: 100,
@@ -26329,6 +26344,7 @@ mod tests {
             FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
                 id: NATIVE_OTCLIENT_PLAYER_ID_END + 1,
                 name: "Rat".into(),
+                name_description: String::new(),
                 position: Position {
                     x: 101,
                     y: 102,
@@ -27622,6 +27638,7 @@ mod tests {
             FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
                 id: NATIVE_OTCLIENT_PLAYER_ID_END + 1,
                 name: "Rat".into(),
+                name_description: String::new(),
                 position: Position {
                     x: 101,
                     y: 100,
@@ -27704,6 +27721,7 @@ mod tests {
         let creature = forgotten_core::FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 101,
                 y: 100,
@@ -27825,6 +27843,7 @@ mod tests {
         let creature = forgotten_core::FeTfsStaticEntity {
             id: NATIVE_OTCLIENT_PLAYER_ID_END + 1,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 101,
                 y: 100,
@@ -27897,6 +27916,7 @@ mod tests {
         let creature = forgotten_core::FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 101,
                 y: 100,
@@ -27964,6 +27984,7 @@ mod tests {
             FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
                 id: creature_id,
                 name: "Rat".into(),
+                name_description: String::new(),
                 position: Position {
                     x: 101,
                     y: 100,
@@ -28058,6 +28079,7 @@ mod tests {
             FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
                 id: creature_id,
                 name: "Rat".into(),
+                name_description: String::new(),
                 position: Position {
                     x: 101,
                     y: 100,
@@ -28201,6 +28223,7 @@ mod tests {
         let creature = forgotten_core::FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 101,
                 y: 100,
@@ -28363,6 +28386,7 @@ mod tests {
             vec![forgotten_core::FeTfsStaticEntity {
                 id: creature_id,
                 name: "Rat".into(),
+                name_description: String::new(),
                 position: Position {
                     x: 101,
                     y: 100,
@@ -28421,6 +28445,7 @@ mod tests {
         let creature = forgotten_core::FeTfsStaticEntity {
             id: creature_id,
             name: "Rat".into(),
+            name_description: String::new(),
             position: Position {
                 x: 101,
                 y: 100,
@@ -28859,6 +28884,7 @@ mod gm_talkaction_tests {
             vec![forgotten_core::FeTfsStaticEntity {
                 id: monster_id,
                 name: "Rat".into(),
+                name_description: String::new(),
                 position: Position { x: 90, y: 90, z: 7 },
                 look_type: 21,
                 head: 0,
