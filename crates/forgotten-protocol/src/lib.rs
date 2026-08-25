@@ -934,6 +934,12 @@ pub const NATIVE_OTCLIENT_GAME_CREATURE_HEALTH: u8 = 0x8c;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT: u8 = 0x8e;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_PARTY: u8 = 0x91;
 pub const NATIVE_OTCLIENT_GAME_EDIT_TEXT: u8 = 0x96;
+/// Classic own-trade record (0x7D): counterparty name + item list the sender offers.
+pub const NATIVE_OTCLIENT_GAME_OWN_TRADE: u8 = 0x7d;
+/// Classic counter-trade record (0x7E): counterparty name + item list offered back.
+pub const NATIVE_OTCLIENT_GAME_COUNTER_TRADE: u8 = 0x7e;
+/// Classic close-trade record (0x7F): zero payload; both windows close.
+pub const NATIVE_OTCLIENT_GAME_CLOSE_TRADE: u8 = 0x7f;
 pub const NATIVE_OTCLIENT_GAME_TEXT_MESSAGE: u8 = 0xb4;
 pub const NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT: u8 = 0x15;
 pub const NATIVE_OTCLIENT_MESSAGE_SAY: u8 = 0x01;
@@ -984,6 +990,12 @@ pub const NATIVE_OTCLIENT_CLIENT_WALK_SOUTH: u8 = 0x67;
 pub const NATIVE_OTCLIENT_CLIENT_WALK_WEST: u8 = 0x68;
 pub const NATIVE_OTCLIENT_CLIENT_STOP: u8 = 0x69;
 pub const NATIVE_OTCLIENT_CLIENT_THROW_ITEM: u8 = 0x78;
+/// Classic request-player-trade opcode: position + thing id + stack pos + target creature id.
+pub const NATIVE_OTCLIENT_CLIENT_REQUEST_TRADE: u8 = 0x7d;
+/// Classic accept-trade opcode: zero payload.
+pub const NATIVE_OTCLIENT_CLIENT_ACCEPT_TRADE: u8 = 0x7f;
+/// Classic reject/cancel-trade opcode: zero payload.
+pub const NATIVE_OTCLIENT_CLIENT_REJECT_TRADE: u8 = 0x80;
 pub const NATIVE_OTCLIENT_CLIENT_WALK_NORTH_EAST: u8 = 0x6a;
 pub const NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_EAST: u8 = 0x6b;
 pub const NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_WEST: u8 = 0x6c;
@@ -1436,6 +1448,17 @@ pub enum NativeOtClientGameAction {
     LookCreature {
         creature_id: u32,
     },
+    /// Classic request-player-trade: the sender offers the item at the given position to the
+    /// target creature. FE resolves the item through its own authoritative inventory instead
+    /// of trusting the client's thing id.
+    RequestTrade {
+        position: NativeOtClientPosition,
+        client_thing_id: u16,
+        stack_position: u8,
+        target_creature_id: u32,
+    },
+    AcceptTrade,
+    RejectTrade,
     RequestOutfit,
     RequestQuestLog,
     RequestQuestLine {
@@ -1874,6 +1897,98 @@ pub fn encode_native_otclient_game_announcement(
     message: &str,
 ) -> Result<Frame, ProtocolError> {
     encode_native_otclient_typed_text_message(profile, NATIVE_OTCLIENT_MESSAGE_GAME, message)
+}
+
+/// One classic trade-window item: mapped client thing id plus the subtype/count byte that the
+/// classic item record carries for stackable things. Non-stackable items omit it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeOtClientTradeItem {
+    pub client_thing_id: u16,
+    pub count: Option<u8>,
+}
+
+impl NativeOtClientTradeItem {
+    pub fn encoded_len(&self) -> usize {
+        2 + usize::from(self.count.is_some())
+    }
+}
+
+fn trade_item_list_fits(items: &[NativeOtClientTradeItem]) -> bool {
+    items.len() <= u8::MAX as usize
+        && items.iter().all(|item| item.client_thing_id != 0)
+        && items.iter().map(|item| item.encoded_len()).sum::<usize>() + 1 <= MAX_FRAME_SIZE
+}
+
+fn write_trade_items(writer: &mut Writer, items: &[NativeOtClientTradeItem]) {
+    writer.byte(items.len() as u8);
+    for item in items {
+        writer.u16(item.client_thing_id);
+        if let Some(count) = item.count {
+            writer.byte(count);
+        }
+    }
+}
+
+/// Encodes one classic own-trade (`0x7D`) record: the counterparty name plus the sender's
+/// offered item list, opening the local trade window.
+pub fn encode_native_otclient_own_trade(
+    profile: &NativeOtClientProfile,
+    counterparty_name: &str,
+    items: &[NativeOtClientTradeItem],
+) -> Result<Frame, ProtocolError> {
+    encode_native_otclient_trade_record(
+        profile,
+        NATIVE_OTCLIENT_GAME_OWN_TRADE,
+        counterparty_name,
+        items,
+    )
+}
+
+/// Encodes one classic counter-trade (`0x7E`) record: the counterparty name plus the items
+/// they offer in return.
+pub fn encode_native_otclient_counter_trade(
+    profile: &NativeOtClientProfile,
+    counterparty_name: &str,
+    items: &[NativeOtClientTradeItem],
+) -> Result<Frame, ProtocolError> {
+    encode_native_otclient_trade_record(
+        profile,
+        NATIVE_OTCLIENT_GAME_COUNTER_TRADE,
+        counterparty_name,
+        items,
+    )
+}
+
+fn encode_native_otclient_trade_record(
+    profile: &NativeOtClientProfile,
+    opcode: u8,
+    counterparty_name: &str,
+    items: &[NativeOtClientTradeItem],
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    if counterparty_name.is_empty()
+        || counterparty_name.len() > MAX_LOGIN_STRING_BYTES
+        || !trade_item_list_fits(items)
+    {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(opcode);
+    writer.string(counterparty_name);
+    write_trade_items(&mut writer, items);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes one classic close-trade (`0x7F`) record: zero payload; both trade windows close.
+pub fn encode_native_otclient_close_trade(
+    profile: &NativeOtClientProfile,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    Ok(Frame(vec![NATIVE_OTCLIENT_GAME_CLOSE_TRADE]))
 }
 
 fn encode_native_otclient_typed_text_message(
@@ -2668,6 +2783,33 @@ pub fn decode_native_otclient_game_action(
             NativeOtClientGameAction::LookCreature {
                 creature_id: reader.u32()?,
             }
+        }
+        NATIVE_OTCLIENT_CLIENT_REQUEST_TRADE => {
+            if reader.remaining() != 15 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            NativeOtClientGameAction::RequestTrade {
+                position: NativeOtClientPosition {
+                    x: reader.u16()?,
+                    y: reader.u16()?,
+                    z: reader.byte()?,
+                },
+                client_thing_id: reader.u16()?,
+                stack_position: reader.byte()?,
+                target_creature_id: reader.u32()?,
+            }
+        }
+        NATIVE_OTCLIENT_CLIENT_ACCEPT_TRADE => {
+            if reader.remaining() != 0 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            NativeOtClientGameAction::AcceptTrade
+        }
+        NATIVE_OTCLIENT_CLIENT_REJECT_TRADE => {
+            if reader.remaining() != 0 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            NativeOtClientGameAction::RejectTrade
         }
         NATIVE_OTCLIENT_CLIENT_CHANGE_OUTFIT => {
             if reader.remaining() != 5 {

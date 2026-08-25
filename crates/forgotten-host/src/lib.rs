@@ -51,6 +51,7 @@ use forgotten_protocol::{
     encode_native_otclient_character_list, encode_native_otclient_choose_outfit,
     encode_native_otclient_classic_vip_entry, encode_native_otclient_classic_vip_presence,
     encode_native_otclient_clear_target, encode_native_otclient_close_container,
+    encode_native_otclient_close_trade, encode_native_otclient_counter_trade,
     encode_native_otclient_creature_health, encode_native_otclient_creature_outfit,
     encode_native_otclient_creature_party_shield, encode_native_otclient_delete_inventory,
     encode_native_otclient_empty_quest_log, encode_native_otclient_failure_message,
@@ -64,26 +65,27 @@ use forgotten_protocol::{
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
     encode_native_otclient_move_creature_at, encode_native_otclient_open_container,
-    encode_native_otclient_open_public_channel, encode_native_otclient_player_modes,
-    encode_native_otclient_player_skills, encode_native_otclient_player_stats,
-    encode_native_otclient_private_message_from, encode_native_otclient_public_channel_say,
-    encode_native_otclient_public_say, encode_native_otclient_quest_line,
-    encode_native_otclient_quest_list, encode_native_otclient_read_only_text_window,
-    encode_native_otclient_set_inventory, encode_native_otclient_status_message,
-    encode_native_otclient_whisper, encode_native_otclient_yell, encode_status_binary,
-    encode_status_metrics, encode_status_xml, generate_legacy_74_game_challenge,
-    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
-    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
-    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection, NativeOtClientClassicChannel,
-    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
-    NativeOtClientClassicOutfit, NativeOtClientClassicPartyShield,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
-    NativeOtClientGameAction, NativeOtClientPlayerVitals, NativeOtClientPosition,
-    NativeOtClientProfile, NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError,
-    StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE, MAX_LOGIN_STRING_BYTES,
-    NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES, NATIVE_OTCLIENT_MESSAGE_GM_BROADCAST,
-    NATIVE_OTCLIENT_MESSAGE_SAY, NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL,
-    NATIVE_OTCLIENT_PLAYER_ID_END, NATIVE_OTCLIENT_PLAYER_ID_START,
+    encode_native_otclient_open_public_channel, encode_native_otclient_own_trade,
+    encode_native_otclient_player_modes, encode_native_otclient_player_skills,
+    encode_native_otclient_player_stats, encode_native_otclient_private_message_from,
+    encode_native_otclient_public_channel_say, encode_native_otclient_public_say,
+    encode_native_otclient_quest_line, encode_native_otclient_quest_list,
+    encode_native_otclient_read_only_text_window, encode_native_otclient_set_inventory,
+    encode_native_otclient_status_message, encode_native_otclient_whisper,
+    encode_native_otclient_yell, encode_status_binary, encode_status_metrics, encode_status_xml,
+    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
+    NativeOtClientCardinalDirection, NativeOtClientClassicChannel, NativeOtClientClassicItemRecord,
+    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
+    NativeOtClientClassicPartyShield, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
+    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerVitals,
+    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientTradeItem,
+    NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
+    StatusSnapshot, MAX_FRAME_SIZE, MAX_LOGIN_STRING_BYTES, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES,
+    NATIVE_OTCLIENT_MESSAGE_GM_BROADCAST, NATIVE_OTCLIENT_MESSAGE_SAY,
+    NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL, NATIVE_OTCLIENT_PLAYER_ID_END,
+    NATIVE_OTCLIENT_PLAYER_ID_START,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
@@ -1067,6 +1069,9 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         NativeOtClientGameAction::EnterGame => "action=enter-game".into(),
         NativeOtClientGameAction::LeaveGame => "action=leave-game".into(),
         NativeOtClientGameAction::Stop => "action=stop".into(),
+        NativeOtClientGameAction::RequestTrade { .. } => "action=request-trade".into(),
+        NativeOtClientGameAction::AcceptTrade => "action=accept-trade".into(),
+        NativeOtClientGameAction::RejectTrade => "action=reject-trade".into(),
         NativeOtClientGameAction::Turn(direction) => format!("action=turn direction={direction:?}"),
         NativeOtClientGameAction::CardinalMove(direction) => {
             format!("action=cardinal-move direction={direction:?}")
@@ -1442,6 +1447,8 @@ pub struct SharedNativeWorld {
     vip_presence_recipients: Arc<Mutex<BTreeMap<u64, SharedVipPresenceRecipient>>>,
     /// Operator-requested disconnects awaiting session pickup, stamped for expiry.
     pending_kicks: Arc<Mutex<BTreeMap<u64, std::time::SystemTime>>>,
+    /// Players whose trade window must close at their next session drain.
+    pending_trades_closed: Arc<Mutex<BTreeSet<u64>>>,
 }
 
 /// Synchronized owner for a mutable native world map. The live listener and heartbeat obtain only
@@ -1769,9 +1776,301 @@ fn handle_native_bank_keyword(
 /// near an active static NPC whose declared shop matches. Payments and proceeds flow through the
 /// durable bank balance; bought stacks chunk into free owned container slots, sold units leave
 /// carried equipment and containers. `Ok(None)` falls through to ordinary routing.
-/// Handles one gamemaster talkaction from live chat. Returns Some(reply text) when the message
-/// was a recognized GM command (whether or not it succeeded), None when the message is not a GM
-/// command and should fall through to ordinary chat routing.
+/// Handles a classic request-trade action: resolves the offered item from the sender's own
+/// authoritative inventory, validates the target is an adjacent live player, opens the trade
+/// session, and delivers both trade windows.
+#[allow(clippy::too_many_arguments)]
+fn handle_native_player_trade_request(
+    stream: &mut TcpStream,
+    profile: &NativeOtClientProfile,
+    shared_world: &SharedNativeWorld,
+    player_id: u64,
+    position: NativeOtClientPosition,
+    client_thing_id: u16,
+    stack_position: u8,
+    target_creature_id: u32,
+    item_presentation_catalog: Option<&NativeItemPresentationCatalog>,
+    stackable_item_server_ids: Option<&BTreeSet<u16>>,
+) -> Result<(), HostError> {
+    // Resolve the target creature id to a connected character.
+    let Some(target_character_id) = native_player_id_to_character_id(target_creature_id) else {
+        let failure = encode_native_otclient_failure_message(
+            profile,
+            "Sorry, not possible. You are not close enough to trade.",
+        )
+        .map_err(HostError::Protocol)?;
+        write_frame(stream, &failure)?;
+        return Ok(());
+    };
+    let world = shared_world.lock()?;
+    let Some(target_player) = world.player(target_character_id) else {
+        drop(world);
+        let failure = encode_native_otclient_failure_message(
+            profile,
+            "Sorry, not possible. You are not close enough to trade.",
+        )
+        .map_err(HostError::Protocol)?;
+        write_frame(stream, &failure)?;
+        return Ok(());
+    };
+    // Adjacency: same floor, within one tile (classic trade reach).
+    let sender_position = world
+        .player(player_id)
+        .map(|player| player.position)
+        .ok_or(forgotten_core::CoreError::UnknownPlayer(player_id))
+        .map_err(HostError::Core)?;
+    if target_player.position.z != sender_position.z
+        || target_player.position.x.abs_diff(sender_position.x) > 1
+        || target_player.position.y.abs_diff(sender_position.y) > 1
+    {
+        drop(world);
+        let failure = encode_native_otclient_failure_message(
+            profile,
+            "Sorry, not possible. You are too far away to trade.",
+        )
+        .map_err(HostError::Protocol)?;
+        write_frame(stream, &failure)?;
+        return Ok(());
+    }
+    drop(world);
+
+    // Resolve the offered item from the sender's own inventory: equipment slots use the
+    // classic 0xFFFF position form; container windows map through open views. FE trusts its
+    // own inventory state, never the client's echoed thing id.
+    let resolved = resolve_native_trade_offer_item(
+        shared_world,
+        player_id,
+        position,
+        client_thing_id,
+        stack_position,
+    )?;
+    let Some((container_id, item_index, _item)) = resolved else {
+        let failure =
+            encode_native_otclient_failure_message(profile, "You cannot trade that item.")
+                .map_err(HostError::Protocol)?;
+        write_frame(stream, &failure)?;
+        return Ok(());
+    };
+
+    // Open the session (or reuse the live one when the counterparty re-offers).
+    let existing = shared_world.lock()?.player_trade(player_id).cloned();
+    match existing {
+        None => {
+            shared_world
+                .lock()?
+                .open_player_trade(player_id, target_character_id)
+                .map_err(HostError::Core)?;
+        }
+        Some(session) => {
+            if (session.initiator == player_id && session.counterparty != target_character_id)
+                || (session.counterparty == player_id && session.initiator != target_character_id)
+            {
+                let failure =
+                    encode_native_otclient_failure_message(profile, "You are already trading.")
+                        .map_err(HostError::Protocol)?;
+                write_frame(stream, &failure)?;
+                return Ok(());
+            }
+        }
+    }
+    shared_world
+        .lock()?
+        .stage_trade_item(
+            player_id,
+            forgotten_core::TradeItemReference {
+                container_id,
+                item_index,
+            },
+        )
+        .map_err(HostError::Core)?;
+
+    // Deliver the window records with current staged offers.
+    deliver_native_trade_windows(
+        stream,
+        profile,
+        shared_world,
+        player_id,
+        item_presentation_catalog,
+        stackable_item_server_ids,
+    )?;
+    Ok(())
+}
+
+/// Resolves one trade offer reference from the sender's own authoritative inventory. Supports
+/// the classic own-equipment position form and own-container windows; returns the container id,
+/// item index, and item snapshot. Map positions are rejected for trade staging.
+fn resolve_native_trade_offer_item(
+    shared_world: &SharedNativeWorld,
+    player_id: u64,
+    position: NativeOtClientPosition,
+    client_thing_id: u16,
+    stack_position: u8,
+) -> Result<Option<(u8, usize, ItemInstance)>, HostError> {
+    let containers = shared_world.player_containers(player_id)?;
+    if position.x == 0xffff {
+        // Own-container window form: y bit 0x40 flags content windows per the classic layout.
+        if position.y & 0x40 != 0 {
+            let container_id = (position.y & 0x0f) as u8;
+            let index = usize::from(position.z);
+            if let Some(item) = containers
+                .container(container_id)
+                .and_then(|container| container.items.item(index))
+                .cloned()
+            {
+                return Ok(Some((container_id, index, item)));
+            }
+            return Ok(None);
+        }
+        // Equipment slot form has no single container home; trades stage from containers only
+        // in this slice, so equipment staging is deferred rather than guessed.
+        return Ok(None);
+    }
+    // A client thing id over a map position is not owned inventory; ignore it.
+    let _ = (client_thing_id, stack_position);
+    Ok(None)
+}
+
+/// Delivers the own/counter trade window records for one side of a live trade using the
+/// session's staged references mapped into client-visible item records.
+fn deliver_native_trade_windows(
+    stream: &mut TcpStream,
+    profile: &NativeOtClientProfile,
+    shared_world: &SharedNativeWorld,
+    viewer_id: u64,
+    item_presentation_catalog: Option<&NativeItemPresentationCatalog>,
+    stackable_item_server_ids: Option<&BTreeSet<u16>>,
+) -> Result<(), HostError> {
+    let Some(session) = shared_world.lock()?.player_trade(viewer_id).cloned() else {
+        return Ok(());
+    };
+    let snapshot_items = |owner: u64,
+                          refs: &[forgotten_core::TradeItemReference]|
+     -> Result<Vec<NativeOtClientTradeItem>, HostError> {
+        let containers = shared_world.player_containers(owner)?;
+        Ok(refs
+            .iter()
+            .filter_map(|reference| {
+                let item = containers
+                    .container(reference.container_id)?
+                    .items
+                    .item(reference.item_index)?;
+                let client_thing_id = item_presentation_catalog
+                    .and_then(|catalog| catalog.presentation(item.server_id))
+                    .map(|presentation| presentation.client_thing_id)?;
+                let count =
+                    if stackable_item_server_ids.is_some_and(|ids| ids.contains(&item.server_id)) {
+                        Some(u8::try_from(item.count).unwrap_or(u8::MAX))
+                    } else {
+                        None
+                    };
+                Some(NativeOtClientTradeItem {
+                    client_thing_id,
+                    count,
+                })
+            })
+            .collect())
+    };
+    let (counterparty_id, counterparty_name, own_items, their_items) =
+        if session.initiator == viewer_id {
+            let name = shared_world
+                .lock()?
+                .player(session.counterparty)
+                .map(|player| player.name.clone())
+                .unwrap_or_default();
+            (
+                session.counterparty,
+                name,
+                snapshot_items(session.initiator, &session.initiator_items)?,
+                snapshot_items(session.counterparty, &session.counterparty_items)?,
+            )
+        } else {
+            let name = shared_world
+                .lock()?
+                .player(session.initiator)
+                .map(|player| player.name.clone())
+                .unwrap_or_default();
+            (
+                session.initiator,
+                name,
+                snapshot_items(session.counterparty, &session.counterparty_items)?,
+                snapshot_items(session.initiator, &session.initiator_items)?,
+            )
+        };
+    let _ = counterparty_id;
+    let own_record = encode_native_otclient_own_trade(profile, &counterparty_name, &own_items)
+        .map_err(HostError::Protocol)?;
+    write_frame(stream, &own_record)?;
+    let counter_record =
+        encode_native_otclient_counter_trade(profile, &counterparty_name, &their_items)
+            .map_err(HostError::Protocol)?;
+    write_frame(stream, &counter_record)?;
+    Ok(())
+}
+
+/// Handles one side's accept: flips acceptance, delivers refreshed windows, and executes +
+/// persists the swap once both sides accepted. Both clients receive the closed-window signal.
+fn handle_native_trade_accept(
+    stream: &mut TcpStream,
+    profile: &NativeOtClientProfile,
+    shared_world: &SharedNativeWorld,
+    database: &mut EngineDatabase,
+    player_id: u64,
+    item_presentation_catalog: Option<&NativeItemPresentationCatalog>,
+    stackable_item_server_ids: Option<&BTreeSet<u16>>,
+) -> Result<(), HostError> {
+    let both_accepted = shared_world
+        .lock()?
+        .accept_player_trade(player_id)
+        .map_err(HostError::Core)?;
+    deliver_native_trade_windows(
+        stream,
+        profile,
+        shared_world,
+        player_id,
+        item_presentation_catalog,
+        stackable_item_server_ids,
+    )?;
+    if !both_accepted {
+        return Ok(());
+    }
+    let execution = shared_world
+        .lock()?
+        .execute_player_trade(player_id)
+        .map_err(HostError::Core)?;
+    // Persist both inventories atomically enough for this slice: each replace is one SQLite
+    // transaction; a failure on the second leaves the first persisted (logged loudly).
+    let initiator_containers = shared_world.player_containers(execution.initiator)?;
+    if let Err(error) =
+        database.replace_player_containers(execution.initiator, &initiator_containers)
+    {
+        eprintln!(
+            "> trade persistence failed for player {}: {error}",
+            execution.initiator
+        );
+    }
+    let counterparty_containers = shared_world.player_containers(execution.counterparty)?;
+    if let Err(error) =
+        database.replace_player_containers(execution.counterparty, &counterparty_containers)
+    {
+        eprintln!(
+            "> trade persistence failed for player {}: {error}",
+            execution.counterparty
+        );
+    }
+    shared_world.signal_trade_closed(execution.initiator, execution.counterparty)?;
+    shared_world.mark_visibility_changed();
+    Ok(())
+}
+
+/// Handles one side's reject/cancel: closes the session and signals the other side's window.
+fn handle_native_trade_reject(
+    shared_world: &SharedNativeWorld,
+    player_id: u64,
+) -> Result<(), HostError> {
+    shared_world.cancel_player_trade_and_signal(player_id)?;
+    Ok(())
+}
+
 fn handle_native_gm_talkaction(
     shared_world: &SharedNativeWorld,
     database: &mut EngineDatabase,
@@ -4004,6 +4303,7 @@ impl SharedNativeWorld {
             chat_recipients: Arc::new(Mutex::new(BTreeMap::new())),
             vip_presence_recipients: Arc::new(Mutex::new(BTreeMap::new())),
             pending_kicks: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_trades_closed: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
@@ -5839,6 +6139,22 @@ impl SharedNativeWorld {
         Ok(true)
     }
 
+    /// Cancels any live trade touching one player and flags the other participant's session
+    /// so its drain loop closes their trade window too. Returns the other player id.
+    pub fn cancel_player_trade_and_signal(&self, player_id: u64) -> Result<Option<u64>, HostError> {
+        let other = {
+            let mut world = self.lock()?;
+            world.cancel_player_trade(player_id)
+        };
+        if let Some(other_id) = other {
+            self.pending_trades_closed
+                .lock()
+                .map_err(|_| HostError::SharedWorldUnavailable)?
+                .insert(other_id);
+        }
+        Ok(other)
+    }
+
     /// Consumes a pending kick for one player: returns true exactly once per requested kick.
     /// The native session loop calls this every iteration so operator kicks disconnect the
     /// target within roughly one heartbeat.
@@ -5848,6 +6164,27 @@ impl SharedNativeWorld {
             .lock()
             .map_err(|_| HostError::SharedWorldUnavailable)?;
         Ok(kicks.remove(&player_id).is_some())
+    }
+
+    /// Consumes the trade-closed signal for one player (their window must close).
+    pub fn take_pending_trade_close(&self, player_id: u64) -> Result<bool, HostError> {
+        let mut closed = self
+            .pending_trades_closed
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        Ok(closed.remove(&player_id))
+    }
+
+    /// Flags both participants' sessions to close their trade windows after a successful swap
+    /// or any cancellation path that bypasses per-player signaling.
+    pub fn signal_trade_closed(&self, initiator: u64, counterparty: u64) -> Result<(), HostError> {
+        let mut closed = self
+            .pending_trades_closed
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        closed.insert(initiator);
+        closed.insert(counterparty);
+        Ok(())
     }
 
     pub fn register_player_at_available_position(
@@ -7448,6 +7785,18 @@ fn handle_native_otclient_game(
                 "lifecycle=kicked-by-operator",
             );
             break;
+        }
+        // Trade window lifecycle: close this side's windows when a swap completed, the
+        // counterparty rejected, or any other path signalled the trade ended for this player.
+        if shared_world.take_pending_trade_close(character.id)? {
+            let close = encode_native_otclient_close_trade(&config.client_profile)
+                .map_err(HostError::Protocol)?;
+            write_frame(stream, &close)?;
+            native_diagnostic(
+                config.extended_diagnostics,
+                peer,
+                "trade=window-closed signal=shared-world",
+            );
         }
         let read_timeout = active_click_walk
             .as_ref()
@@ -10426,6 +10775,46 @@ fn handle_native_otclient_game(
                 if config.extended_diagnostics {
                     eprintln!("> Native OTCv8 compatibility action ignored opcode=0x{opcode:02x}");
                 }
+            }
+            NativeOtClientGameAction::RequestTrade {
+                position,
+                client_thing_id,
+                stack_position,
+                target_creature_id,
+            } => {
+                handle_native_player_trade_request(
+                    stream,
+                    &config.client_profile,
+                    shared_world,
+                    character.id,
+                    position,
+                    client_thing_id,
+                    stack_position,
+                    target_creature_id,
+                    config.item_presentation_catalog.as_deref(),
+                    config.stackable_item_server_ids.as_deref(),
+                )?;
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    "action=request-trade outcome=processed",
+                );
+            }
+            NativeOtClientGameAction::AcceptTrade => {
+                handle_native_trade_accept(
+                    stream,
+                    &config.client_profile,
+                    shared_world,
+                    &mut database,
+                    character.id,
+                    config.item_presentation_catalog.as_deref(),
+                    config.stackable_item_server_ids.as_deref(),
+                )?;
+                native_diagnostic(config.extended_diagnostics, peer, "action=accept-trade");
+            }
+            NativeOtClientGameAction::RejectTrade => {
+                handle_native_trade_reject(shared_world, character.id)?;
+                native_diagnostic(config.extended_diagnostics, peer, "action=reject-trade");
             }
             NativeOtClientGameAction::SelectTarget(native_selected_id) => {
                 let outcome = apply_native_player_interaction(

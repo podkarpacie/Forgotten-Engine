@@ -96,6 +96,10 @@ pub const MAX_WORLD_MAP_TOWNS: usize = 8_192;
 pub const MAX_WORLD_MAP_WAYPOINTS: usize = 8_192;
 pub const MAX_TFS_STATIC_SPAWNS: usize = 65_536;
 
+/// Maximum items one side may stage in a player trade window. Classic clients show a fixed
+/// grid; FE bounds the authoritative staging set identically.
+pub const MAX_TRADE_ITEMS_PER_SIDE: usize = 20;
+
 /// Legacy loot-chance scale: the TFS convention where a declared chance of this value means the
 /// item always drops. Smaller declared chances are proportional probabilities.
 pub const LOOT_CHANCE_SCALE: u32 = 100_000;
@@ -2885,8 +2889,44 @@ pub struct WorldState {
     party_shared_experience_activity_ticks: BTreeMap<u64, u64>,
     static_creatures: BTreeMap<u32, StaticCreatureRuntime>,
     static_occupied_positions: BTreeSet<Position>,
+    /// At most one live trade at a time per participant. The staging lists hold item snapshots
+    /// for window display; the authoritative swap re-validates both inventories atomically.
+    active_trades: BTreeMap<u64, PlayerTradeSession>,
     tick: u64,
     revision: u64,
+}
+
+/// One staged player-to-player trade. `initiator` proposed the trade to `counterparty`; each
+/// side stages items by (container id, item index) references into their own inventory, plus
+/// the acceptance flags that gate the final atomic swap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerTradeSession {
+    pub initiator: u64,
+    pub counterparty: u64,
+    pub initiator_items: Vec<TradeItemReference>,
+    pub counterparty_items: Vec<TradeItemReference>,
+    pub initiator_accepted: bool,
+    pub counterparty_accepted: bool,
+    pub tick_opened: u64,
+}
+
+/// Result of an executed player trade: who traded with whom and what each side gave (now in
+/// the other's inventory). Delivered to callers for packet construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerTradeExecution {
+    pub initiator: u64,
+    pub counterparty: u64,
+    /// Items that left the initiator's inventory (the counterparty received these).
+    pub initiator_gave: Vec<ItemInstance>,
+    /// Items that left the counterparty's inventory (the initiator received these).
+    pub counterparty_gave: Vec<ItemInstance>,
+}
+
+/// A reference into one player's owned container inventory for trade staging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TradeItemReference {
+    pub container_id: u8,
+    pub item_index: usize,
 }
 
 impl WorldState {
@@ -3974,6 +4014,359 @@ impl WorldState {
             .filter(|(id, _)| **id >= DYNAMIC_ID_BASE)
             .map(|(id, runtime)| (*id, runtime.entity.name.clone(), runtime.entity.position))
             .collect()
+    }
+
+    /// Opens a player-to-player trade session. Both players must exist, be distinct, and hold
+    /// no other active trade. Returns the opened session for window display.
+    pub fn open_player_trade(
+        &mut self,
+        initiator: u64,
+        counterparty: u64,
+    ) -> Result<&PlayerTradeSession, CoreError> {
+        if initiator == counterparty {
+            return Err(CoreError::TradeWithSelf);
+        }
+        for player_id in [initiator, counterparty] {
+            if !self.players.contains_key(&player_id) {
+                return Err(CoreError::UnknownPlayer(player_id));
+            }
+            if self
+                .player_respawn_states
+                .get(&player_id)
+                .is_some_and(|state| state.dead)
+            {
+                return Err(CoreError::PlayerIsDead(player_id));
+            }
+        }
+        if self.active_trades.contains_key(&initiator)
+            || self.active_trades.contains_key(&counterparty)
+        {
+            return Err(CoreError::PlayerAlreadyTrading(initiator));
+        }
+        // One authoritative record per trade, stored under the initiator's id. Both sides
+        // resolve through the lookup helpers so mutations always hit the same copy.
+        self.active_trades.insert(
+            initiator,
+            PlayerTradeSession {
+                initiator,
+                counterparty,
+                initiator_items: Vec::new(),
+                counterparty_items: Vec::new(),
+                initiator_accepted: false,
+                counterparty_accepted: false,
+                tick_opened: self.tick,
+            },
+        );
+        Ok(self
+            .active_trades
+            .get(&initiator)
+            .expect("session was just inserted"))
+    }
+
+    /// Reads the live trade session involving one player, if any.
+    pub fn player_trade(&self, player_id: u64) -> Option<&PlayerTradeSession> {
+        if let Some(session) = self.active_trades.get(&player_id) {
+            return Some(session);
+        }
+        self.active_trades
+            .values()
+            .find(|session| session.counterparty == player_id)
+    }
+
+    fn active_trade_entry_mut(
+        &mut self,
+        player_id: u64,
+    ) -> Result<&mut PlayerTradeSession, CoreError> {
+        if self.active_trades.contains_key(&player_id) {
+            return self
+                .active_trades
+                .get_mut(&player_id)
+                .ok_or(CoreError::NoActiveTrade(player_id));
+        }
+        let initiator = self
+            .active_trades
+            .values()
+            .find(|session| session.counterparty == player_id)
+            .map(|session| session.initiator)
+            .ok_or(CoreError::NoActiveTrade(player_id))?;
+        self.active_trades
+            .get_mut(&initiator)
+            .ok_or(CoreError::NoActiveTrade(player_id))
+    }
+
+    /// Stages one container item reference into a side's offer. Staging resets both acceptance
+    /// flags because either offer changed. Bounded by MAX_TRADE_ITEMS_PER_SIDE.
+    pub fn stage_trade_item(
+        &mut self,
+        player_id: u64,
+        reference: TradeItemReference,
+    ) -> Result<usize, CoreError> {
+        let session = self.active_trade_entry_mut(player_id)?;
+        let (side_items, other_side) = if session.initiator == player_id {
+            (
+                &mut session.initiator_items,
+                &mut session.counterparty_accepted,
+            )
+        } else {
+            (
+                &mut session.counterparty_items,
+                &mut session.initiator_accepted,
+            )
+        };
+        if side_items.len() >= MAX_TRADE_ITEMS_PER_SIDE {
+            return Err(CoreError::TradeItemLimit(MAX_TRADE_ITEMS_PER_SIDE));
+        }
+        if side_items.contains(&reference) {
+            return Err(CoreError::DuplicateTradeItem);
+        }
+        *other_side = false;
+        session.initiator_accepted = false;
+        side_items.push(reference);
+        Ok(side_items.len())
+    }
+
+    /// Removes one staged reference from a side's offer, resetting acceptances.
+    pub fn unstage_trade_item(
+        &mut self,
+        player_id: u64,
+        reference: TradeItemReference,
+    ) -> Result<(), CoreError> {
+        let session = self.active_trade_entry_mut(player_id)?;
+        let (side_items, other_side) = if session.initiator == player_id {
+            (
+                &mut session.initiator_items,
+                &mut session.counterparty_accepted,
+            )
+        } else {
+            (
+                &mut session.counterparty_items,
+                &mut session.initiator_accepted,
+            )
+        };
+        let Some(position) = side_items.iter().position(|staged| *staged == reference) else {
+            return Err(CoreError::UnknownTradeItem);
+        };
+        side_items.remove(position);
+        *other_side = false;
+        session.initiator_accepted = false;
+        Ok(())
+    }
+
+    /// Records one side's acceptance. Returns true only when both sides have now accepted —
+    /// the caller must still perform the authoritative atomic swap before closing.
+    pub fn accept_player_trade(&mut self, player_id: u64) -> Result<bool, CoreError> {
+        let session = self.active_trade_entry_mut(player_id)?;
+        if session.initiator == player_id {
+            session.initiator_accepted = true;
+        } else {
+            session.counterparty_accepted = true;
+        }
+        Ok(session.initiator_accepted && session.counterparty_accepted)
+    }
+
+    /// Cancels any live trade touching one player (logout, rejection, walk-away). The other
+    /// participant is located through the shared session record. Returns the other player id
+    /// when a trade existed so callers can notify them.
+    pub fn cancel_player_trade(&mut self, player_id: u64) -> Option<u64> {
+        let (key, other) = if let Some(session) = self.active_trades.get(&player_id) {
+            if session.initiator == player_id {
+                (player_id, session.counterparty)
+            } else {
+                (session.initiator, player_id)
+            }
+        } else {
+            let found = self
+                .active_trades
+                .iter()
+                .find(|(_, session)| session.counterparty == player_id)
+                .map(|(initiator, _)| *initiator)?;
+            (found, player_id)
+        };
+        self.active_trades.remove(&key);
+        Some(other)
+    }
+
+    /// Executes the accepted trade as one atomic transition. Both sides' staged references are
+    /// re-resolved against their live inventories inside the same borrow: any missing or
+    /// duplicated item aborts the whole swap without touching either player (anti-dupe).
+    /// On success both inventories are exchanged, the trade closes for both participants, and
+    /// the moved items are returned for packet delivery.
+    pub fn execute_player_trade(
+        &mut self,
+        player_id: u64,
+    ) -> Result<PlayerTradeExecution, CoreError> {
+        let session = self
+            .player_trade(player_id)
+            .cloned()
+            .ok_or(CoreError::NoActiveTrade(player_id))?;
+        if !(session.initiator_accepted && session.counterparty_accepted) {
+            return Err(CoreError::NoActiveTrade(player_id));
+        }
+        // Snapshot the session data so the mutable passes below never alias it.
+        let initiator = session.initiator;
+        let counterparty = session.counterparty;
+        let initiator_refs = session.initiator_items.clone();
+        let counterparty_refs = session.counterparty_items.clone();
+
+        // Pass 1 - resolve every staged reference to a concrete item snapshot. Any failure
+        // aborts before a single inventory mutates.
+        let mut resolve = |owner: u64,
+                           refs: &[TradeItemReference]|
+         -> Result<Vec<(TradeItemReference, ItemInstance)>, CoreError> {
+            refs.iter()
+                .map(|reference| {
+                    let item = self
+                        .player_containers
+                        .get(&owner)
+                        .and_then(|containers| {
+                            containers
+                                .container(reference.container_id)
+                                .and_then(|container| container.items.item(reference.item_index))
+                        })
+                        .cloned()
+                        .ok_or(CoreError::TradeItemMissing {
+                            player_id: owner,
+                            container_id: reference.container_id,
+                            item_index: reference.item_index,
+                        })?;
+                    Ok((*reference, item))
+                })
+                .collect()
+        };
+        let initiator_resolved = resolve(initiator, &initiator_refs)?;
+        let counterparty_resolved = resolve(counterparty, &counterparty_refs)?;
+
+        // Pass 2 - remove all offered items from both sides first, then insert the received
+        // items. Removal-first ordering means a capacity shortfall cannot duplicate items: the
+        // inserts go into containers that no longer hold the removed goods, and any insert
+        // failure rolls the whole transition back through explicit restore before returning.
+        let mut remove_offered =
+            |owner: u64,
+             resolved: Vec<(TradeItemReference, ItemInstance)>|
+             -> Result<Vec<(TradeItemReference, ItemInstance)>, CoreError> {
+                let mut removed = Vec::new();
+                for (reference, _item) in resolved {
+                    let Some(containers) = self.player_containers.get_mut(&owner) else {
+                        return Err(CoreError::TradeItemMissing {
+                            player_id: owner,
+                            container_id: reference.container_id,
+                            item_index: reference.item_index,
+                        });
+                    };
+                    let Some(container) = containers.container_mut(reference.container_id) else {
+                        return Err(CoreError::TradeItemMissing {
+                            player_id: owner,
+                            container_id: reference.container_id,
+                            item_index: reference.item_index,
+                        });
+                    };
+                    match container.items.remove(reference.item_index) {
+                        Some(removed_item) => removed.push((reference, removed_item)),
+                        None => {
+                            // Restore already-removed items in reverse order.
+                            for (restore_ref, restore_item) in removed.iter().rev() {
+                                if let Some(containers) = self.player_containers.get_mut(&owner) {
+                                    if let Some(container) =
+                                        containers.container_mut(restore_ref.container_id)
+                                    {
+                                        let _ = container.items.insert(restore_item.clone());
+                                    }
+                                }
+                            }
+                            return Err(CoreError::TradeItemMissing {
+                                player_id: owner,
+                                container_id: reference.container_id,
+                                item_index: reference.item_index,
+                            });
+                        }
+                    }
+                }
+                Ok(removed)
+            };
+        let initiator_removed = remove_offered(initiator, initiator_resolved.clone())?;
+        let counterparty_removed = match remove_offered(counterparty, counterparty_resolved.clone())
+        {
+            Ok(items) => items,
+            Err(error) => {
+                // Roll the initiator's removals back before propagating.
+                for (reference, item) in initiator_removed.iter().rev() {
+                    if let Some(containers) = self.player_containers.get_mut(&initiator) {
+                        if let Some(container) = containers.container_mut(reference.container_id) {
+                            let _ = container.items.insert(item.clone());
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        };
+
+        // Pass 3 - deliver each side's received goods into their first container with space.
+        let deliver =
+            |this: &mut Self, owner: u64, items: Vec<ItemInstance>| -> Result<(), CoreError> {
+                for item in items {
+                    let container_ids: Vec<u8> = this
+                        .player_containers
+                        .get(&owner)
+                        .map(|containers| containers.iter().map(|(id, _)| id).collect())
+                        .unwrap_or_default();
+                    let mut placed = false;
+                    for container_id in container_ids {
+                        let Some(containers) = this.player_containers.get_mut(&owner) else {
+                            continue;
+                        };
+                        let Some(mut container) = containers.remove(container_id) else {
+                            continue;
+                        };
+                        let merged = container.items.merge_or_insert_stack(item.clone()).is_ok();
+                        let _ = containers.insert(container);
+                        if merged {
+                            placed = true;
+                            break;
+                        }
+                    }
+                    if !placed {
+                        return Err(CoreError::TradeValidationFailed(format!(
+                            "player {owner} has no space for a traded item"
+                        )));
+                    }
+                }
+                Ok(())
+            };
+        if let Err(error) = deliver(
+            self,
+            initiator,
+            counterparty_removed
+                .iter()
+                .map(|(_, item)| item.clone())
+                .collect(),
+        ) {
+            return Err(error);
+        }
+        deliver(
+            self,
+            counterparty,
+            initiator_removed
+                .iter()
+                .map(|(_, item)| item.clone())
+                .collect(),
+        )?;
+
+        // Close the trade for both participants.
+        self.active_trades.remove(&initiator);
+        self.active_trades.remove(&counterparty);
+        self.mark_changed();
+        Ok(PlayerTradeExecution {
+            initiator,
+            counterparty,
+            initiator_gave: initiator_removed
+                .into_iter()
+                .map(|(_, item)| item)
+                .collect(),
+            counterparty_gave: counterparty_removed
+                .into_iter()
+                .map(|(_, item)| item)
+                .collect(),
+        })
     }
 
     pub fn static_creature(&self, id: u32) -> Option<&FeTfsStaticEntity> {
@@ -7051,6 +7444,28 @@ pub enum CoreError {
     SpawnPositionRejected(Position),
     /// The dynamic spawn registry is exhausted; operators must despawn before summoning more.
     DynamicSpawnLimit(usize),
+    /// A player attempted to trade with themself.
+    TradeWithSelf,
+    /// One trade participant is already in another trade.
+    PlayerAlreadyTrading(u64),
+    /// No live trade session exists for this player.
+    NoActiveTrade(u64),
+    /// The trade-side staging set is full.
+    TradeItemLimit(usize),
+    /// The same container slot was staged twice on one side.
+    DuplicateTradeItem,
+    /// The referenced staged item was not found.
+    UnknownTradeItem,
+    /// One side's staged item no longer resolves against their live inventory, so the swap
+    /// was refused atomically without mutating either player.
+    TradeItemMissing {
+        player_id: u64,
+        container_id: u8,
+        item_index: usize,
+    },
+    /// Both sides accepted but the authoritative re-validation failed before any mutation;
+    /// inventories are untouched and the trade must be renegotiated.
+    TradeValidationFailed(String),
     InvalidStaticCreatureHealthPercent(u8),
     InvalidStaticCreatureReactivationDelay {
         id: u32,
@@ -12841,5 +13256,230 @@ mod tests {
             DeathLossPolicy::from_config(101),
             Err(CoreError::InvalidDeathLossPolicy)
         );
+    }
+}
+
+/// Player-to-player trade state-machine coverage: open gating, staging bounds, atomic swap
+/// success, and the anti-dupe abort when a staged reference no longer resolves.
+#[cfg(test)]
+mod player_trade_tests {
+    use super::*;
+
+    fn two_players() -> WorldState {
+        let mut world = WorldState::default();
+        world
+            .add_player_with_vitals(
+                Player {
+                    id: 1,
+                    account_id: 1,
+                    name: "Alice".into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4200,
+                    skill_points: 0,
+                },
+                PlayerVitals::default(),
+            )
+            .unwrap();
+        world
+            .add_player_with_vitals(
+                Player {
+                    id: 2,
+                    account_id: 2,
+                    name: "Bob".into(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 4200,
+                    skill_points: 0,
+                },
+                PlayerVitals::default(),
+            )
+            .unwrap();
+        world
+    }
+
+    fn give_container(world: &mut WorldState, owner: u64, container_id: u8) {
+        let containers = world.player_containers.entry(owner).or_default();
+        let backpack = PlayerContainer::new(
+            container_id,
+            ItemInstance::new(2854, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        containers.insert(backpack).unwrap();
+    }
+
+    fn add_item(world: &mut WorldState, owner: u64, container_id: u8, item_id: u16) -> usize {
+        let containers = world.player_containers.get_mut(&owner).unwrap();
+        let container = containers.container_mut(container_id).unwrap();
+        container
+            .items
+            .merge_or_insert_stack(ItemInstance::new(item_id, 1).unwrap())
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn trade_open_gates_self_unknown_and_busy_participants() {
+        let mut world = two_players();
+        assert!(matches!(
+            world.open_player_trade(1, 1),
+            Err(CoreError::TradeWithSelf)
+        ));
+        assert!(matches!(
+            world.open_player_trade(1, 99),
+            Err(CoreError::UnknownPlayer(99))
+        ));
+        world.open_player_trade(1, 2).unwrap();
+    }
+
+    #[test]
+    fn staging_resets_acceptance_and_enforces_bounds() {
+        let mut world = two_players();
+        give_container(&mut world, 1, 0);
+        give_container(&mut world, 2, 0);
+        world.open_player_trade(1, 2).unwrap();
+
+        let index = add_item(&mut world, 1, 0, 3031);
+        world
+            .stage_trade_item(
+                1,
+                TradeItemReference {
+                    container_id: 0,
+                    item_index: index,
+                },
+            )
+            .unwrap();
+        // A single acceptance is not enough; restaging resets both flags.
+        assert!(!world.accept_player_trade(1).unwrap());
+        assert!(world
+            .stage_trade_item(
+                1,
+                TradeItemReference {
+                    container_id: 0,
+                    item_index: index
+                }
+            )
+            .is_err()); // duplicate staging is rejected without changing the offer
+        let session = world.player_trade(1).unwrap().clone();
+        assert_eq!(session.initiator_items.len(), 1);
+        // The duplicate rejection left the earlier acceptance intact.
+        assert!(session.initiator_accepted);
+        assert!(!session.counterparty_accepted);
+    }
+
+    #[test]
+    fn accepted_trade_swaps_items_atomically() {
+        let mut world = two_players();
+        give_container(&mut world, 1, 0);
+        give_container(&mut world, 2, 0);
+        let a_index = add_item(&mut world, 1, 0, 2160); // Alice offers item A
+        let b_index = add_item(&mut world, 2, 0, 2392); // Bob offers item B
+        world.open_player_trade(1, 2).unwrap();
+        world
+            .stage_trade_item(
+                1,
+                TradeItemReference {
+                    container_id: 0,
+                    item_index: a_index,
+                },
+            )
+            .unwrap();
+        world
+            .stage_trade_item(
+                2,
+                TradeItemReference {
+                    container_id: 0,
+                    item_index: b_index,
+                },
+            )
+            .unwrap();
+        assert!(!world.accept_player_trade(1).unwrap());
+        assert!(world.accept_player_trade(2).unwrap());
+
+        let execution = world.execute_player_trade(2).unwrap();
+        assert_eq!(execution.initiator, 1);
+        assert_eq!(execution.counterparty, 2);
+        assert_eq!(execution.initiator_gave.len(), 1);
+        assert_eq!(execution.counterparty_gave.len(), 1);
+
+        // The offered items changed owners.
+        let alice_items = world
+            .player_containers
+            .get(&1)
+            .unwrap()
+            .container(0)
+            .unwrap();
+        assert!(alice_items.items.iter().any(|item| item.server_id == 2392));
+        let bob_items = world
+            .player_containers
+            .get(&2)
+            .unwrap()
+            .container(0)
+            .unwrap();
+        assert!(bob_items.items.iter().any(|item| item.server_id == 2160));
+        // Trade closed for both sides.
+        assert!(world.player_trade(1).is_none());
+        assert!(world.player_trade(2).is_none());
+    }
+
+    #[test]
+    fn missing_staged_item_aborts_swap_without_touching_inventories() {
+        let mut world = two_players();
+        give_container(&mut world, 1, 0);
+        give_container(&mut world, 2, 0);
+        let a_index = add_item(&mut world, 1, 0, 2160);
+        let b_index = add_item(&mut world, 2, 0, 2392);
+        world.open_player_trade(1, 2).unwrap();
+        world
+            .stage_trade_item(
+                1,
+                TradeItemReference {
+                    container_id: 0,
+                    item_index: a_index,
+                },
+            )
+            .unwrap();
+        world
+            .stage_trade_item(
+                2,
+                TradeItemReference {
+                    container_id: 0,
+                    item_index: b_index,
+                },
+            )
+            .unwrap();
+        // Bob removes his offered item after staging (e.g. dropped it).
+        {
+            let containers = world.player_containers.get_mut(&2).unwrap();
+            containers.container_mut(0).unwrap().items.remove(b_index);
+        }
+        world.accept_player_trade(1).unwrap();
+        world.accept_player_trade(2).unwrap();
+        let error = world.execute_player_trade(1).unwrap_err();
+        assert!(matches!(
+            error,
+            CoreError::TradeItemMissing { player_id: 2, .. }
+        ));
+        // Anti-dupe: nothing moved on Alice's side either.
+        let alice_items = world
+            .player_containers
+            .get(&1)
+            .unwrap()
+            .container(0)
+            .unwrap();
+        assert!(alice_items.items.iter().any(|item| item.server_id == 2160));
+        // A failed swap leaves the session open so players can renegotiate or cancel.
+        assert!(world.player_trade(1).is_some());
     }
 }
