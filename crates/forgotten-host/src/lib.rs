@@ -11511,7 +11511,33 @@ fn handle_native_otclient_game(
                             )
                             .map_err(HostError::Protocol)?;
                             write_frame(stream, &reply_frame)?;
+                            // GM talkactions mutate authoritative state (summons, teleports,
+                            // deliveries), so this session resends its full viewport from live
+                            // shared state instead of silently adopting the bumped visibility
+                            // epoch — that swallow left summons invisible until relog
+                            // (live-test regression A1). Other sessions refresh through their
+                            // own epoch comparison.
                             shared_world.mark_visibility_changed();
+                            let mut refreshed_snapshot = snapshot.clone();
+                            refreshed_snapshot.player_position = native_position(player_position);
+                            refreshed_snapshot.player_direction = facing.protocol_direction();
+                            let refreshed_viewport = encode_shared_native_world_viewport(
+                                &config.client_profile,
+                                &refreshed_snapshot,
+                                world_map.as_ref(),
+                                shared_world,
+                                character.id,
+                            )?;
+                            let refreshed_static_spawns = shared_world.active_static_spawns()?;
+                            let refreshed_static_health_frames =
+                                native_static_creature_health_frames(
+                                    &config.client_profile,
+                                    &refreshed_static_spawns,
+                                )?;
+                            write_frame(stream, &refreshed_viewport)?;
+                            for frame in &refreshed_static_health_frames {
+                                write_frame(stream, frame)?;
+                            }
                             observed_visibility_epoch = shared_world.visibility_epoch();
                             native_diagnostic(
                                 config.extended_diagnostics,
@@ -18615,6 +18641,72 @@ mod tests {
         assert_eq!(two_target_outcome.source.server_id, 1945);
         assert_eq!(two_target_outcome.target.server_id, 1945);
         assert_eq!(shared.vitals_epoch(), 0);
+    }
+
+    #[test]
+    fn native_gm_talkaction_reply_is_followed_by_a_full_viewport_resend() {
+        let database_path = database_path("native-gm-spawn-viewport");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        database.update_player_gm_level(1, 2).unwrap();
+        drop(database);
+
+        let native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+
+        // GM SAY "/spawn Rat": the reply must be followed immediately by a full-map
+        // viewport resend. The previous behavior swallowed the visibility bump here,
+        // leaving summons invisible until relog (live-test regression A1).
+        let message = b"/spawn Rat";
+        let mut talk = vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_TALK, 1];
+        talk.extend_from_slice(&(message.len() as u16).to_le_bytes());
+        talk.extend_from_slice(message);
+        write_frame(&mut stream, &Frame(talk)).unwrap();
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut saw_reply = false;
+        let viewport_after_reply = loop {
+            let frame = read_frame(&mut stream).unwrap();
+            if saw_reply {
+                break frame;
+            }
+            if frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE) {
+                saw_reply = true;
+            }
+        };
+        assert_eq!(
+            viewport_after_reply.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
     }
 
     #[test]
