@@ -115,6 +115,10 @@ pub struct EngineConfig {
     /// Deterministic wander cadence for active static creatures, in world-tick seconds
     /// (plan v49 slice 4). Defaults to `4`; `0` opts out entirely.
     pub static_creature_wander_interval_ticks: u32,
+    /// Aggro range in tiles for declared direct-melee creatures (plan v49 slice 5). Defaults
+    /// to `3`; `0` disables melee targeting entirely. An explicit nonzero
+    /// `staticCreatureTargetAttackDamage` still overrides the cycling declared ranges.
+    pub static_creature_melee_aggro_range: u8,
     /// Configured corpse despawn delay in seconds. `0` disables decay; a positive value expires
     /// each spawned runtime corpse on a later native heartbeat.
     pub corpse_despawn_seconds: u32,
@@ -319,6 +323,15 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
             message: "must stay between 0 and 3600 seconds".into(),
         });
     }
+    let static_creature_melee_aggro_range =
+        optional_u16(&values, "staticCreatureMeleeAggroRange", 3)?;
+    if static_creature_melee_aggro_range > 8 {
+        return Err(ConfigError::InvalidValue {
+            key: "staticCreatureMeleeAggroRange",
+            message: "must stay between 0 and 8".into(),
+        });
+    }
+    let static_creature_melee_aggro_range = static_creature_melee_aggro_range as u8;
     let corpse_despawn_seconds = optional_u32(&values, "corpseDespawnSeconds", 0)?;
     if corpse_despawn_seconds > 86_400 {
         return Err(ConfigError::InvalidValue {
@@ -492,6 +505,7 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         static_creature_target_attack_damage,
         static_creature_target_pursuit_range,
         static_creature_wander_interval_ticks,
+        static_creature_melee_aggro_range,
         corpse_despawn_seconds,
         party_shared_experience_rules,
         experience_stages,

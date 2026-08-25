@@ -168,7 +168,16 @@ pub struct StaticTargetPursuitSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticTargetAttackPolicy {
     Disabled,
-    SelectedAdjacentFixedDamage { damage: u16 },
+    SelectedAdjacentFixedDamage {
+        damage: u16,
+    },
+    /// Plan v49 slice 5 default: only creatures whose imported definition declares a bounded
+    /// direct-melee range participate, and each hit cycles that declaration's min..=max values
+    /// deterministically. `max_range` bounds target acquisition (aggro); adjacency is still
+    /// validated per attack by the existing core primitive.
+    DeclaredMeleeCycling {
+        max_range: u8,
+    },
 }
 
 /// Derives the acquisition range required by every enabled static-creature policy. Pursuit must
@@ -185,6 +194,7 @@ fn static_target_acquisition_policy(
     let attack_range = match attack_policy {
         StaticTargetAttackPolicy::Disabled => None,
         StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { .. } => Some(1),
+        StaticTargetAttackPolicy::DeclaredMeleeCycling { max_range } => Some(max_range),
     };
     match (pursuit_range, attack_range) {
         (Some(pursuit_range), Some(attack_range)) => {
@@ -269,7 +279,8 @@ fn advance_native_shared_world_heartbeat_with_static_target_policies(
     changed_static_targets += pursuit_summary.changed_static_targets;
     let static_target_attack_summary = match attack_policy {
         StaticTargetAttackPolicy::Disabled => StaticTargetAttackSummary::default(),
-        StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { .. } => shared_world
+        StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { .. }
+        | StaticTargetAttackPolicy::DeclaredMeleeCycling { .. } => shared_world
             .attack_static_creature_targets_once(
                 attack_policy,
                 world_map.ok_or_else(|| {
@@ -5749,13 +5760,19 @@ impl SharedNativeWorld {
         policy: StaticTargetAttackPolicy,
         world_map: &WorldMap,
     ) -> Result<StaticTargetAttackSummary, HostError> {
-        let StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage } = policy else {
+        if matches!(policy, StaticTargetAttackPolicy::Disabled) {
             return Ok(StaticTargetAttackSummary::default());
+        }
+        let fixed_damage = match policy {
+            StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage } => Some(damage),
+            _ => None,
         };
-        if !(1..=100).contains(&damage) {
-            return Err(HostError::InvalidConfiguration(
-                "static target attack damage must be between 1 and 100".into(),
-            ));
+        if let Some(damage) = fixed_damage {
+            if !(1..=100).contains(&damage) {
+                return Err(HostError::InvalidConfiguration(
+                    "static target attack damage must be between 1 and 100".into(),
+                ));
+            }
         }
         let mut world = self.lock()?;
         let creature_ids = world
@@ -5769,8 +5786,22 @@ impl SharedNativeWorld {
             ..StaticTargetAttackSummary::default()
         };
         for creature_id in creature_ids {
+            // Declared-melee policy (plan v49 slice 5): creatures whose definition declares no
+            // bounded direct-melee range stay outside the attack pass entirely, so the core
+            // fixed-damage fallback can never fire for them.
+            if fixed_damage.is_none() && !world.static_creature_declares_direct_melee(creature_id) {
+                continue;
+            }
+            let requested_damage = fixed_damage.unwrap_or_else(|| {
+                world
+                    .static_creature_declared_damage_for_next_hit(creature_id)
+                    .unwrap_or(0)
+            });
+            if requested_damage == 0 {
+                continue;
+            }
             let outcome = world
-                .apply_static_creature_target_damage(creature_id, damage, world_map)
+                .apply_static_creature_target_damage(creature_id, requested_damage, world_map)
                 .map_err(HostError::Core)?;
             match outcome {
                 StaticCreatureTargetAttackOutcome::CooldownNotDue { .. } => {
@@ -28811,6 +28842,135 @@ mod tests {
             }
         );
         assert_eq!(shared.visibility_epoch(), visibility_epoch + 1);
+    }
+
+    #[test]
+    fn heartbeat_declared_melee_attacks_skip_undeclared_creatures() {
+        let declared_id = 0x4000_0001;
+        let undeclared_id = 0x4000_0002;
+        let entity = |id: u32, x: u16| forgotten_core::FeTfsStaticEntity {
+            id,
+            name: "Rat".into(),
+            name_description: String::new(),
+            position: Position { x, y: 100, z: 7 },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut map = WorldMap::new(
+            "declared-melee",
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+        );
+        for x in 99..=103 {
+            for y in 99..=101 {
+                map.set_tile(
+                    Position { x, y, z: 7 },
+                    WorldMapTile {
+                        ground_thing_id: 102,
+                        walkable: true,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        // Declared creature adjacent east; undeclared creature adjacent west. Both see the
+        // player at the spawn tile; only the declared one may attack under slice-5 policy.
+        let static_spawns = FeTfsStaticSpawnCollection::with_combat_metadata(
+            vec![entity(declared_id, 101), entity(undeclared_id, 99)],
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([(declared_id, 2_000_u32)]),
+            std::collections::BTreeMap::from([(
+                declared_id,
+                forgotten_core::StaticCreatureDirectMeleeDamageRange {
+                    min_damage: 2,
+                    max_damage: 4,
+                },
+            )]),
+        )
+        .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        let map = Arc::new(map);
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .update_player_vitals(
+                101,
+                forgotten_core::PlayerVitals {
+                    health: 50,
+                    max_health: 50,
+                    ..forgotten_core::PlayerVitals::default()
+                },
+            )
+            .unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .select_static_creature_target(declared_id, 1)
+            .unwrap();
+
+        let outcome = advance_native_shared_world_heartbeat_with_static_target_policies(
+            &shared,
+            1,
+            StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 },
+            StaticTargetPursuitPolicy::Disabled,
+            StaticTargetAttackPolicy::DeclaredMeleeCycling { max_range: 1 },
+            forgotten_core::StaticCreatureDecisionPolicy::Disabled,
+            0,
+            Some(&map),
+        )
+        .unwrap();
+        assert_eq!(outcome.static_target_attacks, 1);
+        assert_eq!(
+            outcome.static_target_attack_player_ids,
+            BTreeSet::from([101])
+        );
+        assert_eq!(
+            shared.lock().unwrap().player_vitals(101).unwrap().health,
+            48
+        );
+
+        // The next due attack (after the configured 2-tick melee cooldown from the imported
+        // 2000ms interval) cycles to the second declared value (3).
+        advance_native_shared_world_heartbeat_with_static_target_policies(
+            &shared,
+            2,
+            StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 },
+            StaticTargetPursuitPolicy::Disabled,
+            StaticTargetAttackPolicy::DeclaredMeleeCycling { max_range: 1 },
+            forgotten_core::StaticCreatureDecisionPolicy::Disabled,
+            0,
+            Some(&map),
+        )
+        .unwrap();
+        assert_eq!(
+            shared.lock().unwrap().player_vitals(101).unwrap().health,
+            45
+        );
     }
 
     #[test]

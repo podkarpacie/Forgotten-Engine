@@ -808,7 +808,12 @@ fn run_host(
             armor_multiplier_by_vocation,
             static_spawns: (!static_spawns.entities.is_empty()).then(|| Arc::new(static_spawns)),
             static_target_attack_policy: match config.static_creature_target_attack_damage {
-                0 => StaticTargetAttackPolicy::Disabled,
+                0 => match config.static_creature_melee_aggro_range {
+                    // Plan v49 slice 5 default: declared-melee creatures cycle their imported
+                    // ranges against the nearest living player within the aggro range.
+                    0 => StaticTargetAttackPolicy::Disabled,
+                    max_range => StaticTargetAttackPolicy::DeclaredMeleeCycling { max_range },
+                },
                 damage => StaticTargetAttackPolicy::SelectedAdjacentFixedDamage { damage },
             },
             static_target_pursuit_policy: match config.static_creature_target_pursuit_range {

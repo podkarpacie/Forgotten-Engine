@@ -4964,6 +4964,17 @@ impl WorldState {
     /// selected living player target. The target must remain adjacent. A potentially lethal hit
     /// validates the assigned town temple before health changes, then reuses the established
     /// authoritative death state. This does not schedule attacks or imply creature-AI parity.
+    /// Peeks the next declared direct-melee damage value for a static creature without
+    /// advancing its deterministic cycling sequence; the consuming transition remains
+    /// `apply_static_creature_target_damage`. `None` when no range is declared.
+    pub fn static_creature_declared_damage_for_next_hit(&self, id: u32) -> Option<u16> {
+        let runtime = self.static_creatures.get(&id)?;
+        let range = runtime.direct_melee_damage_range?;
+        let span = u64::from(range.max_damage) - u64::from(range.min_damage) + 1;
+        let offset = runtime.direct_melee_damage_sequence % span;
+        u16::try_from(u64::from(range.min_damage) + offset).ok()
+    }
+
     pub fn apply_static_creature_target_damage(
         &mut self,
         creature_id: u32,
@@ -5307,6 +5318,14 @@ impl WorldState {
             )?;
         }
         Ok(batch)
+    }
+
+    /// Whether the installed static creature declares a bounded direct-melee damage range.
+    /// Undeclared creatures stay outside declared-melee attack policies (plan v49 slice 5).
+    pub fn static_creature_declares_direct_melee(&self, id: u32) -> bool {
+        self.static_creatures
+            .get(&id)
+            .is_some_and(|runtime| runtime.direct_melee_damage_range.is_some())
     }
 
     /// Marks a static creature inactive without moving it. The deterministic world tick is
@@ -12081,6 +12100,74 @@ mod tests {
             ));
         }
         assert_eq!(world.player_vitals(7).unwrap().health, 39);
+    }
+
+    #[test]
+    fn static_creature_direct_melee_declares_and_peeks_without_consuming() {
+        let creature_id = 0x4000_0007;
+        let declared_position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let declared = FeTfsStaticEntity {
+            id: creature_id,
+            name: "Rat".into(),
+            name_description: String::new(),
+            position: declared_position,
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let undeclared_id = 0x4000_0008;
+        let mut undeclared = declared.clone();
+        undeclared.id = undeclared_id;
+        undeclared.position = Position {
+            x: 102,
+            y: 100,
+            z: 7,
+        };
+        let mut world = WorldState::default();
+        world
+            .install_static_creatures(
+                &FeTfsStaticSpawnCollection::with_combat_metadata(
+                    vec![declared, undeclared],
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeMap::new(),
+                    std::collections::BTreeMap::from([(
+                        creature_id,
+                        StaticCreatureDirectMeleeDamageRange {
+                            min_damage: 2,
+                            max_damage: 4,
+                        },
+                    )]),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert!(world.static_creature_declares_direct_melee(creature_id));
+        assert!(!world.static_creature_declares_direct_melee(undeclared_id));
+        assert_eq!(
+            world.static_creature_declared_damage_for_next_hit(creature_id),
+            Some(2)
+        );
+        // Peeking never advances the deterministic cycling sequence.
+        assert_eq!(
+            world.static_creature_declared_damage_for_next_hit(creature_id),
+            Some(2)
+        );
+        assert_eq!(
+            world.static_creature_declared_damage_for_next_hit(undeclared_id),
+            None
+        );
     }
 
     #[test]
