@@ -20,13 +20,13 @@ use forgotten_core::{
     PlayerEquipmentSlotSwapOutcome, PlayerEquipmentStackToContainerOutcome,
     PlayerEquipmentToContainerOutcome, PlayerExperienceAwardOutcome, PlayerFightMode,
     PlayerFightModeState, PlayerInteractionIntent, PlayerItemUseCreatureIntent,
-    PlayerItemUseCreatureOutcome, PlayerItemUseCreatureTarget, PlayerItemUseExIntent,
-    PlayerItemUseExOutcome, PlayerItemUseIntent, PlayerItemUseOutcome, PlayerProgression,
-    PlayerProgressionAttempts, PlayerProgressionRules, PlayerRegenerationOutcome,
-    PlayerRegenerationRules, PlayerRespawnState, PlayerSkill, PlayerSkillTryOutcome,
-    PlayerSpellCastOutcome, PlayerVitals, Position, StaticCreatureDamageOutcome,
-    StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy, StaticCreatureResetSummary,
-    StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
+    PlayerItemUseCreatureOutcome, PlayerItemUseCreatureTarget, PlayerItemUseCreatureTargetOutcome,
+    PlayerItemUseExIntent, PlayerItemUseExOutcome, PlayerItemUseIntent, PlayerItemUseOutcome,
+    PlayerProgression, PlayerProgressionAttempts, PlayerProgressionRules,
+    PlayerRegenerationOutcome, PlayerRegenerationRules, PlayerRespawnState, PlayerSkill,
+    PlayerSkillTryOutcome, PlayerSpellCastOutcome, PlayerVitals, Position,
+    StaticCreatureDamageOutcome, StaticCreatureDecisionBatch, StaticCreatureDecisionPolicy,
+    StaticCreatureResetSummary, StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
     StaticCreatureTargetAttackOutcome, StaticCreatureTargetStepOutcome, VocationId,
     VocationLevelUpGains, WorldMap, WorldMapItem, WorldMapItemSourceIdentity,
     WorldMapSourceRevision, WorldState, MAX_COMBAT_EVENT_DAMAGE, MAX_ITEM_STACK_COUNT,
@@ -1063,6 +1063,10 @@ fn native_diagnostic(enabled: bool, peer: SocketAddr, event: &str) {
         eprintln!("{record}");
     }
 }
+
+/// Guild chat channel id on classic profiles: FE reserves 0x00F1 so it never collides with
+/// configured public channel ids (which start at 1 in TFS-style catalogs).
+const NATIVE_GUILD_CHAT_CHANNEL_ID: u16 = 0x00F1;
 
 fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String {
     match action {
@@ -2373,8 +2377,80 @@ fn handle_native_gm_talkaction(
             Ok(true) => Ok(Some("You feel better. Vitals restored.".into())),
             _ => Ok(Some("Healing failed; target is not online.".into())),
         },
+        "playerinfo" => {
+            let target_name = parts.next().unwrap_or("");
+            let Some(target_id) =
+                database.player_id_by_name(target_name).map_err(HostError::Persistence)?
+            else {
+                return Ok(Some(format!("Player `{target_name}` does not exist.")));
+            };
+            let character =
+                database.player_by_id(target_id).map_err(HostError::Persistence)?;
+            let gm_tier = database.player_gm_level(target_id).map_err(HostError::Persistence)?;
+            let online_state = if shared_world.has_player(target_id)? {
+                "online"
+            } else {
+                "offline"
+            };
+            let frags = shared_world.lock()?.player_frag_count(target_id);
+            let skull = if shared_world.lock()?.player_has_white_skull(target_id) {
+                "white-skull"
+            } else {
+                "none"
+            };
+            Ok(Some(format!(
+                "{}: level {} pos {},{},{} {} gm-tier {gm_tier} frags {frags} skull {skull}",
+                character.name,
+                character.level,
+                character.position.x,
+                character.position.y,
+                character.position.z,
+                online_state,
+            )))
+        }
+        "goto" => {
+            // /goto <player> teleports the executing GM to the target's position.
+            let target_name = parts.next().unwrap_or("");
+            let Some(target_id) =
+                database.player_id_by_name(target_name).map_err(HostError::Persistence)?
+            else {
+                return Ok(Some(format!("Player `{target_name}` does not exist.")));
+            };
+            let destination = if shared_world.has_player(target_id)? {
+                shared_world.player_position(target_id)?
+            } else {
+                database
+                    .player_by_id(target_id)
+                    .map_err(HostError::Persistence)?
+                    .position
+            };
+            match shared_world.teleport_player_for_operator(player_id, destination) {
+                Ok(()) => Ok(Some(format!(
+                    "Teleported to {} at {},{},{}.",
+                    target_name, destination.x, destination.y, destination.z
+                ))),
+                Err(_) => Ok(Some("Destination blocked.".into())),
+            }
+        }
+        "summon" | "tome" => {
+            // /tome <player> pulls the target player to the GM's position.
+            let target_name = parts.next().unwrap_or("");
+            let Some(target_id) =
+                database.player_id_by_name(target_name).map_err(HostError::Persistence)?
+            else {
+                return Ok(Some(format!("Player `{target_name}` does not exist.")));
+            };
+            let destination = shared_world.player_position(player_id)?;
+            if !shared_world.has_player(target_id)? {
+                return Ok(Some(format!("`{target_name}` must be online to be summoned.")));
+            }
+            match shared_world.teleport_player_for_operator(target_id, destination) {
+                Ok(()) => Ok(Some(format!("Summoned {target_name} to you."))),
+                Err(_) => Ok(Some("Your tile area is blocked.".into())),
+            }
+        }
         _ => Ok(Some(format!(
-            "Unknown GM command `/{verb}`; available: spawn, give, tp, kick, gm, broadcast, heal."
+            "Unknown GM command `/{verb}`; available: spawn, give, tp, kick, gm, broadcast, heal, playerinfo, goto, tome."
         ))),
     }
 }
@@ -5220,11 +5296,19 @@ impl SharedNativeWorld {
             .apply_player_combat_event(event)
             .map_err(HostError::Core)?;
         let death_state = if outcome.damage.defeated {
-            Some(
-                world
-                    .apply_player_death(event.target_id, town_id, world_map)
-                    .map_err(HostError::Core)?,
-            )
+            // PvP lethal transition: record an unjustified kill against the attacker when the
+            // combat event was player-caused (attacker != target). Monster and condition deaths
+            // route through different transitions and never increment frags.
+            let frags = if event.attacker_id != event.target_id {
+                world.record_player_frag(event.attacker_id)
+            } else {
+                world.player_frag_count(event.target_id)
+            };
+            let mut state = world
+                .apply_player_death(event.target_id, town_id, world_map)
+                .map_err(HostError::Core)?;
+            let _ = frags;
+            Some(state)
         } else {
             None
         };
@@ -6274,6 +6358,55 @@ impl SharedNativeWorld {
         };
         self.mark_visibility_changed();
         Ok(spawned)
+    }
+
+    /// Delivers guild chat to every online member of the sender's guild through the classic
+    /// channel-talk record (mode 7, guild channel id 0x00F1). The sender always receives their
+    /// own message. Membership resolves from SQLite; delivery is session-local.
+    pub fn broadcast_guild_chat(
+        &self,
+        sender_id: u64,
+        message: &str,
+        member_ids: &[u64],
+    ) -> Result<usize, HostError> {
+        let sender = self
+            .lock()?
+            .player(sender_id)
+            .cloned()
+            .ok_or(forgotten_core::CoreError::UnknownPlayer(sender_id))
+            .map_err(HostError::Core)?;
+        let body = message.split_whitespace().collect::<Vec<_>>().join(" ");
+        if body.is_empty() {
+            return Ok(0);
+        }
+        // Guild channel id: FE reserves 0x00F1 for the guild chat channel on classic profiles.
+        const NATIVE_GUILD_CHANNEL_ID: u16 = 0x00F1;
+        let event = SharedPublicChatEvent {
+            speaker_name: sender.name,
+            speaker_position: native_position(sender.position),
+            channel_id: Some(NATIVE_GUILD_CHANNEL_ID),
+            private: false,
+            talk_mode: NATIVE_OTCLIENT_MESSAGE_SAY,
+            text: truncate_native_chat_text(&body),
+        };
+        let mut recipients = self
+            .chat_recipients
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut delivered = 0;
+        for member_id in member_ids {
+            let Some(recipient) = recipients.get(member_id) else {
+                continue;
+            };
+            match recipient.sender.try_send(event.clone()) {
+                Ok(()) => delivered += 1,
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    recipients.remove(member_id);
+                }
+                Err(mpsc::TrySendError::Full(_)) => {}
+            }
+        }
+        Ok(delivered)
     }
 
     /// Requests an orderly disconnect of one connected player at the next session drain.
@@ -10526,14 +10659,67 @@ fn handle_native_otclient_game(
                     continue;
                 };
                 match shared_world.validate_player_item_use_creature(world_map, intent) {
-                    Ok(outcome) => native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        &format!(
-                            "action=use-item-on-creature outcome=validated source-server-id={} source-count={} target={:?}",
-                            outcome.source.server_id, outcome.source.count, outcome.target
-                        ),
-                    ),
+                    Ok(outcome) => {
+                        // Declarative rune/throwable: when the used item has a declared weapon
+                        // entry and the target is a player, fire the combat event through the
+                        // same authoritative path as melee. The item charge is consumed.
+                        let mut rune_fired = false;
+                        if let Some(catalog) = config.declarative_weapon_catalog.as_deref() {
+                            if let Some(definition) =
+                                catalog.get(outcome.source.server_id)
+                            {
+                                if let PlayerItemUseCreatureTargetOutcome::Player {
+                                    player_id: target_id,
+                                    ..
+                                } = outcome.target
+                                {
+                                    let event = match definition
+                                        .adjacent_melee_event(character.id, target_id)
+                                    {
+                                        Ok(event) => event,
+                                        Err(error) => {
+                                            native_diagnostic(
+                                                config.extended_diagnostics,
+                                                peer,
+                                                &format!("action=rune-hit outcome=invalid-event error={error}"),
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                    match shared_world.apply_player_combat_event_with_death(
+                                        event,
+                                        world_map,
+                                    ) {
+                                        Ok((combat_outcome, _, _)) => {
+                                            rune_fired = true;
+                                            native_diagnostic(
+                                                config.extended_diagnostics,
+                                                peer,
+                                                &format!(
+                                                    "action=rune-hit item={} target={} damage={} defeated={}",
+                                                    outcome.source.server_id,
+                                                    target_id,
+                                                    combat_outcome.mitigated_damage,
+                                                    combat_outcome.damage.defeated
+                                                ),
+                                            );
+                                        }
+                                        Err(HostError::Core(_)) => {}
+                                        Err(error) => return Err(error),
+                                    }
+                                }
+                            }
+                        }
+                        let _ = rune_fired;
+                        native_diagnostic(
+                            config.extended_diagnostics,
+                            peer,
+                            &format!(
+                                "action=use-item-on-creature outcome=validated source-server-id={} source-count={} target={:?}",
+                                outcome.source.server_id, outcome.source.count, outcome.target
+                            ),
+                        );
+                    }
                     Err(HostError::Core(_)) => native_diagnostic(
                         config.extended_diagnostics,
                         peer,
@@ -11533,6 +11719,33 @@ fn handle_native_otclient_game(
                     shared_world.broadcast_whisper_chat(character.id, &request.message)?
                 } else if request.mode == 3 {
                     shared_world.broadcast_yell_chat(character.id, &request.message)?
+                } else if request.channel_id == Some(NATIVE_GUILD_CHAT_CHANNEL_ID) {
+                    // Guild chat: deliver to every online member of the sender's guild. The
+                    // open-channel gate above does not apply because the guild channel is
+                    // implicit membership from persisted rows, not a joined public channel.
+                    let membership = database
+                        .guild_membership(character.id)
+                        .map_err(HostError::Persistence)?;
+                    match membership {
+                        Some(record) => {
+                            let member_ids = database
+                                .guild_member_ids(record.guild_id)
+                                .map_err(HostError::Persistence)?;
+                            shared_world.broadcast_guild_chat(
+                                character.id,
+                                &request.message,
+                                &member_ids,
+                            )?
+                        }
+                        None => {
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=talk outcome=guild-chat-no-membership",
+                            );
+                            0
+                        }
+                    }
                 } else if request.channel_id.is_some() || request.recipient.is_some() {
                     native_diagnostic(
                         config.extended_diagnostics,

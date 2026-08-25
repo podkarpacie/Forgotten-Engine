@@ -2890,6 +2890,9 @@ pub struct WorldState {
     player_combat_cooldowns: BTreeMap<u64, PlayerCombatCooldown>,
     player_spell_cooldowns: BTreeMap<u64, PlayerSpellCooldown>,
     player_interactions: BTreeMap<u64, PlayerInteractionIntent>,
+    /// Unjustified player-kill counts keyed by killer id. Classic skulls derive from this;
+    /// decay and client skull frames remain separate slices.
+    player_frags: BTreeMap<u64, u32>,
     // Party state is intentionally session-local. These indexes model the authoritative
     // participant relationship only; client icons, private channels, shared experience, loot,
     // Lua hooks, and durable persistence belong to later independently verified slices.
@@ -4032,6 +4035,27 @@ impl WorldState {
     }
 
     /// Lists every dynamic summon as (id, name, position) records.
+    /// Records an unjustified player kill against the killer (classic frag). Returns the
+    /// killer's new total. Called from lethal PvP transitions; monster and condition deaths
+    /// never route through here.
+    pub fn record_player_frag(&mut self, killer_id: u64) -> u32 {
+        let frags = self.player_frags.entry(killer_id).or_insert(0);
+        *frags = frags.saturating_add(1);
+        let total = *frags;
+        self.mark_changed();
+        total
+    }
+
+    /// Reads one player's current unjustified-kill count.
+    pub fn player_frag_count(&self, player_id: u64) -> u32 {
+        self.player_frags.get(&player_id).copied().unwrap_or(0)
+    }
+
+    /// Classic skull classification: white skull at one or more unjustified kills.
+    pub fn player_has_white_skull(&self, player_id: u64) -> bool {
+        self.player_frag_count(player_id) > 0
+    }
+
     pub fn dynamic_spawn_records(&self) -> Vec<(u32, String, Position)> {
         const DYNAMIC_ID_BASE: u32 = 0x7000_0000;
         self.static_creatures
@@ -13590,5 +13614,43 @@ mod player_trade_tests {
         assert!(alice_items.items.iter().any(|item| item.server_id == 2160));
         // A failed swap leaves the session open so players can renegotiate or cancel.
         assert!(world.player_trade(1).is_some());
+    }
+}
+
+/// Frag tracking coverage: kills accumulate per killer, white-skull classification flips at
+/// one unjustified kill, and non-killers stay clean.
+#[cfg(test)]
+mod frag_tests {
+    use super::*;
+
+    #[test]
+    fn frags_accumulate_per_killer_and_drive_white_skull() {
+        let mut world = WorldState::default();
+        world
+            .add_player(Player {
+                id: 1,
+                account_id: 1,
+                name: "Killer".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4200,
+                skill_points: 0,
+            })
+            .unwrap();
+
+        assert_eq!(world.player_frag_count(1), 0);
+        assert!(!world.player_has_white_skull(1));
+
+        assert_eq!(world.record_player_frag(1), 1);
+        assert!(world.player_has_white_skull(1));
+        assert_eq!(world.record_player_frag(1), 2);
+        assert_eq!(world.player_frag_count(1), 2);
+
+        // A bystander has no frags.
+        assert_eq!(world.player_frag_count(2), 0);
     }
 }

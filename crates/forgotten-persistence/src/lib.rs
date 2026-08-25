@@ -1678,6 +1678,20 @@ impl EngineDatabase {
             .map_err(PersistenceError::Sql)
     }
 
+    /// Lists every member of one guild (player ids only), bounded by a sane ceiling so a
+    /// malformed membership table cannot explode memory.
+    pub fn guild_member_ids(&self, guild_id: u64) -> Result<Vec<u64>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT player_id FROM guild_membership WHERE guild_id = ?1 LIMIT 500")?;
+        let rows = statement.query_map(params![guild_id as i64], |row| row.get::<_, i64>(0))?;
+        let mut members = Vec::new();
+        for row in rows {
+            members.push(row? as u64);
+        }
+        Ok(members)
+    }
+
     pub fn save_player(&self, player: &Player) -> Result<(), PersistenceError> {
         self.connection.execute(
             "INSERT INTO players (id, account_id, name, x, y, z, level, experience, skill_points)\
