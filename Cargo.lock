@@ -216,7 +216,7 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "forgotten-config"
-version = "7.4.47"
+version = "7.4.48"
 dependencies = [
  "forgotten-core",
  "forgotten-protocol",
@@ -225,11 +225,11 @@ dependencies = [
 
 [[package]]
 name = "forgotten-core"
-version = "7.4.47"
+version = "7.4.48"
 
 [[package]]
 name = "forgotten-engine-cli"
-version = "7.4.47"
+version = "7.4.48"
 dependencies = [
  "ctrlc",
  "forgotten-config",
@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "forgotten-host"
-version = "7.4.47"
+version = "7.4.48"
 dependencies = [
  "forgotten-config",
  "forgotten-core",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "forgotten-persistence"
-version = "7.4.47"
+version = "7.4.48"
 dependencies = [
  "argon2",
  "forgotten-core",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "forgotten-protocol"
-version = "7.4.47"
+version = "7.4.48"
 dependencies = [
  "forgotten-core",
  "num-bigint-dig",
@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "forgotten-scripting"
-version = "7.4.47"
+version = "7.4.48"
 dependencies = [
  "mlua",
 ]
