@@ -15538,6 +15538,183 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_summon_corpses_take_into_owned_inventory_end_to_end() {
+        // Plan v49 slice 7 acceptance: a /spawn summon (dynamic id range) that dies leaves its
+        // declared loot inside a runtime corpse, and that corpse takes into owned equipment
+        // through the exact registry path socket clients use.
+        let template_id = 0x5000_0001;
+        let mut template = forgotten_core::FeTfsStaticEntity {
+            id: template_id,
+            name: "Lootrat".into(),
+            name_description: String::new(),
+            position: Position {
+                x: 105,
+                y: 103,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let _ = &mut template;
+        let static_spawns = FeTfsStaticSpawnCollection::with_loot_tables(
+            vec![template],
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeSet::new(),
+            std::collections::BTreeMap::from([(
+                template_id,
+                vec![forgotten_core::StaticCreatureLootEntry {
+                    item_id: 2148,
+                    chance: 100_000,
+                    min_count: 3,
+                    max_count: 3,
+                }],
+            )]),
+        )
+        .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        let map_owner = SharedNativeMap::recover_complete_map_item_state(
+            (*native_world_map()).clone(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let database_path = database_path("dynamic-summon-corpse-take");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        let player_id = 101_u64;
+        database
+            .save_player(&Player {
+                id: player_id,
+                account_id: u64::from(u32::try_from(account_id).unwrap()),
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 0,
+                skill_points: 0,
+            })
+            .unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: player_id,
+                    account_id: u64::from(u32::try_from(account_id).unwrap()),
+                    name: "Knight".into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &native_world_map(),
+            )
+            .unwrap();
+        // Park the import template far away and deactivate it: only the summoned clone fights.
+        shared
+            .lock()
+            .unwrap()
+            .deactivate_static_creature(template_id)
+            .unwrap();
+
+        let dynamic_id = shared
+            .spawn_dynamic_entity_in_front_of_player(101, "Lootrat")
+            .unwrap();
+        assert!(dynamic_id >= 0x7000_0000);
+        shared
+            .set_player_static_target(101, Some(dynamic_id))
+            .unwrap();
+
+        let mut deactivated = false;
+        for _ in 0..40 {
+            if let Some(outcome) =
+                apply_native_selected_static_creature_melee(&shared, 101, &native_world_map())
+                    .unwrap()
+            {
+                persist_static_creature_runtime_to_open_database(&shared, &mut database).unwrap();
+                if outcome.deactivated {
+                    deactivated = true;
+                    break;
+                }
+                advance_native_shared_world_heartbeat(&shared, 2).unwrap();
+            }
+        }
+        assert!(deactivated, "the summoned creature must reach defeat");
+
+        let corpse_position = spawn_native_static_defeat_corpse(
+            &shared,
+            &map_owner,
+            &mut database,
+            dynamic_id,
+            7,
+            NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
+            0,
+        )
+        .unwrap()
+        .expect("defeated summons leave their declared corpse");
+        let runtime_corpse = map_owner
+            .runtime_tile_item(corpse_position, 0)
+            .unwrap()
+            .expect("corpse registered on the tile");
+        assert_eq!(
+            runtime_corpse.server_id,
+            NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID
+        );
+        assert_eq!(
+            runtime_corpse
+                .children
+                .iter()
+                .map(|child| child.server_id)
+                .collect::<Vec<_>>(),
+            vec![2148]
+        );
+
+        // Take the rolled gold from the open corpse window into the empty right hand.
+        map_owner
+            .move_runtime_item_to_inventory(
+                &shared,
+                &mut database,
+                101,
+                corpse_position,
+                0,
+                Some(0),
+                3,
+                forgotten_core::PlayerGroundDropSource::EquipmentSlot(EquipmentSlot::RightHand),
+                None,
+            )
+            .unwrap()
+            .expect("dynamic corpse take succeeds");
+        assert_eq!(
+            database
+                .player_equipment(101)
+                .unwrap()
+                .item(EquipmentSlot::RightHand)
+                .map(|item| (item.server_id, item.count)),
+            Some((2148, 3))
+        );
+        drop(database);
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn native_declared_corpse_resolution_prefers_the_imported_declaration() {
         let declared = BTreeMap::from([("rat".to_owned(), 3073_u16)]);
         assert_eq!(
@@ -20945,6 +21122,9 @@ mod tests {
         database.replace_player_containers(1, &containers).unwrap();
 
         let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.static_creature_wander_policy =
+            forgotten_core::StaticCreatureDecisionPolicy::Disabled;
+        native_config.static_creature_wander_every_ticks = 0;
         native_config.static_spawns = Some(Arc::new(
             FeTfsStaticSpawnCollection::with_combat_metadata_and_npc_ids(
                 vec![forgotten_core::FeTfsStaticEntity {
@@ -21176,6 +21356,9 @@ mod tests {
         database.replace_player_containers(1, &containers).unwrap();
 
         let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.static_creature_wander_policy =
+            forgotten_core::StaticCreatureDecisionPolicy::Disabled;
+        native_config.static_creature_wander_every_ticks = 0;
         native_config.static_spawns = Some(Arc::new(
             FeTfsStaticSpawnCollection::with_combat_metadata_and_npc_ids(
                 vec![forgotten_core::FeTfsStaticEntity {
@@ -27256,6 +27439,12 @@ mod tests {
             )
             .unwrap();
         native_config.item_presentation_catalog = Some(Arc::new(catalog));
+        // This regression pins an exact sequential frame dialogue; the slice-4 default-on
+        // wander would inject unsolicited viewport refreshes whenever the installed creature
+        // steps, so freeze it here.
+        native_config.static_creature_wander_policy =
+            forgotten_core::StaticCreatureDecisionPolicy::Disabled;
+        native_config.static_creature_wander_every_ticks = 0;
         let empty_world = native_config.empty_world.as_mut().unwrap();
         empty_world.outfit_first_look_type = 128;
         empty_world.outfit_last_look_type = 131;
@@ -28553,6 +28742,9 @@ mod tests {
             })
             .unwrap();
         let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.static_creature_wander_policy =
+            forgotten_core::StaticCreatureDecisionPolicy::Disabled;
+        native_config.static_creature_wander_every_ticks = 0;
         native_config.static_spawns = Some(Arc::new(
             FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
                 id: NATIVE_OTCLIENT_PLAYER_ID_END + 1,
