@@ -65,7 +65,8 @@ use forgotten_protocol::{
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
     encode_native_otclient_move_creature_at, encode_native_otclient_open_container,
-    encode_native_otclient_open_public_channel, encode_native_otclient_own_trade,
+    encode_native_otclient_open_npc_trade, encode_native_otclient_open_public_channel,
+    encode_native_otclient_own_trade, encode_native_otclient_player_goods,
     encode_native_otclient_player_modes, encode_native_otclient_player_skills,
     encode_native_otclient_player_stats, encode_native_otclient_private_message_from,
     encode_native_otclient_public_channel_say, encode_native_otclient_public_say,
@@ -79,10 +80,11 @@ use forgotten_protocol::{
     NativeOtClientCardinalDirection, NativeOtClientClassicChannel, NativeOtClientClassicItemRecord,
     NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
     NativeOtClientClassicPartyShield, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
-    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerVitals,
-    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientTradeItem,
-    NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
-    StatusSnapshot, MAX_FRAME_SIZE, MAX_LOGIN_STRING_BYTES, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES,
+    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerGood,
+    NativeOtClientPlayerVitals, NativeOtClientPosition, NativeOtClientProfile,
+    NativeOtClientShopItem, NativeOtClientTradeItem, NativeOtClientVisiblePlayer, OtClientEndpoint,
+    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    MAX_LOGIN_STRING_BYTES, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES,
     NATIVE_OTCLIENT_MESSAGE_GM_BROADCAST, NATIVE_OTCLIENT_MESSAGE_SAY,
     NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
@@ -1072,6 +1074,9 @@ fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String
         NativeOtClientGameAction::RequestTrade { .. } => "action=request-trade".into(),
         NativeOtClientGameAction::AcceptTrade => "action=accept-trade".into(),
         NativeOtClientGameAction::RejectTrade => "action=reject-trade".into(),
+        NativeOtClientGameAction::NpcBuy { .. } => "action=npc-buy".into(),
+        NativeOtClientGameAction::NpcSell { .. } => "action=npc-sell".into(),
+        NativeOtClientGameAction::NpcTradeClose => "action=npc-trade-close".into(),
         NativeOtClientGameAction::Turn(direction) => format!("action=turn direction={direction:?}"),
         NativeOtClientGameAction::CardinalMove(direction) => {
             format!("action=cardinal-move direction={direction:?}")
@@ -2069,6 +2074,100 @@ fn handle_native_trade_reject(
 ) -> Result<(), HostError> {
     shared_world.cancel_player_trade_and_signal(player_id)?;
     Ok(())
+}
+
+/// Builds and delivers the classic NPC shop windows (0x7A catalog + 0x7B player goods) for one
+/// player trading with a named NPC whose declarative shop exists. Returns false when the NPC
+/// has no shop or the presentation mapping is unavailable, so callers can fall through to the
+/// keyword path.
+fn deliver_native_npc_shop_windows(
+    stream: &mut TcpStream,
+    profile: &NativeOtClientProfile,
+    shared_world: &SharedNativeWorld,
+    database: &EngineDatabase,
+    player_id: u64,
+    npc_name: &str,
+    shop_catalog: &DeclarativeShopCatalog,
+    item_presentation_catalog: Option<&NativeItemPresentationCatalog>,
+    stackable_item_server_ids: Option<&BTreeSet<u16>>,
+    item_weight_by_server_id: Option<&BTreeMap<u16, u32>>,
+    item_name_by_server_id: Option<&BTreeMap<u16, String>>,
+) -> Result<bool, HostError> {
+    let Some(shop) = shop_catalog.by_npc_name(npc_name) else {
+        return Ok(false);
+    };
+    let Some(presentation) = item_presentation_catalog else {
+        return Ok(false);
+    };
+    // Catalog entries for the 0x7A record.
+    let mut shop_items = Vec::new();
+    for entry in shop.entries.iter().take(u8::MAX as usize) {
+        let Some(presented) = presentation.presentation(entry.server_id) else {
+            continue;
+        };
+        let name = item_name_by_server_id
+            .and_then(|names| names.get(&entry.server_id))
+            .cloned()
+            .unwrap_or_else(|| format!("item {}", entry.server_id));
+        let weight = item_weight_by_server_id
+            .and_then(|weights| weights.get(&entry.server_id))
+            .copied()
+            .unwrap_or(0);
+        let subtype = if stackable_item_server_ids.is_some_and(|ids| ids.contains(&entry.server_id))
+        {
+            None // classic stackables carry their count at buy time, not a subtype here
+        } else {
+            None
+        };
+        shop_items.push(NativeOtClientShopItem {
+            client_thing_id: presented.client_thing_id,
+            subtype,
+            name,
+            weight,
+            buy_price: u32::try_from(entry.buy_price_gold.unwrap_or(0)).unwrap_or(u32::MAX),
+            sell_price: u32::try_from(entry.sell_price_gold.unwrap_or(0)).unwrap_or(u32::MAX),
+        });
+    }
+    if shop_items.is_empty() {
+        return Ok(false);
+    }
+    let open_record =
+        encode_native_otclient_open_npc_trade(profile, &shop_items).map_err(HostError::Protocol)?;
+    write_frame(stream, &open_record)?;
+
+    // Player goods: gold balance plus sellable items found in owned containers.
+    let gold = database
+        .player_bank_balance(player_id)
+        .map_err(HostError::Persistence)?;
+    let containers = shared_world.player_containers(player_id)?;
+    let mut goods: Vec<NativeOtClientPlayerGood> = Vec::new();
+    for entry in shop.entries.iter() {
+        if entry.sell_price_gold.is_none() {
+            continue;
+        }
+        let Some(presented) = presentation.presentation(entry.server_id) else {
+            continue;
+        };
+        let mut amount = 0_u32;
+        for (_, container) in containers.iter() {
+            for item in container.items.iter() {
+                if item.server_id == entry.server_id {
+                    amount += u32::from(item.count);
+                }
+            }
+        }
+        if amount > 0 {
+            goods.push(NativeOtClientPlayerGood {
+                client_thing_id: presented.client_thing_id,
+                amount: u8::try_from(amount).unwrap_or(u8::MAX),
+            });
+        }
+    }
+    let goods_record =
+        encode_native_otclient_player_goods(profile, gold.min(u32::MAX as u64) as u32, &goods)
+            .map_err(HostError::Protocol)?;
+    write_frame(stream, &goods_record)?;
+    Ok(true)
 }
 
 fn handle_native_gm_talkaction(
@@ -10816,6 +10915,98 @@ fn handle_native_otclient_game(
                 handle_native_trade_reject(shared_world, character.id)?;
                 native_diagnostic(config.extended_diagnostics, peer, "action=reject-trade");
             }
+            NativeOtClientGameAction::NpcTradeClose => {
+                native_diagnostic(config.extended_diagnostics, peer, "action=npc-trade-close");
+            }
+            NativeOtClientGameAction::NpcBuy {
+                client_thing_id,
+                subtype: _,
+                amount,
+                _ignore_capacity: _,
+                _buy_with_backpack: _,
+            } => {
+                // Buy flows through the existing declarative shop keyword path by mapping the
+                // client thing id back to a server item via the presentation catalog.
+                let server_id = config
+                    .item_presentation_catalog
+                    .as_ref()
+                    .and_then(|catalog| {
+                        catalog.unique_server_id_for_client_thing_id(client_thing_id)
+                    });
+                let Some(server_id) = server_id else {
+                    let failure = encode_native_otclient_failure_message(
+                        &config.client_profile,
+                        "You cannot buy this item.",
+                    )
+                    .map_err(HostError::Protocol)?;
+                    write_frame(stream, &failure)?;
+                    continue;
+                };
+                let message = handle_native_shop_keyword(
+                    shared_world,
+                    &mut database,
+                    character.id,
+                    &format!("buy {server_id} {amount}"),
+                    config
+                        .shop_catalog
+                        .as_deref()
+                        .unwrap_or(&DeclarativeShopCatalog::default()),
+                )?;
+                let reply_frame = encode_native_otclient_status_message(
+                    &config.client_profile,
+                    &message.unwrap_or_else(|| "Nothing to buy here.".into()),
+                )
+                .map_err(HostError::Protocol)?;
+                write_frame(stream, &reply_frame)?;
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!("action=npc-buy item={server_id} amount={amount}"),
+                );
+            }
+            NativeOtClientGameAction::NpcSell {
+                client_thing_id,
+                subtype: _,
+                amount,
+                _ignore_equipped: _,
+            } => {
+                let server_id = config
+                    .item_presentation_catalog
+                    .as_ref()
+                    .and_then(|catalog| {
+                        catalog.unique_server_id_for_client_thing_id(client_thing_id)
+                    });
+                let Some(server_id) = server_id else {
+                    let failure = encode_native_otclient_failure_message(
+                        &config.client_profile,
+                        "You cannot sell this item.",
+                    )
+                    .map_err(HostError::Protocol)?;
+                    write_frame(stream, &failure)?;
+                    continue;
+                };
+                let message = handle_native_shop_keyword(
+                    shared_world,
+                    &mut database,
+                    character.id,
+                    &format!("sell {server_id} {amount}"),
+                    config
+                        .shop_catalog
+                        .as_deref()
+                        .unwrap_or(&DeclarativeShopCatalog::default()),
+                )?;
+                let reply_frame = encode_native_otclient_status_message(
+                    &config.client_profile,
+                    &message.unwrap_or_else(|| "Nothing to sell here.".into()),
+                )
+                .map_err(HostError::Protocol)?;
+                write_frame(stream, &reply_frame)?;
+                native_diagnostic(
+                    config.extended_diagnostics,
+                    peer,
+                    &format!("action=npc-sell item={server_id} amount={amount}"),
+                );
+            }
             NativeOtClientGameAction::SelectTarget(native_selected_id) => {
                 let outcome = apply_native_player_interaction(
                     shared_world,
@@ -11330,6 +11521,24 @@ fn handle_native_otclient_game(
                                     text.len()
                                 ),
                             );
+                            // A greeting near a shop NPC also opens the classic shop windows
+                            // (0x7A catalog + 0x7B player goods) when a declarative shop and
+                            // presentation mapping exist for it.
+                            if let Some(shop_catalog) = config.shop_catalog.as_deref() {
+                                let _ = deliver_native_npc_shop_windows(
+                                    stream,
+                                    &config.client_profile,
+                                    shared_world,
+                                    &database,
+                                    character.id,
+                                    &npc_name,
+                                    shop_catalog,
+                                    config.item_presentation_catalog.as_deref(),
+                                    config.stackable_item_server_ids.as_deref(),
+                                    config.item_weight_by_server_id.as_deref(),
+                                    config.item_name_by_server_id.as_deref(),
+                                )?;
+                            }
                         }
                     }
                 }

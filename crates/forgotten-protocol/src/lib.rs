@@ -934,6 +934,12 @@ pub const NATIVE_OTCLIENT_GAME_CREATURE_HEALTH: u8 = 0x8c;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT: u8 = 0x8e;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_PARTY: u8 = 0x91;
 pub const NATIVE_OTCLIENT_GAME_EDIT_TEXT: u8 = 0x96;
+/// Classic open-NPC-trade record (0x7A): NPC name + item list with names, weight, buy/sell.
+pub const NATIVE_OTCLIENT_GAME_OPEN_NPC_TRADE: u8 = 0x7a;
+/// Classic player-goods record (0x7B): player gold + sellable item list.
+pub const NATIVE_OTCLIENT_GAME_PLAYER_GOODS: u8 = 0x7b;
+/// Classic close-NPC-trade record (0x7C): zero payload.
+pub const NATIVE_OTCLIENT_GAME_CLOSE_NPC_TRADE: u8 = 0x7c;
 /// Classic own-trade record (0x7D): counterparty name + item list the sender offers.
 pub const NATIVE_OTCLIENT_GAME_OWN_TRADE: u8 = 0x7d;
 /// Classic counter-trade record (0x7E): counterparty name + item list offered back.
@@ -996,6 +1002,12 @@ pub const NATIVE_OTCLIENT_CLIENT_REQUEST_TRADE: u8 = 0x7d;
 pub const NATIVE_OTCLIENT_CLIENT_ACCEPT_TRADE: u8 = 0x7f;
 /// Classic reject/cancel-trade opcode: zero payload.
 pub const NATIVE_OTCLIENT_CLIENT_REJECT_TRADE: u8 = 0x80;
+/// Classic buy-from-NPC opcode: item id + subtype + amount + ignore-capacity + backpack flags.
+pub const NATIVE_OTCLIENT_CLIENT_BUY_ITEM: u8 = 0x7a;
+/// Classic sell-to-NPC opcode: item id + subtype + amount + ignore-equipped flag.
+pub const NATIVE_OTCLIENT_CLIENT_SELL_ITEM: u8 = 0x7b;
+/// Classic close-NPC-trade opcode: zero payload.
+pub const NATIVE_OTCLIENT_CLIENT_CLOSE_NPC_TRADE: u8 = 0x7c;
 pub const NATIVE_OTCLIENT_CLIENT_WALK_NORTH_EAST: u8 = 0x6a;
 pub const NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_EAST: u8 = 0x6b;
 pub const NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_WEST: u8 = 0x6c;
@@ -1459,6 +1471,22 @@ pub enum NativeOtClientGameAction {
     },
     AcceptTrade,
     RejectTrade,
+    /// Classic buy-from-NPC: item id + subtype + amount + ignore-capacity + backpack flags.
+    NpcBuy {
+        client_thing_id: u16,
+        subtype: u8,
+        amount: u8,
+        _ignore_capacity: bool,
+        _buy_with_backpack: bool,
+    },
+    /// Classic sell-to-NPC: item id + subtype + amount + ignore-equipped flag.
+    NpcSell {
+        client_thing_id: u16,
+        subtype: u8,
+        amount: u8,
+        _ignore_equipped: bool,
+    },
+    NpcTradeClose,
     RequestOutfit,
     RequestQuestLog,
     RequestQuestLine {
@@ -1989,6 +2017,93 @@ pub fn encode_native_otclient_close_trade(
         return Err(ProtocolError::UnsupportedNativeClientProfile);
     }
     Ok(Frame(vec![NATIVE_OTCLIENT_GAME_CLOSE_TRADE]))
+}
+
+/// One classic NPC-shop catalog entry for the 0x7A open record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeOtClientShopItem {
+    pub client_thing_id: u16,
+    pub subtype: Option<u8>,
+    pub name: String,
+    /// Weight in hundredths of an ounce as the legacy wire format expects.
+    pub weight: u32,
+    pub buy_price: u32,
+    pub sell_price: u32,
+}
+
+/// Encodes one classic open-NPC-trade (`0x7A`) record. On the classic profile the list count
+/// is a single byte, no NPC-name string precedes it, and prices are 32-bit.
+pub fn encode_native_otclient_open_npc_trade(
+    profile: &NativeOtClientProfile,
+    items: &[NativeOtClientShopItem],
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    if items.len() > u8::MAX as usize {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_OPEN_NPC_TRADE);
+    writer.byte(items.len() as u8);
+    for item in items {
+        if item.client_thing_id == 0 || item.name.len() > MAX_LOGIN_STRING_BYTES {
+            return Err(ProtocolError::UnsupportedNativeClientProfile);
+        }
+        writer.u16(item.client_thing_id);
+        if let Some(subtype) = item.subtype {
+            writer.byte(subtype);
+        }
+        writer.string(&item.name);
+        writer.u32(item.weight);
+        writer.u32(item.buy_price);
+        writer.u32(item.sell_price);
+    }
+    Ok(Frame(writer.finish()))
+}
+
+/// One sellable-good entry for the classic player-goods (`0x7B`) record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeOtClientPlayerGood {
+    pub client_thing_id: u16,
+    pub amount: u8,
+}
+
+/// Encodes one classic player-goods (`0x7B`) record: the player's gold plus the items they can
+/// sell to this NPC. Classic money is a 32-bit field and amounts are bytes.
+pub fn encode_native_otclient_player_goods(
+    profile: &NativeOtClientProfile,
+    gold: u32,
+    goods: &[NativeOtClientPlayerGood],
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    if goods.len() > u8::MAX as usize {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_PLAYER_GOODS);
+    writer.u32(gold);
+    writer.byte(goods.len() as u8);
+    for good in goods {
+        if good.client_thing_id == 0 {
+            return Err(ProtocolError::UnsupportedNativeClientProfile);
+        }
+        writer.u16(good.client_thing_id);
+        writer.byte(good.amount);
+    }
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes one classic close-NPC-trade (`0x7C`) record: zero payload.
+pub fn encode_native_otclient_close_npc_trade(
+    profile: &NativeOtClientProfile,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    Ok(Frame(vec![NATIVE_OTCLIENT_GAME_CLOSE_NPC_TRADE]))
 }
 
 fn encode_native_otclient_typed_text_message(
@@ -2804,6 +2919,35 @@ pub fn decode_native_otclient_game_action(
                 return Err(ProtocolError::InvalidNativeGameRequest);
             }
             NativeOtClientGameAction::AcceptTrade
+        }
+        NATIVE_OTCLIENT_CLIENT_BUY_ITEM => {
+            if reader.remaining() != 7 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            NativeOtClientGameAction::NpcBuy {
+                client_thing_id: reader.u16()?,
+                subtype: reader.byte()?,
+                amount: reader.byte()?,
+                _ignore_capacity: reader.byte()? != 0,
+                _buy_with_backpack: reader.byte()? != 0,
+            }
+        }
+        NATIVE_OTCLIENT_CLIENT_SELL_ITEM => {
+            if reader.remaining() != 5 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            NativeOtClientGameAction::NpcSell {
+                client_thing_id: reader.u16()?,
+                subtype: reader.byte()?,
+                amount: reader.byte()?,
+                _ignore_equipped: reader.byte()? != 0,
+            }
+        }
+        NATIVE_OTCLIENT_CLIENT_CLOSE_NPC_TRADE => {
+            if reader.remaining() != 0 {
+                return Err(ProtocolError::InvalidNativeGameRequest);
+            }
+            NativeOtClientGameAction::NpcTradeClose
         }
         NATIVE_OTCLIENT_CLIENT_REJECT_TRADE => {
             if reader.remaining() != 0 {
@@ -6019,5 +6163,95 @@ mod classic_760_visible_text_tests {
             "t"
         )
         .is_err());
+    }
+}
+
+/// NPC shop window coverage: 0x7A catalog record layout, 0x7B player-goods record, and the
+/// close-shop zero-payload frame.
+#[cfg(test)]
+mod npc_shop_window_tests {
+    use super::*;
+
+    fn profile_760() -> NativeOtClientProfile {
+        NativeOtClientProfile {
+            protocol_version: 760,
+            numeric_account_ids: true,
+            login_packet_encryption: false,
+            protocol_checksum: false,
+            challenge_on_login: false,
+            max_padding_bytes: 128,
+        }
+    }
+
+    #[test]
+    fn open_npc_trade_record_matches_classic_layout() {
+        let items = vec![
+            NativeOtClientShopItem {
+                client_thing_id: 2666,
+                subtype: None,
+                name: "ham".into(),
+                weight: 800,
+                buy_price: 8,
+                sell_price: 4,
+            },
+            NativeOtClientShopItem {
+                client_thing_id: 2854,
+                subtype: None,
+                name: "backpack".into(),
+                weight: 1800,
+                buy_price: 20,
+                sell_price: 10,
+            },
+        ];
+        let frame = encode_native_otclient_open_npc_trade(&profile_760(), &items).unwrap();
+        let mut expected = vec![
+            NATIVE_OTCLIENT_GAME_OPEN_NPC_TRADE,
+            2, // list count (classic u8)
+        ];
+        // Item 1: id + name + weight + buy + sell (no subtype for non-stackables)
+        expected.extend_from_slice(&[
+            u8::try_from(2666 & 0xff).unwrap(),
+            u8::try_from((2666 >> 8) & 0xff).unwrap(),
+        ]);
+        expected.extend_from_slice(&[3, 0]);
+        expected.extend_from_slice(b"ham");
+        expected.extend_from_slice(&[32, 3, 0, 0]); // weight 800
+        expected.extend_from_slice(&[8, 0, 0, 0]); // buy 8
+        expected.extend_from_slice(&[4, 0, 0, 0]); // sell 4
+                                                   // Item 2
+        expected.extend_from_slice(&[
+            u8::try_from(2854 & 0xff).unwrap(),
+            u8::try_from((2854 >> 8) & 0xff).unwrap(),
+        ]);
+        expected.extend_from_slice(&[8, 0]);
+        expected.extend_from_slice(b"backpack");
+        expected.extend_from_slice(&[8, 7, 0, 0]); // weight 1800
+        expected.extend_from_slice(&[20, 0, 0, 0]);
+        expected.extend_from_slice(&[10, 0, 0, 0]);
+        assert_eq!(frame.0, expected);
+    }
+
+    #[test]
+    fn player_goods_record_carries_gold_and_sellable_list() {
+        let goods = vec![NativeOtClientPlayerGood {
+            client_thing_id: 3031,
+            amount: 250,
+        }];
+        let frame = encode_native_otclient_player_goods(&profile_760(), 12345, &goods).unwrap();
+        let mut expected = vec![NATIVE_OTCLIENT_GAME_PLAYER_GOODS];
+        expected.extend_from_slice(&[57, 48, 0, 0]); // 12345 LE
+        expected.push(1); // one good
+        expected.extend_from_slice(&[
+            u8::try_from(3031 & 0xff).unwrap(),
+            u8::try_from((3031 >> 8) & 0xff).unwrap(),
+        ]);
+        expected.push(250);
+        assert_eq!(frame.0, expected);
+    }
+
+    #[test]
+    fn close_npc_trade_is_a_zero_payload_frame() {
+        let frame = encode_native_otclient_close_npc_trade(&profile_760()).unwrap();
+        assert_eq!(frame.0, vec![NATIVE_OTCLIENT_GAME_CLOSE_NPC_TRADE]);
     }
 }
