@@ -393,21 +393,47 @@ fn load_tfs_entity_catalog_from_data(
 
 fn load_monsters(directory: &Path, catalog: &mut TfsEntityCatalog) -> Result<(), ConfigError> {
     let registry_path = directory.join("monsters.xml");
-    if !registry_path.is_file() {
+    if registry_path.is_file() {
+        for reference in parse_registry_references(&registry_path, b"monsters", b"monster")? {
+            let Some(relative) = safe_relative_path(&reference.file) else {
+                catalog.unsafe_references.push(reference.file);
+                continue;
+            };
+            let definition_path = directory.join(relative);
+            if !definition_path.is_file() {
+                catalog.missing_definitions.push(definition_path);
+                continue;
+            }
+            let definition = parse_entity_definition(
+                &definition_path,
+                TfsEntityKind::Monster,
+                b"monster",
+                None,
+            )?;
+            add_entity(&mut catalog.monsters, definition)?;
+        }
         return Ok(());
     }
-    for reference in parse_registry_references(&registry_path, b"monsters", b"monster")? {
-        let Some(relative) = safe_relative_path(&reference.file) else {
-            catalog.unsafe_references.push(reference.file);
-            continue;
-        };
-        let definition_path = directory.join(relative);
-        if !definition_path.is_file() {
-            catalog.missing_definitions.push(definition_path);
+
+    // No registry: fall through to a bounded directory scan so operator-provided monster
+    // files still load (mirrors the NPC loader behavior). Subdirectories are not traversed.
+    if !directory.is_dir() {
+        return Ok(());
+    }
+    let mut direct_definitions = fs::read_dir(directory)
+        .map_err(ConfigError::Io)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ConfigError::Io)?;
+    direct_definitions.sort_by_key(|entry| entry.file_name());
+    for entry in direct_definitions {
+        let path = entry.path();
+        if path == registry_path
+            || !path.is_file()
+            || path.extension().and_then(|value| value.to_str()) != Some("xml")
+        {
             continue;
         }
-        let definition =
-            parse_entity_definition(&definition_path, TfsEntityKind::Monster, b"monster", None)?;
+        let definition = parse_entity_definition(&path, TfsEntityKind::Monster, b"monster", None)?;
         add_entity(&mut catalog.monsters, definition)?;
     }
     Ok(())

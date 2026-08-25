@@ -716,6 +716,18 @@ pub fn ensure_content_skeleton(world_directory: impl AsRef<Path>) -> Result<(), 
         )
         .map_err(ConfigError::Io)?;
     }
+    // Starter monster registry: TFS convention requires data/monster/monsters.xml mapping
+    // names to files. Without it the monster catalog loads empty and operator /spawn cannot
+    // resolve anything. The starter registry is empty; dropping Rat.xml etc. into
+    // data/monster/ works even without registry entries thanks to the loader's scan fallback.
+    let monster_registry = data.join("monster").join("monsters.xml");
+    if !monster_registry.exists() {
+        fs::write(
+            monster_registry,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<monsters>\n</monsters>\n",
+        )
+        .map_err(ConfigError::Io)?;
+    }
     Ok(())
 }
 
