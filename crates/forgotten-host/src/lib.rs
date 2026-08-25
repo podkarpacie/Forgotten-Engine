@@ -2076,6 +2076,54 @@ fn handle_native_trade_reject(
     Ok(())
 }
 
+/// Opens the player's home-town depot (depot id 0) as a read-only classic container window,
+/// hydrated from SQLite. Window ids for depots live in a dedicated high range so they never
+/// collide with owned-container or corpse windows. Item movement out of depots remains a
+/// deferred slice; this opens the window and shows contents.
+pub fn handle_native_depot_open(
+    stream: &mut TcpStream,
+    profile: &NativeOtClientProfile,
+    database: &EngineDatabase,
+    player_id: u64,
+    item_presentation_catalog: Option<&NativeItemPresentationCatalog>,
+) -> Result<bool, HostError> {
+    const DEPOT_WINDOW_ID_BASE: u8 = 0xE0;
+    let records = database
+        .player_depots(player_id)
+        .map_err(HostError::Persistence)?;
+    let depot_items = records
+        .iter()
+        .find(|record| record.depot_id == 0)
+        .map(|record| record.items.clone())
+        .unwrap_or_default();
+    let mut items = Vec::new();
+    for item in depot_items.iter().take(u8::MAX as usize) {
+        if let Some(record) = native_classic_item_record(item_presentation_catalog, item) {
+            items.push(record);
+        }
+    }
+    let frame = encode_native_otclient_open_container(
+        profile,
+        &NativeOtClientClassicOpenContainer {
+            container_id: DEPOT_WINDOW_ID_BASE.saturating_sub(1),
+            container_item: NativeOtClientClassicItemRecord {
+                client_thing_id: items
+                    .first()
+                    .map(|record| record.client_thing_id)
+                    .unwrap_or(1),
+                subtype: None,
+            },
+            name: "Depot".into(),
+            capacity: u8::MAX,
+            has_parent: false,
+            items,
+        },
+    )
+    .map_err(HostError::Protocol)?;
+    write_frame(stream, &frame)?;
+    Ok(true)
+}
+
 /// Builds and delivers the classic NPC shop windows (0x7A catalog + 0x7B player goods) for one
 /// player trading with a named NPC whose declarative shop exists. Returns false when the NPC
 /// has no shop or the presentation mapping is unavailable, so callers can fall through to the
@@ -2321,8 +2369,12 @@ fn handle_native_gm_talkaction(
                 Err(_) => Ok(Some("Broadcast failed; try again.".into())),
             }
         }
+        "heal" => match shared_world.restore_player_vitals(player_id) {
+            Ok(true) => Ok(Some("You feel better. Vitals restored.".into())),
+            _ => Ok(Some("Healing failed; target is not online.".into())),
+        },
         _ => Ok(Some(format!(
-            "Unknown GM command `/{verb}`; available: spawn, give, tp, kick, gm, broadcast."
+            "Unknown GM command `/{verb}`; available: spawn, give, tp, kick, gm, broadcast, heal."
         ))),
     }
 }
@@ -6272,6 +6324,28 @@ impl SharedNativeWorld {
             .lock()
             .map_err(|_| HostError::SharedWorldUnavailable)?;
         Ok(closed.remove(&player_id))
+    }
+
+    /// Restores a connected player's health and mana to their maximums. Used by operator
+    /// `/heal`; returns false when the player is offline.
+    pub fn restore_player_vitals(&self, player_id: u64) -> Result<bool, HostError> {
+        let current = self.player_and_vitals(player_id);
+        let Ok((_, vitals)) = current else {
+            return Ok(false);
+        };
+        let restored = PlayerVitals {
+            health: vitals.max_health,
+            mana: vitals.max_mana,
+            ..vitals
+        };
+        {
+            let mut world = self.lock()?;
+            world
+                .update_player_vitals(player_id, restored)
+                .map_err(HostError::Core)?;
+        }
+        self.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
     }
 
     /// Flags both participants' sessions to close their trade windows after a successful swap
