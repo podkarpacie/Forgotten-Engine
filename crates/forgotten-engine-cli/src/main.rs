@@ -59,11 +59,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             required_path(&arguments, 1)?,
             selected_profile(&arguments, 2)?,
         ),
-        "validate" => validate(required_path(&arguments, 1)?),
+        "validate" => validate(required_path(&arguments, 1)?, true),
         "tfs-audit" => audit_tfs_conversion(required_path(&arguments, 1)?),
         "run" => {
-            let (directory, extended_diagnostics) = run_options(&arguments)?;
-            run_host(directory, extended_diagnostics)
+            let options = run_options(&arguments)?;
+            run_host(
+                options.directory,
+                options.extended_diagnostics,
+                options.verbose,
+            )
         }
         "status" => status(required_path(&arguments, 1)?),
         "generate-key" => generate_key(required_path(&arguments, 1)?),
@@ -175,21 +179,35 @@ fn required_path(
         .ok_or_else(|| "a Forgotten Engine world directory is required".into())
 }
 
-fn run_options(arguments: &[String]) -> Result<(PathBuf, bool), Box<dyn std::error::Error>> {
+/// One parsed `run` invocation. `verbose` re-enables the full step-by-step startup banner that
+/// the condensed Cloud/supervisor default output omits (plan v49 slice 20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunOptions {
+    directory: PathBuf,
+    extended_diagnostics: bool,
+    verbose: bool,
+}
+
+fn run_options(arguments: &[String]) -> Result<RunOptions, Box<dyn std::error::Error>> {
     let directory = required_path(arguments, 1)?;
-    let mut extended_diagnostics = false;
+    let mut options = RunOptions {
+        directory,
+        extended_diagnostics: false,
+        verbose: false,
+    };
     for flag in &arguments[2..] {
         match flag.as_str() {
-            "--ed" | "--extended-debug" => extended_diagnostics = true,
+            "--ed" | "--extended-debug" => options.extended_diagnostics = true,
+            "--verbose" => options.verbose = true,
             _ => {
                 return Err(format!(
-                    "unknown run option `{flag}`; use --ed for bounded extended diagnostics"
+                    "unknown run option `{flag}`; use --ed for bounded extended diagnostics or --verbose for the full startup banner"
                 )
                 .into())
             }
         }
     }
-    Ok((directory, extended_diagnostics))
+    Ok(options)
 }
 
 fn selected_profile(
@@ -229,12 +247,18 @@ fn init(
     Ok(())
 }
 
-fn validate(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    println!(">> Loading config");
+fn validate(directory: PathBuf, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if verbose {
+        println!(">> Loading config");
+    }
     let config = load(&directory)?;
-    println!(">> Reconciling original content skeleton");
+    if verbose {
+        println!(">> Reconciling original content skeleton");
+    }
     ensure_content_skeleton(&directory)?;
-    println!(">> Validating data content");
+    if verbose {
+        println!(">> Validating data content");
+    }
     let content = validate_content(&directory)?;
     let raw_world_map = load_world_map(&config)?;
     let item_catalog = load_legacy_item_catalog(&config, &raw_world_map)?;
@@ -244,10 +268,17 @@ fn validate(directory: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     };
     let companions = load_world_companions(&config, &world_map)?;
     let vocations = load_tfs_vocation_registry(&config)?;
-    println!(">> Opening database");
+    if verbose {
+        println!(">> Opening database");
+    }
     let database = EngineDatabase::open(&config.database_path)?;
     if database.schema_version()? < 1 {
         return Err("database schema is not migrated".into());
+    }
+    if !verbose {
+        // Condensed supervisor banner (plan v49 slice 20): the standalone `validate`
+        // subcommand keeps the full summary; `run` prints endpoints only.
+        return Ok(());
     }
     println!(
         "> Validation complete: profile={} protocol={} game-port={} status-port={} map={} tiles={} spawn={},{},{} items={} spawns={} houses={} vocations={} data={} database={}",
@@ -467,9 +498,10 @@ fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Er
 fn run_host(
     directory: PathBuf,
     extended_diagnostics: bool,
+    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Forgotten Engine - {}", env!("CARGO_PKG_VERSION"));
-    validate(directory.clone())?;
+    validate(directory.clone(), verbose)?;
     let config = load(&directory)?;
     let raw_world_map = load_world_map(&config)?;
     let item_catalog = load_legacy_item_catalog(&config, &raw_world_map)?;
@@ -508,11 +540,13 @@ fn run_host(
     let database = EngineDatabase::open(&config.database_path)?;
     database.record_event("info", "Forgotten Engine host startup requested")?;
 
-    println!(">> Registering services");
-    if extended_diagnostics {
-        println!(
-            "> Extended diagnostics enabled: native session metadata is logged; credentials and packet bodies are excluded."
-        );
+    if verbose {
+        println!(">> Registering services");
+        if extended_diagnostics {
+            println!(
+                "> Extended diagnostics enabled: native session metadata is logged; credentials and packet bodies are excluded."
+            );
+        }
     }
     let rsa_private_key = if config.legacy_login_enabled || config.game_session_enabled {
         if config.profile.id != "fe-7.4" {
@@ -520,7 +554,9 @@ fn run_host(
                 "legacy login and game-session foundations are currently available only for the fe-7.4 profile".into(),
             );
         }
-        println!(">> Loading fe-7.4 foundation private key");
+        if verbose {
+            println!(">> Loading fe-7.4 foundation private key");
+        }
         Some(Arc::new(LegacyRsaPrivateKey::load_pem(
             &config.rsa_private_key_path,
         )?))
@@ -959,12 +995,14 @@ fn run_host(
             );
         }
     }
-    if config.legacy_login_enabled {
-        println!("> Bounded 7.4 login/character-list foundation is enabled; official-client acceptance remains unverified.");
-    } else {
-        println!(
-            "> Diagnostic probe service is enabled; legacy login remains disabled in config.lua."
-        );
+    if verbose {
+        if config.legacy_login_enabled {
+            println!("> Bounded 7.4 login/character-list foundation is enabled; official-client acceptance remains unverified.");
+        } else {
+            println!(
+                "> Diagnostic probe service is enabled; legacy login remains disabled in config.lua."
+            );
+        }
     }
     println!("> Server host online. Press Ctrl+C for an orderly shutdown.");
 
@@ -2334,7 +2372,7 @@ Commands:
   init <directory> [--profile fe-7.4]
   validate <directory>
   tfs-audit <directory>
-  run <directory> [--ed]
+  run <directory> [--ed] [--verbose]
   status <directory>
   generate-key <directory>
   backup <directory>
@@ -2407,7 +2445,11 @@ mod tests {
         let short = vec!["run".into(), "native-world".into(), "--ed".into()];
         assert_eq!(
             run_options(&short).unwrap(),
-            (PathBuf::from("native-world"), true)
+            RunOptions {
+                directory: PathBuf::from("native-world"),
+                extended_diagnostics: true,
+                verbose: false,
+            }
         );
 
         let long = vec![
@@ -2417,16 +2459,50 @@ mod tests {
         ];
         assert_eq!(
             run_options(&long).unwrap(),
-            (PathBuf::from("native-world"), true)
+            RunOptions {
+                directory: PathBuf::from("native-world"),
+                extended_diagnostics: true,
+                verbose: false,
+            }
         );
 
         let ordinary = vec!["run".into(), "native-world".into()];
         assert_eq!(
             run_options(&ordinary).unwrap(),
-            (PathBuf::from("native-world"), false)
+            RunOptions {
+                directory: PathBuf::from("native-world"),
+                extended_diagnostics: false,
+                verbose: false,
+            }
         );
 
-        let invalid = vec!["run".into(), "native-world".into(), "--verbose".into()];
+        // Plan v49 slice 20: --verbose re-enables the full step-by-step startup banner.
+        let verbose = vec!["run".into(), "native-world".into(), "--verbose".into()];
+        assert_eq!(
+            run_options(&verbose).unwrap(),
+            RunOptions {
+                directory: PathBuf::from("native-world"),
+                extended_diagnostics: false,
+                verbose: true,
+            }
+        );
+
+        let combined = vec![
+            "run".into(),
+            "native-world".into(),
+            "--ed".into(),
+            "--verbose".into(),
+        ];
+        assert_eq!(
+            run_options(&combined).unwrap(),
+            RunOptions {
+                directory: PathBuf::from("native-world"),
+                extended_diagnostics: true,
+                verbose: true,
+            }
+        );
+
+        let invalid = vec!["run".into(), "native-world".into(), "--frobnicate".into()];
         assert!(run_options(&invalid).is_err());
     }
 
@@ -2437,7 +2513,7 @@ mod tests {
             "init <directory>",
             "validate <directory>",
             "tfs-audit <directory>",
-            "run <directory> [--ed]",
+            "run <directory> [--ed] [--verbose]",
             "status <directory>",
             "generate-key <directory>",
             "backup <directory>",
