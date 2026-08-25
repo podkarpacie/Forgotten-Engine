@@ -1013,7 +1013,6 @@ fn native_container_delta_frames(
         sent.remove(&id);
     }
     for (container_id, current_window) in current.clone() {
-        let container_id = container_id;
         let Some(sent_window) = sent.get(&container_id).cloned() else {
             // Newly opened window (or previously unmapped): one full OpenContainer record.
             if let Some((capacity, items)) = current_window.as_ref() {
