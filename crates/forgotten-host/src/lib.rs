@@ -11079,10 +11079,18 @@ fn handle_native_otclient_game(
                     thing_id,
                     stack_position,
                 ) else {
-                    // Universal Look fallback: TFS always answers a look. When the client thing
-                    // id is not uniquely mapped (bare ground, unmapped decorations), reply with
-                    // a bounded generic description instead of silence.
-                    let message = format!("You see {thing_id}.");
+                    // Universal Look fallback: TFS always answers a look. Bare ground and
+                    // unmapped decorations resolve through the imported item name when
+                    // possible; raw numeric ids are never echoed (live-test regression A2).
+                    let message = native_ground_look_message(
+                        world_map,
+                        Position {
+                            x: position.x,
+                            y: position.y,
+                            z: position.z,
+                        },
+                        config.item_name_by_server_id.as_deref(),
+                    );
                     let response =
                         encode_native_otclient_look_message(&config.client_profile, &message)
                             .map_err(HostError::Protocol)?;
@@ -11099,7 +11107,15 @@ fn handle_native_otclient_game(
                     Err(HostError::Core(_)) => {
                         // Tile exists but the item reference did not resolve (moved, out of
                         // range, or stale stackpos). Answer generically like TFS does.
-                        let message = format!("You see {thing_id}.");
+                        let message = native_ground_look_message(
+                            world_map,
+                            Position {
+                                x: position.x,
+                                y: position.y,
+                                z: position.z,
+                            },
+                            config.item_name_by_server_id.as_deref(),
+                        );
                         let response =
                             encode_native_otclient_look_message(&config.client_profile, &message)
                                 .map_err(HostError::Protocol)?;
@@ -12948,6 +12964,11 @@ fn native_creature_inspection_message(
     let observer = world.player(observer_id).ok_or(HostError::Core(
         forgotten_core::CoreError::UnknownPlayer(observer_id),
     ))?;
+    if native_player_id(observer_id).is_ok_and(|native_id| native_id == native_creature_id) {
+        // Self-look: the client addresses the observer's own creature id at its tile
+        // stack position; classic servers answer with the fixed self sentence.
+        return Ok(Some("You see yourself.".into()));
+    }
     let message = if let Some(player_id) = native_player_id_to_character_id(native_creature_id) {
         let Some(target) = world.player(player_id) else {
             return Ok(None);
@@ -12965,15 +12986,48 @@ fn native_creature_inspection_message(
         {
             return Ok(None);
         }
-        world
-            .static_creature(native_creature_id)
-            .map(|creature| format!("You see {}.", creature.name))
+        world.static_creature(native_creature_id).map(|creature| {
+            if creature.name_description.is_empty() {
+                format!("You see {}.", creature.name)
+            } else {
+                // TFS nameDescription carries its own article ("a rat").
+                format!("You see {}.", creature.name_description)
+            }
+        })
     } else {
         // Unresolved creature ids (stale client cache, unmapped ranges) still get an answer:
         // classic servers never leave a look unanswered.
         Some(format!("You see a creature (id {native_creature_id})."))
     };
     Ok(message.filter(|message| message.len() <= NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES))
+}
+
+/// Bounded non-numeric look reply for bare ground and unmapped decorations. Resolves the
+/// topmost tile item's imported item name when the operator catalog provides one, degrades to
+/// a generic item sentence without one, and answers plain ground tiles with "You see ground."
+/// Raw numeric ids are never echoed back to clients (live-test regression A2).
+fn native_ground_look_message(
+    world_map: &WorldMap,
+    position: Position,
+    name_by_server_id: Option<&BTreeMap<u16, String>>,
+) -> String {
+    let resolved_name = world_map
+        .tile_items(position)
+        .and_then(|items| items.last())
+        .and_then(|item| name_by_server_id.and_then(|names| names.get(&item.server_id).cloned()));
+    match resolved_name {
+        Some(name) => format!("You see {name}."),
+        None => {
+            if world_map
+                .tile_items(position)
+                .is_some_and(|items| !items.is_empty())
+            {
+                "You see an item.".into()
+            } else {
+                "You see ground.".into()
+            }
+        }
+    }
 }
 
 fn apply_native_player_interaction(
@@ -19045,6 +19099,123 @@ mod tests {
                 target_static_creature_id: Some(creature_id),
                 follow_player_id: None,
             }
+        );
+    }
+
+    #[test]
+    fn native_creature_look_prefers_name_description_and_answers_self_looks() {
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let static_spawns =
+            FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
+                id: creature_id,
+                name: "Rat".into(),
+                name_description: "a rat".into(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 100,
+                direction: 2,
+            }])
+            .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        let map = native_world_map();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+
+        assert_eq!(
+            native_creature_inspection_message(&shared, 101, NATIVE_OTCLIENT_PLAYER_ID_START + 101)
+                .unwrap()
+                .as_deref(),
+            Some("You see yourself.")
+        );
+        assert_eq!(
+            native_creature_inspection_message(&shared, 101, creature_id)
+                .unwrap()
+                .as_deref(),
+            Some("You see a rat.")
+        );
+    }
+
+    #[test]
+    fn native_ground_look_replies_use_imported_names_and_never_numeric_ids() {
+        let item_position = Position {
+            x: 105,
+            y: 103,
+            z: 7,
+        };
+        let mut map = WorldMap::new(
+            "ground-look",
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+        );
+        map.set_tile(
+            item_position,
+            WorldMapTile {
+                ground_thing_id: 102,
+                walkable: true,
+            },
+        )
+        .unwrap();
+        map.set_tile_items(
+            item_position,
+            vec![WorldMapItem {
+                server_id: 2666,
+                client_thing_id: None,
+                count: 1,
+                action_id: None,
+                unique_id: None,
+                text: None,
+                description: None,
+                teleport_destination: None,
+                duration: None,
+                charges: None,
+                children: Vec::new(),
+            }],
+        )
+        .unwrap();
+        let names = BTreeMap::from([(2666u16, "Dragon Ham".to_owned())]);
+
+        assert_eq!(
+            native_ground_look_message(&map, item_position, Some(&names)),
+            "You see Dragon Ham."
+        );
+        assert_eq!(
+            native_ground_look_message(&map, item_position, None),
+            "You see an item."
+        );
+
+        let bare_ground = Position {
+            x: 107,
+            y: 107,
+            z: 7,
+        };
+        assert_eq!(
+            native_ground_look_message(&map, bare_ground, Some(&names)),
+            "You see ground."
         );
     }
 

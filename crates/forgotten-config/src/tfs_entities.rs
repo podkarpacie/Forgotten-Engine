@@ -17,6 +17,8 @@ const MAX_ENTITY_XML_DEPTH: usize = 32;
 /// tuning remain outside this import boundary.
 const MAX_MONSTER_LOOT_ITEMS: usize = 32;
 const MAX_ENTITY_DEFINITIONS: usize = 200_000;
+/// Bounded TFS `nameDescription` article text ("a rat") retained for Look replies.
+const MAX_ENTITY_NAME_DESCRIPTION_BYTES: usize = 128;
 const STATIC_TFS_ENTITY_ID_START: u32 = 0x4000_0001;
 const DEFAULT_STATIC_ENTITY_SPEED: u16 = 220;
 
@@ -39,6 +41,10 @@ impl TfsEntityKind {
 pub struct TfsEntityDefinition {
     pub kind: TfsEntityKind,
     pub name: String,
+    /// Optional TFS `nameDescription` article phrase including the indefinite article
+    /// (`"a rat"`), rendered by Look replies verbatim after "You see". Empty when the
+    /// definition omits it or the kind does not provide one.
+    pub name_description: String,
     /// Non-executing monster metadata retained for explicit future reward policies. NPCs and
     /// monster definitions without a root `experience` attribute retain zero.
     pub experience: u64,
@@ -243,7 +249,7 @@ pub fn materialize_tfs_static_spawns(
             entities.push(FeTfsStaticEntity {
                 id: next_id,
                 name: definition.name.clone(),
-                name_description: String::new(),
+                name_description: definition.name_description.clone(),
                 position: creature.position,
                 look_type: appearance.look_type,
                 head: appearance.head,
@@ -339,7 +345,7 @@ pub fn materialize_tfs_spawn_templates(
         entities.push(FeTfsStaticEntity {
             id: next_id,
             name: definition.name.clone(),
-            name_description: String::new(),
+            name_description: definition.name_description.clone(),
             position: Position { x: 0, y: 0, z: 0 },
             look_type: appearance.look_type,
             head: appearance.head,
@@ -697,6 +703,21 @@ fn entity_from_root_event(
     npc_directory: Option<&Path>,
 ) -> Result<TfsEntityDefinition, ConfigError> {
     let name = required_attribute_string(event, b"name")?;
+    let name_description = match optional_attribute_string(event, b"nameDescription")? {
+        Some(description) => {
+            let trimmed = description.trim();
+            if trimmed.len() > MAX_ENTITY_NAME_DESCRIPTION_BYTES {
+                return Err(invalid(format!(
+                    "TFS {} definition {} nameDescription exceeds {} bytes",
+                    kind.label(),
+                    definition_path.display(),
+                    MAX_ENTITY_NAME_DESCRIPTION_BYTES
+                )));
+            }
+            trimmed.to_owned()
+        }
+        None => String::new(),
+    };
     let (script_path, script_present) = if let Some(directory) = npc_directory {
         let script = optional_attribute_string(event, b"script")?;
         resolve_npc_script(directory, script.as_deref())
@@ -706,6 +727,7 @@ fn entity_from_root_event(
     Ok(TfsEntityDefinition {
         kind,
         name,
+        name_description,
         experience: if matches!(kind, TfsEntityKind::Monster) {
             optional_attribute_u64(event, b"experience")?.unwrap_or_default()
         } else {
@@ -1041,7 +1063,7 @@ mod tests {
         .unwrap();
         fs::write(
             data.join("monster/monsters/rat.xml"),
-            r#"<monster name="Rat" speed="134" experience="25"><health now="20" max="20"/><look type="21"/><attacks><attack name="melee" interval="2000" min="0" max="-40"/></attacks></monster>"#,
+            r#"<monster name="Rat" nameDescription="a rat" speed="134" experience="25"><health now="20" max="20"/><look type="21"/><attacks><attack name="melee" interval="2000" min="0" max="-40"/></attacks></monster>"#,
         )
         .unwrap();
         fs::write(
@@ -1055,6 +1077,7 @@ mod tests {
         assert!(catalog.contains(TfsEntityKind::Monster, "rat"));
         assert!(catalog.contains(TfsEntityKind::Npc, "ALICE"));
         assert_eq!(catalog.monsters[0].experience, 25);
+        assert_eq!(catalog.monsters[0].name_description, "a rat");
         assert_eq!(
             catalog.monsters[0].direct_melee,
             Some(TfsDirectMeleeAttack {
@@ -1080,6 +1103,14 @@ mod tests {
         );
         assert_eq!(catalog.missing_definitions.len(), 0);
         assert_eq!(catalog.missing_scripts.len(), 0);
+
+        let templates = materialize_tfs_spawn_templates(&catalog).unwrap();
+        let rendered = templates
+            .at(Position { x: 0, y: 0, z: 0 })
+            .find(|entity| entity.name == "Rat")
+            .unwrap();
+        assert_eq!(rendered.name_description, "a rat");
+
         let _ = fs::remove_dir_all(data.parent().unwrap());
     }
 
@@ -1126,6 +1157,7 @@ mod tests {
             monsters: vec![TfsEntityDefinition {
                 kind: TfsEntityKind::Monster,
                 name: "Rat".into(),
+                name_description: String::new(),
                 experience: 0,
                 direct_melee: None,
                 loot: Vec::new(),
@@ -1137,6 +1169,7 @@ mod tests {
             npcs: vec![TfsEntityDefinition {
                 kind: TfsEntityKind::Npc,
                 name: "Alice".into(),
+                name_description: String::new(),
                 experience: 0,
                 direct_melee: None,
                 loot: Vec::new(),
@@ -1207,6 +1240,7 @@ mod tests {
             monsters: vec![TfsEntityDefinition {
                 kind: TfsEntityKind::Monster,
                 name: "Rat".into(),
+                name_description: String::new(),
                 experience: 25,
                 direct_melee: Some(TfsDirectMeleeAttack {
                     interval_millis: 2_000,
