@@ -84,12 +84,41 @@ pub enum OperatorRequest {
         #[serde(default)]
         player: String,
     },
+    /// Restore a connected character's health and mana to maximums.
+    Heal {
+        #[serde(default)]
+        player: String,
+    },
+    /// Report one character's level, position, online state, gm tier, frags and skull.
+    PlayerInfo {
+        #[serde(default)]
+        player: String,
+        /// "online" resolves only connected characters; offline reads SQLite directly.
+        #[serde(default = "default_scope_offline")]
+        scope: String,
+    },
+    /// Teleport the executing operator (console) to a player's position.
+    Goto {
+        #[serde(default)]
+        player: String,
+    },
+    /// Summon a player to the anchor player's position.
+    Tome {
+        #[serde(default)]
+        player: String,
+        #[serde(default)]
+        scope: String,
+    },
     /// Report live world counters for console display.
     Status,
 }
 
 fn default_count() -> u16 {
     1
+}
+
+fn default_scope_offline() -> String {
+    "offline".to_string()
 }
 
 /// A serialized success/failure answer. `ok=false` carries a human-readable `error`.
@@ -249,6 +278,12 @@ pub fn apply_operator_request(
         }
         OperatorRequest::Spawn { entity, player } => apply_spawn(runtime, &entity, &player),
         OperatorRequest::Kick { player } => apply_kick(runtime, &player),
+        OperatorRequest::Heal { player } => apply_heal(runtime, &player),
+        OperatorRequest::PlayerInfo { player, scope } => {
+            apply_player_info(runtime, &player, &scope)
+        }
+        OperatorRequest::Goto { player } => apply_goto(runtime, &player),
+        OperatorRequest::Tome { player, scope } => apply_tome(runtime, &player, &scope),
     }
 }
 
@@ -505,6 +540,143 @@ fn apply_kick(runtime: &BridgeRuntime, player: &str) -> OperatorResponse {
         Ok(true) => OperatorResponse::success("kick", Some(format!("player-id={player_id}"))),
         Ok(false) => OperatorResponse::failure(format!("player `{}` is not online", player.trim())),
         Err(error) => OperatorResponse::failure(format!("kick failed: {error}")),
+    }
+}
+
+fn apply_heal(runtime: &BridgeRuntime, player: &str) -> OperatorResponse {
+    let player_id = match resolve_player_id(runtime, player, "online") {
+        Ok(id) => id,
+        Err(error) => return OperatorResponse::failure(error),
+    };
+    match runtime.config.shared_world.restore_player_vitals(player_id) {
+        Ok(true) => OperatorResponse::success(
+            "heal",
+            Some(format!("player-id={player_id} vitals=restored")),
+        ),
+        Ok(false) => OperatorResponse::failure(format!("player `{}` is not online", player.trim())),
+        Err(error) => OperatorResponse::failure(format!("heal failed: {error}")),
+    }
+}
+
+fn apply_player_info(runtime: &BridgeRuntime, player: &str, scope: &str) -> OperatorResponse {
+    let player_id = match resolve_player_id(runtime, player, scope) {
+        Ok(id) => id,
+        Err(error) => return OperatorResponse::failure(error),
+    };
+    let mut database = match open_database(&runtime.config.database_path) {
+        Ok(database) => database,
+        Err(error) => return OperatorResponse::failure(error),
+    };
+    let character = match database.player_by_id(player_id) {
+        Ok(character) => character,
+        Err(error) => return OperatorResponse::failure(format!("lookup failed: {error}")),
+    };
+    let gm_tier = match database.player_gm_level(player_id) {
+        Ok(level) => level,
+        Err(error) => return OperatorResponse::failure(format!("gm lookup failed: {error}")),
+    };
+    let (online_state, frags, skull) = if runtime
+        .config
+        .shared_world
+        .has_player(player_id)
+        .unwrap_or(false)
+    {
+        let world = runtime.config.shared_world.lock();
+        match world {
+            Ok(world) => {
+                let frags = world.player_frag_count(player_id);
+                let skull = if world.player_has_white_skull(player_id) {
+                    "white-skull"
+                } else {
+                    "none"
+                };
+                ("online", frags, skull)
+            }
+            Err(_) => ("unknown", 0, "unknown"),
+        }
+    } else {
+        ("offline", 0, "none")
+    };
+    OperatorResponse::success(
+        "playerinfo",
+        Some(format!(
+            "{}: level {} pos {},{},{} {} gm-tier {gm_tier} frags {frags} skull {skull}",
+            character.name,
+            character.level,
+            character.position.x,
+            character.position.y,
+            character.position.z,
+            online_state,
+        )),
+    )
+}
+
+fn apply_goto(runtime: &BridgeRuntime, player: &str) -> OperatorResponse {
+    // The console has no body; goto requires an in-game executor. Resolve the target's
+    // position so operators at least get the coordinates echoed.
+    let target_id = match resolve_player_id(runtime, player, "") {
+        Ok(id) => id,
+        Err(error) => return OperatorResponse::failure(error),
+    };
+    if !runtime
+        .config
+        .shared_world
+        .has_player(target_id)
+        .unwrap_or(false)
+    {
+        return OperatorResponse::failure(format!("player `{}` is not online", player.trim()));
+    }
+    match runtime.config.shared_world.player_position(target_id) {
+        Ok(position) => OperatorResponse::success(
+            "goto",
+            Some(format!(
+                "{} is at {},{},{} (in-game GMs can /goto from chat)",
+                player.trim(),
+                position.x,
+                position.y,
+                position.z
+            )),
+        ),
+        Err(error) => OperatorResponse::failure(format!("position read failed: {error}")),
+    }
+}
+
+fn apply_tome(runtime: &BridgeRuntime, player: &str, scope: &str) -> OperatorResponse {
+    let _ = scope;
+    let target_id = match resolve_player_id(runtime, player, "online") {
+        Ok(id) => id,
+        Err(error) => return OperatorResponse::failure(error),
+    };
+    // Console-initiated summons anchor on any other connected player; with one player online
+    // there is nothing to summon to.
+    let anchors: Vec<u64> = match runtime.config.shared_world.lock() {
+        Ok(world) => world
+            .registered_player_ids()
+            .into_iter()
+            .filter(|id| *id != target_id)
+            .collect(),
+        Err(error) => return OperatorResponse::failure(format!("world read failed: {error}")),
+    };
+    let Some(anchor_id) = anchors.first() else {
+        return OperatorResponse::failure("no second online player to anchor the summon");
+    };
+    let destination = match runtime.config.shared_world.player_position(*anchor_id) {
+        Ok(position) => position,
+        Err(error) => return OperatorResponse::failure(format!("position read failed: {error}")),
+    };
+    match runtime
+        .config
+        .shared_world
+        .teleport_player_for_operator(target_id, destination)
+    {
+        Ok(()) => OperatorResponse::success(
+            "tome",
+            Some(format!(
+                "summoned {} to player-id={anchor_id}",
+                player.trim()
+            )),
+        ),
+        Err(error) => OperatorResponse::failure(format!("summon failed: {error}")),
     }
 }
 
