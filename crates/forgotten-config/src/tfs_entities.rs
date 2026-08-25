@@ -393,6 +393,7 @@ fn load_tfs_entity_catalog_from_data(
 
 fn load_monsters(directory: &Path, catalog: &mut TfsEntityCatalog) -> Result<(), ConfigError> {
     let registry_path = directory.join("monsters.xml");
+    let mut registry_files: Vec<PathBuf> = Vec::new();
     if registry_path.is_file() {
         for reference in parse_registry_references(&registry_path, b"monsters", b"monster")? {
             let Some(relative) = safe_relative_path(&reference.file) else {
@@ -404,6 +405,7 @@ fn load_monsters(directory: &Path, catalog: &mut TfsEntityCatalog) -> Result<(),
                 catalog.missing_definitions.push(definition_path);
                 continue;
             }
+            registry_files.push(definition_path.clone());
             let definition = parse_entity_definition(
                 &definition_path,
                 TfsEntityKind::Monster,
@@ -412,11 +414,11 @@ fn load_monsters(directory: &Path, catalog: &mut TfsEntityCatalog) -> Result<(),
             )?;
             add_entity(&mut catalog.monsters, definition)?;
         }
-        return Ok(());
     }
 
-    // No registry: fall through to a bounded directory scan so operator-provided monster
-    // files still load (mirrors the NPC loader behavior). Subdirectories are not traversed.
+    // Fallback scan: also load every XML the registry did not already cover. Operators
+    // routinely drop a single Rat.xml into data/monster/ without editing monsters.xml; those
+    // files must still resolve for /spawn and combat imports.
     if !directory.is_dir() {
         return Ok(());
     }
@@ -431,6 +433,9 @@ fn load_monsters(directory: &Path, catalog: &mut TfsEntityCatalog) -> Result<(),
             || !path.is_file()
             || path.extension().and_then(|value| value.to_str()) != Some("xml")
         {
+            continue;
+        }
+        if registry_files.iter().any(|registered| registered == &path) {
             continue;
         }
         let definition = parse_entity_definition(&path, TfsEntityKind::Monster, b"monster", None)?;
@@ -742,18 +747,56 @@ fn parse_direct_melee_event(
             "monster melee interval exceeds the supported bound",
         ));
     }
-    let parse_damage = |attribute: &[u8]| -> Result<u16, ConfigError> {
-        let value = required_attribute_string(event, attribute)?
-            .parse::<i32>()
-            .map_err(|_| invalid("monster melee damage must be a signed integer"))?;
-        u16::try_from(value.unsigned_abs())
-            .map_err(|_| invalid("monster melee damage exceeds the supported bound"))
-    };
-    *direct_melee = Some(TfsDirectMeleeAttack {
-        interval_millis,
-        min_damage: parse_damage(b"min")?,
-        max_damage: parse_damage(b"max")?,
-    });
+    // Classic TFS files come in two shapes: explicit `min`/`max` damage bounds, or the older
+    // `skill`/`attack` pair (damage derived from attacker skill). Both are accepted here; the
+    // skill/attack form maps to a deterministic bounded range so downstream combat code never
+    // needs to know which shape produced it.
+    let explicit_min = optional_attribute_string(event, b"min")?;
+    let explicit_max = optional_attribute_string(event, b"max")?;
+    match (explicit_min, explicit_max) {
+        (Some(min_raw), Some(max_raw)) => {
+            let parse_bound = |raw: &str, label: &str| -> Result<u16, ConfigError> {
+                raw.parse::<i32>()
+                    .map_err(|_| invalid("monster melee damage must be a signed integer"))
+                    .and_then(|value| {
+                        u16::try_from(value.unsigned_abs()).map_err(|_| {
+                            invalid("monster melee damage exceeds the supported bound")
+                        })
+                    })
+                    .map_err(|error: ConfigError| {
+                        invalid(format!("monster melee {label}: {error}"))
+                    })
+            };
+            let min_damage = parse_bound(&min_raw, "min")?;
+            let max_damage = parse_bound(&max_raw, "max")?;
+            *direct_melee = Some(TfsDirectMeleeAttack {
+                interval_millis,
+                min_damage: min_damage.min(max_damage),
+                max_damage: min_damage.max(max_damage),
+            });
+        }
+        _ => {
+            // skill/attack shape: classic approximation of average damage with a ±20% spread,
+            // clamped to at least 1..=1 so the creature still deals measurable damage.
+            let skill = optional_attribute_string(event, b"skill")?
+                .and_then(|raw| raw.parse::<u32>().ok())
+                .unwrap_or(10);
+            let attack = optional_attribute_string(event, b"attack")?
+                .and_then(|raw| raw.parse::<u32>().ok())
+                .unwrap_or(5);
+            let average = skill.saturating_mul(attack) / 4;
+            let spread = (average / 5).max(1);
+            let max_damage = u16::try_from((average + spread).clamp(1, 2_000)).unwrap_or(2_000);
+            let min_damage = u16::try_from(average.saturating_sub(spread).clamp(1, 2_000))
+                .unwrap_or(1)
+                .max(1);
+            *direct_melee = Some(TfsDirectMeleeAttack {
+                interval_millis,
+                min_damage,
+                max_damage: max_damage.max(min_damage),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1241,5 +1284,64 @@ mod tests {
                 max_damage: 4,
             })
         );
+    }
+}
+
+/// Classic TFS monster files commonly use the skill/attack melee shape without explicit
+/// min/max damage, and operators drop loose XMLs without editing monsters.xml. Both must work.
+#[cfg(test)]
+mod classic_monster_file_tests {
+    use super::*;
+
+    #[test]
+    fn skill_attack_melee_parses_and_loose_files_load_alongside_registry() {
+        let directory = std::env::temp_dir().join(format!(
+            "fe-monster-scan-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+
+        // Registry lists only the first monster; Rat.xml sits loose next to it.
+        fs::write(
+            directory.join("monsters.xml"),
+            "<?xml version=\"1.0\"?><monsters><monster name=\"Demon\" file=\"demon.xml\"/></monsters>",
+        )
+        .unwrap();
+        fs::write(
+            directory.join("demon.xml"),
+            "<monster name=\"Demon\"><health now=\"100\" max=\"100\"/><look type=\"30\"/><attacks><attack name=\"melee\" interval=\"2000\" min=\"10\" max=\"20\"/></attacks></monster>",
+        )
+        .unwrap();
+        fs::write(
+            directory.join("rat.xml"),
+            "<monster name=\"Rat\"><health now=\"20\" max=\"20\"/><look type=\"21\"/><attacks><attack name=\"melee\" interval=\"2000\" skill=\"15\" attack=\"7\"/></attacks><loot><item id=\"2148\" countmax=\"7\" chance=\"80000\"/></loot></monster>",
+        )
+        .unwrap();
+
+        let mut catalog = TfsEntityCatalog {
+            monsters: Vec::new(),
+            npcs: Vec::new(),
+            missing_definitions: Vec::new(),
+            missing_scripts: Vec::new(),
+            unsafe_references: Vec::new(),
+        };
+        load_monsters(&directory, &mut catalog).unwrap();
+
+        assert_eq!(catalog.monsters.len(), 2);
+        let demon = catalog.find(TfsEntityKind::Monster, "Demon").unwrap();
+        assert_eq!(demon.direct_melee.unwrap().min_damage, 10);
+        assert_eq!(demon.direct_melee.unwrap().max_damage, 20);
+
+        // The loose skill/attack file resolves and derives a sane bounded damage range.
+        let rat = catalog.find(TfsEntityKind::Monster, "Rat").unwrap();
+        let melee = rat.direct_melee.unwrap();
+        assert!(melee.min_damage >= 1);
+        assert!(melee.max_damage >= melee.min_damage);
+        assert!(!rat.loot.is_empty());
+
+        let _ = fs::remove_dir_all(&directory);
     }
 }
