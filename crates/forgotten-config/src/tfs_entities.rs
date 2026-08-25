@@ -41,6 +41,9 @@ impl TfsEntityKind {
 pub struct TfsEntityDefinition {
     pub kind: TfsEntityKind,
     pub name: String,
+    /// Optional bounded `corpse="serverItemId"` root declaration (plan v49 slice 6): the
+    /// client-visible corpse sprite placed on defeat. Absent means the host default corpse.
+    pub corpse_server_id: Option<u16>,
     /// Optional TFS `nameDescription` article phrase including the indefinite article
     /// (`"a rat"`), rendered by Look replies verbatim after "You see". Empty when the
     /// definition omits it or the kind does not provide one.
@@ -703,6 +706,26 @@ fn entity_from_root_event(
     npc_directory: Option<&Path>,
 ) -> Result<TfsEntityDefinition, ConfigError> {
     let name = required_attribute_string(event, b"name")?;
+    let corpse_server_id = match optional_attribute_string(event, b"corpse")? {
+        Some(raw) => {
+            let parsed: u16 = raw.trim().parse().map_err(|_| {
+                invalid(format!(
+                    "TFS {} definition {} has an invalid corpse item id",
+                    kind.label(),
+                    definition_path.display()
+                ))
+            })?;
+            if parsed == 0 {
+                return Err(invalid(format!(
+                    "TFS {} definition {} corpse item id must be nonzero",
+                    kind.label(),
+                    definition_path.display()
+                )));
+            }
+            Some(parsed)
+        }
+        None => None,
+    };
     let name_description = match optional_attribute_string(event, b"nameDescription")? {
         Some(description) => {
             let trimmed = description.trim();
@@ -727,6 +750,7 @@ fn entity_from_root_event(
     Ok(TfsEntityDefinition {
         kind,
         name,
+        corpse_server_id,
         name_description,
         experience: if matches!(kind, TfsEntityKind::Monster) {
             optional_attribute_u64(event, b"experience")?.unwrap_or_default()
@@ -1063,7 +1087,7 @@ mod tests {
         .unwrap();
         fs::write(
             data.join("monster/monsters/rat.xml"),
-            r#"<monster name="Rat" nameDescription="a rat" speed="134" experience="25"><health now="20" max="20"/><look type="21"/><attacks><attack name="melee" interval="2000" min="0" max="-40"/></attacks></monster>"#,
+            r#"<monster name="Rat" nameDescription="a rat" corpse="3073" speed="134" experience="25"><health now="20" max="20"/><look type="21"/><attacks><attack name="melee" interval="2000" min="0" max="-40"/></attacks></monster>"#,
         )
         .unwrap();
         fs::write(
@@ -1078,6 +1102,7 @@ mod tests {
         assert!(catalog.contains(TfsEntityKind::Npc, "ALICE"));
         assert_eq!(catalog.monsters[0].experience, 25);
         assert_eq!(catalog.monsters[0].name_description, "a rat");
+        assert_eq!(catalog.monsters[0].corpse_server_id, Some(3073));
         assert_eq!(
             catalog.monsters[0].direct_melee,
             Some(TfsDirectMeleeAttack {
@@ -1157,6 +1182,7 @@ mod tests {
             monsters: vec![TfsEntityDefinition {
                 kind: TfsEntityKind::Monster,
                 name: "Rat".into(),
+                corpse_server_id: None,
                 name_description: String::new(),
                 experience: 0,
                 direct_melee: None,
@@ -1169,6 +1195,7 @@ mod tests {
             npcs: vec![TfsEntityDefinition {
                 kind: TfsEntityKind::Npc,
                 name: "Alice".into(),
+                corpse_server_id: None,
                 name_description: String::new(),
                 experience: 0,
                 direct_melee: None,
@@ -1240,6 +1267,7 @@ mod tests {
             monsters: vec![TfsEntityDefinition {
                 kind: TfsEntityKind::Monster,
                 name: "Rat".into(),
+                corpse_server_id: None,
                 name_description: String::new(),
                 experience: 25,
                 direct_melee: Some(TfsDirectMeleeAttack {

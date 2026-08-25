@@ -807,6 +807,17 @@ fn run_host(
             item_speed_bonus_by_server_id: item_speed_bonus_by_server_id.map(Arc::new),
             armor_multiplier_by_vocation,
             static_spawns: (!static_spawns.entities.is_empty()).then(|| Arc::new(static_spawns)),
+            corpse_server_id_by_creature_name: Some(Arc::new(
+                entity_catalog
+                    .monsters
+                    .iter()
+                    .filter_map(|definition| {
+                        definition
+                            .corpse_server_id
+                            .map(|corpse| (definition.name.to_ascii_lowercase(), corpse))
+                    })
+                    .collect(),
+            )),
             static_target_attack_policy: match config.static_creature_target_attack_damage {
                 0 => match config.static_creature_melee_aggro_range {
                     // Plan v49 slice 5 default: declared-melee creatures cycle their imported

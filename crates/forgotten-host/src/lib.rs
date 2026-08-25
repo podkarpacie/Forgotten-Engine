@@ -1593,6 +1593,9 @@ pub struct NativeOtClientHostConfig {
     /// Immutable display-only TFS spawn entities. No AI, combat, movement, or Lua behavior is
     /// attached at this host boundary.
     pub static_spawns: Option<Arc<FeTfsStaticSpawnCollection>>,
+    /// Declared corpse sprite per lowercased creature name (plan v49 slice 6). Creatures absent
+    /// from the map fall back to the bounded default corpse server id on defeat.
+    pub corpse_server_id_by_creature_name: Option<Arc<BTreeMap<String, u16>>>,
     /// Disabled by default. When enabled, one heartbeat pass may apply bounded fixed damage from
     /// each active static creature to its already selected adjacent target. Formula, persistence,
     /// packet, loot, corpse, script, and general AI behavior remain separate and deferred.
@@ -8644,13 +8647,22 @@ fn handle_native_otclient_game(
                             &mut database,
                         )?;
                         if outcome.deactivated {
+                            let creature_name = shared_world.lock().ok().and_then(|world| {
+                                world
+                                    .static_creature(outcome.target_id)
+                                    .map(|creature| creature.name.clone())
+                            });
+                            let corpse_server_id = native_declared_corpse_server_id(
+                                config.corpse_server_id_by_creature_name.as_deref(),
+                                creature_name,
+                            );
                             if let Some(corpse_position) = spawn_native_static_defeat_corpse(
                                 shared_world,
                                 map_owner,
                                 &mut database,
                                 outcome.target_id,
                                 shared_world.tick()?,
-                                NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
+                                corpse_server_id,
                                 config.corpse_despawn_seconds,
                             )? {
                                 native_diagnostic(
@@ -13837,6 +13849,20 @@ fn apply_and_persist_native_fixed_death_loss(
 /// Places one deterministic loot corpse on the defeated static creature's tile. The corpse is a
 /// runtime-only map item (no source identity, no journal entry) whose children are the rolled
 /// loot. The caller owns defeat validation, persistence of the map state, and client delivery.
+/// Resolves the client-visible corpse sprite for a defeated creature: the operator-declared
+/// corpse item id when the imported definition declares one, otherwise the shared default.
+fn native_declared_corpse_server_id(
+    corpse_by_creature_name: Option<&BTreeMap<String, u16>>,
+    creature_name: Option<String>,
+) -> u16 {
+    creature_name
+        .as_deref()
+        .and_then(|name| {
+            corpse_by_creature_name.and_then(|map| map.get(&name.to_ascii_lowercase()).copied())
+        })
+        .unwrap_or(NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID)
+}
+
 fn spawn_native_static_defeat_corpse(
     shared_world: &SharedNativeWorld,
     map_owner: &SharedNativeMap,
@@ -13847,9 +13873,8 @@ fn spawn_native_static_defeat_corpse(
     corpse_despawn_seconds: u32,
 ) -> Result<Option<Position>, HostError> {
     let roll = shared_world.roll_defeated_static_creature_loot(creature_id, seed)?;
-    if roll.items.is_empty() {
-        return Ok(None);
-    }
+    // Plan v49 slice 6: defeated creatures always leave their declared corpse, even when the
+    // loot roll is empty; the roll only fills the corpse container's children.
     let lifecycle = {
         let world = shared_world.lock()?;
         world.static_creature_lifecycle(creature_id)
@@ -14626,6 +14651,7 @@ mod tests {
             item_speed_bonus_by_server_id: None,
             armor_multiplier_by_vocation: None,
             static_spawns: None,
+            corpse_server_id_by_creature_name: None,
             static_target_attack_policy: StaticTargetAttackPolicy::Disabled,
             static_target_pursuit_policy: StaticTargetPursuitPolicy::Disabled,
             static_creature_wander_policy:
@@ -15508,6 +15534,126 @@ mod tests {
             vec![(2148_u16, 3_u16)],
             "equal seeds must produce equal loot"
         );
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_declared_corpse_resolution_prefers_the_imported_declaration() {
+        let declared = BTreeMap::from([("rat".to_owned(), 3073_u16)]);
+        assert_eq!(
+            native_declared_corpse_server_id(Some(&declared), Some("Rat".into())),
+            3073
+        );
+        // Name matching is case-insensitive; unknown and missing names use the default.
+        assert_eq!(
+            native_declared_corpse_server_id(Some(&declared), Some("rat".into())),
+            3073
+        );
+        assert_eq!(
+            native_declared_corpse_server_id(Some(&declared), Some("Dragon".into())),
+            NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID
+        );
+        assert_eq!(
+            native_declared_corpse_server_id(None, Some("Rat".into())),
+            NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID
+        );
+    }
+
+    #[test]
+    fn defeat_spawns_the_declared_corpse_even_when_loot_is_empty() {
+        let creature_id = 0x4000_0009;
+        let static_spawns =
+            FeTfsStaticSpawnCollection::new(vec![forgotten_core::FeTfsStaticEntity {
+                id: creature_id,
+                name: "Rat".into(),
+                name_description: String::new(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 100,
+                direction: 2,
+            }])
+            .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        let map_owner = SharedNativeMap::recover_complete_map_item_state(
+            (*native_world_map()).clone(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &native_world_map(),
+            )
+            .unwrap();
+        shared
+            .set_player_static_target(101, Some(creature_id))
+            .unwrap();
+
+        let database_path = database_path("declared-corpse-no-loot");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+
+        // Empty loot rolls previously swallowed the corpse entirely (plan v49 slice 6 gap).
+        let roll = shared
+            .roll_defeated_static_creature_loot(creature_id, 1)
+            .unwrap();
+        let _ = roll;
+
+        let mut deactivated = false;
+        for _ in 0..40 {
+            if let Some(outcome) =
+                apply_native_selected_static_creature_melee(&shared, 101, &native_world_map())
+                    .unwrap()
+            {
+                if outcome.deactivated {
+                    deactivated = true;
+                    break;
+                }
+                advance_native_shared_world_heartbeat(&shared, 1).unwrap();
+            }
+        }
+        assert!(deactivated, "creature must reach its death transition");
+
+        let corpse_position = spawn_native_static_defeat_corpse(
+            &shared,
+            &map_owner,
+            &mut database,
+            creature_id,
+            1,
+            3073,
+            0,
+        )
+        .unwrap()
+        .expect("defeated creatures always leave their declared corpse");
+        let snapshot = map_owner.render_snapshot().unwrap();
+        let tile_items = snapshot.tile_items(corpse_position).unwrap();
+        assert_eq!(tile_items.len(), 1);
+        assert_eq!(tile_items[0].server_id, 3073);
+        assert!(tile_items[0].children.is_empty());
+        drop(database);
         let _ = fs::remove_file(database_path);
     }
 
