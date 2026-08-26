@@ -1592,6 +1592,18 @@ pub struct PlayerMagicAdvanceOutcome {
 }
 
 pub const MAX_REGENERATION_ELAPSED_SECONDS: u16 = 60;
+/// Classic food cadence (plan v49 slice 16): one health per interval while the food window
+/// from the last eaten item is active.
+pub const FOOD_REGENERATION_INTERVAL_SECONDS: u16 = 4;
+pub const FOOD_REGENERATION_HEALTH_PER_INTERVAL: u16 = 1;
+
+/// One player's classic fed state. `until_tick` is authoritative-tick absolute; the
+/// accumulator paces one-health gains at the fixed food cadence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PlayerFoodWindow {
+    until_tick: u64,
+    elapsed_seconds: u16,
+}
 
 /// One bounded player-resource regeneration rule. Intervals are expressed in wall-clock seconds
 /// by the host boundary; the core never assumes that a network heartbeat is itself a second.
@@ -2980,6 +2992,7 @@ pub struct WorldState {
     player_progression_attempts: BTreeMap<u64, PlayerProgressionAttempts>,
     player_towns: BTreeMap<u64, u32>,
     player_regeneration_schedules: BTreeMap<u64, PlayerRegenerationSchedule>,
+    player_food_windows: BTreeMap<u64, PlayerFoodWindow>,
     player_conditions: BTreeMap<u64, BTreeMap<PlayerConditionKind, PlayerCondition>>,
     player_respawn_states: BTreeMap<u64, PlayerRespawnState>,
     player_equipments: BTreeMap<u64, PlayerEquipment>,
@@ -6733,6 +6746,44 @@ impl WorldState {
         Ok(())
     }
 
+    /// Grants (or refuses) one classic food window (plan v49 slice 16). While a window is
+    /// active the player answers "You are full." and the item is not consumed; otherwise the
+    /// window starts now and lasts the declared seconds.
+    pub fn grant_player_food_window(
+        &mut self,
+        player_id: u64,
+        seconds: u16,
+    ) -> Result<bool, CoreError> {
+        if seconds == 0 {
+            return Err(CoreError::InvalidRegenerationInterval);
+        }
+        self.player(player_id)
+            .ok_or(CoreError::UnknownPlayer(player_id))?;
+        let now = self.tick;
+        match self.player_food_windows.get(&player_id) {
+            Some(window) if window.until_tick > now => Ok(false),
+            _ => {
+                self.player_food_windows.insert(
+                    player_id,
+                    PlayerFoodWindow {
+                        until_tick: now.saturating_add(u64::from(seconds)),
+                        elapsed_seconds: 0,
+                    },
+                );
+                self.mark_changed();
+                Ok(true)
+            }
+        }
+    }
+
+    pub fn player_food_window_remaining_ticks(&self, player_id: u64) -> Option<u64> {
+        let window = self.player_food_windows.get(&player_id)?;
+        window
+            .until_tick
+            .checked_sub(self.tick)
+            .filter(|remaining| *remaining > 0)
+    }
+
     /// Applies a bounded elapsed period to one player's configured health/mana schedules. The
     /// caller owns wall-clock measurement; this method admits only a capped duration and mutates
     /// authoritative vitals when a configured recovery event produces a positive gain.
@@ -6791,13 +6842,35 @@ impl WorldState {
             mana: current_vitals.mana.saturating_add(mana_gained),
             ..current_vitals
         };
-        if health_gained > 0 || mana_gained > 0 {
+        // Classic fed state (plan v49 slice 16): while the food window lasts, every configured
+        // interval restores one health point. The window drains in wall-clock time regardless.
+        let mut food_gained = 0_u16;
+        let mut final_health = vitals.health;
+        if let Some(window) = self.player_food_windows.get_mut(&player_id) {
+            if window.until_tick > self.tick {
+                window.elapsed_seconds = window.elapsed_seconds.saturating_add(elapsed_seconds);
+                let intervals =
+                    (window.elapsed_seconds / FOOD_REGENERATION_INTERVAL_SECONDS) as u16;
+                if intervals > 0 {
+                    window.elapsed_seconds %= FOOD_REGENERATION_INTERVAL_SECONDS;
+                    food_gained = (FOOD_REGENERATION_HEALTH_PER_INTERVAL)
+                        .saturating_mul(intervals)
+                        .min(vitals.max_health.saturating_sub(final_health));
+                    final_health = final_health.saturating_add(food_gained);
+                }
+            }
+        }
+        let vitals = PlayerVitals {
+            health: final_health,
+            ..vitals
+        };
+        if health_gained > 0 || mana_gained > 0 || food_gained > 0 {
             self.player_vitals.insert(player_id, vitals);
             self.mark_changed();
         }
         Ok(PlayerRegenerationOutcome {
             player_id,
-            health_gained,
+            health_gained: health_gained + food_gained,
             mana_gained,
             vitals,
         })
@@ -12205,6 +12278,44 @@ mod tests {
             ));
         }
         assert_eq!(world.player_vitals(7).unwrap().health, 39);
+    }
+
+    #[test]
+    fn classic_food_windows_feed_once_regen_and_refuse_when_full() {
+        let mut world = WorldState::default();
+        let mut eater = player();
+        eater.id = 5;
+        world.add_player(eater).unwrap();
+        world
+            .update_player_vitals(
+                5,
+                PlayerVitals {
+                    health: 40,
+                    max_health: 100,
+                    mana: 10,
+                    max_mana: 50,
+                    ..PlayerVitals::default()
+                },
+            )
+            .unwrap();
+
+        // First bite grants the window; a second while active answers "You are full."
+        assert!(world.grant_player_food_window(5, 8).unwrap());
+        assert!(!world.grant_player_food_window(5, 8).unwrap());
+        assert_eq!(world.player_food_window_remaining_ticks(5), Some(8));
+
+        // Four elapsed seconds: exactly one cadence point of health.
+        let rules = PlayerRegenerationRules {
+            health: RegenerationRule::new(100, 0).unwrap(),
+            mana: RegenerationRule::new(100, 0).unwrap(),
+        };
+        let outcome = world.apply_player_regeneration(5, rules, 4).unwrap();
+        assert_eq!(outcome.health_gained, FOOD_REGENERATION_HEALTH_PER_INTERVAL);
+
+        // Window expiry is authoritative-tick absolute: once the clock passes it, eating works.
+        world.advance_ticks(9);
+        assert_eq!(world.player_food_window_remaining_ticks(5), None);
+        assert!(world.grant_player_food_window(5, 8).unwrap());
     }
 
     #[test]

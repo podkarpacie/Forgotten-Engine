@@ -50,7 +50,7 @@ const SCHEMA_VERSION_CORPSE_DESPAWN_TICKS: i64 = 27;
 const SCHEMA_VERSION_PLAYER_GM_LEVEL: i64 = 32;
 const SCHEMA_VERSION_PLAYER_FACING: i64 = 33;
 const SCHEMA_VERSION_ACCOUNT_BANS: i64 = 34;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_FACING;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_ACCOUNT_BANS;
 /// Classic blessing count ceiling; the audited default death-loss reduction consumes this.
 pub const MAX_PLAYER_BLESSINGS: u8 = 5;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);

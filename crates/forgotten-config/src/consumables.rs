@@ -25,12 +25,14 @@ const MAX_CONSUMABLE_CATALOG_DEPTH: usize = 4;
 const MAX_CONSUMABLE_AMOUNT: u16 = 500;
 
 /// One bounded operator-declared consumable effect keyed by authoritative server item ID.
-/// Health and mana restore instantly on UseItem from owned inventory; regeneration food,
-/// condition cures, and charge semantics remain outside this first adapter.
+/// Health and mana restore instantly on UseItem from owned inventory. `regeneration_seconds`
+/// (plan v49 slice 16) marks classic food: while the window lasts the player regenerates
+/// health slowly; eating while a window is active answers "You are full."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsumableEffect {
     pub health: u16,
     pub mana: u16,
+    pub regeneration_seconds: u16,
 }
 
 /// Validated consumable catalog. It is immutable runtime input; nothing here executes scripts or
@@ -159,7 +161,7 @@ fn parse_consumable(event: &BytesStart<'_>) -> Result<(u16, ConsumableEffect), C
         let attribute =
             attribute.map_err(|error| invalid(format!("invalid consumable attribute: {error}")))?;
         match attribute.key.as_ref() {
-            b"id" | b"health" | b"mana" => {}
+            b"id" | b"health" | b"mana" | b"regenerationSeconds" => {}
             _ => return Err(invalid("unsupported consumable attribute")),
         }
     }
@@ -193,5 +195,19 @@ fn parse_consumable(event: &BytesStart<'_>) -> Result<(u16, ConsumableEffect), C
             "consumable restore amounts exceed the configured bound",
         ));
     }
-    Ok((server_id, ConsumableEffect { health, mana }))
+    // Plan v49 slice 16: classic food windows. Purely optional; zero means not food.
+    let regeneration_seconds = optional_u16(event, b"regenerationSeconds")?.unwrap_or(0);
+    if regeneration_seconds > 3_600 {
+        return Err(invalid(
+            "consumable regeneration window must stay within one hour",
+        ));
+    }
+    Ok((
+        server_id,
+        ConsumableEffect {
+            health,
+            mana,
+            regeneration_seconds,
+        },
+    ))
 }

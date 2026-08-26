@@ -1626,8 +1626,9 @@ pub struct NativeOtClientHostConfig {
     /// defense, blocking chance, and TFS formula parity remain excluded.
     pub item_shield_defense_by_server_id: Option<Arc<BTreeMap<u16, u16>>>,
     /// Optional operator-declared instant consumable effects keyed by server item ID. UseItem on
-    /// an owned inventory item restores the declared health/mana once per item unit.
-    pub consumable_effects: Option<Arc<BTreeMap<u16, (u16, u16)>>>,
+    /// owned inventory applies them directly; effects carrying a regeneration window also feed
+    /// the player (slice 16).
+    pub consumable_effects: Option<Arc<BTreeMap<u16, forgotten_config::ConsumableEffect>>>,
     /// Optional operator quest catalog. RequestQuestLog lists only quests the persisted player
     /// state has started, resolved through this catalog for display names.
     pub quest_catalog: Option<Arc<QuestCatalog>>,
@@ -10737,13 +10738,38 @@ fn handle_native_otclient_game(
                         continue;
                     };
                     let _ = client_thing_id;
-                    let Some(&(heal, mana_restore)) = config
+                    let Some(&effect) = config
                         .consumable_effects
                         .as_deref()
                         .and_then(|effects| effects.get(&consumable_server_id))
                     else {
                         continue;
                     };
+                    let (heal, mana_restore) = (effect.health, effect.mana);
+                    // Classic fed state (plan v49 slice 16): eating while a food window is
+                    // active answers "You are full." and leaves the item untouched.
+                    if effect.regeneration_seconds > 0 {
+                        let granted = shared_world
+                            .lock()?
+                            .grant_player_food_window(character.id, effect.regeneration_seconds)
+                            .map_err(HostError::Core)?;
+                        if !granted {
+                            let full_notice = encode_native_otclient_status_message(
+                                &config.client_profile,
+                                "You are full.",
+                            )
+                            .map_err(HostError::Protocol)?;
+                            write_frame(stream, &full_notice)?;
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "action=use-item outcome=too-full server-id={consumable_server_id}"
+                                ),
+                            );
+                            continue;
+                        }
+                    }
                     let mut vitals = shared_world.player_vitals(character.id)?;
                     if heal > 0 {
                         vitals.health = vitals
@@ -21757,8 +21783,14 @@ mod tests {
         database.replace_player_containers(1, &containers).unwrap();
 
         let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
-        native_config.consumable_effects =
-            Some(Arc::new(BTreeMap::from([(2666_u16, (25_u16, 0_u16))])));
+        native_config.consumable_effects = Some(Arc::new(BTreeMap::from([(
+            2666_u16,
+            forgotten_config::ConsumableEffect {
+                health: 25,
+                mana: 0,
+                regeneration_seconds: 0,
+            },
+        )])));
         let game = start_native_otclient_game(native_config, &database_path).unwrap();
         let mut stream = TcpStream::connect(game.local_addr()).unwrap();
         write_frame(

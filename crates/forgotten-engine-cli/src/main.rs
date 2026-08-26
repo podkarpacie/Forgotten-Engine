@@ -777,8 +777,9 @@ fn run_host(
             Arc::new(
                 catalog
                     .iter()
-                    .map(|(server_id, effect)| (server_id, (effect.health, effect.mana)))
-                    .collect::<std::collections::BTreeMap<u16, (u16, u16)>>(),
+                    .map(|(server_id, effect)| (server_id, effect))
+                    .collect::<std::collections::BTreeMap<u16, forgotten_config::ConsumableEffect>>(
+                    ),
             )
         });
         if let Some(catalog) = &declarative_npc_dialogue_catalog {
