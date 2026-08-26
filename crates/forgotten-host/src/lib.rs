@@ -71,23 +71,23 @@ use forgotten_protocol::{
     encode_native_otclient_open_npc_trade, encode_native_otclient_open_public_channel,
     encode_native_otclient_own_trade, encode_native_otclient_player_goods,
     encode_native_otclient_player_modes, encode_native_otclient_player_skills,
-    encode_native_otclient_player_stats, encode_native_otclient_private_message_from,
-    encode_native_otclient_public_channel_say, encode_native_otclient_public_say,
-    encode_native_otclient_quest_line, encode_native_otclient_quest_list,
-    encode_native_otclient_read_only_text_window, encode_native_otclient_set_inventory,
-    encode_native_otclient_status_message, encode_native_otclient_whisper,
-    encode_native_otclient_yell, encode_status_binary, encode_status_metrics, encode_status_xml,
-    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
-    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
-    NativeOtClientCardinalDirection, NativeOtClientClassicChannel, NativeOtClientClassicItemRecord,
-    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
-    NativeOtClientClassicPartyShield, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
-    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerGood,
-    NativeOtClientPlayerVitals, NativeOtClientPosition, NativeOtClientProfile,
-    NativeOtClientShopItem, NativeOtClientTradeItem, NativeOtClientVisiblePlayer, OtClientEndpoint,
-    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
-    MAX_LOGIN_STRING_BYTES, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES,
+    encode_native_otclient_player_state_bits, encode_native_otclient_player_stats,
+    encode_native_otclient_private_message_from, encode_native_otclient_public_channel_say,
+    encode_native_otclient_public_say, encode_native_otclient_quest_line,
+    encode_native_otclient_quest_list, encode_native_otclient_read_only_text_window,
+    encode_native_otclient_set_inventory, encode_native_otclient_status_message,
+    encode_native_otclient_whisper, encode_native_otclient_yell, encode_status_binary,
+    encode_status_metrics, encode_status_xml, generate_legacy_74_game_challenge,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
+    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
+    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection, NativeOtClientClassicChannel,
+    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
+    NativeOtClientClassicOutfit, NativeOtClientClassicPartyShield,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
+    NativeOtClientGameAction, NativeOtClientPlayerGood, NativeOtClientPlayerVitals,
+    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientShopItem, NativeOtClientTradeItem,
+    NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
+    StatusSnapshot, MAX_FRAME_SIZE, MAX_LOGIN_STRING_BYTES, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES,
     NATIVE_OTCLIENT_MESSAGE_GM_BROADCAST, NATIVE_OTCLIENT_MESSAGE_SAY,
     NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
@@ -8408,6 +8408,18 @@ fn handle_native_otclient_game(
     // Slice 11: the white-skull award record is emitted once per session when the attacker's
     // first unjustified kill flips their skull state.
     let mut observed_white_skull_sent = false;
+    // Slice 13: hydrated condition icons are read now but written after the bootstrap so the
+    // login-state frame stays first on the wire.
+    let mut observed_state_bits = shared_world
+        .lock()
+        .map(|world| {
+            native_condition_state_bits(
+                world
+                    .player_conditions(character.id)
+                    .unwrap_or(&BTreeMap::new()),
+            )
+        })
+        .unwrap_or(0);
     let static_health_frames =
         native_static_creature_health_frames(&config.client_profile, &active_static_spawns)?;
     // Establish all shared-state baselines before any initialization frame becomes observable by
@@ -8447,6 +8459,14 @@ fn handle_native_otclient_game(
     }
     for frame in &static_health_frames {
         write_frame(stream, frame)?;
+    }
+    // Slice 13: hydrated condition icons arrive after the bootstrap so the login-state record
+    // stays first on the wire; zero bits match the bootstrap default and skip the write.
+    if observed_state_bits != 0 {
+        let state_frame =
+            encode_native_otclient_player_state_bits(&config.client_profile, observed_state_bits)
+                .map_err(HostError::Protocol)?;
+        write_frame(stream, &state_frame)?;
     }
     let mut delivered_vip_entries = 0usize;
     let mut skipped_vip_entries = 0usize;
@@ -8658,6 +8678,28 @@ fn handle_native_otclient_game(
                             shared_world,
                             character.id,
                         )?;
+                        // Slice 13: condition icons refresh whenever the active bit set
+                        // changes (new poison, expiry, etc.). Expired kinds drop out of
+                        // the authoritative map, so the diff catches both directions.
+                        let current_state_bits = shared_world
+                            .lock()
+                            .map(|world| {
+                                native_condition_state_bits(
+                                    world
+                                        .player_conditions(character.id)
+                                        .unwrap_or(&BTreeMap::new()),
+                                )
+                            })
+                            .unwrap_or(observed_state_bits);
+                        if current_state_bits != observed_state_bits {
+                            let state_frame = encode_native_otclient_player_state_bits(
+                                &config.client_profile,
+                                current_state_bits,
+                            )
+                            .map_err(HostError::Protocol)?;
+                            write_frame(stream, &state_frame)?;
+                            observed_state_bits = current_state_bits;
+                        }
                         if outcome.applied_damage > 0 {
                             let died = death_state.is_some();
                             let loss_persisted = if died {
@@ -14255,6 +14297,23 @@ fn apply_and_persist_native_fixed_death_loss(
 /// Places one deterministic loot corpse on the defeated static creature's tile. The corpse is a
 /// runtime-only map item (no source identity, no journal entry) whose children are the rolled
 /// loot. The caller owns defeat validation, persistence of the map state, and client delivery.
+/// Maps authoritative condition kinds onto the legacy client PlayerState bit flags (plan v49
+/// slice 13): poison 0x0001, burning 0x0002, energy 0x0004.
+fn native_condition_state_bits(
+    conditions: &BTreeMap<forgotten_core::PlayerConditionKind, forgotten_core::PlayerCondition>,
+) -> u16 {
+    use forgotten_core::PlayerConditionKind as Kind;
+    let mut bits = 0_u16;
+    for (kind, _) in conditions {
+        bits |= match kind {
+            Kind::Poison => 0x0001,
+            Kind::Burning => 0x0002,
+            Kind::Energy => 0x0004,
+        };
+    }
+    bits
+}
+
 /// Resolves the client-visible corpse sprite for a defeated creature: the operator-declared
 /// corpse item id when the imported definition declares one, otherwise the shared default.
 fn native_declared_corpse_server_id(
@@ -15942,6 +16001,27 @@ mod tests {
             "equal seeds must produce equal loot"
         );
         let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn condition_kinds_map_to_legacy_player_state_bits() {
+        use forgotten_core::{PlayerCondition, PlayerConditionKind};
+        let mut conditions = BTreeMap::new();
+        conditions.insert(
+            PlayerConditionKind::Poison,
+            PlayerCondition::new(PlayerConditionKind::Poison, 4, 2, 16).unwrap(),
+        );
+        assert_eq!(native_condition_state_bits(&conditions), 0x0001);
+        conditions.insert(
+            PlayerConditionKind::Energy,
+            PlayerCondition::new(PlayerConditionKind::Energy, 4, 2, 16).unwrap(),
+        );
+        assert_eq!(native_condition_state_bits(&conditions), 0x0005);
+        conditions.insert(
+            PlayerConditionKind::Burning,
+            PlayerCondition::new(PlayerConditionKind::Burning, 4, 2, 16).unwrap(),
+        );
+        assert_eq!(native_condition_state_bits(&conditions), 0x0007);
     }
 
     #[test]

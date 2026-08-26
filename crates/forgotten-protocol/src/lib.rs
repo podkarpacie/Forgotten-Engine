@@ -2397,6 +2397,22 @@ pub fn encode_native_otclient_player_bootstrap(
     Ok(Frame(payload))
 }
 
+/// Encodes one classic PlayerState record (`0xA2`) with explicit condition bits (plan v49
+/// slice 13). Bit assignments follow the legacy client icon map: poison 0x0001, burning
+/// 0x0002, energy 0x0004.
+pub fn encode_native_otclient_player_state_bits(
+    profile: &NativeOtClientProfile,
+    state_bits: u16,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_PLAYER_STATE);
+    writer.u16(state_bits);
+    Ok(Frame(writer.finish()))
+}
+
 /// Encodes classic `SetInventory` (`0x78`) for the parser-verified native 740 layout. The caller
 /// must obtain `client_thing_id` and subtype semantics from a validated operator-supplied item
 /// catalog; this codec does not infer either property from a server item ID.
@@ -5003,6 +5019,12 @@ mod tests {
                 .unwrap()
                 .0,
             vec![NATIVE_OTCLIENT_GAME_CREATURE_UNPASS, 2, 0, 0, 0x40, 1]
+        );
+        assert_eq!(
+            encode_native_otclient_player_state_bits(&profile, 0x0005)
+                .unwrap()
+                .0,
+            vec![NATIVE_OTCLIENT_GAME_PLAYER_STATE, 0x05, 0x00]
         );
         assert!(encode_native_otclient_create_in_container(
             &NativeOtClientProfile {
