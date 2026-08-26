@@ -1174,6 +1174,22 @@ impl EngineDatabase {
     /// Deletes one durable guild and all FE-owned dependent invitation, membership, and rank
     /// records in a single transaction. Authorization, client state, wars, banking, houses, and
     /// broader gameplay cleanup remain outside this storage operation.
+    /// Reads one guild's display name and message-of-the-day for channel-list and login
+    /// delivery (plan v49 slice 19). `None` when the guild does not exist.
+    pub fn guild_name_and_motd(
+        &self,
+        guild_id: u64,
+    ) -> Result<Option<(String, String)>, PersistenceError> {
+        self.connection
+            .query_row(
+                "SELECT name, motd FROM guilds WHERE id = ?1",
+                params![guild_id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(PersistenceError::Sql)
+    }
+
     pub fn delete_guild(&mut self, guild_id: u64) -> Result<GuildRecord, PersistenceError> {
         let transaction = self.connection.transaction()?;
         let guild = transaction

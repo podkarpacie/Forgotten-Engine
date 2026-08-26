@@ -8468,6 +8468,28 @@ fn handle_native_otclient_game(
                 .map_err(HostError::Protocol)?;
         write_frame(stream, &state_frame)?;
     }
+    // Slice 19: guild members receive their guild channel context and message-of-the-day as a
+    // login-time status record, matching classic server behavior.
+    if let Some((channel, motd)) = native_guild_channel_context(&database, character.id) {
+        if !motd.trim().is_empty() {
+            let motd_frame = encode_native_otclient_status_message(
+                &config.client_profile,
+                &format!("Message of the day: {motd}"),
+            )
+            .map_err(HostError::Protocol)?;
+            write_frame(stream, &motd_frame)?;
+        }
+        native_diagnostic(
+            config.extended_diagnostics,
+            peer,
+            &format!(
+                "login=guild-context channel-id={} name={} motd-bytes={}",
+                channel.id,
+                channel.name,
+                motd.len()
+            ),
+        );
+    }
     let mut delivered_vip_entries = 0usize;
     let mut skipped_vip_entries = 0usize;
     for entry in persisted_vip_entries
@@ -11613,8 +11635,13 @@ fn handle_native_otclient_game(
                 );
             }
             NativeOtClientGameAction::RequestChannels => {
-                let entries =
+                let mut entries =
                     native_classic_channel_list_entries(config.public_channel_catalog.as_deref());
+                // Plan v49 slice 19: guild members see the reserved guild channel (0x00F1).
+                let guild_context = native_guild_channel_context(&database, character.id);
+                if let Some((channel, _)) = &guild_context {
+                    entries.push(channel.clone());
+                }
                 let channels =
                     encode_native_otclient_channel_list(&config.client_profile, &entries)
                         .map_err(HostError::Protocol)?;
@@ -14314,6 +14341,23 @@ fn native_condition_state_bits(
     bits
 }
 
+/// Resolves the guild channel entry and message-of-the-day for one character (plan v49 slice
+/// 19). `None` when the character belongs to no guild or the guild row is missing.
+fn native_guild_channel_context(
+    database: &EngineDatabase,
+    character_id: u64,
+) -> Option<(NativeOtClientClassicChannel, String)> {
+    let membership = database.guild_membership(character_id).ok()??;
+    let (name, motd) = database.guild_name_and_motd(membership.guild_id).ok()??;
+    Some((
+        NativeOtClientClassicChannel {
+            id: NATIVE_GUILD_CHAT_CHANNEL_ID,
+            name,
+        },
+        motd,
+    ))
+}
+
 /// Resolves the client-visible corpse sprite for a defeated creature: the operator-declared
 /// corpse item id when the imported definition declares one, otherwise the shared default.
 fn native_declared_corpse_server_id(
@@ -16320,6 +16364,35 @@ mod tests {
         ));
         drop(database);
         let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn guild_members_get_channel_entry_and_motd_context() {
+        let path = database_path("guild-channel-motd");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id: i64 = database.create_account("leader", "password").unwrap();
+        let character = database
+            .create_player_for_account(account_id as u32, "Leader")
+            .unwrap();
+        let guild = database
+            .create_guild(character.id, "Iron Vanguard", "Raid at sunset")
+            .unwrap();
+
+        // Non-members get nothing.
+        assert!(native_guild_channel_context(&database, 999).is_none());
+
+        let (channel, motd) =
+            native_guild_channel_context(&database, character.id).expect("member context");
+        assert_eq!(channel.id, NATIVE_GUILD_CHAT_CHANNEL_ID);
+        assert_eq!(channel.name, "Iron Vanguard");
+        assert_eq!(motd, "Raid at sunset");
+        assert_eq!(
+            database.guild_name_and_motd(guild.id).unwrap(),
+            Some(("Iron Vanguard".to_owned(), "Raid at sunset".to_owned()))
+        );
+        // Unknown guild ids stay None.
+        assert!(database.guild_name_and_motd(0).unwrap().is_none());
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
