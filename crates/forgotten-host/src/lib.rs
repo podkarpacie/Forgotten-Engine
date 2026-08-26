@@ -2692,6 +2692,29 @@ fn handle_native_gm_talkaction(
                 Err(_) => Ok(Some("That destination is blocked.".into())),
             }
         }
+        "god" | "invisible" => {
+            // Toggles on the speaking GM only (classic semantics). Runtime-only: relogs reset.
+            let enabling = !match verb.as_str() {
+                "god" => shared_world
+                    .lock()?
+                    .player_is_in_god_mode(player_id),
+                _ => shared_world.lock()?.player_is_invisible(player_id),
+            };
+            let applied = {
+                let mut world = shared_world.lock()?;
+                if verb == "god" {
+                    world.set_player_god_mode(player_id, enabling)
+                } else {
+                    world.set_player_invisible(player_id, enabling)
+                }
+                .map_err(HostError::Core)?
+            };
+            Ok(Some(format!(
+                "You are now {}{}.",
+                if applied { "" } else { "no longer " },
+                if verb == "god" { "invulnerable (god mode)" } else { "invisible" }
+            )))
+        }
         "item" => {
             // /item <id> [count]: quick self-delivery. For giving to other players use /give.
             let item_id: u16 = match parts.next().and_then(|value| value.parse().ok()) {
@@ -6385,7 +6408,14 @@ impl SharedNativeWorld {
         look_type: u8,
         speed: u16,
     ) -> Result<Vec<NativeOtClientVisiblePlayer>, HostError> {
-        let player_snapshots = self.lock()?.player_render_snapshots();
+        let (player_snapshots, invisible_ids) = {
+            let world = self.lock()?;
+            (
+                world.player_render_snapshots(),
+                world.invisible_player_ids(),
+            )
+        };
+        let invisible_ids: std::collections::BTreeSet<u64> = invisible_ids.into_iter().collect();
         let player_outfits = self
             .player_outfits
             .lock()
@@ -6396,7 +6426,8 @@ impl SharedNativeWorld {
             .map_err(|_| HostError::SharedWorldUnavailable)?;
         player_snapshots
             .into_iter()
-            .filter(|player| player.id != observer_id)
+            // /invisible players are hidden from every other player's viewport.
+            .filter(|player| player.id != observer_id && !invisible_ids.contains(&player.id))
             .map(|player| {
                 Ok(NativeOtClientVisiblePlayer {
                     player_id: native_player_id(player.id)?,
@@ -6431,13 +6462,15 @@ impl SharedNativeWorld {
         look_type: u8,
         speed: u16,
     ) -> Result<NativeWorldRenderSnapshot, HostError> {
-        let (static_spawns, player_snapshots) = {
+        let (static_spawns, player_snapshots, invisible_ids) = {
             let world = self.lock()?;
             (
                 world.active_static_spawn_collection(),
                 world.player_render_snapshots(),
+                world.invisible_player_ids(),
             )
         };
+        let invisible_ids: std::collections::BTreeSet<u64> = invisible_ids.into_iter().collect();
         let player_outfits = self
             .player_outfits
             .lock()
@@ -6448,7 +6481,8 @@ impl SharedNativeWorld {
             .map_err(|_| HostError::SharedWorldUnavailable)?;
         let visible_players = player_snapshots
             .into_iter()
-            .filter(|player| player.id != observer_id)
+            // /invisible players are hidden from every other player's viewport.
+            .filter(|player| player.id != observer_id && !invisible_ids.contains(&player.id))
             .map(|player| {
                 Ok(NativeOtClientVisiblePlayer {
                     player_id: native_player_id(player.id)?,

@@ -2993,6 +2993,10 @@ pub struct WorldState {
     player_towns: BTreeMap<u64, u32>,
     player_regeneration_schedules: BTreeMap<u64, PlayerRegenerationSchedule>,
     player_food_windows: BTreeMap<u64, PlayerFoodWindow>,
+    /// Operator /god toggles (plan v49 slice 18 follow-up): invincible and creature-untargetable.
+    player_god_mode: BTreeSet<u64>,
+    /// Operator /invisible toggles: hidden from creatures and every other player's viewport.
+    player_invisible: BTreeSet<u64>,
     player_conditions: BTreeMap<u64, BTreeMap<PlayerConditionKind, PlayerCondition>>,
     player_respawn_states: BTreeMap<u64, PlayerRespawnState>,
     player_equipments: BTreeMap<u64, PlayerEquipment>,
@@ -4950,8 +4954,11 @@ impl WorldState {
         let target_player_id = self
             .players
             .iter()
+            // Plan v49: /god and /invisible players are never targeted by creatures.
             .filter(|(player_id, player)| {
                 player.position.z == position.z
+                    && !self.player_god_mode.contains(player_id)
+                    && !self.player_invisible.contains(player_id)
                     && self
                         .player_respawn_states
                         .get(player_id)
@@ -6776,6 +6783,54 @@ impl WorldState {
         }
     }
 
+    /// Toggles the operator /god flag (invincible, creature-untargetable). Returns the new state.
+    pub fn set_player_god_mode(
+        &mut self,
+        player_id: u64,
+        enabled: bool,
+    ) -> Result<bool, CoreError> {
+        self.player(player_id)
+            .ok_or(CoreError::UnknownPlayer(player_id))?;
+        if enabled {
+            self.player_god_mode.insert(player_id);
+        } else {
+            self.player_god_mode.remove(&player_id);
+        }
+        self.mark_changed();
+        Ok(enabled)
+    }
+
+    pub fn player_is_in_god_mode(&self, player_id: u64) -> bool {
+        self.player_god_mode.contains(&player_id)
+    }
+
+    /// Toggles the operator /invisible flag (hidden from creatures and all other players).
+    /// Returns the new state.
+    pub fn set_player_invisible(
+        &mut self,
+        player_id: u64,
+        enabled: bool,
+    ) -> Result<bool, CoreError> {
+        self.player(player_id)
+            .ok_or(CoreError::UnknownPlayer(player_id))?;
+        if enabled {
+            self.player_invisible.insert(player_id);
+        } else {
+            self.player_invisible.remove(&player_id);
+        }
+        self.mark_changed();
+        Ok(enabled)
+    }
+
+    pub fn player_is_invisible(&self, player_id: u64) -> bool {
+        self.player_invisible.contains(&player_id)
+    }
+
+    /// Ids of every currently invisible player, for render-side viewport filtering.
+    pub fn invisible_player_ids(&self) -> Vec<u64> {
+        self.player_invisible.iter().copied().collect()
+    }
+
     pub fn player_food_window_remaining_ticks(&self, player_id: u64) -> Option<u64> {
         let window = self.player_food_windows.get(&player_id)?;
         window
@@ -7211,6 +7266,12 @@ impl WorldState {
         if self.player_vitals(event.target_id)?.health == 0 {
             return Err(CoreError::TargetAlreadyDefeated(event.target_id));
         }
+        // /god and /invisible players are unattackable by other players (plan v49 slice 18).
+        if self.player_god_mode.contains(&event.target_id)
+            || self.player_invisible.contains(&event.target_id)
+        {
+            return Err(CoreError::InvalidCombatEvent);
+        }
         let cooldown = self.player_combat_cooldown(event.attacker_id)?;
         if self.tick < cooldown.next_attack_tick {
             return Err(CoreError::CombatCooldownActive {
@@ -7305,6 +7366,15 @@ impl WorldState {
         target_id: u64,
         requested_damage: u16,
     ) -> Result<(u16, u16), CoreError> {
+        // /god players are invincible: every damage source funnels through here.
+        if self.player_god_mode.contains(&target_id) {
+            let health = self
+                .player_vitals
+                .get(&target_id)
+                .map(|vitals| vitals.health)
+                .unwrap_or(0);
+            return Ok((0, health));
+        }
         let vitals = self
             .player_vitals
             .get_mut(&target_id)
@@ -12278,6 +12348,88 @@ mod tests {
             ));
         }
         assert_eq!(world.player_vitals(7).unwrap().health, 39);
+    }
+
+    #[test]
+    fn god_and_invisible_players_are_untargetable_and_invincible() {
+        let mut world = WorldState::default();
+        let mut spawn_at = |id, x, y| {
+            let mut player = player();
+            player.id = id;
+            player.position = Position { x, y, z: 7 };
+            world.add_player(player).unwrap();
+        };
+        spawn_at(1, 100, 100); // god-mode GM
+        spawn_at(2, 102, 100); // invisible scout
+        spawn_at(3, 104, 100); // regular player
+        let mut creature = FeTfsStaticEntity {
+            id: 0x4000_0001,
+            name: "Rat".into(),
+            name_description: String::new(),
+            position: Position {
+                x: 106,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let _ = &mut creature;
+        world
+            .install_static_creatures(&FeTfsStaticSpawnCollection::new(vec![creature]).unwrap())
+            .unwrap();
+        world.set_player_god_mode(1, true).unwrap();
+        world.set_player_invisible(2, true).unwrap();
+        // The only unflagged player leaves acquisition range: the creature must find nobody.
+        world
+            .teleport_player(
+                3,
+                Position {
+                    x: 130,
+                    y: 100,
+                    z: 7,
+                },
+            )
+            .unwrap();
+
+        // Creature targeting skips both flagged players entirely.
+        let selection = world.select_static_creature_target(0x4000_0001, 8).unwrap();
+        assert_eq!(selection.target_player_id, None);
+
+        // PvP against either flagged player is rejected (attacker walks up to the god first).
+        world
+            .teleport_player(
+                3,
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            )
+            .unwrap();
+        let event = PlayerCombatEvent::adjacent_melee(
+            3,
+            1,
+            CombatDamageType::Physical,
+            5,
+            CombatAttackTiming::new(2).unwrap(),
+        )
+        .unwrap();
+        let pvp_result = world.apply_player_combat_event(event);
+        assert!(matches!(pvp_result, Err(CoreError::InvalidCombatEvent)));
+
+        // Invincibility zeroes every damage funnel.
+        let health_before = world.player_vitals(1).unwrap().health;
+        let outcome = world.apply_player_melee_damage(3, 1, 9).unwrap();
+        assert_eq!(outcome.applied_damage, 0);
+        assert_eq!(world.player_vitals(1).unwrap().health, health_before);
     }
 
     #[test]
