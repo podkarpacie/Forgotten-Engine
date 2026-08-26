@@ -6229,6 +6229,32 @@ impl WorldState {
         })
     }
 
+    /// Consumes one unit of an owned top-level container stack (plan v49 slice 10: rune
+    /// charges). Removing the final unit drops the entry entirely, matching legacy
+    /// rune-stack semantics. Returns false when the slot does not resolve.
+    pub fn consume_player_container_item_unit(
+        &mut self,
+        player_id: u64,
+        container_id: u8,
+        item_index: usize,
+    ) -> Result<bool, CoreError> {
+        let mut containers = self.player_containers(player_id)?.clone();
+        let mut container =
+            containers
+                .remove(container_id)
+                .ok_or(CoreError::UnknownPlayerContainer {
+                    player_id,
+                    container_id,
+                })?;
+        let consumed = container.items.consume_item_unit(item_index);
+        if consumed {
+            containers.insert(container)?;
+            self.player_containers.insert(player_id, containers);
+            self.mark_changed();
+        }
+        Ok(consumed)
+    }
+
     /// Moves one depth-one content item out of a container item into another top-level owned
     /// container. Cloned-state preparation keeps every error path atomic.
     pub fn move_content_item_to_container(
@@ -12168,6 +12194,62 @@ mod tests {
             world.static_creature_declared_damage_for_next_hit(undeclared_id),
             None
         );
+    }
+
+    #[test]
+    fn rune_stack_charge_consumption_drops_the_final_unit() {
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        let mut backpack =
+            PlayerContainer::new(0, ItemInstance::new(1988, 1).unwrap(), "Backpack", false, 4)
+                .unwrap();
+        backpack
+            .items
+            .insert(ItemInstance::new(3198, 3).unwrap())
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(backpack).unwrap();
+        world.replace_player_containers(7, containers).unwrap();
+
+        assert!(world.consume_player_container_item_unit(7, 0, 0).unwrap());
+        assert_eq!(
+            world
+                .player_containers(7)
+                .unwrap()
+                .container(0)
+                .unwrap()
+                .items
+                .item(0)
+                .map(|item| item.count),
+            Some(2)
+        );
+        assert!(world.consume_player_container_item_unit(7, 0, 0).unwrap());
+        assert!(world.consume_player_container_item_unit(7, 0, 0).unwrap());
+        // The final consumed unit removes the entry entirely (legacy rune-stack semantics).
+        assert!(world
+            .player_containers(7)
+            .unwrap()
+            .container(0)
+            .unwrap()
+            .items
+            .item(0)
+            .is_none());
+
+        // Unknown players, containers, and indexes stay typed errors.
+        assert!(matches!(
+            world.consume_player_container_item_unit(99, 0, 0),
+            Err(CoreError::UnknownPlayer(99))
+        ));
+        assert!(matches!(
+            world.consume_player_container_item_unit(7, 5, 0),
+            Err(CoreError::UnknownPlayerContainer {
+                container_id: 5,
+                ..
+            })
+        ));
+        assert!(!world
+            .consume_player_container_item_unit(7, 0, 9)
+            .unwrap_or(true));
     }
 
     #[test]

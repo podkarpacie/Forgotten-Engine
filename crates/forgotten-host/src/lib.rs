@@ -593,6 +593,71 @@ fn native_map_item_use_creature_intent(
     Some(PlayerItemUseCreatureIntent { source, target })
 }
 
+/// Decodes one classic flagged owned-container address (`x=0xFFFF`, `y=0x40|container_id`,
+/// `z=item index`) as encoded by the client for inventory-borne use targets. Map tiles,
+/// equipment slots, and nonzero stack positions stay outside this bounded decode.
+fn native_classic_owned_container_address(
+    position: NativeOtClientPosition,
+    stack_position: u8,
+) -> Option<(u8, usize)> {
+    if position.x != u16::MAX || position.y & 0x40 == 0 {
+        return None;
+    }
+    if stack_position != 0 {
+        return None;
+    }
+    Some(((position.y & 0x0f) as u8, usize::from(position.z)))
+}
+
+/// Consumes one unit of the fired rune from its owned container slot (plan v49 slice 10).
+/// Persists the resulting stack and refreshes this session's rendered-window baseline so the
+/// container delta layer emits the precise Change/Delete record. Returns false when the source
+/// was not an owned container slot or the slot no longer resolves.
+#[allow(clippy::too_many_arguments)]
+fn consume_declared_rune_charge(
+    shared_world: &SharedNativeWorld,
+    database: &mut EngineDatabase,
+    character_id: u64,
+    source_position: NativeOtClientPosition,
+    source_stack_position: u8,
+    profile: &NativeOtClientProfile,
+    catalog: Option<&NativeItemPresentationCatalog>,
+    sent_container_windows: &mut BTreeMap<u8, NativeRenderedContainerWindow>,
+) -> bool {
+    let Some((container_id, item_index)) =
+        native_classic_owned_container_address(source_position, source_stack_position)
+    else {
+        return false;
+    };
+    let consumed = shared_world
+        .lock()
+        .ok()
+        .and_then(|mut world| {
+            world
+                .consume_player_container_item_unit(character_id, container_id, item_index)
+                .ok()
+        })
+        .unwrap_or(false);
+    if !consumed {
+        return false;
+    }
+    if let Ok(containers) = shared_world.player_containers(character_id) {
+        let _ = database.replace_player_containers(character_id, &containers);
+        match containers.container(container_id) {
+            Some(container) => {
+                sent_container_windows.insert(
+                    container_id,
+                    native_rendered_container_window(profile, catalog, container),
+                );
+            }
+            None => {
+                sent_container_windows.remove(&container_id);
+            }
+        }
+    }
+    true
+}
+
 fn native_classic_channel_list_entries(
     catalog: Option<&LegacyPublicChannelCatalog>,
 ) -> Vec<NativeOtClientClassicChannel> {
@@ -11001,7 +11066,6 @@ fn handle_native_otclient_game(
                         // Declarative rune/throwable: when the used item has a declared weapon
                         // entry and the target is a player, fire the combat event through the
                         // same authoritative path as melee. The item charge is consumed.
-                        let mut rune_fired = false;
                         if let Some(catalog) = config.declarative_weapon_catalog.as_deref() {
                             if let Some(definition) =
                                 catalog.get(outcome.source.server_id)
@@ -11029,16 +11093,28 @@ fn handle_native_otclient_game(
                                         world_map,
                                     ) {
                                         Ok((combat_outcome, _, _)) => {
-                                            rune_fired = true;
+                                            // Plan v49 slice 10: each fired rune consumes one
+                                            // charge from its owned container stack.
+                                            let charge_consumed = consume_declared_rune_charge(
+                                                shared_world,
+                                                &mut database,
+                                                character.id,
+                                                source_position,
+                                                source_stack_position,
+                                                &config.client_profile,
+                                                config.item_presentation_catalog.as_deref(),
+                                                &mut sent_container_windows,
+                                            );
                                             native_diagnostic(
                                                 config.extended_diagnostics,
                                                 peer,
                                                 &format!(
-                                                    "action=rune-hit item={} target={} damage={} defeated={}",
+                                                    "action=rune-hit item={} target={} damage={} defeated={} charge-consumed={}",
                                                     outcome.source.server_id,
                                                     target_id,
                                                     combat_outcome.mitigated_damage,
-                                                    combat_outcome.damage.defeated
+                                                    combat_outcome.damage.defeated,
+                                                    charge_consumed
                                                 ),
                                             );
                                         }
@@ -11048,7 +11124,6 @@ fn handle_native_otclient_game(
                                 }
                             }
                         }
-                        let _ = rune_fired;
                         native_diagnostic(
                             config.extended_diagnostics,
                             peer,
@@ -15710,6 +15785,127 @@ mod tests {
                 .map(|item| (item.server_id, item.count)),
             Some((2148, 3))
         );
+        drop(database);
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn fired_rune_charges_decrement_owned_container_stacks_and_persist() {
+        let profile = native_otclient_config("127.0.0.1:0".parse().unwrap()).client_profile;
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                3198,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 11698,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let map = native_world_map();
+        let database_path = database_path("rune-charge-consume");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 101,
+                account_id: u64::from(u32::try_from(account_id).unwrap()),
+                name: "Knight".into(),
+                position: map.spawn(),
+                level: 8,
+                experience: 0,
+                skill_points: 0,
+            })
+            .unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: u64::from(u32::try_from(account_id).unwrap()),
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        let mut backpack =
+            PlayerContainer::new(2, ItemInstance::new(1988, 1).unwrap(), "Backpack", false, 4)
+                .unwrap();
+        backpack
+            .items
+            .insert(ItemInstance::new(3198, 3).unwrap())
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(backpack).unwrap();
+        shared.replace_player_containers(101, containers).unwrap();
+        let mut sent_container_windows: BTreeMap<u8, NativeRenderedContainerWindow> =
+            native_rendered_container_windows(
+                &profile,
+                Some(&catalog),
+                &shared.player_containers(101).unwrap(),
+                &BTreeSet::new(),
+            );
+
+        // Classic flagged container address: window 2, item index 0.
+        let source = NativeOtClientPosition {
+            x: u16::MAX,
+            y: 0x40 | 2,
+            z: 0,
+        };
+        assert!(consume_declared_rune_charge(
+            &shared,
+            &mut database,
+            101,
+            source,
+            0,
+            &profile,
+            Some(&catalog),
+            &mut sent_container_windows
+        ));
+        assert_eq!(
+            database
+                .player_containers(101)
+                .unwrap()
+                .container(2)
+                .unwrap()
+                .items
+                .item(0)
+                .map(|item| (item.server_id, item.count)),
+            Some((3198, 2))
+        );
+        // The baseline tracked the consumed stack's current rendering (count is carried by
+        // subtype only for catalog-declared stackables, absent here).
+        assert_eq!(
+            sent_container_windows
+                .get(&2)
+                .and_then(|window| window.as_ref())
+                .and_then(|(_, slots)| slots.first())
+                .map(|record| (record.client_thing_id, record.subtype)),
+            Some((11698, None))
+        );
+
+        // Map-tile and equipment-style sources are not owned container stacks.
+        let map_source = NativeOtClientPosition {
+            x: 102,
+            y: 100,
+            z: 7,
+        };
+        assert!(!consume_declared_rune_charge(
+            &shared,
+            &mut database,
+            101,
+            map_source,
+            0,
+            &profile,
+            Some(&catalog),
+            &mut sent_container_windows
+        ));
         drop(database);
         let _ = fs::remove_file(database_path);
     }
