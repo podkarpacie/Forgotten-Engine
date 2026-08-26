@@ -986,6 +986,8 @@ pub const NATIVE_OTCLIENT_DEFAULT_OUTFIT_LAST_LOOK_TYPE: u8 = 134;
 pub const NATIVE_OTCLIENT_GAME_ANIMATED_TEXT: u8 = 0x84;
 /// Server opcode `0x83`: one tile graphical effect.
 pub const NATIVE_OTCLIENT_GAME_MAGIC_EFFECT: u8 = 0x83;
+/// Server opcode `0x85`: one distance-effect missile from tile to tile (plan v49 slice 9).
+pub const NATIVE_OTCLIENT_GAME_DISTANCE_EFFECT: u8 = 0x85;
 pub const NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT: u8 = 0xc8;
 pub const NATIVE_OTCLIENT_GAME_VIP_ADD: u8 = 0xd2;
 pub const NATIVE_OTCLIENT_GAME_VIP_STATE: u8 = 0xd3;
@@ -2170,6 +2172,30 @@ pub fn encode_native_otclient_magic_effect(
     writer.u16(position.y);
     writer.byte(position.z);
     writer.byte(effect_id);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes one classic distance-effect missile (`0x85`): origin tile, destination tile, then the
+/// bounded shot id (plan v49 slice 9). Same-floor tiles are the caller's responsibility; the
+/// codec only rejects unmapped effect ids.
+pub fn encode_native_otclient_distance_effect(
+    profile: &NativeOtClientProfile,
+    from: NativeOtClientPosition,
+    to: NativeOtClientPosition,
+    shot_id: u8,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_classic_740_inventory_records() || shot_id == 0 {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_DISTANCE_EFFECT);
+    writer.u16(from.x);
+    writer.u16(from.y);
+    writer.byte(from.z);
+    writer.u16(to.x);
+    writer.u16(to.y);
+    writer.byte(to.z);
+    writer.byte(shot_id);
     Ok(Frame(writer.finish()))
 }
 
@@ -4879,6 +4905,53 @@ mod tests {
                 .0,
             vec![NATIVE_OTCLIENT_GAME_DELETE_IN_CONTAINER, 2, 6]
         );
+        assert_eq!(
+            encode_native_otclient_distance_effect(
+                &profile,
+                NativeOtClientPosition {
+                    x: 100,
+                    y: 100,
+                    z: 7
+                },
+                NativeOtClientPosition {
+                    x: 105,
+                    y: 103,
+                    z: 7
+                },
+                29,
+            )
+            .unwrap()
+            .0,
+            vec![
+                NATIVE_OTCLIENT_GAME_DISTANCE_EFFECT,
+                100,
+                0,
+                100,
+                0,
+                7,
+                105,
+                0,
+                103,
+                0,
+                7,
+                29,
+            ]
+        );
+        assert!(encode_native_otclient_distance_effect(
+            &profile,
+            NativeOtClientPosition {
+                x: 100,
+                y: 100,
+                z: 7
+            },
+            NativeOtClientPosition {
+                x: 101,
+                y: 100,
+                z: 7
+            },
+            0,
+        )
+        .is_err());
         assert!(encode_native_otclient_create_in_container(
             &NativeOtClientProfile {
                 protocol_version: 860,

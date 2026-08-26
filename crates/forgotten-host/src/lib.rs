@@ -56,9 +56,9 @@ use forgotten_protocol::{
     encode_native_otclient_create_in_container, encode_native_otclient_creature_health,
     encode_native_otclient_creature_outfit, encode_native_otclient_creature_party_shield,
     encode_native_otclient_delete_in_container, encode_native_otclient_delete_inventory,
-    encode_native_otclient_empty_quest_log, encode_native_otclient_failure_message,
-    encode_native_otclient_game_announcement, encode_native_otclient_game_cancel_walk_facing,
-    encode_native_otclient_game_death,
+    encode_native_otclient_distance_effect, encode_native_otclient_empty_quest_log,
+    encode_native_otclient_failure_message, encode_native_otclient_game_announcement,
+    encode_native_otclient_game_cancel_walk_facing, encode_native_otclient_game_death,
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
@@ -11063,9 +11063,10 @@ fn handle_native_otclient_game(
                 };
                 match shared_world.validate_player_item_use_creature(world_map, intent) {
                     Ok(outcome) => {
-                        // Declarative rune/throwable: when the used item has a declared weapon
-                        // entry and the target is a player, fire the combat event through the
-                        // same authoritative path as melee. The item charge is consumed.
+                        // Declarative weapon use against a creature: adjacent melee for sword/
+                        // club/axe declarations and runes; ranged distance shots with ammo
+                        // consumption plus a 0x85 missile record for declared distance weapons
+                        // (plan v49 slices 9-10).
                         if let Some(catalog) = config.declarative_weapon_catalog.as_deref() {
                             if let Some(definition) =
                                 catalog.get(outcome.source.server_id)
@@ -11075,9 +11076,37 @@ fn handle_native_otclient_game(
                                     ..
                                 } = outcome.target
                                 {
-                                    let event = match definition
-                                        .adjacent_melee_event(character.id, target_id)
-                                    {
+                                    let is_distance = definition.distance_range.is_some();
+                                    if is_distance {
+                                        // Ammo gate: one unit from the ammo slot per shot.
+                                        let has_ammo = shared_world
+                                            .lock()
+                                            .ok()
+                                            .and_then(|world| {
+                                                world.player_equipment(character.id).ok().map(
+                                                    |equipment| {
+                                                        equipment
+                                                            .item(EquipmentSlot::Ammo)
+                                                            .is_some()
+                                                    },
+                                                )
+                                            })
+                                            .unwrap_or(false);
+                                        if !has_ammo {
+                                            native_diagnostic(
+                                                config.extended_diagnostics,
+                                                peer,
+                                                "action=distance-shot outcome=deferred-no-ammo",
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    let event = if is_distance {
+                                        definition.distance_shot_event(character.id, target_id)
+                                    } else {
+                                        definition.adjacent_melee_event(character.id, target_id)
+                                    };
+                                    let event = match event {
                                         Ok(event) => event,
                                         Err(error) => {
                                             native_diagnostic(
@@ -11093,30 +11122,80 @@ fn handle_native_otclient_game(
                                         world_map,
                                     ) {
                                         Ok((combat_outcome, _, _)) => {
-                                            // Plan v49 slice 10: each fired rune consumes one
-                                            // charge from its owned container stack.
-                                            let charge_consumed = consume_declared_rune_charge(
-                                                shared_world,
-                                                &mut database,
-                                                character.id,
-                                                source_position,
-                                                source_stack_position,
-                                                &config.client_profile,
-                                                config.item_presentation_catalog.as_deref(),
-                                                &mut sent_container_windows,
-                                            );
-                                            native_diagnostic(
-                                                config.extended_diagnostics,
-                                                peer,
-                                                &format!(
-                                                    "action=rune-hit item={} target={} damage={} defeated={} charge-consumed={}",
-                                                    outcome.source.server_id,
-                                                    target_id,
-                                                    combat_outcome.mitigated_damage,
-                                                    combat_outcome.damage.defeated,
-                                                    charge_consumed
-                                                ),
-                                            );
+                                            if is_distance {
+                                                let ammo_consumed = shared_world
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|mut world| {
+                                                        world
+                                                            .consume_player_equipment_item_unit(
+                                                                character.id,
+                                                                EquipmentSlot::Ammo,
+                                                            )
+                                                            .ok()
+                                                    })
+                                                    .unwrap_or(false);
+                                                if let Some(shot_effect) = definition.shot_effect
+                                                {
+                                                    let target_position = shared_world
+                                                        .lock()
+                                                        .ok()
+                                                        .and_then(|world| {
+                                                            world
+                                                                .player(target_id)
+                                                                .map(|target| target.position)
+                                                        });
+                                                    if let Some(target_position) = target_position
+                                                    {
+                                                        let missile =
+                                                            encode_native_otclient_distance_effect(
+                                                                &config.client_profile,
+                                                                native_position(player_position),
+                                                                native_position(target_position),
+                                                                shot_effect,
+                                                            )
+                                                            .map_err(HostError::Protocol)?;
+                                                        write_frame(stream, &missile)?;
+                                                    }
+                                                }
+                                                native_diagnostic(
+                                                    config.extended_diagnostics,
+                                                    peer,
+                                                    &format!(
+                                                        "action=distance-shot item={} target={} damage={} defeated={} ammo-consumed={}",
+                                                        outcome.source.server_id,
+                                                        target_id,
+                                                        combat_outcome.mitigated_damage,
+                                                        combat_outcome.damage.defeated,
+                                                        ammo_consumed
+                                                    ),
+                                                );
+                                            } else {
+                                                // Plan v49 slice 10: each fired rune consumes one
+                                                // charge from its owned container stack.
+                                                let charge_consumed = consume_declared_rune_charge(
+                                                    shared_world,
+                                                    &mut database,
+                                                    character.id,
+                                                    source_position,
+                                                    source_stack_position,
+                                                    &config.client_profile,
+                                                    config.item_presentation_catalog.as_deref(),
+                                                    &mut sent_container_windows,
+                                                );
+                                                native_diagnostic(
+                                                    config.extended_diagnostics,
+                                                    peer,
+                                                    &format!(
+                                                        "action=rune-hit item={} target={} damage={} defeated={} charge-consumed={}",
+                                                        outcome.source.server_id,
+                                                        target_id,
+                                                        combat_outcome.mitigated_damage,
+                                                        combat_outcome.damage.defeated,
+                                                        charge_consumed
+                                                    ),
+                                                );
+                                            }
                                         }
                                         Err(HostError::Core(_)) => {}
                                         Err(error) => return Err(error),

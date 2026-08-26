@@ -2425,7 +2425,15 @@ pub enum CombatDamageType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CombatDelivery {
     AdjacentMelee,
+    /// Declarative distance shot (plan v49 slice 9): validated against Chebyshev tile
+    /// distance and same-floor adjacency at application time.
+    RangedDistance {
+        max_range: u8,
+    },
 }
+
+/// Bounded maximum for declarative distance weapons; legacy bows/crossbows stay within five.
+pub const MAX_DISTANCE_WEAPON_RANGE: u8 = 5;
 
 pub const MAX_COMBAT_EVENT_DAMAGE: u16 = 10_000;
 pub const MAX_COMBAT_INTERVAL_TICKS: u16 = 60;
@@ -2516,6 +2524,36 @@ impl PlayerCombatEvent {
             attacker_id,
             target_id,
             delivery: CombatDelivery::AdjacentMelee,
+            damage_type,
+            requested_damage,
+            timing,
+        })
+    }
+
+    /// Declares one distance-weapon shot. The declared range is clamped to the bounded legacy
+    /// maximum; per-application range and floor validation happen in the authoritative combat
+    /// transition against live positions.
+    pub fn distance_shot(
+        attacker_id: u64,
+        target_id: u64,
+        damage_type: CombatDamageType,
+        requested_damage: u16,
+        timing: CombatAttackTiming,
+        declared_range: u8,
+    ) -> Result<Self, CoreError> {
+        if requested_damage == 0
+            || requested_damage > MAX_COMBAT_EVENT_DAMAGE
+            || declared_range == 0
+            || declared_range > MAX_DISTANCE_WEAPON_RANGE
+        {
+            return Err(CoreError::InvalidCombatEvent);
+        }
+        Ok(Self {
+            attacker_id,
+            target_id,
+            delivery: CombatDelivery::RangedDistance {
+                max_range: declared_range,
+            },
             damage_type,
             requested_damage,
             timing,
@@ -6229,6 +6267,28 @@ impl WorldState {
         })
     }
 
+    /// Consumes one unit from an owned equipment slot stack (plan v49 slice 9: distance-weapon
+    /// ammunition). Removing the final unit clears the slot. Returns false when the slot is
+    /// already empty.
+    pub fn consume_player_equipment_item_unit(
+        &mut self,
+        player_id: u64,
+        slot: EquipmentSlot,
+    ) -> Result<bool, CoreError> {
+        let mut equipment = self.player_equipment(player_id)?.clone();
+        let Some(item) = equipment.item_mut(slot) else {
+            return Ok(false);
+        };
+        if item.count > 1 {
+            item.count -= 1;
+        } else {
+            equipment.unequip(slot);
+        }
+        self.player_equipments.insert(player_id, equipment);
+        self.mark_changed();
+        Ok(true)
+    }
+
     /// Consumes one unit of an owned top-level container stack (plan v49 slice 10: rune
     /// charges). Removing the final unit drops the entry entirely, matching legacy
     /// rune-stack semantics. Returns false when the slot does not resolve.
@@ -7055,6 +7115,25 @@ impl WorldState {
                 attacker_id: event.attacker_id,
                 target_id: event.target_id,
             });
+        }
+        if let CombatDelivery::RangedDistance { max_range } = event.delivery {
+            if attacker.position.z != target.position.z {
+                return Err(CoreError::CombatOutOfRange {
+                    attacker_id: event.attacker_id,
+                    target_id: event.target_id,
+                });
+            }
+            let x_distance = i32::from(attacker.position.x) - i32::from(target.position.x);
+            let y_distance = i32::from(attacker.position.y) - i32::from(target.position.y);
+            let chebyshev = x_distance.abs().max(y_distance.abs());
+            // Distance shots may include the shooter's own tile ring but never point-blank
+            // adjacency exclusions: zero means the same tile, which classic servers reject.
+            if chebyshev == 0 || chebyshev > i32::from(max_range) {
+                return Err(CoreError::CombatOutOfRange {
+                    attacker_id: event.attacker_id,
+                    target_id: event.target_id,
+                });
+            }
         }
         if self.player_vitals(event.target_id)?.health == 0 {
             return Err(CoreError::TargetAlreadyDefeated(event.target_id));
@@ -12194,6 +12273,115 @@ mod tests {
             world.static_creature_declared_damage_for_next_hit(undeclared_id),
             None
         );
+    }
+
+    #[test]
+    fn distance_shots_validate_range_and_floor_before_applying() {
+        let mut map = WorldMap::new(
+            "distance",
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+        );
+        for x in 95..=110 {
+            for y in 98..=102 {
+                map.set_tile(
+                    Position { x, y, z: 7 },
+                    WorldMapTile {
+                        ground_thing_id: 102,
+                        walkable: true,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let mut world = WorldState::default();
+        let mut shooter = player();
+        shooter.id = 1;
+        world.add_player(shooter).unwrap();
+        let mut target = player();
+        target.id = 2;
+        target.position = Position {
+            x: 104,
+            y: 101,
+            z: 7,
+        };
+        world.add_player(target).unwrap();
+        world
+            .update_player_vitals(
+                2,
+                PlayerVitals {
+                    health: 50,
+                    max_health: 50,
+                    ..PlayerVitals::default()
+                },
+            )
+            .unwrap();
+
+        // Within the declared range (Chebyshev 4 of a declared 5): applies.
+        let event = PlayerCombatEvent::distance_shot(
+            1,
+            2,
+            CombatDamageType::Physical,
+            5,
+            CombatAttackTiming::new(2).unwrap(),
+            5,
+        )
+        .unwrap();
+        let outcome = world.apply_player_combat_event(event).unwrap();
+        assert_eq!(outcome.damage.applied_damage, 5);
+
+        // Beyond any bounded range: rejected.
+        world
+            .teleport_player(
+                2,
+                Position {
+                    x: 108,
+                    y: 101,
+                    z: 7,
+                },
+            )
+            .unwrap();
+        let event = PlayerCombatEvent::distance_shot(
+            1,
+            2,
+            CombatDamageType::Physical,
+            5,
+            CombatAttackTiming::new(2).unwrap(),
+            5,
+        )
+        .unwrap();
+        assert!(matches!(
+            world.apply_player_combat_event(event),
+            Err(CoreError::CombatOutOfRange { .. })
+        ));
+
+        // Cross-floor shots are rejected even at zero tile distance.
+        world
+            .teleport_player(
+                2,
+                Position {
+                    x: 100,
+                    y: 100,
+                    z: 6,
+                },
+            )
+            .unwrap();
+        let event = PlayerCombatEvent::distance_shot(
+            1,
+            2,
+            CombatDamageType::Physical,
+            5,
+            CombatAttackTiming::new(2).unwrap(),
+            5,
+        )
+        .unwrap();
+        assert!(matches!(
+            world.apply_player_combat_event(event),
+            Err(CoreError::CombatOutOfRange { .. })
+        ));
     }
 
     #[test]

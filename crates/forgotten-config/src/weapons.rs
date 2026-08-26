@@ -1,6 +1,7 @@
 use super::{ConfigError, EngineConfig};
 use forgotten_core::{
     CombatAttackTiming, CombatDamageType, PlayerCombatEvent, PlayerSkill, MAX_COMBAT_EVENT_DAMAGE,
+    MAX_DISTANCE_WEAPON_RANGE,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
@@ -20,6 +21,12 @@ pub struct DeclarativeWeaponDefinition {
     pub item_id: u16,
     pub physical_damage: u16,
     pub timing: CombatAttackTiming,
+    /// Plan v49 slice 9: when declared (1..=5), the weapon is a distance weapon whose use
+    /// against a creature fires a ranged shot instead of adjacent melee.
+    pub distance_range: Option<u8>,
+    /// Client-visible projectile effect id for the 0x85 missile record. Required together with
+    /// `distance_range`; absent for melee declarations.
+    pub shot_effect: Option<u8>,
 }
 
 impl DeclarativeWeaponDefinition {
@@ -28,12 +35,38 @@ impl DeclarativeWeaponDefinition {
         attacker_id: u64,
         target_id: u64,
     ) -> Result<PlayerCombatEvent, ConfigError> {
+        if self.distance_range.is_some() || self.shot_effect.is_some() {
+            return Err(invalid(
+                "distance weapon declarations cannot fire adjacent-melee events",
+            ));
+        }
         PlayerCombatEvent::adjacent_melee(
             attacker_id,
             target_id,
             CombatDamageType::Physical,
             self.physical_damage,
             self.timing,
+        )
+        .map_err(|_| invalid("validated declarative weapon could not create a combat event"))
+    }
+
+    pub fn distance_shot_event(
+        self,
+        attacker_id: u64,
+        target_id: u64,
+    ) -> Result<PlayerCombatEvent, ConfigError> {
+        let Some(distance_range) = self.distance_range else {
+            return Err(invalid(
+                "only declared distance weapons can fire distance-shot events",
+            ));
+        };
+        PlayerCombatEvent::distance_shot(
+            attacker_id,
+            target_id,
+            CombatDamageType::Physical,
+            self.physical_damage,
+            self.timing,
+            distance_range,
         )
         .map_err(|_| invalid("validated declarative weapon could not create a combat event"))
     }
@@ -209,6 +242,8 @@ fn parse_weapon(event: &BytesStart<'_>) -> Result<DeclarativeWeaponDefinition, C
     let timing = CombatAttackTiming::new(required_u16(event, b"intervalticks")?)
         .map_err(|_| invalid("declarative weapon interval is outside the configured range"))?;
     let mut known = [false; 3];
+    let mut distance_range: Option<u8> = None;
+    let mut shot_effect: Option<u8> = None;
     for attribute in event.attributes().with_checks(false) {
         let attribute =
             attribute.map_err(|error| invalid(format!("invalid weapon attribute: {error}")))?;
@@ -216,6 +251,34 @@ fn parse_weapon(event: &BytesStart<'_>) -> Result<DeclarativeWeaponDefinition, C
             b"itemid" => known[0] = true,
             b"damage" => known[1] = true,
             b"intervalticks" => known[2] = true,
+            b"distance" => {
+                let raw = attribute
+                    .unescape_value()
+                    .map_err(|error| invalid(format!("invalid weapon attribute: {error}")))?;
+                let parsed: u16 = raw
+                    .trim()
+                    .parse()
+                    .map_err(|_| invalid("declarative weapon distance must be numeric"))?;
+                if parsed == 0 || parsed > u16::from(MAX_DISTANCE_WEAPON_RANGE) {
+                    return Err(invalid(
+                        "declarative weapon distance must stay between 1 and 5",
+                    ));
+                }
+                distance_range = Some(parsed as u8);
+            }
+            b"shoteffect" => {
+                let raw = attribute
+                    .unescape_value()
+                    .map_err(|error| invalid(format!("invalid weapon attribute: {error}")))?;
+                let parsed: u8 = raw
+                    .trim()
+                    .parse()
+                    .map_err(|_| invalid("declarative weapon shotEffect must be numeric"))?;
+                if parsed == 0 {
+                    return Err(invalid("declarative weapon shotEffect must be nonzero"));
+                }
+                shot_effect = Some(parsed);
+            }
             _ => return Err(invalid("unsupported declarative weapon attribute")),
         }
     }
@@ -224,10 +287,23 @@ fn parse_weapon(event: &BytesStart<'_>) -> Result<DeclarativeWeaponDefinition, C
             "declarative weapon is missing a required attribute",
         ));
     }
+    // Distance declarations require a projectile effect; melee declarations must not carry
+    // distance-only attributes.
+    match (distance_range.is_some(), shot_effect.is_some()) {
+        (true, true) => {}
+        (false, false) => {}
+        _ => {
+            return Err(invalid(
+                "declarative distance weapons require both distance and shotEffect attributes",
+            ))
+        }
+    }
     Ok(DeclarativeWeaponDefinition {
         item_id,
         physical_damage,
         timing,
+        distance_range,
+        shot_effect,
     })
 }
 
@@ -273,6 +349,8 @@ mod tests {
                 item_id: 2376,
                 physical_damage: 12,
                 timing: CombatAttackTiming::new(2).unwrap(),
+                distance_range: None,
+                shot_effect: None,
             })
         );
         let event = catalog
@@ -282,6 +360,37 @@ mod tests {
             .unwrap();
         assert_eq!(event.damage_type, CombatDamageType::Physical);
         assert_eq!(event.requested_damage, 24);
+    }
+
+    #[test]
+    fn parses_distance_declarations_and_rejects_incomplete_pairs() {
+        let catalog = parse_declarative_weapons_xml(
+            br#"<fe-weapons><weapon itemid="2455" damage="18" intervalticks="2" distance="5" shoteffect="29"/></fe-weapons>"#,
+        )
+        .unwrap();
+        let definition = catalog.get(2455).unwrap();
+        assert_eq!(definition.distance_range, Some(5));
+        assert_eq!(definition.shot_effect, Some(29));
+        let event = definition.distance_shot_event(7, 8).unwrap();
+        assert!(matches!(
+            event.delivery,
+            forgotten_core::CombatDelivery::RangedDistance { max_range: 5 }
+        ));
+
+        // Distance without a shot effect (and the inverse) is rejected.
+        assert!(parse_declarative_weapons_xml(
+            br#"<fe-weapons><weapon itemid="2455" damage="18" intervalticks="2" distance="5"/></fe-weapons>"#,
+        )
+        .is_err());
+        assert!(parse_declarative_weapons_xml(
+            br#"<fe-weapons><weapon itemid="2455" damage="18" intervalticks="2" shoteffect="29"/></fe-weapons>"#,
+        )
+        .is_err());
+        // Out-of-bounded ranges are rejected.
+        assert!(parse_declarative_weapons_xml(
+            br#"<fe-weapons><weapon itemid="2455" damage="18" intervalticks="2" distance="6" shoteffect="29"/></fe-weapons>"#,
+        )
+        .is_err());
     }
 
     #[test]
