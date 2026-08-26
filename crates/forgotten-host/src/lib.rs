@@ -2381,6 +2381,69 @@ fn handle_native_trade_accept(
     Ok(())
 }
 
+/// Flips one persisted quest to completed and grants the catalog-declared rewards into the
+/// player's first owned container (plan v49 slice 15). Returns the granted rewards, or `None`
+/// when the player is offline, the quest is unknown to the catalog, or it was already completed.
+fn complete_native_player_quest(
+    shared_world: &SharedNativeWorld,
+    database: &mut EngineDatabase,
+    player_id: u64,
+    quest_id: u16,
+    quest_catalog: Option<&QuestCatalog>,
+) -> Result<Option<Vec<(u16, u16)>>, HostError> {
+    let Some(definition) = quest_catalog.and_then(|catalog| catalog.get(quest_id)) else {
+        return Ok(None);
+    };
+    if !shared_world.has_player(player_id)? {
+        return Ok(None);
+    }
+    let mut states = database.player_quests(player_id)?;
+    if states
+        .iter()
+        .any(|(id, completed)| *id == quest_id && *completed)
+    {
+        return Ok(None);
+    }
+    match states.iter_mut().find(|(id, _)| *id == quest_id) {
+        Some(entry) => entry.1 = true,
+        None => states.push((quest_id, true)),
+    }
+    database.replace_player_quests(player_id, &states)?;
+
+    let mut rewards = Vec::new();
+    if !definition.rewards.is_empty() {
+        let mut containers = shared_world.player_containers(player_id)?;
+        let first_container_id = containers.iter().next().map(|(id, _)| id);
+        let Some(container_id) = first_container_id else {
+            return Ok(Some(rewards));
+        };
+        let mut container = match containers.remove(container_id) {
+            Some(container) => container,
+            None => return Ok(Some(rewards)),
+        };
+        for (item_id, count) in &definition.rewards {
+            let Ok(stack) = forgotten_core::ItemInstance::new(*item_id, (*count).min(100)) else {
+                continue;
+            };
+            // Merge into a matching stack when possible; otherwise start a fresh one.
+            let placed = match container.items.merge_or_insert_stack(stack.clone()) {
+                Ok(_) => true,
+                Err(_) => container.items.insert(stack).is_ok(),
+            };
+            if placed {
+                rewards.push((*item_id, *count));
+            }
+        }
+        containers.insert(container).map_err(HostError::Core)?;
+        shared_world.replace_player_containers(player_id, containers)?;
+        database
+            .replace_player_containers(player_id, &shared_world.player_containers(player_id)?)
+            .map_err(HostError::Persistence)?;
+        shared_world.mark_containers_changed();
+    }
+    Ok(Some(rewards))
+}
+
 /// Handles one side's reject/cancel: closes the session and signals the other side's window.
 fn handle_native_trade_reject(
     shared_world: &SharedNativeWorld,
@@ -2539,6 +2602,7 @@ fn handle_native_gm_talkaction(
     player_id: u64,
     message: &str,
     _gm_level: u8,
+    quest_catalog: Option<&QuestCatalog>,
 ) -> Result<Option<String>, HostError> {
     let trimmed = message.trim();
     if !trimmed.starts_with('/') {
@@ -2626,6 +2690,102 @@ fn handle_native_gm_talkaction(
                     from_name, destination.x, destination.y, destination.z
                 ))),
                 Err(_) => Ok(Some("That destination is blocked.".into())),
+            }
+        }
+        "item" => {
+            // /item <id> [count]: quick self-delivery. For giving to other players use /give.
+            let item_id: u16 = match parts.next().and_then(|value| value.parse().ok()) {
+                Some(value) => value,
+                None => return Ok(Some("Usage: /item <item-id> [count]".into())),
+            };
+            let count: u16 = parts
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1);
+            if item_id == 0 || count == 0 || count > 100 {
+                return Ok(Some(
+                    "Item id must be nonzero and count between 1 and 100.".into(),
+                ));
+            }
+            give_items_to_player(shared_world, database, player_id, item_id, u64::from(count))
+        }
+        "freeze" | "unfreeze" => {
+            let freezing = verb == "freeze";
+            let target_name = parts.next().unwrap_or("");
+            let Some(target_id) = database
+                .player_id_by_name(target_name)
+                .map_err(HostError::Persistence)?
+            else {
+                return Ok(Some(format!("Player `{target_name}` does not exist.")));
+            };
+            database
+                .set_player_frozen(target_id, freezing)
+                .map_err(HostError::Persistence)?;
+            Ok(Some(if freezing {
+                format!("Froze {target_name} in place.")
+            } else {
+                format!("Unfroze {target_name}.")
+            }))
+        }
+        "down" | "up" => {
+            let current = shared_world.player_position(player_id)?;
+            let destination_z = if verb == "down" {
+                current.z.saturating_add(1).min(15)
+            } else {
+                current.z.saturating_sub(1)
+            };
+            let destination = forgotten_core::Position {
+                x: current.x,
+                y: current.y,
+                z: destination_z,
+            };
+            match shared_world.teleport_player_for_operator(player_id, destination) {
+                Ok(()) => Ok(Some(format!(
+                    "Moved {} to floor {}.",
+                    if verb == "down" { "down" } else { "up" },
+                    destination.z
+                ))),
+                Err(_) => Ok(Some("That level is blocked here.".into())),
+            }
+        }
+        "completequest" => {
+            // /completequest <player> <quest-id>: flips the persisted completion flag and
+            // grants the catalog-declared rewards into the player's starter backpack.
+            let target_name = parts.next().unwrap_or("");
+            let quest_id: u16 = match parts.next().and_then(|value| value.parse().ok()) {
+                Some(value) => value,
+                None => {
+                    return Ok(Some(
+                        "Usage: /completequest <player> <quest-id>".into(),
+                    ))
+                }
+            };
+            let Some(target_id) = database
+                .player_id_by_name(target_name)
+                .map_err(HostError::Persistence)?
+            else {
+                return Ok(Some(format!("Player `{target_name}` does not exist.")));
+            };
+            match complete_native_player_quest(
+                shared_world,
+                database,
+                target_id,
+                quest_id,
+                quest_catalog,
+            )? {
+                Some(rewards) => {
+                    let reward_text = rewards
+                        .iter()
+                        .map(|(item_id, count)| format!("{count}x item {item_id}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Ok(Some(format!(
+                        "{target_name} completed quest {quest_id}; granted {reward_text}."
+                    )))
+                }
+                None => Ok(Some(format!(
+                    "`{target_name}` is not online or quest {quest_id} is unknown/already completed."
+                ))),
             }
         }
         "kick" => {
@@ -12305,6 +12465,7 @@ fn handle_native_otclient_game(
                             character.id,
                             &request.message,
                             gm_level,
+                            config.quest_catalog.as_deref(),
                         )? {
                             let reply_frame = encode_native_otclient_status_message(
                                 &config.client_profile,
@@ -13392,6 +13553,16 @@ fn move_native_map_player(
     facing: &mut NativeOtClientCardinalDirection,
     direction: NativeOtClientCardinalDirection,
 ) -> Result<bool, HostError> {
+    // Operator freeze (plan v49 slice 18): frozen characters face the requested direction but
+    // never step, identical to the classic blocked response.
+    if database.player_frozen(character_id)? {
+        write_frame(
+            stream,
+            &encode_native_otclient_game_cancel_walk_facing(profile, facing.protocol_direction())
+                .map_err(HostError::Protocol)?,
+        )?;
+        return Ok(false);
+    }
     let moved = {
         let mut world = shared_world.lock()?;
         let source = world
@@ -13575,6 +13746,15 @@ fn move_native_map_player_diagonal(
     facing: &mut NativeOtClientCardinalDirection,
     direction: NativeOtClientAutoWalkDirection,
 ) -> Result<bool, HostError> {
+    // Operator freeze (plan v49 slice 18): frozen characters cancel the diagonal attempt.
+    if database.player_frozen(character_id)? {
+        write_frame(
+            stream,
+            &encode_native_otclient_game_cancel_walk_facing(profile, facing.protocol_direction())
+                .map_err(HostError::Protocol)?,
+        )?;
+        return Ok(false);
+    }
     let steps = direction.cardinal_steps();
     debug_assert_eq!(steps.len(), 2);
     let moved = {
@@ -16364,6 +16544,140 @@ mod tests {
         ));
         drop(database);
         let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn gm_item_freeze_and_quest_completion_flow() {
+        let path = database_path("gm-item-freeze-quest");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id: i64 = database.create_account("owner", "password").unwrap();
+        let character = database
+            .create_player_for_account(account_id as u32, "Knight")
+            .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: u64::from(character.id),
+                    account_id: account_id as u64,
+                    name: "Knight".into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &native_world_map(),
+            )
+            .unwrap();
+
+        // /item self-delivers into the first container.
+        let starter_containers = {
+            let mut containers = PlayerContainers::default();
+            containers
+                .insert(
+                    PlayerContainer::new(
+                        0,
+                        ItemInstance::new(1988, 1).unwrap(),
+                        "Backpack",
+                        false,
+                        20,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            containers
+        };
+        database
+            .replace_player_containers(u64::from(character.id), &starter_containers)
+            .unwrap();
+        shared
+            .replace_player_containers(u64::from(character.id), starter_containers)
+            .unwrap();
+
+        let reply = handle_native_gm_talkaction(
+            &shared,
+            &mut database,
+            u64::from(character.id),
+            "/item 2148 100",
+            2,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(reply.contains("Delivered"));
+        assert!(database
+            .player_containers(u64::from(character.id))
+            .unwrap()
+            .container(0)
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.server_id == 2148 && item.count == 100));
+
+        // Freeze persists and survives relog reads.
+        handle_native_gm_talkaction(
+            &shared,
+            &mut database,
+            u64::from(character.id),
+            "/unfreeze Knight",
+            1,
+            None,
+        )
+        .unwrap();
+        let frozen_reply = handle_native_gm_talkaction(
+            &shared,
+            &mut database,
+            u64::from(character.id),
+            "/freeze Knight",
+            1,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(frozen_reply.contains("Froze Knight"));
+        assert!(database.player_frozen(u64::from(character.id)).unwrap());
+
+        // Quest completion flips the flag and grants declared rewards into the backpack.
+        let mut quest_catalog = QuestCatalog::default();
+        let mut quest_bytes = Vec::new();
+        quest_bytes.extend_from_slice(
+            br#"<fe-quests><fe-quest id="7" name="Rat Hunt"><fe-reward itemid="2148" count="50"/></fe-quest></fe-quests>"#,
+        );
+        quest_catalog = parse_quests_xml(&quest_bytes).unwrap();
+        database
+            .replace_player_quests(u64::from(character.id), &[(7_u16, false)])
+            .unwrap();
+        let granted = complete_native_player_quest(
+            &shared,
+            &mut database,
+            u64::from(character.id),
+            7,
+            Some(&quest_catalog),
+        )
+        .unwrap()
+        .expect("first completion grants");
+        assert_eq!(granted, vec![(2148, 50)]);
+        assert!(database
+            .player_quests(u64::from(character.id))
+            .unwrap()
+            .iter()
+            .any(|(id, completed)| *id == 7 && *completed));
+        // Second completion is a no-op.
+        assert!(complete_native_player_quest(
+            &shared,
+            &mut database,
+            u64::from(character.id),
+            7,
+            Some(&quest_catalog)
+        )
+        .unwrap()
+        .is_none());
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -30879,7 +31193,8 @@ mod gm_talkaction_tests {
         let mut database = EngineDatabase::open(&path).unwrap();
         let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
         let reply =
-            handle_native_gm_talkaction(&shared, &mut database, 1, "hello everyone", 2).unwrap();
+            handle_native_gm_talkaction(&shared, &mut database, 1, "hello everyone", 2, None)
+                .unwrap();
         assert!(reply.is_none());
         let _ = fs::remove_file(&path);
     }
@@ -30890,7 +31205,7 @@ mod gm_talkaction_tests {
         let mut database = EngineDatabase::open(&path).unwrap();
         let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
         let reply =
-            handle_native_gm_talkaction(&shared, &mut database, 1, "/frobnicate", 1).unwrap();
+            handle_native_gm_talkaction(&shared, &mut database, 1, "/frobnicate", 1, None).unwrap();
         assert!(reply.unwrap().contains("Unknown GM command"));
         let _ = fs::remove_file(&path);
     }
@@ -30905,19 +31220,20 @@ mod gm_talkaction_tests {
             .unwrap();
         let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
 
-        let missing_scope = handle_native_gm_talkaction(&shared, &mut database, 1, "/gm Target", 1)
-            .unwrap()
-            .unwrap();
+        let missing_scope =
+            handle_native_gm_talkaction(&shared, &mut database, 1, "/gm Target", 1, None)
+                .unwrap()
+                .unwrap();
         assert!(missing_scope.contains("Usage"));
 
         let offline_scope =
-            handle_native_gm_talkaction(&shared, &mut database, 1, "/gm online Target", 1)
+            handle_native_gm_talkaction(&shared, &mut database, 1, "/gm online Target", 1, None)
                 .unwrap()
                 .unwrap();
         assert!(offline_scope.contains("not online"));
 
         let promoted =
-            handle_native_gm_talkaction(&shared, &mut database, 1, "/gm offline Target 2", 1)
+            handle_native_gm_talkaction(&shared, &mut database, 1, "/gm offline Target 2", 1, None)
                 .unwrap()
                 .unwrap();
         assert!(promoted.contains("level 2"));
@@ -30945,6 +31261,7 @@ mod gm_talkaction_tests {
             1,
             "/ban Target Botting in depot",
             1,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -30956,9 +31273,10 @@ mod gm_talkaction_tests {
         assert!(ban_reason.contains("Botting"));
 
         // Unban lifts it.
-        let lifted = handle_native_gm_talkaction(&shared, &mut database, 1, "/unban Target", 1)
-            .unwrap()
-            .unwrap();
+        let lifted =
+            handle_native_gm_talkaction(&shared, &mut database, 1, "/unban Target", 1, None)
+                .unwrap()
+                .unwrap();
         assert!(lifted.contains("1 ban(s)"));
         assert!(database
             .active_account_ban(account_id as u64)
@@ -30966,7 +31284,7 @@ mod gm_talkaction_tests {
             .is_none());
 
         // Mute records remaining seconds; unmute clears and reports the not-muted case.
-        let muted = handle_native_gm_talkaction(&shared, &mut database, 1, "/mute Target", 1)
+        let muted = handle_native_gm_talkaction(&shared, &mut database, 1, "/mute Target", 1, None)
             .unwrap()
             .unwrap();
         assert!(muted.contains("Muted Target"));
@@ -30974,13 +31292,15 @@ mod gm_talkaction_tests {
             .account_mute_remaining_seconds(account_id as u64)
             .unwrap()
             .is_some());
-        let unmuted = handle_native_gm_talkaction(&shared, &mut database, 1, "/unmute Target", 1)
-            .unwrap()
-            .unwrap();
+        let unmuted =
+            handle_native_gm_talkaction(&shared, &mut database, 1, "/unmute Target", 1, None)
+                .unwrap()
+                .unwrap();
         assert!(unmuted.contains("Unmuted"));
-        let again = handle_native_gm_talkaction(&shared, &mut database, 1, "/unmute Target", 1)
-            .unwrap()
-            .unwrap();
+        let again =
+            handle_native_gm_talkaction(&shared, &mut database, 1, "/unmute Target", 1, None)
+                .unwrap()
+                .unwrap();
         assert!(again.contains("was not muted"));
         let _ = fs::remove_file(&path);
     }
@@ -31063,14 +31383,20 @@ mod gm_talkaction_tests {
             .update_player_facing(player_id, NativeOtClientCardinalDirection::South)
             .unwrap();
 
-        let unknown =
-            handle_native_gm_talkaction(&shared, &mut database, player_id, "/spawn Dragon", 1)
-                .unwrap()
-                .unwrap();
+        let unknown = handle_native_gm_talkaction(
+            &shared,
+            &mut database,
+            player_id,
+            "/spawn Dragon",
+            1,
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert!(unknown.contains("Unknown entity"));
 
         let summoned =
-            handle_native_gm_talkaction(&shared, &mut database, player_id, "/spawn Rat", 1)
+            handle_native_gm_talkaction(&shared, &mut database, player_id, "/spawn Rat", 1, None)
                 .unwrap()
                 .unwrap();
         assert!(summoned.contains("Summoned"));

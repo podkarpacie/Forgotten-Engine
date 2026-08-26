@@ -50,7 +50,8 @@ const SCHEMA_VERSION_CORPSE_DESPAWN_TICKS: i64 = 27;
 const SCHEMA_VERSION_PLAYER_GM_LEVEL: i64 = 32;
 const SCHEMA_VERSION_PLAYER_FACING: i64 = 33;
 const SCHEMA_VERSION_ACCOUNT_BANS: i64 = 34;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_ACCOUNT_BANS;
+const SCHEMA_VERSION_PLAYER_FROZEN: i64 = 35;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_FROZEN;
 /// Classic blessing count ceiling; the audited default death-loss reduction consumes this.
 pub const MAX_PLAYER_BLESSINGS: u8 = 5;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1792,6 +1793,30 @@ impl EngineDatabase {
             params![account_id as i64],
         )?;
         Ok(affected)
+    }
+
+    /// Sets the operator freeze flag for one character (plan v49 slice 18). Frozen characters
+    /// cannot step until unfrozen; the flag survives relogs.
+    pub fn set_player_frozen(&self, player_id: u64, frozen: bool) -> Result<(), PersistenceError> {
+        let affected = self.connection.execute(
+            "UPDATE players SET frozen = ?1 WHERE id = ?2",
+            params![i64::from(frozen), player_id as i64],
+        )?;
+        if affected == 0 {
+            return Err(PersistenceError::UnknownPlayer(player_id));
+        }
+        Ok(())
+    }
+
+    pub fn player_frozen(&self, player_id: u64) -> Result<bool, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT frozen FROM players WHERE id = ?1")?;
+        let mut rows = statement.query(params![player_id as i64])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get::<_, i64>(0)? != 0),
+            None => Ok(false),
+        }
     }
 
     /// Records an account ban (plan v49 slice 17). `duration_seconds` of `None` means
@@ -4764,6 +4789,17 @@ impl EngineDatabase {
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![SCHEMA_VERSION_ACCOUNT_BANS, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < SCHEMA_VERSION_PLAYER_FROZEN {
+            // Operator freeze flag (plan v49 slice 18): a frozen character cannot step. The
+            // flag survives relogs so moderation holds while the operator walks over.
+            self.connection.execute_batch(
+                "ALTER TABLE players ADD COLUMN frozen INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_PLAYER_FROZEN, unix_seconds()],
             )?;
         }
         Ok(())

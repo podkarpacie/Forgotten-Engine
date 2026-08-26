@@ -10,13 +10,14 @@ const MAX_QUEST_NAME_BYTES: usize = 64;
 const MAX_QUESTS: usize = 256;
 const MAX_QUEST_MISSIONS: usize = 16;
 
-/// One bounded operator-declared quest identity plus optional mission lines. Storage flags and
-/// reward logic remain outside this adapter.
+/// One bounded operator-declared quest identity plus optional mission lines and item rewards
+/// granted into the starter backpack on the completion transition (plan v49 slice 15).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuestDefinition {
     pub quest_id: u16,
     pub name: String,
     pub missions: Vec<(String, String)>,
+    pub rewards: Vec<(u16, u16)>,
 }
 
 /// Validated quest catalog keyed by numeric quest ID.
@@ -107,8 +108,12 @@ pub fn parse_quests_xml(bytes: &[u8]) -> Result<QuestCatalog, ConfigError> {
                         quest_id,
                         name,
                         missions: Vec::new(),
+                        rewards: Vec::new(),
                     });
-                } else if !(depth == 3 && event.name().as_ref() == b"fe-mission") {
+                } else if !(depth == 3
+                    && (event.name().as_ref() == b"fe-mission"
+                        || event.name().as_ref() == b"fe-reward"))
+                {
                     return Err(invalid("unexpected quest XML element"));
                 }
             }
@@ -121,15 +126,21 @@ pub fn parse_quests_xml(bytes: &[u8]) -> Result<QuestCatalog, ConfigError> {
                         return Err(invalid("quest missions exceed the supported bound"));
                     }
                     quest.missions.push(parse_mission(&event)?);
+                } else if depth == 2
+                    && event.name().as_ref() == b"fe-reward"
+                    && active_quest.is_some()
+                {
+                    let Some(quest) = active_quest.as_mut() else {
+                        return Err(invalid("reward outside a quest element"));
+                    };
+                    quest.rewards.push(parse_reward(&event)?);
                 } else if depth == 1 && event.name().as_ref() == b"fe-quest" {
-                    if catalog.len() >= MAX_QUESTS {
-                        return Err(invalid("quest catalog exceeds the supported bound"));
-                    }
                     let (quest_id, name) = parse_quest(&event)?;
                     catalog.insert(QuestDefinition {
                         quest_id,
                         name,
                         missions: Vec::new(),
+                        rewards: Vec::new(),
                     })?;
                 } else {
                     return Err(invalid("unexpected quest XML element"));
@@ -162,6 +173,36 @@ pub fn parse_quests_xml(bytes: &[u8]) -> Result<QuestCatalog, ConfigError> {
         return Err(invalid("quest catalog is missing a complete root"));
     }
     Ok(catalog)
+}
+
+/// One bounded quest reward: a nonzero item id and count within the classic stack bound.
+fn parse_reward(event: &BytesStart<'_>) -> Result<(u16, u16), ConfigError> {
+    let item_id = optional_u16_attr(event, b"itemid")?.unwrap_or(0);
+    let count = optional_u16_attr(event, b"count")?.unwrap_or(1);
+    if item_id == 0 || count == 0 {
+        return Err(invalid("quest rewards need a nonzero itemid and count"));
+    }
+    Ok((item_id, count))
+}
+
+fn optional_u16_attr(event: &BytesStart<'_>, key: &[u8]) -> Result<Option<u16>, ConfigError> {
+    event
+        .attributes()
+        .with_checks(false)
+        .find_map(|attribute| {
+            let attribute = attribute.ok()?;
+            (attribute.key.as_ref() == key).then_some(attribute)
+        })
+        .map(|attribute| {
+            let value = attribute
+                .unescape_value()
+                .map_err(|error| invalid(format!("invalid quest reward value: {error}")))?;
+            value
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| invalid("quest reward values must fit an unsigned 16-bit integer"))
+        })
+        .transpose()
 }
 
 fn parse_mission(event: &BytesStart<'_>) -> Result<(String, String), ConfigError> {
