@@ -119,6 +119,8 @@ pub struct EngineConfig {
     /// to `3`; `0` disables melee targeting entirely. An explicit nonzero
     /// `staticCreatureTargetAttackDamage` still overrides the cycling declared ranges.
     pub static_creature_melee_aggro_range: u8,
+    /// Optional combat feedback (plan v49 slice 11): render animated damage numbers on hits.
+    pub animated_damage_text_enabled: bool,
     /// Configured corpse despawn delay in seconds. `0` disables decay; a positive value expires
     /// each spawned runtime corpse on a later native heartbeat.
     pub corpse_despawn_seconds: u32,
@@ -332,6 +334,8 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         });
     }
     let static_creature_melee_aggro_range = static_creature_melee_aggro_range as u8;
+    // Optional combat feedback (plan v49 slice 11): animated damage numbers on hits.
+    let animated_damage_text_enabled = optional_boolean(&values, "animatedDamageText", false)?;
     let corpse_despawn_seconds = optional_u32(&values, "corpseDespawnSeconds", 0)?;
     if corpse_despawn_seconds > 86_400 {
         return Err(ConfigError::InvalidValue {
@@ -506,6 +510,7 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         static_creature_target_pursuit_range,
         static_creature_wander_interval_ticks,
         static_creature_melee_aggro_range,
+        animated_damage_text_enabled,
         corpse_despawn_seconds,
         party_shared_experience_rules,
         experience_stages,
@@ -1471,6 +1476,9 @@ fn is_recognized_config_key(key: &str) -> bool {
             | "rateMagic"
             | "staticCreatureTargetAttackDamage"
             | "staticCreatureTargetPursuitRange"
+            | "staticCreatureWanderIntervalTicks"
+            | "staticCreatureMeleeAggroRange"
+            | "animatedDamageText"
             | "corpseDespawnSeconds"
             | "partySharedExperienceEnabled"
             | "partySharedExperienceRange"

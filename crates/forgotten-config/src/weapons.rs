@@ -27,6 +27,9 @@ pub struct DeclarativeWeaponDefinition {
     /// Client-visible projectile effect id for the 0x85 missile record. Required together with
     /// `distance_range`; absent for melee declarations.
     pub shot_effect: Option<u8>,
+    /// Optional client-visible magic-effect id rendered at the target tile on every successful
+    /// hit (plan v49 slice 11). Absent means no effect.
+    pub hit_effect: Option<u8>,
 }
 
 impl DeclarativeWeaponDefinition {
@@ -242,6 +245,7 @@ fn parse_weapon(event: &BytesStart<'_>) -> Result<DeclarativeWeaponDefinition, C
     let timing = CombatAttackTiming::new(required_u16(event, b"intervalticks")?)
         .map_err(|_| invalid("declarative weapon interval is outside the configured range"))?;
     let mut known = [false; 3];
+    let mut hit_effect: Option<u8> = None;
     let mut distance_range: Option<u8> = None;
     let mut shot_effect: Option<u8> = None;
     for attribute in event.attributes().with_checks(false) {
@@ -279,6 +283,19 @@ fn parse_weapon(event: &BytesStart<'_>) -> Result<DeclarativeWeaponDefinition, C
                 }
                 shot_effect = Some(parsed);
             }
+            b"hiteffect" => {
+                let raw = attribute
+                    .unescape_value()
+                    .map_err(|error| invalid(format!("invalid weapon attribute: {error}")))?;
+                let parsed: u8 = raw
+                    .trim()
+                    .parse()
+                    .map_err(|_| invalid("declarative weapon hitEffect must be numeric"))?;
+                if parsed == 0 {
+                    return Err(invalid("declarative weapon hitEffect must be nonzero"));
+                }
+                hit_effect = Some(parsed);
+            }
             _ => return Err(invalid("unsupported declarative weapon attribute")),
         }
     }
@@ -304,6 +321,7 @@ fn parse_weapon(event: &BytesStart<'_>) -> Result<DeclarativeWeaponDefinition, C
         timing,
         distance_range,
         shot_effect,
+        hit_effect,
     })
 }
 
@@ -351,6 +369,7 @@ mod tests {
                 timing: CombatAttackTiming::new(2).unwrap(),
                 distance_range: None,
                 shot_effect: None,
+                hit_effect: None,
             })
         );
         let event = catalog
@@ -376,6 +395,12 @@ mod tests {
             event.delivery,
             forgotten_core::CombatDelivery::RangedDistance { max_range: 5 }
         ));
+        // Slice 11: hit-effect declarations ride along any weapon kind.
+        let with_hit = parse_declarative_weapons_xml(
+            br#"<fe-weapons><weapon itemid="2425" damage="9" intervalticks="2" hiteffect="13"/></fe-weapons>"#,
+        )
+        .unwrap();
+        assert_eq!(with_hit.get(2425).unwrap().hit_effect, Some(13));
 
         // Distance without a shot effect (and the inverse) is rejected.
         assert!(parse_declarative_weapons_xml(

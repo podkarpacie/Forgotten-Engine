@@ -988,6 +988,12 @@ pub const NATIVE_OTCLIENT_GAME_ANIMATED_TEXT: u8 = 0x84;
 pub const NATIVE_OTCLIENT_GAME_MAGIC_EFFECT: u8 = 0x83;
 /// Server opcode `0x85`: one distance-effect missile from tile to tile (plan v49 slice 9).
 pub const NATIVE_OTCLIENT_GAME_DISTANCE_EFFECT: u8 = 0x85;
+/// Server opcode `0x90`: creature skull state (classic values 0..=6).
+pub const NATIVE_OTCLIENT_GAME_CREATURE_SKULL: u8 = 0x90;
+/// Server opcode `0x92`: creature unpass (tile-blocking) flag.
+pub const NATIVE_OTCLIENT_GAME_CREATURE_UNPASS: u8 = 0x92;
+/// Classic white skull value (first unjustified player kill).
+pub const NATIVE_OTCLIENT_SKULL_WHITE: u8 = 3;
 pub const NATIVE_OTCLIENT_GAME_CHOOSE_OUTFIT: u8 = 0xc8;
 pub const NATIVE_OTCLIENT_GAME_VIP_ADD: u8 = 0xd2;
 pub const NATIVE_OTCLIENT_GAME_VIP_STATE: u8 = 0xd3;
@@ -2196,6 +2202,39 @@ pub fn encode_native_otclient_distance_effect(
     writer.u16(to.y);
     writer.byte(to.z);
     writer.byte(shot_id);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes one classic creature-skull record (`0x90`): creature id then bounded skull value
+/// (plan v49 slice 11).
+pub fn encode_native_otclient_creature_skull(
+    profile: &NativeOtClientProfile,
+    creature_id: u32,
+    skull: u8,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() || skull > 6 {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_CREATURE_SKULL);
+    writer.u32(creature_id);
+    writer.byte(skull);
+    Ok(Frame(writer.finish()))
+}
+
+/// Encodes one classic creature-unpass record (`0x92`): creature id then the tile-blocking flag.
+pub fn encode_native_otclient_creature_unpass(
+    profile: &NativeOtClientProfile,
+    creature_id: u32,
+    unpass: bool,
+) -> Result<Frame, ProtocolError> {
+    if !profile.supports_current_native_foundation() {
+        return Err(ProtocolError::UnsupportedNativeClientProfile);
+    }
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_CREATURE_UNPASS);
+    writer.u32(creature_id);
+    writer.byte(u8::from(unpass));
     Ok(Frame(writer.finish()))
 }
 
@@ -4952,6 +4991,19 @@ mod tests {
             0,
         )
         .is_err());
+        assert_eq!(
+            encode_native_otclient_creature_skull(&profile, 0x7000_0001, 3)
+                .unwrap()
+                .0,
+            vec![NATIVE_OTCLIENT_GAME_CREATURE_SKULL, 1, 0, 0, 0x70, 3]
+        );
+        assert!(encode_native_otclient_creature_skull(&profile, 1, 7).is_err());
+        assert_eq!(
+            encode_native_otclient_creature_unpass(&profile, 0x4000_0002, true)
+                .unwrap()
+                .0,
+            vec![NATIVE_OTCLIENT_GAME_CREATURE_UNPASS, 2, 0, 0, 0x40, 1]
+        );
         assert!(encode_native_otclient_create_in_container(
             &NativeOtClientProfile {
                 protocol_version: 860,

@@ -854,6 +854,7 @@ fn run_host(
                     })
                     .collect(),
             )),
+            animated_damage_text_enabled: config.animated_damage_text_enabled,
             static_target_attack_policy: match config.static_creature_target_attack_damage {
                 0 => match config.static_creature_melee_aggro_range {
                     // Plan v49 slice 5 default: declared-melee creatures cycle their imported

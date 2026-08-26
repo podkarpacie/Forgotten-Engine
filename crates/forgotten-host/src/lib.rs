@@ -47,7 +47,7 @@ use forgotten_protocol::{
     encode_fe_otclient_initial_world, encode_fe_otclient_movement_ack,
     encode_fe_otclient_world_tick, encode_legacy_74_character_list,
     encode_legacy_74_game_challenge, encode_legacy_74_game_session_error,
-    encode_legacy_74_game_session_ready, encode_login_error,
+    encode_legacy_74_game_session_ready, encode_login_error, encode_native_otclient_animated_text,
     encode_native_otclient_change_in_container, encode_native_otclient_channel_list,
     encode_native_otclient_character_list, encode_native_otclient_choose_outfit,
     encode_native_otclient_classic_vip_entry, encode_native_otclient_classic_vip_presence,
@@ -55,6 +55,7 @@ use forgotten_protocol::{
     encode_native_otclient_close_trade, encode_native_otclient_counter_trade,
     encode_native_otclient_create_in_container, encode_native_otclient_creature_health,
     encode_native_otclient_creature_outfit, encode_native_otclient_creature_party_shield,
+    encode_native_otclient_creature_skull, encode_native_otclient_creature_unpass,
     encode_native_otclient_delete_in_container, encode_native_otclient_delete_inventory,
     encode_native_otclient_distance_effect, encode_native_otclient_empty_quest_log,
     encode_native_otclient_failure_message, encode_native_otclient_game_announcement,
@@ -62,7 +63,7 @@ use forgotten_protocol::{
     encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
     encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
     encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
-    encode_native_otclient_look_message,
+    encode_native_otclient_look_message, encode_native_otclient_magic_effect,
     encode_native_otclient_map_step_with_static_spawns_and_players,
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
@@ -1660,6 +1661,8 @@ pub struct NativeOtClientHostConfig {
     pub static_spawns: Option<Arc<FeTfsStaticSpawnCollection>>,
     /// Declared corpse sprite per lowercased creature name (plan v49 slice 6). Creatures absent
     /// from the map fall back to the bounded default corpse server id on defeat.
+    /// Optional combat feedback (plan v49 slice 11): render animated damage numbers on hits.
+    pub animated_damage_text_enabled: bool,
     pub corpse_server_id_by_creature_name: Option<Arc<BTreeMap<String, u16>>>,
     /// Disabled by default. When enabled, one heartbeat pass may apply bounded fixed damage from
     /// each active static creature to its already selected adjacent target. Formula, persistence,
@@ -8280,6 +8283,9 @@ fn handle_native_otclient_game(
         &bootstrap_containers,
         &BTreeSet::new(),
     );
+    // Slice 11: the white-skull award record is emitted once per session when the attacker's
+    // first unjustified kill flips their skull state.
+    let mut observed_white_skull_sent = false;
     let static_health_frames =
         native_static_creature_health_frames(&config.client_profile, &active_static_spawns)?;
     // Establish all shared-state baselines before any initialization frame becomes observable by
@@ -8712,6 +8718,15 @@ fn handle_native_otclient_game(
                             &mut database,
                         )?;
                         if outcome.deactivated {
+                            // Slice 11: tell this client the defeated creature no longer blocks
+                            // its tile before the corpse appears.
+                            let unpass = encode_native_otclient_creature_unpass(
+                                &config.client_profile,
+                                outcome.target_id,
+                                false,
+                            )
+                            .map_err(HostError::Protocol)?;
+                            write_frame(stream, &unpass)?;
                             let creature_name = shared_world.lock().ok().and_then(|world| {
                                 world
                                     .static_creature(outcome.target_id)
@@ -11077,9 +11092,18 @@ fn handle_native_otclient_game(
                                 } = outcome.target
                                 {
                                     let is_distance = definition.distance_range.is_some();
-                                    if is_distance {
-                                        // Ammo gate: one unit from the ammo slot per shot.
-                                        let has_ammo = shared_world
+                                    // Target tile for slice-11 feedback records (missile,
+                                    // hit effect, animated damage number).
+                                    let target_position_feedback = shared_world
+                                        .lock()
+                                        .ok()
+                                        .and_then(|world| {
+                                            world
+                                                .player(target_id)
+                                                .map(|target| target.position)
+                                        });
+                                    let has_ammo = if is_distance {
+                                        let has = shared_world
                                             .lock()
                                             .ok()
                                             .and_then(|world| {
@@ -11092,7 +11116,7 @@ fn handle_native_otclient_game(
                                                 )
                                             })
                                             .unwrap_or(false);
-                                        if !has_ammo {
+                                        if !has {
                                             native_diagnostic(
                                                 config.extended_diagnostics,
                                                 peer,
@@ -11100,6 +11124,12 @@ fn handle_native_otclient_game(
                                             );
                                             continue;
                                         }
+                                        true
+                                    } else {
+                                        true
+                                    };
+                                    if !has_ammo {
+                                        continue;
                                     }
                                     let event = if is_distance {
                                         definition.distance_shot_event(character.id, target_id)
@@ -11156,8 +11186,7 @@ fn handle_native_otclient_game(
                                                             )
                                                             .map_err(HostError::Protocol)?;
                                                         write_frame(stream, &missile)?;
-                                                    }
-                                                }
+                                                    }                                                }
                                                 native_diagnostic(
                                                     config.extended_diagnostics,
                                                     peer,
@@ -11195,6 +11224,63 @@ fn handle_native_otclient_game(
                                                         charge_consumed
                                                     ),
                                                 );
+                                            }
+                                            // Plan v49 slice 11 combat feedback: declared hit
+                                            // effect, optional animated damage number, and the
+                                            // attacker's white-skull award record.
+                                            if let (Some(target_position), Some(hit_effect)) = (
+                                                target_position_feedback,
+                                                definition.hit_effect,
+                                            ) {
+                                                let effect_frame =
+                                                    encode_native_otclient_magic_effect(
+                                                        &config.client_profile,
+                                                        native_position(target_position),
+                                                        hit_effect,
+                                                    )
+                                                    .map_err(HostError::Protocol)?;
+                                                write_frame(stream, &effect_frame)?;
+                                            }
+                                            if config.animated_damage_text_enabled
+                                                && combat_outcome.damage.applied_damage > 0
+                                            {
+                                                if let Some(target_position) =
+                                                    target_position_feedback
+                                                {
+                                                    let animated =
+                                                        encode_native_otclient_animated_text(
+                                                            &config.client_profile,
+                                                            native_position(target_position),
+                                                            180,
+                                                            &combat_outcome
+                                                                .damage
+                                                                .applied_damage
+                                                                .to_string(),
+                                                        )
+                                                        .map_err(HostError::Protocol)?;
+                                                    write_frame(stream, &animated)?;
+                                                }
+                                            }
+                                            if shared_world
+                                                .lock()
+                                                .map(|world| {
+                                                    world.player_has_white_skull(character.id)
+                                                })
+                                                .unwrap_or(false)
+                                                && !observed_white_skull_sent
+                                            {
+                                                observed_white_skull_sent = true;
+                                                if let Ok(native_id) =
+                                                    native_player_id(character.id)
+                                                {
+                                                    let skull = encode_native_otclient_creature_skull(
+                                                        &config.client_profile,
+                                                        native_id,
+                                                        forgotten_protocol::NATIVE_OTCLIENT_SKULL_WHITE,
+                                                    )
+                                                    .map_err(HostError::Protocol)?;
+                                                    write_frame(stream, &skull)?;
+                                                }
                                             }
                                         }
                                         Err(HostError::Core(_)) => {}
@@ -14806,6 +14892,7 @@ mod tests {
             armor_multiplier_by_vocation: None,
             static_spawns: None,
             corpse_server_id_by_creature_name: None,
+            animated_damage_text_enabled: false,
             static_target_attack_policy: StaticTargetAttackPolicy::Disabled,
             static_target_pursuit_policy: StaticTargetPursuitPolicy::Disabled,
             static_creature_wander_policy:
