@@ -32,7 +32,7 @@ use forgotten_core::{
     WorldMapSourceRevision, WorldState, MAX_COMBAT_EVENT_DAMAGE, MAX_ITEM_STACK_COUNT,
 };
 use forgotten_persistence::{
-    EngineDatabase, MapItemCountOverrideRecord, MapItemRemovalJournal,
+    EngineDatabase, MapItemCountOverrideRecord, MapItemRemovalJournal, PersistenceError,
     PlayerExperienceVitalsUpdate, PlayerFixedDeathLossSnapshot, PlayerOutfit,
     PlayerVitals as PersistedPlayerVitals, RuntimeMapItemChildRecord, RuntimeMapItemRecord,
     StaticCreatureRuntimeRecord,
@@ -2640,6 +2640,108 @@ fn handle_native_gm_talkaction(
                 Ok(false) => Ok(Some(format!("`{target_name}` is not online."))),
                 Err(_) => Ok(Some("Kick failed; try again.".into())),
             }
+        }
+        "ban" => {
+            // /ban <player> [days] [reason words...]: days 0 (default) means permanent.
+            let target_name = parts.next().unwrap_or("");
+            let Some(target_id) = database
+                .player_id_by_name(target_name)
+                .map_err(HostError::Persistence)?
+            else {
+                return Ok(Some(format!("Player `{target_name}` does not exist.")));
+            };
+            let account_id = database
+                .account_id_by_player_id(target_id)
+                .map_err(HostError::Persistence)?
+                .ok_or(HostError::Persistence(PersistenceError::UnknownPlayer(target_id)))?;
+            // Days are optional; a non-numeric word starts the reason so operators can write
+            // `/ban Name Botting in depot` without quoting.
+            let rest: Vec<String> = parts.map(str::to_owned).collect();
+            let (days, reason) = match rest.first().and_then(|value| value.parse::<u64>().ok()) {
+                Some(days) => (days, rest[1..].join(" ")),
+                None => (0_u64, rest.join(" ")),
+            };
+            let reason = if reason.is_empty() {
+                "Unspecified misconduct".to_owned()
+            } else {
+                reason
+            };
+            database
+                .record_account_ban(
+                    account_id,
+                    &reason,
+                    (days > 0).then(|| days.saturating_mul(86_400)),
+                )
+                .map_err(HostError::Persistence)?;
+            let _ = shared_world.request_kick(target_id);
+            Ok(Some(if days > 0 {
+                format!("Banned {target_name} for {days} day(s): {reason}")
+            } else {
+                format!("Permanently banned {target_name}: {reason}")
+            }))
+        }
+        "unban" => {
+            let target_name = parts.next().unwrap_or("");
+            let Some(target_id) = database
+                .player_id_by_name(target_name)
+                .map_err(HostError::Persistence)?
+            else {
+                return Ok(Some(format!("Player `{target_name}` does not exist.")));
+            };
+            let account_id = database
+                .account_id_by_player_id(target_id)
+                .map_err(HostError::Persistence)?
+                .ok_or(HostError::Persistence(PersistenceError::UnknownPlayer(target_id)))?;
+            let removed = database
+                .clear_account_bans(u64::from(account_id))
+                .map_err(HostError::Persistence)?;
+            Ok(Some(format!(
+                "Lifted {removed} ban(s) from {target_name}."
+            )))
+        }
+        "mute" => {
+            // /mute <player> [minutes]: default 5 minutes, bounded to 30 days.
+            let target_name = parts.next().unwrap_or("");
+            let Some(target_id) = database
+                .player_id_by_name(target_name)
+                .map_err(HostError::Persistence)?
+            else {
+                return Ok(Some(format!("Player `{target_name}` does not exist.")));
+            };
+            let account_id = database
+                .account_id_by_player_id(target_id)
+                .map_err(HostError::Persistence)?
+                .ok_or(HostError::Persistence(PersistenceError::UnknownPlayer(target_id)))?;
+            let minutes: u64 = parts
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(5);
+            database
+                .record_account_mute(account_id, minutes.saturating_mul(60))
+                .map_err(HostError::Persistence)?;
+            Ok(Some(format!("Muted {target_name} for {minutes} minute(s).")))
+        }
+        "unmute" => {
+            let target_name = parts.next().unwrap_or("");
+            let Some(target_id) = database
+                .player_id_by_name(target_name)
+                .map_err(HostError::Persistence)?
+            else {
+                return Ok(Some(format!("Player `{target_name}` does not exist.")));
+            };
+            let account_id = database
+                .account_id_by_player_id(target_id)
+                .map_err(HostError::Persistence)?
+                .ok_or(HostError::Persistence(PersistenceError::UnknownPlayer(target_id)))?;
+            let _ = database.account_mute_remaining_seconds(u64::from(account_id))?; // prunes lapsed rows
+            let cleared = database
+                .clear_account_mute(u64::from(account_id))
+                .map_err(HostError::Persistence)?;
+            Ok(Some(if cleared == 1 {
+                format!("Unmuted {target_name}.")
+            } else {
+                format!("{target_name} was not muted.")
+            }))
         }
         "gm" => {
             // /gm <online|offline> <player> [level] promotes another character.
@@ -7929,6 +8031,25 @@ fn handle_native_otclient_login(
         )?;
         return Ok(());
     };
+    // Plan v49 slice 17: banned accounts get a clean login error instead of a character list.
+    if let Some(reason) = database
+        .active_account_ban(u64::try_from(account.id).unwrap_or(0))
+        .map_err(HostError::Persistence)?
+    {
+        write_frame(
+            stream,
+            &encode_native_otclient_login_error(&format!("Your account is banned. {reason}")),
+        )?;
+        record_event(
+            database_path,
+            "info",
+            &format!(
+                "native client login rejected banned-account={} peer={peer}",
+                account.id
+            ),
+        );
+        return Ok(());
+    }
     let entries = account
         .characters
         .iter()
@@ -12054,6 +12175,25 @@ fn handle_native_otclient_game(
                     continue;
                 }
                 talk_windows.push_back(now);
+                // Plan v49 slice 17: muted accounts cannot route talk records. GMs are exempt
+                // through their persisted tier so moderation stays possible while muted.
+                let speaker_gm_level = database
+                    .player_gm_level(character.id)
+                    .map_err(HostError::Persistence)?;
+                if speaker_gm_level == 0 {
+                    if let Some(remaining) = database
+                        .account_mute_remaining_seconds(account_id)
+                        .map_err(HostError::Persistence)?
+                    {
+                        let muted_notice = encode_native_otclient_status_message(
+                            &config.client_profile,
+                            &format!("You are muted for {remaining} more seconds."),
+                        )
+                        .map_err(HostError::Protocol)?;
+                        write_frame(stream, &muted_notice)?;
+                        continue;
+                    }
+                }
                 // Gamemaster talkactions ("/give", "/tp", "/spawn", ...) run before every other
                 // keyword router and are only available to characters with a persisted GM tier.
                 if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
@@ -30600,6 +30740,63 @@ mod gm_talkaction_tests {
             database.player_gm_level(u64::from(character.id)).unwrap(),
             2
         );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gm_ban_unban_and_mute_round_trip_through_talkactions() {
+        let path = database_path("gm-ban-mute");
+        let mut database = EngineDatabase::open(&path).unwrap();
+        let account_id: i64 = database.create_account("troublemaker", "password").unwrap();
+        let character = database
+            .create_player_for_account(account_id as u32, "Target")
+            .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+
+        // Permanent ban with a reason, then the login gate sees it.
+        let reply = handle_native_gm_talkaction(
+            &shared,
+            &mut database,
+            1,
+            "/ban Target Botting in depot",
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(reply.contains("Permanently banned"));
+        let ban_reason = database
+            .active_account_ban(account_id as u64)
+            .unwrap()
+            .expect("ban recorded");
+        assert!(ban_reason.contains("Botting"));
+
+        // Unban lifts it.
+        let lifted = handle_native_gm_talkaction(&shared, &mut database, 1, "/unban Target", 1)
+            .unwrap()
+            .unwrap();
+        assert!(lifted.contains("1 ban(s)"));
+        assert!(database
+            .active_account_ban(account_id as u64)
+            .unwrap()
+            .is_none());
+
+        // Mute records remaining seconds; unmute clears and reports the not-muted case.
+        let muted = handle_native_gm_talkaction(&shared, &mut database, 1, "/mute Target", 1)
+            .unwrap()
+            .unwrap();
+        assert!(muted.contains("Muted Target"));
+        assert!(database
+            .account_mute_remaining_seconds(account_id as u64)
+            .unwrap()
+            .is_some());
+        let unmuted = handle_native_gm_talkaction(&shared, &mut database, 1, "/unmute Target", 1)
+            .unwrap()
+            .unwrap();
+        assert!(unmuted.contains("Unmuted"));
+        let again = handle_native_gm_talkaction(&shared, &mut database, 1, "/unmute Target", 1)
+            .unwrap()
+            .unwrap();
+        assert!(again.contains("was not muted"));
         let _ = fs::remove_file(&path);
     }
 

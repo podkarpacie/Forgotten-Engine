@@ -49,6 +49,7 @@ const SCHEMA_VERSION_PLAYER_PARTIES: i64 = 30;
 const SCHEMA_VERSION_CORPSE_DESPAWN_TICKS: i64 = 27;
 const SCHEMA_VERSION_PLAYER_GM_LEVEL: i64 = 32;
 const SCHEMA_VERSION_PLAYER_FACING: i64 = 33;
+const SCHEMA_VERSION_ACCOUNT_BANS: i64 = 34;
 pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_FACING;
 /// Classic blessing count ceiling; the audited default death-loss reduction consumes this.
 pub const MAX_PLAYER_BLESSINGS: u8 = 5;
@@ -1754,6 +1755,118 @@ impl EngineDatabase {
             return Err(PersistenceError::UnknownPlayer(player_id));
         }
         Ok(())
+    }
+
+    /// Resolves one account ID from a character row for moderation commands.
+    pub fn account_id_by_player_id(&self, player_id: u64) -> Result<Option<u32>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT account_id FROM players WHERE id = ?1")?;
+        let mut rows = statement.query(params![player_id as i64])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get::<_, i64>(0)? as u32)),
+            None => Ok(None),
+        }
+    }
+
+    /// Lifts any account mute immediately. Returns 1 when a row was removed.
+    pub fn clear_account_mute(&self, account_id: u64) -> Result<usize, PersistenceError> {
+        let affected = self.connection.execute(
+            "DELETE FROM account_mutes WHERE account_id = ?1",
+            params![account_id as i64],
+        )?;
+        Ok(affected)
+    }
+
+    /// Records an account ban (plan v49 slice 17). `duration_seconds` of `None` means
+    /// permanent; a bounded positive value expires the ban automatically.
+    pub fn record_account_ban(
+        &self,
+        account_id: u32,
+        reason: &str,
+        duration_seconds: Option<u64>,
+    ) -> Result<(), PersistenceError> {
+        let reason = reason.trim();
+        if reason.is_empty() || reason.len() > 256 {
+            return Err(PersistenceError::InvalidPlayerName);
+        }
+        self.ensure_account_exists(account_id)?;
+        let expires_at = duration_seconds
+            .map(|seconds| (unix_seconds().saturating_add(seconds)).min(i64::MAX as u64) as i64);
+        self.connection.execute(
+            "INSERT INTO account_bans (account_id, reason, expires_at, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![account_id as i64, reason, expires_at, unix_seconds()],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the active ban reason for an account when one exists and has not expired.
+    pub fn active_account_ban(&self, account_id: u64) -> Result<Option<String>, PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT reason FROM account_bans WHERE account_id = ?1 AND (expires_at IS NULL OR expires_at > ?2) ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = statement.query(params![account_id as i64, unix_seconds()])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Lifts every ban for an account. Returns the number of rows removed.
+    pub fn clear_account_bans(&self, account_id: u64) -> Result<usize, PersistenceError> {
+        let affected = self.connection.execute(
+            "DELETE FROM account_bans WHERE account_id = ?1",
+            params![account_id as i64],
+        )?;
+        Ok(affected)
+    }
+
+    /// Mutes an account until the configured number of seconds elapse. A later mute replaces
+    /// any earlier one.
+    pub fn record_account_mute(
+        &self,
+        account_id: u32,
+        duration_seconds: u64,
+    ) -> Result<(), PersistenceError> {
+        if duration_seconds == 0 || duration_seconds > 86_400 * 30 {
+            return Err(PersistenceError::InvalidPlayerName);
+        }
+        self.ensure_account_exists(account_id)?;
+        self.connection.execute(
+            "INSERT INTO account_mutes (account_id, muted_until) VALUES (?1, ?2)
+             ON CONFLICT(account_id) DO UPDATE SET muted_until = excluded.muted_until",
+            params![
+                account_id as i64,
+                (unix_seconds().saturating_add(duration_seconds)).min(i64::MAX as u64) as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remaining mute seconds for an account, pruning the row once it lapses. `None` means not
+    /// muted.
+    pub fn account_mute_remaining_seconds(
+        &self,
+        account_id: u64,
+    ) -> Result<Option<u64>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT muted_until FROM account_mutes WHERE account_id = ?1")?;
+        let mut rows = statement.query(params![account_id as i64])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let muted_until: i64 = row.get(0)?;
+        let now = unix_seconds();
+        if muted_until > now as i64 {
+            Ok(Some((muted_until - now as i64) as u64))
+        } else {
+            self.connection.execute(
+                "DELETE FROM account_mutes WHERE account_id = ?1",
+                params![account_id as i64],
+            )?;
+            Ok(None)
+        }
     }
 
     /// Resolves one character row by exact case-insensitive name for operator commands.
@@ -4614,6 +4727,27 @@ impl EngineDatabase {
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![SCHEMA_VERSION_PLAYER_FACING, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < SCHEMA_VERSION_ACCOUNT_BANS {
+            // Operator moderation state (plan v49 slice 17): account bans with optional
+            // expiry plus account mutes for chat suppression. Version-neutral infrastructure.
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS account_bans (
+                    id INTEGER PRIMARY KEY,
+                    account_id INTEGER NOT NULL REFERENCES accounts(id),
+                    reason TEXT NOT NULL,
+                    expires_at INTEGER,
+                    created_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS account_mutes (
+                    account_id INTEGER PRIMARY KEY REFERENCES accounts(id),
+                    muted_until INTEGER NOT NULL
+                 );",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_ACCOUNT_BANS, unix_seconds()],
             )?;
         }
         Ok(())
@@ -7864,6 +7998,60 @@ mod tests {
                 .vocation,
             VocationId::new(4)
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn account_bans_and_mutes_round_trip_with_expiry_and_lifting() {
+        let path = temporary_path("account-bans-mutes");
+        let database = EngineDatabase::open(&path).unwrap();
+        let account_id: u64 = database.create_account("moderated", "hash").unwrap() as u64;
+        assert_eq!(database.active_account_ban(account_id).unwrap(), None);
+        assert_eq!(
+            database.account_mute_remaining_seconds(account_id).unwrap(),
+            None
+        );
+
+        // Permanent ban round-trips its reason.
+        database
+            .record_account_ban(account_id as u32, "Botting", None)
+            .unwrap();
+        assert_eq!(
+            database.active_account_ban(account_id).unwrap(),
+            Some("Botting".to_owned())
+        );
+
+        // Lifting clears every row for the account.
+        assert_eq!(database.clear_account_bans(account_id).unwrap(), 1);
+        assert_eq!(database.active_account_ban(account_id).unwrap(), None);
+
+        // Timed bans expire; a one-second mute lapses and prunes itself.
+        database
+            .record_account_ban(account_id as u32, "brief", Some(0))
+            .unwrap();
+        assert_eq!(database.active_account_ban(account_id).unwrap(), None);
+        database.record_account_mute(account_id as u32, 1).unwrap();
+        assert!(database
+            .account_mute_remaining_seconds(account_id)
+            .unwrap()
+            .is_some());
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert_eq!(
+            database.account_mute_remaining_seconds(account_id).unwrap(),
+            None
+        );
+        assert_eq!(database.clear_account_mute(account_id).unwrap(), 0);
+
+        // Invalid input stays typed.
+        assert!(database
+            .record_account_ban(account_id as u32, "   ", None)
+            .is_err());
+        assert!(database.record_account_mute(account_id as u32, 0).is_err());
+
+        // Bans require a known account.
+        assert!(database
+            .record_account_ban(u32::MAX - 7, "x", None)
+            .is_err());
         let _ = fs::remove_file(path);
     }
 
