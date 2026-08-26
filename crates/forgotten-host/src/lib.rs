@@ -30748,7 +30748,7 @@ mod gm_talkaction_tests {
         let path = database_path("gm-ban-mute");
         let mut database = EngineDatabase::open(&path).unwrap();
         let account_id: i64 = database.create_account("troublemaker", "password").unwrap();
-        let character = database
+        database
             .create_player_for_account(account_id as u32, "Target")
             .unwrap();
         let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
