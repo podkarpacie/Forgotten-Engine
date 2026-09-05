@@ -72,7 +72,11 @@ impl SharedNativeWorld {
         Ok(())
     }
 
-    pub(crate) fn accept_party_invitation(&self, invitee_id: u64, leader_id: u64) -> Result<(), HostError> {
+    pub(crate) fn accept_party_invitation(
+        &self,
+        invitee_id: u64,
+        leader_id: u64,
+    ) -> Result<(), HostError> {
         self.lock()?
             .accept_party_invitation(invitee_id, leader_id)
             .map_err(HostError::Core)?;
@@ -80,7 +84,11 @@ impl SharedNativeWorld {
         Ok(())
     }
 
-    pub(crate) fn revoke_party_invitation(&self, leader_id: u64, invitee_id: u64) -> Result<(), HostError> {
+    pub(crate) fn revoke_party_invitation(
+        &self,
+        leader_id: u64,
+        invitee_id: u64,
+    ) -> Result<(), HostError> {
         self.lock()?
             .revoke_party_invitation(leader_id, invitee_id)
             .map_err(HostError::Core)?;
@@ -120,7 +128,10 @@ impl SharedNativeWorld {
         Ok(())
     }
 
-    pub(crate) fn record_party_shared_experience_activity(&self, player_id: u64) -> Result<bool, HostError> {
+    pub(crate) fn record_party_shared_experience_activity(
+        &self,
+        player_id: u64,
+    ) -> Result<bool, HostError> {
         let mut world = self.lock()?;
         if world
             .player_party_leader(player_id)
@@ -134,5 +145,4 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)?;
         Ok(true)
     }
-
 }
