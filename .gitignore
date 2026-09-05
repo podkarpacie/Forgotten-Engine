@@ -8,3 +8,7 @@
 
 *.log
 release-7.4.46/
+
+# Release archives are published via GitHub Releases, never committed
+release-*/
+dist/
