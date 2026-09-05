@@ -12,6 +12,8 @@ const MAX_SPELL_CATALOG_BYTES: usize = 256 * 1024;
 const MAX_SPELL_WORDS_BYTES: usize = 32;
 /// Bounded fixed spell damage; shares the combat-event ceiling scale.
 pub const MAX_SPELL_DAMAGE: u32 = 500;
+/// Bounded haste self-modifier ceiling: no operator configuration can exceed 2x speed.
+pub const MAX_SPELL_SPEED_PERCENT: u16 = 100;
 const MAX_SPELL_CATALOG_DEPTH: usize = 4;
 const MAX_SPELL_CATALOG_ENTRIES: usize = 10_000;
 const SPELL_CATALOG_RELATIVE_PATH: &str = "spells/forgotten-engine-spells.xml";
@@ -27,6 +29,8 @@ pub struct DeclarativeSpellDefinition {
     pub timing: CombatAttackTiming,
     pub words: Option<String>,
     pub damage: Option<u16>,
+    /// Timed self speed modifier (haste) in additive percent, 1..=MAX_SPELL_SPEED_PERCENT.
+    pub speed_percent: Option<u16>,
 }
 
 impl DeclarativeSpellDefinition {
@@ -194,9 +198,10 @@ fn parse_spell(event: &BytesStart<'_>) -> Result<DeclarativeSpellDefinition, Con
     }
     let timing = CombatAttackTiming::new(interval_ticks)
         .map_err(|_| invalid("declarative spell interval is outside the configured range"))?;
-    let mut known = [false; 5];
+    let mut known = [false; 6];
     let mut words: Option<String> = None;
     let mut damage: Option<u16> = None;
+    let mut speed_percent: Option<u16> = None;
     for attribute in event.attributes().with_checks(false) {
         let attribute =
             attribute.map_err(|error| invalid(format!("invalid spell attribute: {error}")))?;
@@ -232,11 +237,26 @@ fn parse_spell(event: &BytesStart<'_>) -> Result<DeclarativeSpellDefinition, Con
                 damage = Some(value);
                 known[4] = true;
             }
+            b"speed" => {
+                let value = required_u16(event, b"speed")?;
+                if value == 0 || value > MAX_SPELL_SPEED_PERCENT {
+                    return Err(invalid(
+                        "declarative spell speed percent is outside the configured range",
+                    ));
+                }
+                speed_percent = Some(value);
+                known[5] = true;
+            }
             _ => return Err(invalid("unsupported declarative spell attribute")),
         }
     }
     if known.iter().take(3).any(|known| !known) {
         return Err(invalid("declarative spell is missing a required attribute"));
+    }
+    if damage.is_some() && speed_percent.is_some() {
+        return Err(invalid(
+            "declarative spell cannot combine damage and speed effects",
+        ));
     }
     Ok(DeclarativeSpellDefinition {
         spell_id,
@@ -244,6 +264,7 @@ fn parse_spell(event: &BytesStart<'_>) -> Result<DeclarativeSpellDefinition, Con
         timing,
         words,
         damage,
+        speed_percent,
     })
 }
 
@@ -291,6 +312,7 @@ mod tests {
                 timing: CombatAttackTiming::new(2).unwrap(),
                 words: None,
                 damage: None,
+                speed_percent: None,
             })
         );
         let event = catalog.get(200).unwrap().cast_event(7).unwrap();
@@ -344,6 +366,36 @@ mod tests {
         .is_err());
         assert!(parse_declarative_spells_xml(
             br#"<spells><fe-spell id="100" manacost="20" intervalticks="2"/></spells>"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parses_speed_effect_with_bounds_and_rejects_damage_combination() {
+        let catalog = parse_declarative_spells_xml(
+            br#"<fe-spells>
+                    <fe-spell id="400" manacost="30" intervalticks="4" words="hur" speed="40"/>
+                </fe-spells>"#,
+        )
+        .unwrap();
+        let haste = catalog.get(400).unwrap();
+        assert_eq!(haste.speed_percent, Some(40));
+        assert_eq!(haste.damage, None);
+        assert_eq!(haste.words.as_deref(), Some("hur"));
+
+        // Speed beyond the bounded ceiling is rejected.
+        assert!(parse_declarative_spells_xml(
+            br#"<fe-spells><fe-spell id="401" manacost="30" intervalticks="4" speed="101"/></fe-spells>"#,
+        )
+        .is_err());
+        // Zero speed is rejected.
+        assert!(parse_declarative_spells_xml(
+            br#"<fe-spells><fe-spell id="401" manacost="30" intervalticks="4" speed="0"/></fe-spells>"#,
+        )
+        .is_err());
+        // Combining damage and speed on one spell is rejected.
+        assert!(parse_declarative_spells_xml(
+            br#"<fe-spells><fe-spell id="402" manacost="30" intervalticks="2" damage="15" speed="40"/></fe-spells>"#,
         )
         .is_err());
     }

@@ -953,10 +953,9 @@ impl WorldMap {
         }
         for (position, mut indices) in by_position {
             indices.sort_unstable_by(|left, right| right.cmp(left));
-            let items = self
-                .tile_items
-                .get_mut(&position)
-                .expect("validated tile list exists");
+            let items = self.tile_items.get_mut(&position).ok_or_else(|| {
+                CoreError::InvalidMap("map-item journal references a missing tile item list".into())
+            })?;
             for index in indices {
                 items.remove(index);
             }
@@ -1652,13 +1651,15 @@ pub struct PlayerRegenerationOutcome {
 
 pub const MAX_CONDITION_DURATION_SECONDS: u16 = 60 * 60;
 
-/// Bounded damage-over-time condition families. Their visual effects, immunity rules, Lua hooks,
-/// and death policy remain separate protocol and scripting concerns.
+/// Bounded damage-over-time condition families plus the timed speed modifier (haste). Their
+/// visual effects, immunity rules, Lua hooks, and death policy remain separate protocol and
+/// scripting concerns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PlayerConditionKind {
     Poison,
     Burning,
     Energy,
+    Haste,
 }
 
 impl PlayerConditionKind {
@@ -1667,6 +1668,7 @@ impl PlayerConditionKind {
             Self::Poison => 0,
             Self::Burning => 1,
             Self::Energy => 2,
+            Self::Haste => 3,
         }
     }
 
@@ -1675,8 +1677,14 @@ impl PlayerConditionKind {
             0 => Some(Self::Poison),
             1 => Some(Self::Burning),
             2 => Some(Self::Energy),
+            3 => Some(Self::Haste),
             _ => None,
         }
+    }
+
+    /// Classic 7.4 haste has no PlayerState icon bit; the modifier is felt through walk cadence.
+    pub const fn is_damage_over_time(self) -> bool {
+        !matches!(self, Self::Haste)
     }
 }
 
@@ -1687,18 +1695,28 @@ pub struct PlayerCondition {
     pub kind: PlayerConditionKind,
     pub interval_seconds: u16,
     pub damage: u16,
+    /// Haste modifier: additive percent applied to effective walk speed. Zero for DoT kinds.
+    pub speed_bonus_percent: u16,
     pub remaining_seconds: u16,
     elapsed_seconds: u16,
 }
 
+/// Bounded cap for the haste speed modifier so no operator configuration can exceed 2x speed.
+pub const MAX_SPEED_BONUS_PERCENT: u16 = 100;
+
 impl PlayerCondition {
+    /// Damage-over-time constructor. Haste requires `new_haste`.
     pub fn new(
         kind: PlayerConditionKind,
         interval_seconds: u16,
         damage: u16,
         remaining_seconds: u16,
     ) -> Result<Self, CoreError> {
-        if interval_seconds == 0 || damage == 0 || remaining_seconds == 0 {
+        if kind.is_damage_over_time() {
+            if interval_seconds == 0 || damage == 0 || remaining_seconds == 0 {
+                return Err(CoreError::InvalidPlayerCondition);
+            }
+        } else {
             return Err(CoreError::InvalidPlayerCondition);
         }
         if remaining_seconds > MAX_CONDITION_DURATION_SECONDS {
@@ -1708,6 +1726,26 @@ impl PlayerCondition {
             kind,
             interval_seconds,
             damage,
+            speed_bonus_percent: 0,
+            remaining_seconds,
+            elapsed_seconds: 0,
+        })
+    }
+
+    /// Timed speed modifier: no damage, no per-interval schedule; interval stays 1 so the
+    /// persisted elapsed invariant (elapsed < interval) holds.
+    pub fn new_haste(speed_bonus_percent: u16, remaining_seconds: u16) -> Result<Self, CoreError> {
+        if speed_bonus_percent == 0 || speed_bonus_percent > MAX_SPEED_BONUS_PERCENT {
+            return Err(CoreError::InvalidPlayerCondition);
+        }
+        if remaining_seconds == 0 || remaining_seconds > MAX_CONDITION_DURATION_SECONDS {
+            return Err(CoreError::InvalidPlayerCondition);
+        }
+        Ok(Self {
+            kind: PlayerConditionKind::Haste,
+            interval_seconds: 1,
+            damage: 0,
+            speed_bonus_percent,
             remaining_seconds,
             elapsed_seconds: 0,
         })
@@ -1719,10 +1757,21 @@ impl PlayerCondition {
         kind: PlayerConditionKind,
         interval_seconds: u16,
         damage: u16,
+        speed_bonus_percent: u16,
         remaining_seconds: u16,
         elapsed_seconds: u16,
     ) -> Result<Self, CoreError> {
-        let mut condition = Self::new(kind, interval_seconds, damage, remaining_seconds)?;
+        let mut condition = if kind.is_damage_over_time() {
+            if speed_bonus_percent != 0 {
+                return Err(CoreError::InvalidPlayerCondition);
+            }
+            Self::new(kind, interval_seconds, damage, remaining_seconds)?
+        } else {
+            if interval_seconds == 0 || damage != 0 || speed_bonus_percent == 0 {
+                return Err(CoreError::InvalidPlayerCondition);
+            }
+            Self::new_haste(speed_bonus_percent, remaining_seconds)?
+        };
         if elapsed_seconds >= interval_seconds {
             return Err(CoreError::InvalidPlayerCondition);
         }
@@ -2878,6 +2927,8 @@ impl<T> DeterministicWorldCommandBatch<T> {
 
 impl<T> Default for DeterministicWorldCommandBatch<T> {
     fn default() -> Self {
+        // MAX_DETERMINISTIC_COMMAND_BATCH is a compile-time constant validated once here; the
+        // default constructor has no error channel, and the constant cannot be invalid.
         Self::new(MAX_DETERMINISTIC_COMMAND_BATCH)
             .expect("the built-in deterministic command-batch limit is valid")
     }
@@ -3543,15 +3594,21 @@ impl WorldState {
             .max()
             .unwrap_or_default();
         let minimum_level = highest_level.saturating_mul(2).saturating_add(2) / 3;
-        let leader = self
-            .players
-            .get(&leader_id)
-            .expect("known party leader must remain a live player");
+        // Fail closed: any party member (leader included) missing from the live player map
+        // means inconsistent party state, so shared experience is denied rather than guessed.
+        let Some(leader) = self.players.get(&leader_id) else {
+            return Ok(PartySharedExperienceState {
+                requested,
+                eligibility: PartySharedExperienceEligibility::LevelSpreadTooLarge,
+            });
+        };
         for participant_id in participant_ids {
-            let participant = self
-                .players
-                .get(&participant_id)
-                .expect("known party participant must remain a live player");
+            let Some(participant) = self.players.get(&participant_id) else {
+                return Ok(PartySharedExperienceState {
+                    requested,
+                    eligibility: PartySharedExperienceEligibility::LevelSpreadTooLarge,
+                });
+            };
             if participant.level < minimum_level {
                 return Ok(PartySharedExperienceState {
                     requested,
@@ -4250,10 +4307,9 @@ impl WorldState {
                 tick_opened: self.tick,
             },
         );
-        Ok(self
-            .active_trades
+        self.active_trades
             .get(&initiator)
-            .expect("session was just inserted"))
+            .ok_or(CoreError::UnknownPlayer(initiator))
     }
 
     /// Reads the live trade session involving one player, if any.
@@ -4695,10 +4751,11 @@ impl WorldState {
 
         let mut changed = false;
         for record in known_records {
-            let runtime = self
-                .static_creatures
-                .get_mut(&record.id)
-                .expect("matching static creature ID must remain installed");
+            // Skip records whose creature vanished from the runtime map; the next full
+            // reconciliation pass re-installs or prunes them without crashing the tick.
+            let Some(runtime) = self.static_creatures.get_mut(&record.id) else {
+                continue;
+            };
             if runtime.entity.position != record.position
                 || runtime.active != record.active
                 || runtime.health_percent != record.health_percent
@@ -5086,19 +5143,20 @@ impl WorldState {
                 target_player_id,
             });
         }
-        let requested_damage = if let Some(range) = direct_melee_damage_range {
-            let runtime = self
-                .static_creatures
-                .get_mut(&creature_id)
-                .expect("validated static creature remains installed");
-            let span = u64::from(range.max_damage) - u64::from(range.min_damage) + 1;
-            let offset = runtime.direct_melee_damage_sequence % span;
-            runtime.direct_melee_damage_sequence =
-                runtime.direct_melee_damage_sequence.saturating_add(1);
-            u16::try_from(u64::from(range.min_damage) + offset)
-                .expect("validated direct melee range fits u16")
-        } else {
-            fallback_damage
+        let requested_damage = match (
+            direct_melee_damage_range,
+            self.static_creatures.get_mut(&creature_id),
+        ) {
+            (Some(range), Some(runtime)) => {
+                let span = u64::from(range.max_damage) - u64::from(range.min_damage) + 1;
+                let offset = runtime.direct_melee_damage_sequence % span;
+                runtime.direct_melee_damage_sequence =
+                    runtime.direct_melee_damage_sequence.saturating_add(1);
+                // The validated range is u16-bounded; clamp defensively instead of
+                // panicking if a future config source ever violates that bound.
+                u16::try_from(u64::from(range.min_damage) + offset).unwrap_or(range.max_damage)
+            }
+            _ => fallback_damage,
         };
         let current_health = self.player_vitals(target_player_id)?.health;
         let mitigated_damage = self
@@ -5127,10 +5185,10 @@ impl WorldState {
             self.mark_changed();
         }
         if let Some(cooldown_ticks) = melee_cooldown_ticks {
-            self.static_creatures
-                .get_mut(&creature_id)
-                .expect("validated static creature remains installed")
-                .next_melee_due_tick = self.tick.saturating_add(cooldown_ticks);
+            // The creature was validated above; a missing entry just skips the cooldown write.
+            if let Some(runtime) = self.static_creatures.get_mut(&creature_id) {
+                runtime.next_melee_due_tick = self.tick.saturating_add(cooldown_ticks);
+            }
         }
         Ok(StaticCreatureTargetAttackOutcome::Applied {
             creature_id,
@@ -5343,10 +5401,9 @@ impl WorldState {
                 (world_map.is_walkable(destination)
                     && !player_positions.contains(&destination)
                     && !occupied_positions.contains(&destination))
-                .then_some(direction)
+                .then_some((direction, destination))
             });
-            if let Some(direction) = selected {
-                let destination = source.step(direction).expect("selected cardinal step");
+            if let Some((direction, destination)) = selected {
                 occupied_positions.insert(destination);
                 batch.decisions.push(StaticCreatureMoveDecision {
                     creature_id: *id,
@@ -7091,6 +7148,10 @@ impl WorldState {
         let current_vitals = self.player_vitals(player_id)?;
         let conditions = self.player_conditions(player_id)?;
         let requested_damage = conditions.values().fold(0_u32, |total_damage, condition| {
+            // Speed conditions carry no damage; their tick only expires remaining_seconds.
+            if !condition.kind.is_damage_over_time() {
+                return total_damage;
+            }
             let active_seconds = elapsed_seconds.min(condition.remaining_seconds);
             let elapsed = condition.elapsed_seconds.saturating_add(active_seconds);
             let events = elapsed / condition.interval_seconds;
@@ -7098,6 +7159,36 @@ impl WorldState {
                 .saturating_add(u32::from(events).saturating_mul(u32::from(condition.damage)))
         });
         Ok(requested_damage.min(u32::from(current_vitals.health)) as u16)
+    }
+
+    /// Active haste modifier for one player, in additive percent (0 when none). Expired entries
+    /// are pruned by the condition tick, so a stale row never lingers in the reported value.
+    pub fn player_speed_bonus_percent(&self, player_id: u64) -> u16 {
+        self.player_conditions
+            .get(&player_id)
+            .and_then(|conditions| conditions.get(&PlayerConditionKind::Haste))
+            .map(|condition| condition.speed_bonus_percent)
+            .unwrap_or(0)
+    }
+
+    /// Applies or refreshes the bounded haste speed condition. Non-stacking: a re-application
+    /// overwrites the previous modifier and duration. Persists through the regular condition set.
+    pub fn apply_player_speed_condition(
+        &mut self,
+        player_id: u64,
+        speed_bonus_percent: u16,
+        remaining_seconds: u16,
+    ) -> Result<bool, CoreError> {
+        if !self.players.contains_key(&player_id) {
+            return Err(CoreError::UnknownPlayer(player_id));
+        }
+        let condition = PlayerCondition::new_haste(speed_bonus_percent, remaining_seconds)?;
+        self.player_conditions
+            .entry(player_id)
+            .or_default()
+            .insert(PlayerConditionKind::Haste, condition);
+        self.mark_changed();
+        Ok(true)
     }
 
     /// Replaces player vocation and all typed skills atomically in the authoritative world. No-op
@@ -14459,7 +14550,7 @@ mod tests {
     #[test]
     fn persisted_condition_elapsed_progress_resumes_exact_tick_timing() {
         assert_eq!(
-            PlayerCondition::from_persisted(PlayerConditionKind::Poison, 2, 7, 5, 2),
+            PlayerCondition::from_persisted(PlayerConditionKind::Poison, 2, 7, 0, 5, 2),
             Err(CoreError::InvalidPlayerCondition)
         );
         let mut world = WorldState::default();
@@ -14467,7 +14558,8 @@ mod tests {
         world
             .apply_player_condition(
                 7,
-                PlayerCondition::from_persisted(PlayerConditionKind::Poison, 3, 7, 5, 2).unwrap(),
+                PlayerCondition::from_persisted(PlayerConditionKind::Poison, 3, 7, 0, 5, 2)
+                    .unwrap(),
             )
             .unwrap();
         let outcome = world.apply_player_conditions(7, 1).unwrap();
@@ -14480,6 +14572,68 @@ mod tests {
                 .unwrap()
                 .elapsed_seconds(),
             0
+        );
+    }
+
+    #[test]
+    fn haste_condition_bounds_apply_and_expire_without_damage() {
+        // Bounds: zero or oversized bonus rejected, oversized duration rejected.
+        assert_eq!(
+            PlayerCondition::new_haste(0, 25),
+            Err(CoreError::InvalidPlayerCondition)
+        );
+        assert_eq!(
+            PlayerCondition::new_haste(MAX_SPEED_BONUS_PERCENT + 1, 25),
+            Err(CoreError::InvalidPlayerCondition)
+        );
+        assert_eq!(
+            PlayerCondition::new_haste(50, MAX_CONDITION_DURATION_SECONDS + 1),
+            Err(CoreError::InvalidPlayerCondition)
+        );
+        assert_eq!(
+            PlayerCondition::new(PlayerConditionKind::Haste, 1, 0, 25),
+            Err(CoreError::InvalidPlayerCondition)
+        );
+
+        let mut world = WorldState::default();
+        world.add_player(player()).unwrap();
+        world.apply_player_speed_condition(7, 40, 2).unwrap();
+        assert_eq!(world.player_speed_bonus_percent(7), 40);
+
+        // One elapsed second leaves the condition active with no damage applied.
+        let outcome = world.apply_player_conditions(7, 1).unwrap();
+        assert_eq!(outcome.applied_damage, 0);
+        assert_eq!(outcome.expired_conditions, 0);
+        assert_eq!(world.player_speed_bonus_percent(7), 40);
+
+        // Second elapsed second expires the condition and clears the modifier.
+        let outcome = world.apply_player_conditions(7, 1).unwrap();
+        assert_eq!(outcome.applied_damage, 0);
+        assert_eq!(outcome.expired_conditions, 1);
+        assert_eq!(world.player_speed_bonus_percent(7), 0);
+
+        // Persistence round-trip preserves the bonus through the elapsed-remainder path.
+        let condition = PlayerCondition::new_haste(30, 10).unwrap();
+        world.apply_player_condition(7, condition).unwrap();
+        let restored = PlayerCondition::from_persisted(
+            PlayerConditionKind::Haste,
+            condition.interval_seconds,
+            condition.damage,
+            condition.speed_bonus_percent,
+            condition.remaining_seconds,
+            0,
+        )
+        .unwrap();
+        assert_eq!(restored, condition);
+        // A persisted haste row with damage must be rejected (per-kind payload discipline).
+        assert_eq!(
+            PlayerCondition::from_persisted(PlayerConditionKind::Haste, 1, 5, 30, 10, 0),
+            Err(CoreError::InvalidPlayerCondition)
+        );
+        // A persisted DoT row with a speed payload must be rejected.
+        assert_eq!(
+            PlayerCondition::from_persisted(PlayerConditionKind::Poison, 2, 7, 30, 10, 0),
+            Err(CoreError::InvalidPlayerCondition)
         );
     }
 

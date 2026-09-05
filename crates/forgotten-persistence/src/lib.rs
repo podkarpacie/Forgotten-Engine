@@ -51,7 +51,9 @@ const SCHEMA_VERSION_PLAYER_GM_LEVEL: i64 = 32;
 const SCHEMA_VERSION_PLAYER_FACING: i64 = 33;
 const SCHEMA_VERSION_ACCOUNT_BANS: i64 = 34;
 const SCHEMA_VERSION_PLAYER_FROZEN: i64 = 35;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_PLAYER_FROZEN;
+/// Timed speed condition (haste, plan v49 slice 12): per-kind payload column on conditions.
+const SCHEMA_VERSION_CONDITION_SPEED: i64 = 36;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_CONDITION_SPEED;
 /// Classic blessing count ceiling; the audited default death-loss reduction consumes this.
 pub const MAX_PLAYER_BLESSINGS: u8 = 5;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -145,8 +147,9 @@ fn insert_runtime_map_items(
                 i64::from(item.ordinal),
                 i64::from(item.server_id),
                 i64::from(item.count),
-                item.despawn_tick
-                    .map(|tick| i64::try_from(tick).expect("validated tick fits i64")),
+                  item.despawn_tick
+                      // Clamp rather than panic: an overflowed tick persists as "far future".
+                      .map(|tick| i64::try_from(tick).unwrap_or(i64::MAX)),
             ],
         )?;
         for (child_index, child) in item.children.iter().enumerate() {
@@ -157,7 +160,12 @@ fn insert_runtime_map_items(
                     i64::from(item.position.y),
                     i64::from(item.position.z),
                     i64::from(item.ordinal),
-                    i64::try_from(child_index).expect("bounded child index fits i64"),
+                      i64::try_from(child_index).map_err(|_| {
+                          PersistenceError::InvalidMapItemJournal(format!(
+                              "runtime map item child index {} exceeds SQLite INTEGER",
+                              child_index
+                          ))
+                      })?,
                     i64::from(child.server_id),
                     i64::from(child.count),
                 ],
@@ -869,7 +877,11 @@ impl EngineDatabase {
                 leader_rank_id = Some(transaction.last_insert_rowid() as u64);
             }
         }
-        let leader_rank_id = leader_rank_id.expect("fixed guild rank provisioning includes leader");
+        let leader_rank_id = leader_rank_id.ok_or_else(|| {
+            PersistenceError::InvalidGuildRecord(
+                "fixed guild rank provisioning did not produce a leader rank".into(),
+            )
+        })?;
         transaction.execute(
             "INSERT INTO guild_membership (player_id, guild_id, rank_id, nick) VALUES (?1, ?2, ?3, '')",
             params![owner_player_id as i64, guild_id as i64, leader_rank_id as i64],
@@ -1962,7 +1974,12 @@ impl EngineDatabase {
             z: 7,
         };
         let experience = classic_experience_for_level(DEFAULT_PROVISIONED_PLAYER_LEVEL)
-            .expect("the fixed local provisioning level must have a representable threshold");
+            .ok_or_else(|| {
+                PersistenceError::InvalidProgressionRecord(
+                    "the fixed local provisioning level has no representable experience threshold"
+                        .into(),
+                )
+            })?;
         self.connection.execute(
             "INSERT INTO players (account_id, name, x, y, z, level, experience, skill_points, vocation)\
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -2438,7 +2455,7 @@ impl EngineDatabase {
         )?;
         for condition in conditions.values() {
             transaction.execute(
-                "INSERT INTO player_conditions (player_id, kind, interval_seconds, damage, remaining_seconds, elapsed_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO player_conditions (player_id, kind, interval_seconds, damage, remaining_seconds, elapsed_seconds, speed_percent) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     player_id as i64,
                     i64::from(condition.kind.code()),
@@ -2446,6 +2463,7 @@ impl EngineDatabase {
                     i64::from(condition.damage),
                     i64::from(condition.remaining_seconds),
                     i64::from(condition.elapsed_seconds()),
+                    i64::from(condition.speed_bonus_percent),
                 ],
             )?;
         }
@@ -2461,7 +2479,7 @@ impl EngineDatabase {
     ) -> Result<BTreeMap<PlayerConditionKind, PlayerCondition>, PersistenceError> {
         self.ensure_player_exists(player_id)?;
         let mut statement = self.connection.prepare(
-            "SELECT kind, interval_seconds, damage, remaining_seconds, elapsed_seconds FROM player_conditions WHERE player_id = ?1 ORDER BY kind",
+            "SELECT kind, interval_seconds, damage, remaining_seconds, elapsed_seconds, speed_percent FROM player_conditions WHERE player_id = ?1 ORDER BY kind",
         )?;
         let records = statement
             .query_map(params![player_id as i64], |row| {
@@ -2471,11 +2489,14 @@ impl EngineDatabase {
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let mut conditions = BTreeMap::new();
-        for (kind, interval_seconds, damage, remaining_seconds, elapsed_seconds) in records {
+        for (kind, interval_seconds, damage, remaining_seconds, elapsed_seconds, speed_percent) in
+            records
+        {
             let kind = u8::try_from(kind).map_err(|_| {
                 PersistenceError::InvalidConditionRecord("kind does not fit u8".into())
             })?;
@@ -2496,10 +2517,14 @@ impl EngineDatabase {
             let elapsed_seconds = u16::try_from(elapsed_seconds).map_err(|_| {
                 PersistenceError::InvalidConditionRecord("elapsed interval does not fit u16".into())
             })?;
+            let speed_percent = u16::try_from(speed_percent).map_err(|_| {
+                PersistenceError::InvalidConditionRecord("speed percent does not fit u16".into())
+            })?;
             let condition = PlayerCondition::from_persisted(
                 kind,
                 interval_seconds,
                 damage,
+                speed_percent,
                 remaining_seconds,
                 elapsed_seconds,
             )
@@ -3617,8 +3642,13 @@ impl EngineDatabase {
                     i64::from(record.health_percent),
                     record.reactivation_remaining_seconds.map(i64::from),
                     record.direct_melee_cooldown_remaining_ticks.map(i64::from),
-                    i64::try_from(record.direct_melee_damage_sequence)
-                        .expect("validated sequence fits SQLite INTEGER"),
+                      i64::try_from(record.direct_melee_damage_sequence)
+                          .map_err(|_| {
+                              PersistenceError::InvalidStaticCreatureRuntimeRecord(format!(
+                                  "direct melee damage sequence {} exceeds SQLite INTEGER",
+                                  record.direct_melee_damage_sequence
+                              ))
+                          })?,
                 ],
             )?;
         }
@@ -4800,6 +4830,17 @@ impl EngineDatabase {
             self.connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
                 params![SCHEMA_VERSION_PLAYER_FROZEN, unix_seconds()],
+            )?;
+        }
+        if self.schema_version()? < SCHEMA_VERSION_CONDITION_SPEED {
+            // Timed speed condition payload (plan v49 slice 12): one percent column per row;
+            // zero for damage-over-time kinds, 1..=100 for haste rows.
+            self.connection.execute_batch(
+                "ALTER TABLE player_conditions ADD COLUMN speed_percent INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_CONDITION_SPEED, unix_seconds()],
             )?;
         }
         Ok(())
@@ -6883,11 +6924,14 @@ mod tests {
             .unwrap();
 
         let poison =
-            PlayerCondition::from_persisted(PlayerConditionKind::Poison, 2, 7, 10, 1).unwrap();
+            PlayerCondition::from_persisted(PlayerConditionKind::Poison, 2, 7, 0, 10, 1).unwrap();
         let burning = PlayerCondition::new(PlayerConditionKind::Burning, 3, 4, 9).unwrap();
+        // Haste (plan v49 slice 12) round-trips its speed payload through the dedicated column.
+        let haste = PlayerCondition::new_haste(40, 25).unwrap();
         let conditions = BTreeMap::from([
             (PlayerConditionKind::Poison, poison),
             (PlayerConditionKind::Burning, burning),
+            (PlayerConditionKind::Haste, haste),
         ]);
         database.replace_player_conditions(7, &conditions).unwrap();
         assert_eq!(database.player_conditions(7).unwrap(), conditions);

@@ -4,6 +4,31 @@
 
 pub mod operator;
 
+mod bank;
+mod gm_commands;
+mod map_transfers;
+mod native_diagnostics;
+mod native_render;
+mod trade;
+
+pub(crate) use bank::{
+    handle_native_bank_keyword, native_carried_weight, NATIVE_BANK_NPC_RANGE_TILES,
+};
+pub(crate) use gm_commands::handle_native_gm_talkaction;
+pub(crate) use native_diagnostics::{
+    native_action_diagnostic_summary, native_diagnostic, native_diagnostic_record,
+    NATIVE_GUILD_CHAT_CHANNEL_ID,
+};
+#[cfg(test)]
+pub(crate) use native_render::{
+    NativeRenderPreparationPool, NativeRenderPreparationRequest, NativeRenderPreparationWorker,
+    NativeRenderPublication, NativeRenderPublicationError, MAX_NATIVE_RENDER_PUBLICATION_BATCH,
+};
+pub(crate) use trade::{
+    deliver_native_trade_windows, handle_native_player_trade_request, handle_native_trade_accept,
+    handle_native_trade_reject, resolve_native_trade_offer_item,
+};
+
 use forgotten_config::{
     DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog, DeclarativeSpellCatalog,
     DeclarativeWeaponCatalog, LegacyItemSlotType, LegacyPublicChannelCatalog, QuestCatalog,
@@ -1105,7 +1130,7 @@ fn native_rendered_container_windows(
 /// Emits the minimal classic CreateInContainer / ChangeInContainer / DeleteInContainer records
 /// transforming what the client currently shows (`sent`) into the authoritative rendering
 /// (`current`). Windows the session never sent, whose capacity changed, or whose mutation is not
-/// representable as bounded slot deltas fall back to one full OpenContainer resend — the exact
+/// representable as bounded slot deltas fall back to one full OpenContainer resend Ă„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ä‚ËĂ˘â€šÂ¬ÄąÄ„ the exact
 /// frame the previous blanket refresh emitted. Closed and vanished windows drop their baseline.
 /// Slot-index semantics respect classic client behavior: DeleteInContainer removes the slot and
 /// shifts the remainder, so a contiguous removed block is emitted as descending deletes.
@@ -1352,210 +1377,6 @@ fn native_classic_outfit_is_allowed(
         && (outfit_first_look_type..=outfit_last_look_type).contains(&outfit.look_type)
 }
 
-fn native_diagnostic_record(enabled: bool, peer: SocketAddr, event: &str) -> Option<String> {
-    enabled.then(|| format!("> Native OTCv8 trace peer={peer} {event}"))
-}
-
-fn native_diagnostic(enabled: bool, peer: SocketAddr, event: &str) {
-    if let Some(record) = native_diagnostic_record(enabled, peer, event) {
-        eprintln!("{record}");
-    }
-}
-
-/// Guild chat channel id on classic profiles: FE reserves 0x00F1 so it never collides with
-/// configured public channel ids (which start at 1 in TFS-style catalogs).
-const NATIVE_GUILD_CHAT_CHANNEL_ID: u16 = 0x00F1;
-
-fn native_action_diagnostic_summary(action: &NativeOtClientGameAction) -> String {
-    match action {
-        NativeOtClientGameAction::Ping => "action=ping".into(),
-        NativeOtClientGameAction::PingBack => "action=ping-back".into(),
-        NativeOtClientGameAction::EnterGame => "action=enter-game".into(),
-        NativeOtClientGameAction::LeaveGame => "action=leave-game".into(),
-        NativeOtClientGameAction::Stop => "action=stop".into(),
-        NativeOtClientGameAction::RequestTrade { .. } => "action=request-trade".into(),
-        NativeOtClientGameAction::AcceptTrade => "action=accept-trade".into(),
-        NativeOtClientGameAction::RejectTrade => "action=reject-trade".into(),
-        NativeOtClientGameAction::NpcBuy { .. } => "action=npc-buy".into(),
-        NativeOtClientGameAction::NpcSell { .. } => "action=npc-sell".into(),
-        NativeOtClientGameAction::NpcTradeClose => "action=npc-trade-close".into(),
-        NativeOtClientGameAction::Turn(direction) => format!("action=turn direction={direction:?}"),
-        NativeOtClientGameAction::CardinalMove(direction) => {
-            format!("action=cardinal-move direction={direction:?}")
-        }
-        NativeOtClientGameAction::DiagonalMove(direction) => {
-            format!("action=diagonal-move direction={direction:?}")
-        }
-        NativeOtClientGameAction::AutoWalk(path) => format!(
-            "action=auto-walk path-directions={} expanded-steps={}",
-            path.len(),
-            path.iter()
-                .map(|direction| direction.cardinal_steps().len())
-                .sum::<usize>()
-        ),
-        NativeOtClientGameAction::Talk(request) => {
-            format!(
-                "action=talk mode={} channel-id={} text-bytes={}",
-                request.mode,
-                request.channel_id.map_or(0, u16::from),
-                request.message.len()
-            )
-        }
-        NativeOtClientGameAction::AddVip(name) => {
-            format!("action=vip-add target-name-bytes={}", name.len())
-        }
-        NativeOtClientGameAction::RemoveVip(target_player_id) => {
-            format!("action=vip-remove target-player-id={target_player_id}")
-        }
-        NativeOtClientGameAction::EditVip {
-            target_player_id,
-            description,
-            icon,
-            notify,
-        } => format!(
-            "action=vip-edit target-player-id={target_player_id} description-bytes={} icon={icon} notify={notify}",
-            description.len()
-        ),
-        NativeOtClientGameAction::ThrowItem {
-            source_position,
-            source_client_thing_id,
-            source_stack_position,
-            target_position,
-            count,
-        } => format!(
-            "action=throw-item source={},{},{} source-client-thing-id={} source-stack-position={} target={},{},{} count={}",
-            source_position.x,
-            source_position.y,
-            source_position.z,
-            source_client_thing_id,
-            source_stack_position,
-            target_position.x,
-            target_position.y,
-            target_position.z,
-            count
-        ),
-        NativeOtClientGameAction::ChangeFightModes(request) => format!(
-            "action=change-fight-modes mode={:?} chase={} secure={}",
-            request.mode, request.chase, request.secure
-        ),
-        NativeOtClientGameAction::CloseContainer(container_id) => {
-            format!("action=close-container container-id={container_id}")
-        }
-        NativeOtClientGameAction::UpArrowContainer(container_id) => {
-            format!("action=up-arrow-container container-id={container_id}")
-        }
-        NativeOtClientGameAction::UpdateContainer(container_id) => {
-            format!("action=update-container container-id={container_id}")
-        }
-        NativeOtClientGameAction::UseItem {
-            position,
-            client_thing_id,
-            stack_position,
-            index,
-        } => format!(
-            "action=use-item position={},{},{} client-thing-id={} stack-position={} index={}",
-            position.x, position.y, position.z, client_thing_id, stack_position, index
-        ),
-        NativeOtClientGameAction::UseItemEx {
-            source_position,
-            source_client_thing_id,
-            source_stack_position,
-            target_position,
-            target_client_thing_id,
-            target_stack_position,
-        } => format!(
-            "action=use-item-ex source={},{},{} source-client-thing-id={} source-stack-position={} target={},{},{} target-client-thing-id={} target-stack-position={}",
-            source_position.x,
-            source_position.y,
-            source_position.z,
-            source_client_thing_id,
-            source_stack_position,
-            target_position.x,
-            target_position.y,
-            target_position.z,
-            target_client_thing_id,
-            target_stack_position,
-        ),
-        NativeOtClientGameAction::UseItemOnCreature {
-            source_position,
-            source_client_thing_id,
-            source_stack_position,
-            target_creature_id,
-        } => format!(
-            "action=use-item-on-creature source={},{},{} source-client-thing-id={} source-stack-position={} target-creature-id={}",
-            source_position.x,
-            source_position.y,
-            source_position.z,
-            source_client_thing_id,
-            source_stack_position,
-            target_creature_id,
-        ),
-        NativeOtClientGameAction::RotateItem {
-            position,
-            client_thing_id,
-            stack_position,
-        } => format!(
-            "action=rotate-item position={},{},{} client-thing-id={} stack-position={}",
-            position.x, position.y, position.z, client_thing_id, stack_position
-        ),
-        NativeOtClientGameAction::LookMap {
-            position,
-            thing_id,
-            stack_position,
-        } => format!(
-            "action=look-map position={},{},{} thing-id={} stack-position={}",
-            position.x, position.y, position.z, thing_id, stack_position
-        ),
-        NativeOtClientGameAction::LookCreature { creature_id } => {
-            format!("action=look-creature creature-id={creature_id}")
-        }
-        NativeOtClientGameAction::RequestOutfit => "action=request-outfit".into(),
-        NativeOtClientGameAction::RequestQuestLog => "action=request-quest-log".into(),
-        NativeOtClientGameAction::RequestQuestLine { quest_id } => {
-            format!("action=request-quest-line quest-id={quest_id}")
-        }
-        NativeOtClientGameAction::RequestChannels => "action=request-channels".into(),
-        NativeOtClientGameAction::JoinChannel(channel_id) => {
-            format!("action=join-channel channel-id={channel_id}")
-        }
-        NativeOtClientGameAction::LeaveChannel(channel_id) => {
-            format!("action=leave-channel channel-id={channel_id}")
-        }
-        NativeOtClientGameAction::ChangeOutfit(outfit) => format!(
-            "action=change-outfit look-type={} colors={},{},{},{}",
-            outfit.look_type, outfit.head, outfit.body, outfit.legs, outfit.feet
-        ),
-        NativeOtClientGameAction::IgnoredInteraction(opcode) => {
-            format!("action=ignored-interaction opcode=0x{opcode:02x}")
-        }
-        NativeOtClientGameAction::SelectTarget(native_id) => {
-            format!("action=select-target native-id={native_id}")
-        }
-        NativeOtClientGameAction::SelectFollow(native_id) => {
-            format!("action=select-follow native-id={native_id}")
-        }
-        NativeOtClientGameAction::PartyInvite(native_id) => {
-            format!("action=party-invite native-id={native_id}")
-        }
-        NativeOtClientGameAction::PartyJoin(native_id) => {
-            format!("action=party-join native-id={native_id}")
-        }
-        NativeOtClientGameAction::PartyRevokeInvitation(native_id) => {
-            format!("action=party-revoke-invitation native-id={native_id}")
-        }
-        NativeOtClientGameAction::PartyPassLeadership(native_id) => {
-            format!("action=party-pass-leadership native-id={native_id}")
-        }
-        NativeOtClientGameAction::PartyLeave => "action=party-leave".into(),
-        NativeOtClientGameAction::PartySharedExperience(active) => {
-            format!("action=party-shared-experience active={active}")
-        }
-        NativeOtClientGameAction::CancelAttackAndFollow => {
-            "action=cancel-attack-and-follow".into()
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct HostConfig {
     pub bind_addr: SocketAddr,
@@ -1704,6 +1525,10 @@ pub struct NativeOtClientHostConfig {
     /// leaves native enable requests inert; party persistence, client messages, and broad reward
     /// sources remain outside this boundary.
     pub party_shared_experience_rules: Option<PartySharedExperienceRules>,
+    /// Party loot split (plan v49 slice 14): when a party member lands the killing blow, rolled
+    /// loot stacks distribute round-robin across online party members' owned containers;
+    /// leftovers stay in the corpse. Deterministic member order: leader first, then members by id.
+    pub party_loot_split_enabled: bool,
     /// Validated `deathLosePercent` mode. The host applies only the bounded explicit fixed-percent
     /// mode when an accepted native death transition has matching vocation progression rules.
     /// Default-formula, promotion, blessing, and client lifecycle semantics remain deferred.
@@ -1775,13 +1600,13 @@ pub struct SharedNativeWorld {
 /// documented atomic lock order with `SharedNativeWorld` before client routing is enabled.
 #[derive(Debug, Clone)]
 pub struct SharedNativeMap {
-    map: Arc<Mutex<WorldMap>>,
-    source: Arc<WorldMap>,
-    source_item_indices: Arc<Mutex<BTreeMap<Position, Vec<u8>>>>,
-    removed_source_items: Arc<Mutex<BTreeSet<WorldMapItemSourceIdentity>>>,
-    source_item_count_overrides: Arc<Mutex<BTreeMap<WorldMapItemSourceIdentity, u16>>>,
-    runtime_tile_items: Arc<Mutex<Vec<RuntimeMapItemRecord>>>,
-    revision: Arc<AtomicU64>,
+    pub(crate) map: Arc<Mutex<WorldMap>>,
+    pub(crate) source: Arc<WorldMap>,
+    pub(crate) source_item_indices: Arc<Mutex<BTreeMap<Position, Vec<u8>>>>,
+    pub(crate) removed_source_items: Arc<Mutex<BTreeSet<WorldMapItemSourceIdentity>>>,
+    pub(crate) source_item_count_overrides: Arc<Mutex<BTreeMap<WorldMapItemSourceIdentity, u16>>>,
+    pub(crate) runtime_tile_items: Arc<Mutex<Vec<RuntimeMapItemRecord>>>,
+    pub(crate) revision: Arc<AtomicU64>,
 }
 
 /// Result of one persisted, revision-bound, whole-item transfer from an authoritative imported
@@ -1875,512 +1700,6 @@ fn runtime_world_map_item_to_record(
     })
 }
 
-/// Computes the bounded flat carried weight in hundredths of an ounce across equipment slots,
-/// owned container shells, and their top-level items. Recursive nested trees stay outside this
-/// first gate because FE's container model remains non-nested.
-fn native_carried_weight(
-    weight_by_server_id: &BTreeMap<u16, u32>,
-    equipment: &PlayerEquipment,
-    containers: &PlayerContainers,
-) -> u64 {
-    let item_weight = |item: &ItemInstance| -> u64 {
-        u64::from(*weight_by_server_id.get(&item.server_id).unwrap_or(&0))
-            .saturating_mul(u64::from(item.count))
-    };
-    let mut total = 0_u64;
-    for (_, item) in equipment.iter() {
-        total = total.saturating_add(item_weight(item));
-    }
-    for (_, container) in containers.iter() {
-        total = total.saturating_add(item_weight(&container.container_item));
-        for item in container.items.iter() {
-            total = total.saturating_add(item_weight(item));
-        }
-    }
-    total
-}
-
-/// Legacy currency coin identities and their gold values. These are factual classic item
-/// identifiers, not redistributed client assets.
-const NATIVE_CURRENCY_COINS: &[(u16, u64)] = &[(2148, 1), (2152, 100), (2160, 10_000)];
-/// Bounded same-floor proximity to an active static NPC for banking keywords.
-const NATIVE_BANK_NPC_RANGE_TILES: i32 = 2;
-
-fn native_coin_value(server_id: u16) -> Option<u64> {
-    NATIVE_CURRENCY_COINS
-        .iter()
-        .find(|(id, _)| *id == server_id)
-        .map(|(_, value)| *value)
-}
-
-/// Returns whether an active static NPC stands within the bounded banking range on the player's
-/// floor. Banking stays an NPC-adjacent service; remote or offline banking remains deferred.
-fn native_bank_officer_nearby(
-    shared_world: &SharedNativeWorld,
-    player_id: u64,
-) -> Result<bool, HostError> {
-    let (player, _) = shared_world.player_and_vitals(player_id)?;
-    let spawns = shared_world.active_static_spawns()?;
-    for entity in &spawns.entities {
-        if !spawns.is_npc(entity.id) || entity.position.z != player.position.z {
-            continue;
-        }
-        if entity.position.x.abs_diff(player.position.x) as i32 <= NATIVE_BANK_NPC_RANGE_TILES
-            && entity.position.y.abs_diff(player.position.y) as i32 <= NATIVE_BANK_NPC_RANGE_TILES
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Handles bounded NPC banking Say keywords ("balance", "deposit all", "withdraw <n>") for one
-/// authenticated player standing near an active static NPC. `Ok(None)` means the message is not
-/// a handled banking command and falls through to ordinary routing. Deposit converts every
-/// carried coin stack into bank credit atomically with inventory persistence; withdraw debits
-/// first and only creates coin stacks that actually fit owned top-level containers.
-fn handle_native_bank_keyword(
-    shared_world: &SharedNativeWorld,
-    database: &mut EngineDatabase,
-    player_id: u64,
-    message: &str,
-) -> Result<Option<String>, HostError> {
-    let normalized = message.trim().to_ascii_lowercase();
-    let is_balance = normalized == "balance";
-    let is_deposit_all = normalized == "deposit all";
-    let withdraw_amount = normalized
-        .strip_prefix("withdraw ")
-        .and_then(|amount| amount.trim().parse::<u64>().ok())
-        .filter(|amount| *amount > 0);
-    if !is_balance && !is_deposit_all && withdraw_amount.is_none() {
-        return Ok(None);
-    }
-    if !native_bank_officer_nearby(shared_world, player_id)? {
-        return Ok(None);
-    }
-
-    let mut equipment = shared_world.player_equipment(player_id)?;
-    let mut containers = shared_world.player_containers(player_id)?;
-
-    if is_balance {
-        let balance = database
-            .player_bank_balance(player_id)
-            .map_err(HostError::Persistence)?;
-        return Ok(Some(format!("Your account balance is {balance} gold.")));
-    }
-
-    if is_deposit_all {
-        let mut deposited = 0_u64;
-        // Strip every carried coin stack from staged inventory clones while summing value.
-        for slot in [
-            EquipmentSlot::Head,
-            EquipmentSlot::Neck,
-            EquipmentSlot::Backpack,
-            EquipmentSlot::Armor,
-            EquipmentSlot::RightHand,
-            EquipmentSlot::LeftHand,
-            EquipmentSlot::Legs,
-            EquipmentSlot::Feet,
-            EquipmentSlot::Ring,
-            EquipmentSlot::Ammo,
-        ] {
-            if let Some(item) = equipment.item(slot).cloned() {
-                if let Some(value) = native_coin_value(item.server_id) {
-                    deposited += value.saturating_mul(u64::from(item.count));
-                    equipment.unequip(slot);
-                }
-            }
-        }
-        let mut next_containers = PlayerContainers::default();
-        for (_, container) in containers.iter() {
-            let mut next = container.clone();
-            for index in (0..next.items.len()).rev() {
-                if let Some(item) = next.items.item(index).cloned() {
-                    if let Some(value) = native_coin_value(item.server_id) {
-                        deposited += value.saturating_mul(u64::from(item.count));
-                        next.items.remove(index);
-                    }
-                }
-            }
-            next_containers.insert(next).map_err(HostError::Core)?;
-        }
-        containers = next_containers;
-        if deposited == 0 {
-            return Ok(Some("You have no coins to deposit.".into()));
-        }
-        let new_balance = database
-            .player_bank_balance(player_id)
-            .map_err(HostError::Persistence)?
-            .saturating_add(deposited);
-        database.replace_player_inventory_and_bank_balance(
-            player_id,
-            &equipment,
-            &containers,
-            new_balance,
-        )?;
-        shared_world
-            .replace_player_equipment(player_id, equipment)
-            .expect("validated player remains present while banking");
-        shared_world
-            .replace_player_containers(player_id, containers)
-            .expect("validated player remains present while banking");
-        return Ok(Some(format!("You deposited {deposited} gold.")));
-    }
-
-    let amount = withdraw_amount.expect("withdraw branch implies a parsed amount");
-    let balance = database
-        .player_bank_balance(player_id)
-        .map_err(HostError::Persistence)?;
-    if balance < amount {
-        return Ok(Some("You do not have enough gold on your account.".into()));
-    }
-    // Chunk the withdrawal into bounded stacks and place them into free top-level container
-    // slots without debiting unless every chunk fits.
-    let mut chunks = Vec::new();
-    let mut remaining_amount = amount;
-    while remaining_amount > 0 {
-        let chunk = remaining_amount.min(u64::from(MAX_ITEM_STACK_COUNT));
-        let chunk = u16::try_from(chunk)
-            .map_err(|_| HostError::InvalidConfiguration("chunk overflow".into()))?;
-        chunks.push(chunk);
-        remaining_amount -= u64::from(chunk);
-        if chunks.len() > 256 {
-            return Ok(Some("You cannot withdraw that much at once.".into()));
-        }
-    }
-    let mut staged_containers = containers.clone();
-    for chunk in &chunks {
-        let item = ItemInstance::new(NATIVE_CURRENCY_COINS[0].0, u16::from(*chunk))
-            .map_err(HostError::Core)?;
-        let container_ids: Vec<u8> = staged_containers.iter().map(|(id, _)| id).collect();
-        let mut placed = false;
-        for container_id in container_ids {
-            let Some(mut container) = staged_containers.remove(container_id) else {
-                continue;
-            };
-            if !container.has_parent && container.items.merge_or_insert_stack(item.clone()).is_ok()
-            {
-                placed = true;
-            }
-            staged_containers
-                .insert(container)
-                .map_err(HostError::Core)?;
-            if placed {
-                break;
-            }
-        }
-        if !placed {
-            return Ok(Some(
-                "You need a container with free space to withdraw.".into(),
-            ));
-        }
-    }
-    let new_balance = balance - amount;
-    database.replace_player_inventory_and_bank_balance(
-        player_id,
-        &equipment,
-        &staged_containers,
-        new_balance,
-    )?;
-    shared_world
-        .replace_player_equipment(player_id, equipment)
-        .expect("validated player remains present while banking");
-    shared_world
-        .replace_player_containers(player_id, staged_containers)
-        .expect("validated player remains present while banking");
-    Ok(Some(format!("You withdrew {amount} gold.")))
-}
-
-/// Handles bounded NPC shop keywords ("buy <server-id> <count>" / "sell <server-id> <count>")
-/// near an active static NPC whose declared shop matches. Payments and proceeds flow through the
-/// durable bank balance; bought stacks chunk into free owned container slots, sold units leave
-/// carried equipment and containers. `Ok(None)` falls through to ordinary routing.
-/// Handles a classic request-trade action: resolves the offered item from the sender's own
-/// authoritative inventory, validates the target is an adjacent live player, opens the trade
-/// session, and delivers both trade windows.
-#[allow(clippy::too_many_arguments)]
-fn handle_native_player_trade_request(
-    stream: &mut TcpStream,
-    profile: &NativeOtClientProfile,
-    shared_world: &SharedNativeWorld,
-    player_id: u64,
-    position: NativeOtClientPosition,
-    client_thing_id: u16,
-    stack_position: u8,
-    target_creature_id: u32,
-    item_presentation_catalog: Option<&NativeItemPresentationCatalog>,
-    stackable_item_server_ids: Option<&BTreeSet<u16>>,
-) -> Result<(), HostError> {
-    // Resolve the target creature id to a connected character.
-    let Some(target_character_id) = native_player_id_to_character_id(target_creature_id) else {
-        let failure = encode_native_otclient_failure_message(
-            profile,
-            "Sorry, not possible. You are not close enough to trade.",
-        )
-        .map_err(HostError::Protocol)?;
-        write_frame(stream, &failure)?;
-        return Ok(());
-    };
-    let world = shared_world.lock()?;
-    let Some(target_player) = world.player(target_character_id) else {
-        drop(world);
-        let failure = encode_native_otclient_failure_message(
-            profile,
-            "Sorry, not possible. You are not close enough to trade.",
-        )
-        .map_err(HostError::Protocol)?;
-        write_frame(stream, &failure)?;
-        return Ok(());
-    };
-    // Adjacency: same floor, within one tile (classic trade reach).
-    let sender_position = world
-        .player(player_id)
-        .map(|player| player.position)
-        .ok_or(forgotten_core::CoreError::UnknownPlayer(player_id))
-        .map_err(HostError::Core)?;
-    if target_player.position.z != sender_position.z
-        || target_player.position.x.abs_diff(sender_position.x) > 1
-        || target_player.position.y.abs_diff(sender_position.y) > 1
-    {
-        drop(world);
-        let failure = encode_native_otclient_failure_message(
-            profile,
-            "Sorry, not possible. You are too far away to trade.",
-        )
-        .map_err(HostError::Protocol)?;
-        write_frame(stream, &failure)?;
-        return Ok(());
-    }
-    drop(world);
-
-    // Resolve the offered item from the sender's own inventory: equipment slots use the
-    // classic 0xFFFF position form; container windows map through open views. FE trusts its
-    // own inventory state, never the client's echoed thing id.
-    let resolved = resolve_native_trade_offer_item(
-        shared_world,
-        player_id,
-        position,
-        client_thing_id,
-        stack_position,
-    )?;
-    let Some((container_id, item_index, _item)) = resolved else {
-        let failure =
-            encode_native_otclient_failure_message(profile, "You cannot trade that item.")
-                .map_err(HostError::Protocol)?;
-        write_frame(stream, &failure)?;
-        return Ok(());
-    };
-
-    // Open the session (or reuse the live one when the counterparty re-offers).
-    let existing = shared_world.lock()?.player_trade(player_id).cloned();
-    match existing {
-        None => {
-            shared_world
-                .lock()?
-                .open_player_trade(player_id, target_character_id)
-                .map_err(HostError::Core)?;
-        }
-        Some(session) => {
-            if (session.initiator == player_id && session.counterparty != target_character_id)
-                || (session.counterparty == player_id && session.initiator != target_character_id)
-            {
-                let failure =
-                    encode_native_otclient_failure_message(profile, "You are already trading.")
-                        .map_err(HostError::Protocol)?;
-                write_frame(stream, &failure)?;
-                return Ok(());
-            }
-        }
-    }
-    shared_world
-        .lock()?
-        .stage_trade_item(
-            player_id,
-            forgotten_core::TradeItemReference {
-                container_id,
-                item_index,
-            },
-        )
-        .map_err(HostError::Core)?;
-
-    // Deliver the window records with current staged offers.
-    deliver_native_trade_windows(
-        stream,
-        profile,
-        shared_world,
-        player_id,
-        item_presentation_catalog,
-        stackable_item_server_ids,
-    )?;
-    Ok(())
-}
-
-/// Resolves one trade offer reference from the sender's own authoritative inventory. Supports
-/// the classic own-equipment position form and own-container windows; returns the container id,
-/// item index, and item snapshot. Map positions are rejected for trade staging.
-fn resolve_native_trade_offer_item(
-    shared_world: &SharedNativeWorld,
-    player_id: u64,
-    position: NativeOtClientPosition,
-    client_thing_id: u16,
-    stack_position: u8,
-) -> Result<Option<(u8, usize, ItemInstance)>, HostError> {
-    let containers = shared_world.player_containers(player_id)?;
-    if position.x == 0xffff {
-        // Own-container window form: y bit 0x40 flags content windows per the classic layout.
-        if position.y & 0x40 != 0 {
-            let container_id = (position.y & 0x0f) as u8;
-            let index = usize::from(position.z);
-            if let Some(item) = containers
-                .container(container_id)
-                .and_then(|container| container.items.item(index))
-                .cloned()
-            {
-                return Ok(Some((container_id, index, item)));
-            }
-            return Ok(None);
-        }
-        // Equipment slot form has no single container home; trades stage from containers only
-        // in this slice, so equipment staging is deferred rather than guessed.
-        return Ok(None);
-    }
-    // A client thing id over a map position is not owned inventory; ignore it.
-    let _ = (client_thing_id, stack_position);
-    Ok(None)
-}
-
-/// Delivers the own/counter trade window records for one side of a live trade using the
-/// session's staged references mapped into client-visible item records.
-fn deliver_native_trade_windows(
-    stream: &mut TcpStream,
-    profile: &NativeOtClientProfile,
-    shared_world: &SharedNativeWorld,
-    viewer_id: u64,
-    item_presentation_catalog: Option<&NativeItemPresentationCatalog>,
-    stackable_item_server_ids: Option<&BTreeSet<u16>>,
-) -> Result<(), HostError> {
-    let Some(session) = shared_world.lock()?.player_trade(viewer_id).cloned() else {
-        return Ok(());
-    };
-    let snapshot_items = |owner: u64,
-                          refs: &[forgotten_core::TradeItemReference]|
-     -> Result<Vec<NativeOtClientTradeItem>, HostError> {
-        let containers = shared_world.player_containers(owner)?;
-        Ok(refs
-            .iter()
-            .filter_map(|reference| {
-                let item = containers
-                    .container(reference.container_id)?
-                    .items
-                    .item(reference.item_index)?;
-                let client_thing_id = item_presentation_catalog
-                    .and_then(|catalog| catalog.presentation(item.server_id))
-                    .map(|presentation| presentation.client_thing_id)?;
-                let count =
-                    if stackable_item_server_ids.is_some_and(|ids| ids.contains(&item.server_id)) {
-                        Some(u8::try_from(item.count).unwrap_or(u8::MAX))
-                    } else {
-                        None
-                    };
-                Some(NativeOtClientTradeItem {
-                    client_thing_id,
-                    count,
-                })
-            })
-            .collect())
-    };
-    let (counterparty_id, counterparty_name, own_items, their_items) =
-        if session.initiator == viewer_id {
-            let name = shared_world
-                .lock()?
-                .player(session.counterparty)
-                .map(|player| player.name.clone())
-                .unwrap_or_default();
-            (
-                session.counterparty,
-                name,
-                snapshot_items(session.initiator, &session.initiator_items)?,
-                snapshot_items(session.counterparty, &session.counterparty_items)?,
-            )
-        } else {
-            let name = shared_world
-                .lock()?
-                .player(session.initiator)
-                .map(|player| player.name.clone())
-                .unwrap_or_default();
-            (
-                session.initiator,
-                name,
-                snapshot_items(session.counterparty, &session.counterparty_items)?,
-                snapshot_items(session.initiator, &session.initiator_items)?,
-            )
-        };
-    let _ = counterparty_id;
-    let own_record = encode_native_otclient_own_trade(profile, &counterparty_name, &own_items)
-        .map_err(HostError::Protocol)?;
-    write_frame(stream, &own_record)?;
-    let counter_record =
-        encode_native_otclient_counter_trade(profile, &counterparty_name, &their_items)
-            .map_err(HostError::Protocol)?;
-    write_frame(stream, &counter_record)?;
-    Ok(())
-}
-
-/// Handles one side's accept: flips acceptance, delivers refreshed windows, and executes +
-/// persists the swap once both sides accepted. Both clients receive the closed-window signal.
-fn handle_native_trade_accept(
-    stream: &mut TcpStream,
-    profile: &NativeOtClientProfile,
-    shared_world: &SharedNativeWorld,
-    database: &mut EngineDatabase,
-    player_id: u64,
-    item_presentation_catalog: Option<&NativeItemPresentationCatalog>,
-    stackable_item_server_ids: Option<&BTreeSet<u16>>,
-) -> Result<(), HostError> {
-    let both_accepted = shared_world
-        .lock()?
-        .accept_player_trade(player_id)
-        .map_err(HostError::Core)?;
-    deliver_native_trade_windows(
-        stream,
-        profile,
-        shared_world,
-        player_id,
-        item_presentation_catalog,
-        stackable_item_server_ids,
-    )?;
-    if !both_accepted {
-        return Ok(());
-    }
-    let execution = shared_world
-        .lock()?
-        .execute_player_trade(player_id)
-        .map_err(HostError::Core)?;
-    // Persist both inventories atomically enough for this slice: each replace is one SQLite
-    // transaction; a failure on the second leaves the first persisted (logged loudly).
-    let initiator_containers = shared_world.player_containers(execution.initiator)?;
-    if let Err(error) =
-        database.replace_player_containers(execution.initiator, &initiator_containers)
-    {
-        eprintln!(
-            "> trade persistence failed for player {}: {error}",
-            execution.initiator
-        );
-    }
-    let counterparty_containers = shared_world.player_containers(execution.counterparty)?;
-    if let Err(error) =
-        database.replace_player_containers(execution.counterparty, &counterparty_containers)
-    {
-        eprintln!(
-            "> trade persistence failed for player {}: {error}",
-            execution.counterparty
-        );
-    }
-    shared_world.signal_trade_closed(execution.initiator, execution.counterparty)?;
-    shared_world.mark_visibility_changed();
-    Ok(())
-}
-
 /// Flips one persisted quest to completed and grants the catalog-declared rewards into the
 /// player's first owned container (plan v49 slice 15). Returns the granted rewards, or `None`
 /// when the player is offline, the quest is unknown to the catalog, or it was already completed.
@@ -2442,15 +1761,6 @@ fn complete_native_player_quest(
         shared_world.mark_containers_changed();
     }
     Ok(Some(rewards))
-}
-
-/// Handles one side's reject/cancel: closes the session and signals the other side's window.
-fn handle_native_trade_reject(
-    shared_world: &SharedNativeWorld,
-    player_id: u64,
-) -> Result<(), HostError> {
-    shared_world.cancel_player_trade_and_signal(player_id)?;
-    Ok(())
 }
 
 /// Opens the player's home-town depot (depot id 0) as a read-only classic container window,
@@ -2596,461 +1906,6 @@ fn deliver_native_npc_shop_windows(
     Ok(true)
 }
 
-fn handle_native_gm_talkaction(
-    shared_world: &SharedNativeWorld,
-    database: &mut EngineDatabase,
-    player_id: u64,
-    message: &str,
-    _gm_level: u8,
-    quest_catalog: Option<&QuestCatalog>,
-) -> Result<Option<String>, HostError> {
-    let trimmed = message.trim();
-    if !trimmed.starts_with('/') {
-        return Ok(None);
-    }
-    let mut parts = trimmed[1..].split_whitespace();
-    let verb = parts.next().unwrap_or("").to_ascii_lowercase();
-    match verb.as_str() {
-        "spawn" => {
-            let entity = parts.next().unwrap_or("");
-            if entity.is_empty() {
-                return Ok(Some("Usage: /spawn <entity>".into()));
-            }
-            match shared_world.spawn_dynamic_entity_in_front_of_player(player_id, entity) {
-                Ok(spawned_id) => Ok(Some(format!(
-                    "Summoned {entity} ahead (creature {spawned_id})."
-                ))),
-                Err(HostError::Core(forgotten_core::CoreError::UnknownEntityName(_))) => {
-                    Ok(Some(format!(
-                        "Unknown entity `{entity}`; only imported creature names can be summoned."
-                    )))
-                }
-                Err(_) => Ok(Some("The target tile is blocked.".into())),
-            }
-        }
-        "give" => {
-            let target_name = parts.next().unwrap_or("");
-            let item_id: u16 = match parts.next().and_then(|value| value.parse().ok()) {
-                Some(value) => value,
-                None => return Ok(Some("Usage: /give <player> <item-id> [count]".into())),
-            };
-            let count: u16 = parts
-                .next()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(1);
-            if item_id == 0 || count == 0 || count > 100 {
-                return Ok(Some(
-                    "Item id must be nonzero and count between 1 and 100.".into(),
-                ));
-            }
-            let Some(target_id) = database
-                .player_id_by_name(target_name)
-                .map_err(HostError::Persistence)?
-            else {
-                return Ok(Some(format!("Player `{target_name}` does not exist.")));
-            };
-            give_items_to_player(shared_world, database, target_id, item_id, u64::from(count))
-        }
-        "tp" => {
-            let from_name = parts.next().unwrap_or("");
-            let to_name = parts.next().unwrap_or("");
-            if to_name.is_empty() {
-                return Ok(Some(
-                    "Usage: /tp <player> <player>   ('me' = yourself)".into(),
-                ));
-            }
-            let resolve = |name: &str| -> Result<Option<u64>, HostError> {
-                if name.eq_ignore_ascii_case("me") {
-                    return Ok(Some(player_id));
-                }
-                database
-                    .player_id_by_name(name)
-                    .map_err(HostError::Persistence)
-            };
-            let Some(from_target) = resolve(from_name)? else {
-                return Ok(Some(format!("Player `{from_name}` does not exist.")));
-            };
-            let Some(to_target) = resolve(to_name)? else {
-                return Ok(Some(format!("Player `{to_name}` does not exist.")));
-            };
-            if !shared_world.has_player(from_target)? {
-                return Ok(Some(format!("`{from_name}` must be online to teleport.")));
-            }
-            let destination = if shared_world.has_player(to_target)? {
-                shared_world.player_position(to_target)?
-            } else {
-                database
-                    .player_by_id(to_target)
-                    .map_err(HostError::Persistence)?
-                    .position
-            };
-            match shared_world.teleport_player_for_operator(from_target, destination) {
-                Ok(()) => Ok(Some(format!(
-                    "Teleported {} to {} {} {}.",
-                    from_name, destination.x, destination.y, destination.z
-                ))),
-                Err(_) => Ok(Some("That destination is blocked.".into())),
-            }
-        }
-        "god" | "invisible" => {
-            // Toggles on the speaking GM only (classic semantics). Runtime-only: relogs reset.
-            let enabling = !match verb.as_str() {
-                "god" => shared_world
-                    .lock()?
-                    .player_is_in_god_mode(player_id),
-                _ => shared_world.lock()?.player_is_invisible(player_id),
-            };
-            let applied = {
-                let mut world = shared_world.lock()?;
-                if verb == "god" {
-                    world.set_player_god_mode(player_id, enabling)
-                } else {
-                    world.set_player_invisible(player_id, enabling)
-                }
-                .map_err(HostError::Core)?
-            };
-            Ok(Some(format!(
-                "You are now {}{}.",
-                if applied { "" } else { "no longer " },
-                if verb == "god" { "invulnerable (god mode)" } else { "invisible" }
-            )))
-        }
-        "item" => {
-            // /item <id> [count]: quick self-delivery. For giving to other players use /give.
-            let item_id: u16 = match parts.next().and_then(|value| value.parse().ok()) {
-                Some(value) => value,
-                None => return Ok(Some("Usage: /item <item-id> [count]".into())),
-            };
-            let count: u16 = parts
-                .next()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(1);
-            if item_id == 0 || count == 0 || count > 100 {
-                return Ok(Some(
-                    "Item id must be nonzero and count between 1 and 100.".into(),
-                ));
-            }
-            give_items_to_player(shared_world, database, player_id, item_id, u64::from(count))
-        }
-        "freeze" | "unfreeze" => {
-            let freezing = verb == "freeze";
-            let target_name = parts.next().unwrap_or("");
-            let Some(target_id) = database
-                .player_id_by_name(target_name)
-                .map_err(HostError::Persistence)?
-            else {
-                return Ok(Some(format!("Player `{target_name}` does not exist.")));
-            };
-            database
-                .set_player_frozen(target_id, freezing)
-                .map_err(HostError::Persistence)?;
-            Ok(Some(if freezing {
-                format!("Froze {target_name} in place.")
-            } else {
-                format!("Unfroze {target_name}.")
-            }))
-        }
-        "down" | "up" => {
-            let current = shared_world.player_position(player_id)?;
-            let destination_z = if verb == "down" {
-                current.z.saturating_add(1).min(15)
-            } else {
-                current.z.saturating_sub(1)
-            };
-            let destination = forgotten_core::Position {
-                x: current.x,
-                y: current.y,
-                z: destination_z,
-            };
-            match shared_world.teleport_player_for_operator(player_id, destination) {
-                Ok(()) => Ok(Some(format!(
-                    "Moved {} to floor {}.",
-                    if verb == "down" { "down" } else { "up" },
-                    destination.z
-                ))),
-                Err(_) => Ok(Some("That level is blocked here.".into())),
-            }
-        }
-        "completequest" => {
-            // /completequest <player> <quest-id>: flips the persisted completion flag and
-            // grants the catalog-declared rewards into the player's starter backpack.
-            let target_name = parts.next().unwrap_or("");
-            let quest_id: u16 = match parts.next().and_then(|value| value.parse().ok()) {
-                Some(value) => value,
-                None => {
-                    return Ok(Some(
-                        "Usage: /completequest <player> <quest-id>".into(),
-                    ))
-                }
-            };
-            let Some(target_id) = database
-                .player_id_by_name(target_name)
-                .map_err(HostError::Persistence)?
-            else {
-                return Ok(Some(format!("Player `{target_name}` does not exist.")));
-            };
-            match complete_native_player_quest(
-                shared_world,
-                database,
-                target_id,
-                quest_id,
-                quest_catalog,
-            )? {
-                Some(rewards) => {
-                    let reward_text = rewards
-                        .iter()
-                        .map(|(item_id, count)| format!("{count}x item {item_id}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    Ok(Some(format!(
-                        "{target_name} completed quest {quest_id}; granted {reward_text}."
-                    )))
-                }
-                None => Ok(Some(format!(
-                    "`{target_name}` is not online or quest {quest_id} is unknown/already completed."
-                ))),
-            }
-        }
-        "kick" => {
-            let target_name = parts.next().unwrap_or("");
-            let Some(target_id) = database
-                .player_id_by_name(target_name)
-                .map_err(HostError::Persistence)?
-            else {
-                return Ok(Some(format!("Player `{target_name}` does not exist.")));
-            };
-            match shared_world.request_kick(target_id) {
-                Ok(true) => Ok(Some(format!("Kicked {target_name}."))),
-                Ok(false) => Ok(Some(format!("`{target_name}` is not online."))),
-                Err(_) => Ok(Some("Kick failed; try again.".into())),
-            }
-        }
-        "ban" => {
-            // /ban <player> [days] [reason words...]: days 0 (default) means permanent.
-            let target_name = parts.next().unwrap_or("");
-            let Some(target_id) = database
-                .player_id_by_name(target_name)
-                .map_err(HostError::Persistence)?
-            else {
-                return Ok(Some(format!("Player `{target_name}` does not exist.")));
-            };
-            let account_id = database
-                .account_id_by_player_id(target_id)
-                .map_err(HostError::Persistence)?
-                .ok_or(HostError::Persistence(PersistenceError::UnknownPlayer(target_id)))?;
-            // Days are optional; a non-numeric word starts the reason so operators can write
-            // `/ban Name Botting in depot` without quoting.
-            let rest: Vec<String> = parts.map(str::to_owned).collect();
-            let (days, reason) = match rest.first().and_then(|value| value.parse::<u64>().ok()) {
-                Some(days) => (days, rest[1..].join(" ")),
-                None => (0_u64, rest.join(" ")),
-            };
-            let reason = if reason.is_empty() {
-                "Unspecified misconduct".to_owned()
-            } else {
-                reason
-            };
-            database
-                .record_account_ban(
-                    account_id,
-                    &reason,
-                    (days > 0).then(|| days.saturating_mul(86_400)),
-                )
-                .map_err(HostError::Persistence)?;
-            let _ = shared_world.request_kick(target_id);
-            Ok(Some(if days > 0 {
-                format!("Banned {target_name} for {days} day(s): {reason}")
-            } else {
-                format!("Permanently banned {target_name}: {reason}")
-            }))
-        }
-        "unban" => {
-            let target_name = parts.next().unwrap_or("");
-            let Some(target_id) = database
-                .player_id_by_name(target_name)
-                .map_err(HostError::Persistence)?
-            else {
-                return Ok(Some(format!("Player `{target_name}` does not exist.")));
-            };
-            let account_id = database
-                .account_id_by_player_id(target_id)
-                .map_err(HostError::Persistence)?
-                .ok_or(HostError::Persistence(PersistenceError::UnknownPlayer(target_id)))?;
-            let removed = database
-                .clear_account_bans(u64::from(account_id))
-                .map_err(HostError::Persistence)?;
-            Ok(Some(format!(
-                "Lifted {removed} ban(s) from {target_name}."
-            )))
-        }
-        "mute" => {
-            // /mute <player> [minutes]: default 5 minutes, bounded to 30 days.
-            let target_name = parts.next().unwrap_or("");
-            let Some(target_id) = database
-                .player_id_by_name(target_name)
-                .map_err(HostError::Persistence)?
-            else {
-                return Ok(Some(format!("Player `{target_name}` does not exist.")));
-            };
-            let account_id = database
-                .account_id_by_player_id(target_id)
-                .map_err(HostError::Persistence)?
-                .ok_or(HostError::Persistence(PersistenceError::UnknownPlayer(target_id)))?;
-            let minutes: u64 = parts
-                .next()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(5);
-            database
-                .record_account_mute(account_id, minutes.saturating_mul(60))
-                .map_err(HostError::Persistence)?;
-            Ok(Some(format!("Muted {target_name} for {minutes} minute(s).")))
-        }
-        "unmute" => {
-            let target_name = parts.next().unwrap_or("");
-            let Some(target_id) = database
-                .player_id_by_name(target_name)
-                .map_err(HostError::Persistence)?
-            else {
-                return Ok(Some(format!("Player `{target_name}` does not exist.")));
-            };
-            let account_id = database
-                .account_id_by_player_id(target_id)
-                .map_err(HostError::Persistence)?
-                .ok_or(HostError::Persistence(PersistenceError::UnknownPlayer(target_id)))?;
-            let _ = database.account_mute_remaining_seconds(u64::from(account_id))?; // prunes lapsed rows
-            let cleared = database
-                .clear_account_mute(u64::from(account_id))
-                .map_err(HostError::Persistence)?;
-            Ok(Some(if cleared == 1 {
-                format!("Unmuted {target_name}.")
-            } else {
-                format!("{target_name} was not muted.")
-            }))
-        }
-        "gm" => {
-            // /gm <online|offline> <player> [level] promotes another character.
-            let scope = parts.next().unwrap_or("").to_ascii_lowercase();
-            let target_name = parts.next().unwrap_or("");
-            let level: u8 = parts
-                .next()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(1);
-            if scope != "online" && scope != "offline" {
-                return Ok(Some(
-                    "Usage: /gm <online|offline> <player> [level 0-3]".into(),
-                ));
-            }
-            if level > 3 {
-                return Ok(Some("GM levels run 0-3.".into()));
-            }
-            let Some(target_id) = database
-                .player_id_by_name(target_name)
-                .map_err(HostError::Persistence)?
-            else {
-                return Ok(Some(format!("Player `{target_name}` does not exist.")));
-            };
-            if scope == "online" && !shared_world.has_player(target_id)? {
-                return Ok(Some(format!("`{target_name}` is not online.")));
-            }
-            database
-                .update_player_gm_level(target_id, level)
-                .map_err(HostError::Persistence)?;
-            Ok(Some(format!(
-                "Set gamemaster level {level} for {target_name}."
-            )))
-        }
-        "broadcast" => {
-            let body: String = parts.collect::<Vec<_>>().join(" ");
-            if body.is_empty() {
-                return Ok(Some("Usage: /broadcast <message>".into()));
-            }
-            match shared_world.broadcast_console_message("Console", &body) {
-                Ok(delivered) => Ok(Some(format!("Broadcast queued for {delivered} players."))),
-                Err(_) => Ok(Some("Broadcast failed; try again.".into())),
-            }
-        }
-        "heal" => match shared_world.restore_player_vitals(player_id) {
-            Ok(true) => Ok(Some("You feel better. Vitals restored.".into())),
-            _ => Ok(Some("Healing failed; target is not online.".into())),
-        },
-        "playerinfo" => {
-            let target_name = parts.next().unwrap_or("");
-            let Some(target_id) =
-                database.player_id_by_name(target_name).map_err(HostError::Persistence)?
-            else {
-                return Ok(Some(format!("Player `{target_name}` does not exist.")));
-            };
-            let character =
-                database.player_by_id(target_id).map_err(HostError::Persistence)?;
-            let gm_tier = database.player_gm_level(target_id).map_err(HostError::Persistence)?;
-            let online_state = if shared_world.has_player(target_id)? {
-                "online"
-            } else {
-                "offline"
-            };
-            let frags = shared_world.lock()?.player_frag_count(target_id);
-            let skull = if shared_world.lock()?.player_has_white_skull(target_id) {
-                "white-skull"
-            } else {
-                "none"
-            };
-            Ok(Some(format!(
-                "{}: level {} pos {},{},{} {} gm-tier {gm_tier} frags {frags} skull {skull}",
-                character.name,
-                character.level,
-                character.position.x,
-                character.position.y,
-                character.position.z,
-                online_state,
-            )))
-        }
-        "goto" => {
-            // /goto <player> teleports the executing GM to the target's position.
-            let target_name = parts.next().unwrap_or("");
-            let Some(target_id) =
-                database.player_id_by_name(target_name).map_err(HostError::Persistence)?
-            else {
-                return Ok(Some(format!("Player `{target_name}` does not exist.")));
-            };
-            let destination = if shared_world.has_player(target_id)? {
-                shared_world.player_position(target_id)?
-            } else {
-                database
-                    .player_by_id(target_id)
-                    .map_err(HostError::Persistence)?
-                    .position
-            };
-            match shared_world.teleport_player_for_operator(player_id, destination) {
-                Ok(()) => Ok(Some(format!(
-                    "Teleported to {} at {},{},{}.",
-                    target_name, destination.x, destination.y, destination.z
-                ))),
-                Err(_) => Ok(Some("Destination blocked.".into())),
-            }
-        }
-        "summon" | "tome" => {
-            // /tome <player> pulls the target player to the GM's position.
-            let target_name = parts.next().unwrap_or("");
-            let Some(target_id) =
-                database.player_id_by_name(target_name).map_err(HostError::Persistence)?
-            else {
-                return Ok(Some(format!("Player `{target_name}` does not exist.")));
-            };
-            let destination = shared_world.player_position(player_id)?;
-            if !shared_world.has_player(target_id)? {
-                return Ok(Some(format!("`{target_name}` must be online to be summoned.")));
-            }
-            match shared_world.teleport_player_for_operator(target_id, destination) {
-                Ok(()) => Ok(Some(format!("Summoned {target_name} to you."))),
-                Err(_) => Ok(Some("Your tile area is blocked.".into())),
-            }
-        }
-        _ => Ok(Some(format!(
-            "Unknown GM command `/{verb}`; available: spawn, give, tp, kick, gm, broadcast, heal, playerinfo, goto, tome."
-        ))),
-    }
-}
-
 /// Inserts bounded single units of one server item into the target's top-level containers,
 /// returning `(containers, unplaced_units)`.
 fn insert_units_into_containers(
@@ -3087,7 +1942,7 @@ fn insert_units_into_containers(
 
 /// Delivers items to an online or offline character's first container with space. Shared by the
 /// GM `/give` talkaction and the operator bridge.
-fn give_items_to_player(
+pub(crate) fn give_items_to_player(
     shared_world: &SharedNativeWorld,
     database: &mut EngineDatabase,
     target_id: u64,
@@ -3133,6 +1988,10 @@ fn give_items_to_player(
     )))
 }
 
+/// Handles bounded NPC shop keywords ("buy <server-id> <count>" / "sell <server-id> <count>")
+/// near an active static NPC whose declared shop matches. Payments and proceeds flow through the
+/// durable bank balance; bought stacks chunk into free owned container slots, sold units leave
+/// carried equipment and containers. `Ok(None)` falls through to ordinary routing.
 fn handle_native_shop_keyword(
     shared_world: &SharedNativeWorld,
     database: &mut EngineDatabase,
@@ -3227,12 +2086,8 @@ fn handle_native_shop_keyword(
             &staged_containers,
             balance - total,
         )?;
-        shared_world
-            .replace_player_equipment(player_id, equipment)
-            .expect("validated player remains present while shopping");
-        shared_world
-            .replace_player_containers(player_id, staged_containers)
-            .expect("validated player remains present while shopping");
+        shared_world.replace_player_equipment(player_id, equipment)?;
+        shared_world.replace_player_containers(player_id, staged_containers)?;
         shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
         return Ok(Some(format!("You bought {count} for {total} gold.")));
     }
@@ -3312,17 +2167,17 @@ fn handle_native_shop_keyword(
         &containers,
         new_balance,
     )?;
-    shared_world
-        .replace_player_equipment(player_id, equipment)
-        .expect("validated player remains present while shopping");
-    shared_world
-        .replace_player_containers(player_id, containers)
-        .expect("validated player remains present while shopping");
+    shared_world.replace_player_equipment(player_id, equipment)?;
+    shared_world.replace_player_containers(player_id, containers)?;
     shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
     Ok(Some(format!("You sold {count} for {total} gold.")))
 }
 
 impl SharedNativeMap {
+    /// Startup-only constructor: with no journal supplied, recovery validates against nothing
+    /// and cannot fail, so the expect documents a construction invariant rather than a runtime
+    /// risk. The network-facing path goes through `recover_from_removal_journal`, which returns
+    /// `Result` and fails closed.
     pub fn new(map: WorldMap) -> Self {
         Self::recover_from_removal_journal(map, None)
             .expect("an empty map-item removal journal cannot invalidate a world map")
@@ -3423,8 +2278,12 @@ impl SharedNativeMap {
                 })?
                 .to_vec();
             let mut next_items = items;
-            next_items[usize::from(identity.item_index)].count =
-                u8::try_from(*remaining_count).expect("bounded item-stack count fits map u8");
+            next_items[usize::from(identity.item_index)].count = u8::try_from(*remaining_count)
+                .map_err(|_| {
+                    HostError::Core(forgotten_core::CoreError::InvalidMap(
+                        "persisted count override exceeds the map u8 stack bound".into(),
+                    ))
+                })?;
             map.set_tile_items(identity.position, next_items)
                 .map_err(HostError::Core)?;
         }
@@ -3499,7 +2358,9 @@ impl SharedNativeMap {
                 position,
                 (0..items.len())
                     .filter_map(|index| {
-                        let item_index = u8::try_from(index).expect("world map item limit fits u8");
+                        let Ok(item_index) = u8::try_from(index) else {
+                            return None;
+                        };
                         (!removed_source_items.contains(&WorldMapItemSourceIdentity {
                             map_revision: source.source_revision(),
                             position,
@@ -3763,1122 +2624,10 @@ impl SharedNativeMap {
             .into_iter()
             .collect())
     }
-
-    /// Moves one requested bounded player stack from owned inventory onto an authoritative ground
-    /// tile adjacent to (or under) the player, appending it to the durable runtime registry. The
-    /// inventory change and registry persist in one SQLite transaction while authoritative locks
-    /// are held; staged memory commits only after a successful commit.
-    #[allow(clippy::too_many_arguments)]
-    pub fn move_player_stack_to_ground(
-        &self,
-        shared_world: &SharedNativeWorld,
-        database: &mut EngineDatabase,
-        player_id: u64,
-        source: forgotten_core::PlayerGroundDropSource,
-        target_position: Position,
-        count: u16,
-        item_weight_by_server_id: Option<&BTreeMap<u16, u32>>,
-    ) -> Result<Option<forgotten_core::PlayerGroundDropOutcome>, HostError> {
-        let mut world = shared_world.lock()?;
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let mut registry = self
-            .runtime_tile_items
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        // Bounded placement rules: existing walkable tile, within one step of the player, and
-        // below the per-tile item limit.
-        let Some(tile) = map.tile(target_position) else {
-            return Ok(None);
-        };
-        if !tile.walkable {
-            return Ok(None);
-        }
-        let player = world.player(player_id).ok_or(HostError::Core(
-            forgotten_core::CoreError::UnknownPlayer(player_id),
-        ))?;
-        if player.position.z != target_position.z
-            || player.position.x.abs_diff(target_position.x) > 1
-            || player.position.y.abs_diff(target_position.y) > 1
-        {
-            return Ok(None);
-        }
-        let current_items = map
-            .tile_items(target_position)
-            .map(<[WorldMapItem]>::len)
-            .unwrap_or(0);
-        if current_items >= forgotten_core::MAX_WORLD_MAP_ITEMS_PER_TILE {
-            return Ok(None);
-        }
-        if count == 0 || count > u16::from(u8::MAX) {
-            return Ok(None);
-        }
-        // Stage the inventory mutation on a clone so nothing publishes before persistence.
-        let mut staged_world = world.clone();
-        let outcome = match staged_world.take_player_stack_for_ground_drop(player_id, source, count)
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return match error {
-                    forgotten_core::CoreError::EmptyEquipmentSlot { .. }
-                    | forgotten_core::CoreError::UnknownPlayerContainer { .. }
-                    | forgotten_core::CoreError::UnknownPlayerContainerItem { .. } => Ok(None),
-                    other => Err(HostError::Core(other)),
-                };
-            }
-        };
-        let ordinal = u8::try_from(
-            registry
-                .iter()
-                .filter(|record| record.position == target_position)
-                .count(),
-        )
-        .map_err(|_| {
-            HostError::Core(forgotten_core::CoreError::InvalidMap(
-                "runtime tile-item ordinals exhausted for this tile".into(),
-            ))
-        })?;
-        let Ok(dropped_count) = u8::try_from(outcome.moved_item.count) else {
-            return Err(HostError::InvalidConfiguration(
-                "dropped stack exceeds the ground count bound".into(),
-            ));
-        };
-        let record = RuntimeMapItemRecord {
-            position: target_position,
-            ordinal,
-            server_id: outcome.moved_item.server_id,
-            count: dropped_count,
-            children: Vec::new(),
-            despawn_tick: None,
-        };
-        let mut next_registry = registry.clone();
-        next_registry.push(record);
-        let mut next_map = (*map).clone();
-        let mut next_items = map
-            .tile_items(target_position)
-            .map(<[WorldMapItem]>::to_vec)
-            .unwrap_or_default();
-        next_items.push(WorldMapItem {
-            server_id: outcome.moved_item.server_id,
-            client_thing_id: None,
-            count: dropped_count,
-            action_id: None,
-            unique_id: None,
-            text: None,
-            description: None,
-            teleport_destination: None,
-            duration: None,
-            charges: None,
-            children: Vec::new(),
-        });
-        next_map
-            .set_tile_items(target_position, next_items)
-            .map_err(HostError::Core)?;
-        let published_equipment = staged_world
-            .player_equipment(player_id)
-            .map_err(HostError::Core)?
-            .clone();
-        let published_containers = staged_world
-            .player_containers(player_id)
-            .map_err(HostError::Core)?
-            .clone();
-        // Bounded capacity-weight gate: hundredths-of-an-ounce carried weight must stay within
-        // the player's ounce capacity after the move. Missing operator weight metadata skips
-        // the gate entirely, preserving prior transfer behavior.
-        if let Some(weights) = item_weight_by_server_id {
-            let capacity = world
-                .player_vitals(player_id)
-                .map_err(HostError::Core)?
-                .capacity;
-            let capacity_hundredths = u64::from(capacity).saturating_mul(100);
-            if native_carried_weight(weights, &published_equipment, &published_containers)
-                > capacity_hundredths
-            {
-                return Ok(None);
-            }
-        }
-        database.replace_player_inventory_and_runtime_map_items(
-            player_id,
-            &published_equipment,
-            &published_containers,
-            self.source_revision(),
-            &next_registry,
-        )?;
-        world
-            .replace_player_equipment(player_id, published_equipment)
-            .expect("validated player remains present while the shared-world lock is held");
-        world
-            .replace_player_containers(player_id, published_containers)
-            .expect("validated player remains present while the shared-world lock is held");
-        *map = next_map;
-        *registry = next_registry;
-        self.revision.fetch_add(1, Ordering::SeqCst);
-        Ok(Some(outcome))
-    }
-
-    /// Resolves the ordered runtime-tail start index for one tile: every map item at or above
-    /// this index belongs to the durable runtime registry rather than imported source content.
-    fn runtime_tail_start(
-        &self,
-        map_items_len: Option<usize>,
-        position: &Position,
-        registry: &[RuntimeMapItemRecord],
-    ) -> usize {
-        let runtime_count = registry
-            .iter()
-            .filter(|record| &record.position == position)
-            .count();
-        map_items_len.unwrap_or(0).saturating_sub(runtime_count)
-    }
-
-    /// Moves one bounded count out of a durable runtime tile item into owned player inventory.
-    /// `child_index = None` takes from the top-level stack itself (whole or partial), while
-    /// `Some(index)` takes from one corpse child. The inventory change and complete registry
-    /// persist in one SQLite transaction while authoritative locks are held; staged memory
-    /// publishes only after commit. Depleted top-level records are removed from both the map and
-    /// the registry together, and surviving sibling ordinals stay contiguous.
-    #[allow(clippy::too_many_arguments)]
-    pub fn move_runtime_item_to_inventory(
-        &self,
-        shared_world: &SharedNativeWorld,
-        database: &mut EngineDatabase,
-        player_id: u64,
-        position: Position,
-        item_index: usize,
-        child_index: Option<usize>,
-        count: u16,
-        destination: forgotten_core::PlayerGroundDropSource,
-        item_weight_by_server_id: Option<&BTreeMap<u16, u32>>,
-    ) -> Result<Option<forgotten_core::PlayerGroundDropOutcome>, HostError> {
-        if count == 0 || count > u16::from(u8::MAX) {
-            return Ok(None);
-        }
-        let mut world = shared_world.lock()?;
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let mut registry_guard = self
-            .runtime_tile_items
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let runtime_start = self.runtime_tail_start(
-            map.tile_items(position).map(<[WorldMapItem]>::len),
-            &position,
-            &registry_guard,
-        );
-        let Some(items) = map.tile_items(position) else {
-            return Ok(None);
-        };
-        if item_index < runtime_start || item_index >= items.len() {
-            return Ok(None);
-        }
-        let Ok(ordinal) = u8::try_from(item_index - runtime_start) else {
-            return Ok(None);
-        };
-        let Some(record_index) = registry_guard
-            .iter()
-            .position(|record| record.position == position && record.ordinal == ordinal)
-        else {
-            return Ok(None);
-        };
-        let map_item = items[item_index].clone();
-        let top_level_count_before_take = map_item.count;
-        let top_level_server_id = map_item.server_id;
-
-        // Resolve the moved stack plus the staged post-take source shape.
-        let (moved_item, next_children, next_top_count, remove_top, source_remaining_count) =
-            match child_index {
-                Some(child_index) => {
-                    let Some(available_child) = map_item.children.get(child_index).cloned() else {
-                        return Ok(None);
-                    };
-                    let Ok(take) = u8::try_from(count) else {
-                        return Ok(None);
-                    };
-                    if available_child.count < take {
-                        return Ok(None);
-                    }
-                    let mut remaining_child = available_child.clone();
-                    let mut moved = available_child;
-                    moved.count = take;
-                    remaining_child.count -= take;
-                    let source_remaining_count =
-                        (remaining_child.count > 0).then_some(u16::from(remaining_child.count));
-                    let mut next_children = map_item.children.clone();
-                    if remaining_child.count > 0 {
-                        next_children[child_index] = remaining_child;
-                    } else {
-                        next_children.remove(child_index);
-                    }
-                    (moved, next_children, None, false, source_remaining_count)
-                }
-                None => {
-                    if u16::from(map_item.count) < count {
-                        return Ok(None);
-                    }
-                    let Ok(take) = u8::try_from(count) else {
-                        return Ok(None);
-                    };
-                    let mut remaining_top = map_item.clone();
-                    let mut moved = map_item;
-                    moved.count = take;
-                    remaining_top.count -= take;
-                    if remaining_top.count > 0 {
-                        let source_remaining_count = Some(u16::from(remaining_top.count));
-                        (
-                            moved,
-                            remaining_top.children.clone(),
-                            Some(remaining_top.count),
-                            false,
-                            source_remaining_count,
-                        )
-                    } else {
-                        // A fully depleted top-level item leaves nothing on the tile.
-                        let source_remaining_count: Option<u16> = None;
-                        (moved, Vec::new(), None, true, source_remaining_count)
-                    }
-                }
-            };
-
-        // Stage the inventory destination on a cloned world so nothing publishes before
-        // persistence succeeds.
-        let moved_item =
-            forgotten_core::ItemInstance::new(moved_item.server_id, u16::from(moved_item.count))
-                .map_err(HostError::Core)?;
-        let mut staged_world = world.clone();
-        let destination_admission = match destination {
-            forgotten_core::PlayerGroundDropSource::EquipmentSlot(slot) => {
-                let mut equipment = staged_world
-                    .player_equipment(player_id)
-                    .map_err(HostError::Core)?
-                    .clone();
-                match equipment.item(slot).cloned() {
-                    Some(mut existing) => {
-                        if existing.merge_stack(&moved_item).is_err() {
-                            return Ok(None);
-                        }
-                        equipment.equip(slot, existing);
-                    }
-                    None => {
-                        equipment.equip(slot, moved_item.clone());
-                    }
-                }
-                staged_world
-                    .replace_player_equipment(player_id, equipment)
-                    .map_err(HostError::Core)?;
-                true
-            }
-            forgotten_core::PlayerGroundDropSource::ContainerItem { container_id, .. } => {
-                let mut containers = staged_world
-                    .player_containers(player_id)
-                    .map_err(HostError::Core)?
-                    .clone();
-                let Some(mut container) = containers.remove(container_id) else {
-                    return Ok(None);
-                };
-                if container.has_parent
-                    || container
-                        .items
-                        .merge_or_insert_stack(moved_item.clone())
-                        .is_err()
-                {
-                    return Ok(None);
-                }
-                containers.insert(container).map_err(HostError::Core)?;
-                staged_world
-                    .replace_player_containers(player_id, containers)
-                    .map_err(HostError::Core)?;
-                true
-            }
-            // Content items drop out of nested storage; destination admission is decided by
-            // the ground-tile checks below, not by inventory topology.
-            forgotten_core::PlayerGroundDropSource::ContainerContent { .. } => true,
-        };
-        if !destination_admission {
-            return Ok(None);
-        }
-
-        // Stage the registry and map mutations.
-        let mut next_registry = registry_guard.clone();
-        if remove_top {
-            next_registry.remove(record_index);
-            for sibling in next_registry
-                .iter_mut()
-                .filter(|record| record.position == position && record.ordinal > ordinal)
-            {
-                sibling.ordinal -= 1;
-            }
-        } else {
-            match child_index {
-                Some(_) => {
-                    next_registry[record_index].children = next_children
-                        .iter()
-                        .map(|child| RuntimeMapItemChildRecord {
-                            server_id: child.server_id,
-                            count: child.count,
-                        })
-                        .collect();
-                }
-                None => {
-                    next_registry[record_index].count =
-                        next_top_count.expect("partial top-level take keeps its remainder");
-                }
-            }
-        }
-        let mut next_items = items.to_vec();
-        if remove_top {
-            next_items.remove(item_index);
-        } else {
-            next_items[item_index] = WorldMapItem {
-                server_id: top_level_server_id,
-                client_thing_id: None,
-                count: next_top_count.unwrap_or(top_level_count_before_take),
-                action_id: None,
-                unique_id: None,
-                text: None,
-                description: None,
-                teleport_destination: None,
-                duration: None,
-                charges: None,
-                children: next_children,
-            };
-        }
-        let mut next_map = (*map).clone();
-        next_map
-            .set_tile_items(position, next_items)
-            .map_err(HostError::Core)?;
-        let published_equipment = staged_world
-            .player_equipment(player_id)
-            .map_err(HostError::Core)?
-            .clone();
-        let published_containers = staged_world
-            .player_containers(player_id)
-            .map_err(HostError::Core)?
-            .clone();
-        // Bounded capacity-weight gate: hundredths-of-an-ounce carried weight must stay within
-        // the player's ounce capacity after the move. Missing operator weight metadata skips
-        // the gate entirely, preserving prior transfer behavior.
-        if let Some(weights) = item_weight_by_server_id {
-            let capacity = world
-                .player_vitals(player_id)
-                .map_err(HostError::Core)?
-                .capacity;
-            let capacity_hundredths = u64::from(capacity).saturating_mul(100);
-            if native_carried_weight(weights, &published_equipment, &published_containers)
-                > capacity_hundredths
-            {
-                return Ok(None);
-            }
-        }
-        database.replace_player_inventory_and_runtime_map_items(
-            player_id,
-            &published_equipment,
-            &published_containers,
-            self.source_revision(),
-            &next_registry,
-        )?;
-        world
-            .replace_player_equipment(player_id, published_equipment)
-            .expect("validated player remains present while the shared-world lock is held");
-        world
-            .replace_player_containers(player_id, published_containers)
-            .expect("validated player remains present while the shared-world lock is held");
-        *map = next_map;
-        *registry_guard = next_registry;
-        drop(world);
-        drop(map);
-        drop(registry_guard);
-        self.revision.fetch_add(1, Ordering::SeqCst);
-        Ok(Some(forgotten_core::PlayerGroundDropOutcome {
-            player_id,
-            source: destination,
-            moved_item,
-            source_remaining_count,
-        }))
-    }
-
-    /// Replaces one imported tile's complete ordered item list after `WorldMap` validates its
-    /// per-tile limit. This is an ownership primitive only; it does not transfer an item into a
-    /// player inventory, persist a change, or emit any native packet.
-    pub fn replace_tile_items(
-        &self,
-        position: Position,
-        items: Vec<WorldMapItem>,
-    ) -> Result<u64, HostError> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let mut source_item_indices = self
-            .source_item_indices
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        map.set_tile_items(position, items)
-            .map_err(HostError::Core)?;
-        source_item_indices.remove(&position);
-        Ok(self.revision.fetch_add(1, Ordering::SeqCst) + 1)
-    }
-
-    /// Transfers one exact complete top-level imported source stack into one equipment slot. The
-    /// slot is either empty or contains one exact compatible stack with bounded remaining room.
-    /// The lock order is always map, authoritative player world, source-index map, then removal
-    /// journal.
-    /// It creates candidate map/inventory/journal state first, commits the candidate inventory and
-    /// journal through one SQLite transaction, then publishes the already validated in-memory
-    /// state and advances both affected epochs. Native ThrowItem decoding and map refresh packets
-    /// deliberately remain outside this primitive.
-    pub fn move_source_item_to_empty_equipment(
-        &self,
-        shared_world: &SharedNativeWorld,
-        database: &mut EngineDatabase,
-        player_id: u64,
-        position: Position,
-        runtime_item_index: usize,
-        equipment_slot: EquipmentSlot,
-    ) -> Result<SourceMapItemToEquipmentTransferOutcome, HostError> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let mut world = shared_world.lock()?;
-        let mut source_item_indices = self
-            .source_item_indices
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let mut removed_source_items = self
-            .removed_source_items
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-
-        let runtime_item = map
-            .tile_items(position)
-            .and_then(|items| items.get(runtime_item_index))
-            .cloned()
-            .ok_or(HostError::Core(forgotten_core::CoreError::UnknownMapItem {
-                position,
-                stack_index: u8::try_from(runtime_item_index).unwrap_or(u8::MAX),
-                expected_server_id: 0,
-            }))?;
-        let source_item_index = source_item_indices
-            .get(&position)
-            .and_then(|indices| indices.get(runtime_item_index))
-            .copied()
-            .ok_or_else(|| {
-                HostError::InvalidConfiguration(
-                    "map item has no source-bound runtime identity".into(),
-                )
-            })?;
-        let source_identity = self
-            .source
-            .source_item_identity(position, usize::from(source_item_index))
-            .ok_or_else(|| {
-                HostError::InvalidConfiguration(
-                    "map source item identity no longer resolves".into(),
-                )
-            })?;
-        let source_item = self
-            .source
-            .tile_items(position)
-            .and_then(|items| items.get(usize::from(source_item_index)))
-            .ok_or_else(|| {
-                HostError::InvalidConfiguration("map source item no longer resolves".into())
-            })?;
-        if source_item != &runtime_item {
-            return Err(HostError::InvalidConfiguration(
-                "map runtime item no longer matches its immutable source item".into(),
-            ));
-        }
-        let item = plain_source_map_item_to_inventory_item(&runtime_item)?;
-        let mut equipment = world
-            .player_equipment(player_id)
-            .cloned()
-            .map_err(HostError::Core)?;
-        match equipment.item(equipment_slot).cloned() {
-            None => {
-                equipment.equip(equipment_slot, item.clone());
-            }
-            Some(mut existing) => {
-                existing.merge_stack(&item).map_err(HostError::Core)?;
-                equipment.equip(equipment_slot, existing);
-            }
-        }
-        let containers = world
-            .player_containers(player_id)
-            .cloned()
-            .map_err(HostError::Core)?;
-        if removed_source_items.contains(&source_identity) {
-            return Err(HostError::InvalidConfiguration(
-                "map source item identity has already been removed".into(),
-            ));
-        }
-        let mut next_map = map.clone();
-        let mut next_items = next_map
-            .tile_items(position)
-            .map(ToOwned::to_owned)
-            .expect("validated runtime item list exists");
-        next_items.remove(runtime_item_index);
-        next_map
-            .set_tile_items(position, next_items)
-            .map_err(HostError::Core)?;
-        let mut next_removed_source_items = removed_source_items.clone();
-        next_removed_source_items.insert(source_identity);
-        let next_journal = MapItemRemovalJournal {
-            map_revision: self.source_revision(),
-            removed_items: next_removed_source_items.iter().copied().collect(),
-        };
-
-        database.replace_player_inventory_and_map_item_removal_journal(
-            player_id,
-            &equipment,
-            &containers,
-            &next_journal,
-        )?;
-
-        *map = next_map;
-        let changed = world
-            .replace_player_equipment(player_id, equipment)
-            .expect("validated player remains present while shared-world lock is held");
-        debug_assert!(changed);
-        let source_indices = source_item_indices
-            .get_mut(&position)
-            .expect("validated source index list exists");
-        source_indices.remove(runtime_item_index);
-        if source_indices.is_empty() {
-            source_item_indices.remove(&position);
-        }
-        *removed_source_items = next_removed_source_items;
-        let map_revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
-        shared_world.equipment_epoch.fetch_add(1, Ordering::SeqCst);
-        Ok(SourceMapItemToEquipmentTransferOutcome {
-            player_id,
-            source_identity,
-            item,
-            equipment_slot,
-            map_revision,
-        })
-    }
-
-    /// Transfers one exact plain source-bound map stack count into one equipment slot. The slot is
-    /// empty or contains an exact compatible bounded stack. A whole-count request completes the
-    /// source removal, while a smaller request reduces the runtime source stack and persists its
-    /// remaining count in the same SQLite transaction as the equipment change.
-    #[allow(clippy::too_many_arguments)] // Explicit map identity and destination fields preserve the authoritative transfer contract.
-    pub fn move_source_item_stack_to_equipment(
-        &self,
-        shared_world: &SharedNativeWorld,
-        database: &mut EngineDatabase,
-        player_id: u64,
-        position: Position,
-        runtime_item_index: usize,
-        requested_count: u16,
-        equipment_slot: EquipmentSlot,
-    ) -> Result<SourceMapItemToEquipmentTransferOutcome, HostError> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let mut world = shared_world.lock()?;
-        let mut source_item_indices = self
-            .source_item_indices
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let mut removed_source_items = self
-            .removed_source_items
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let mut source_item_count_overrides = self
-            .source_item_count_overrides
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let runtime_item = map
-            .tile_items(position)
-            .and_then(|items| items.get(runtime_item_index))
-            .cloned()
-            .ok_or(HostError::Core(forgotten_core::CoreError::UnknownMapItem {
-                position,
-                stack_index: u8::try_from(runtime_item_index).unwrap_or(u8::MAX),
-                expected_server_id: 0,
-            }))?;
-        let source_item_index = source_item_indices
-            .get(&position)
-            .and_then(|indices| indices.get(runtime_item_index))
-            .copied()
-            .ok_or_else(|| {
-                HostError::InvalidConfiguration(
-                    "map item has no source-bound runtime identity".into(),
-                )
-            })?;
-        let source_identity = self
-            .source
-            .source_item_identity(position, usize::from(source_item_index))
-            .ok_or_else(|| {
-                HostError::InvalidConfiguration(
-                    "map source item identity no longer resolves".into(),
-                )
-            })?;
-        let source_item = self
-            .source
-            .tile_items(position)
-            .and_then(|items| items.get(usize::from(source_item_index)))
-            .ok_or_else(|| {
-                HostError::InvalidConfiguration("map source item no longer resolves".into())
-            })?;
-        if runtime_item.server_id != source_item.server_id
-            || runtime_item.action_id != source_item.action_id
-            || runtime_item.unique_id != source_item.unique_id
-            || runtime_item.children != source_item.children
-            || runtime_item.text != source_item.text
-            || runtime_item.description != source_item.description
-            || runtime_item.teleport_destination != source_item.teleport_destination
-            || runtime_item.duration != source_item.duration
-            || runtime_item.charges != source_item.charges
-        {
-            return Err(HostError::InvalidConfiguration(
-                "map runtime item no longer matches its immutable source item identity".into(),
-            ));
-        }
-        if removed_source_items.contains(&source_identity) {
-            return Err(HostError::InvalidConfiguration(
-                "map source item identity has already been removed".into(),
-            ));
-        }
-        let available_count = u16::from(runtime_item.count);
-        if requested_count == 0 || requested_count > available_count {
-            return Err(HostError::Core(
-                forgotten_core::CoreError::InvalidItemTransferCount {
-                    requested: requested_count,
-                    available: available_count,
-                },
-            ));
-        }
-        let mut item = plain_source_map_item_to_inventory_item(&runtime_item)?;
-        item.count = requested_count;
-        let mut equipment = world
-            .player_equipment(player_id)
-            .cloned()
-            .map_err(HostError::Core)?;
-        match equipment.item(equipment_slot).cloned() {
-            None => {
-                equipment.equip(equipment_slot, item.clone());
-            }
-            Some(mut existing) => {
-                existing.merge_stack(&item).map_err(HostError::Core)?;
-                equipment.equip(equipment_slot, existing);
-            }
-        }
-        let containers = world
-            .player_containers(player_id)
-            .cloned()
-            .map_err(HostError::Core)?;
-        let mut next_map = map.clone();
-        let mut next_items = next_map
-            .tile_items(position)
-            .map(ToOwned::to_owned)
-            .expect("validated runtime item list exists");
-        let mut next_removed_source_items = removed_source_items.clone();
-        let mut next_source_item_count_overrides = source_item_count_overrides.clone();
-        let whole_source = requested_count == available_count;
-        if whole_source {
-            next_items.remove(runtime_item_index);
-            next_removed_source_items.insert(source_identity);
-            next_source_item_count_overrides.remove(&source_identity);
-        } else {
-            let remaining_count = available_count - requested_count;
-            next_items[runtime_item_index].count =
-                u8::try_from(remaining_count).expect("bounded item-stack count fits map u8");
-            next_source_item_count_overrides.insert(source_identity, remaining_count);
-        }
-        next_map
-            .set_tile_items(position, next_items)
-            .map_err(HostError::Core)?;
-        let next_journal = MapItemRemovalJournal {
-            map_revision: self.source_revision(),
-            removed_items: next_removed_source_items.iter().copied().collect(),
-        };
-        let next_override_records = next_source_item_count_overrides
-            .iter()
-            .map(
-                |(source_identity, remaining_count)| MapItemCountOverrideRecord {
-                    source_identity: *source_identity,
-                    remaining_count: *remaining_count,
-                },
-            )
-            .collect::<Vec<_>>();
-        database.replace_player_inventory_and_map_item_state(
-            player_id,
-            &equipment,
-            &containers,
-            &next_journal,
-            &next_override_records,
-        )?;
-        *map = next_map;
-        let changed = world
-            .replace_player_equipment(player_id, equipment)
-            .expect("validated player remains present while shared-world lock is held");
-        debug_assert!(changed);
-        if whole_source {
-            let source_indices = source_item_indices
-                .get_mut(&position)
-                .expect("validated source index list exists");
-            source_indices.remove(runtime_item_index);
-            if source_indices.is_empty() {
-                source_item_indices.remove(&position);
-            }
-        }
-        *removed_source_items = next_removed_source_items;
-        *source_item_count_overrides = next_source_item_count_overrides;
-        let map_revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
-        shared_world.equipment_epoch.fetch_add(1, Ordering::SeqCst);
-        Ok(SourceMapItemToEquipmentTransferOutcome {
-            player_id,
-            source_identity,
-            item,
-            equipment_slot,
-            map_revision,
-        })
-    }
-
-    /// Transfers one exact complete plain top-level source-bound map stack into one existing,
-    /// owned, non-nested container. It merges only an exact compatible stack or appends one
-    /// bounded stack, then follows the established map, world, source-index, journal lock order.
-    pub fn move_source_item_to_top_level_container(
-        &self,
-        shared_world: &SharedNativeWorld,
-        database: &mut EngineDatabase,
-        player_id: u64,
-        position: Position,
-        runtime_item_index: usize,
-        container_id: u8,
-    ) -> Result<SourceMapItemToContainerTransferOutcome, HostError> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let mut world = shared_world.lock()?;
-        let mut source_item_indices = self
-            .source_item_indices
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let mut removed_source_items = self
-            .removed_source_items
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let runtime_item = map
-            .tile_items(position)
-            .and_then(|items| items.get(runtime_item_index))
-            .cloned()
-            .ok_or(HostError::Core(forgotten_core::CoreError::UnknownMapItem {
-                position,
-                stack_index: u8::try_from(runtime_item_index).unwrap_or(u8::MAX),
-                expected_server_id: 0,
-            }))?;
-        let source_item_index = source_item_indices
-            .get(&position)
-            .and_then(|indices| indices.get(runtime_item_index))
-            .copied()
-            .ok_or_else(|| {
-                HostError::InvalidConfiguration(
-                    "map item has no source-bound runtime identity".into(),
-                )
-            })?;
-        let source_identity = self
-            .source
-            .source_item_identity(position, usize::from(source_item_index))
-            .ok_or_else(|| {
-                HostError::InvalidConfiguration(
-                    "map source item identity no longer resolves".into(),
-                )
-            })?;
-        if self
-            .source
-            .tile_items(position)
-            .and_then(|items| items.get(usize::from(source_item_index)))
-            != Some(&runtime_item)
-        {
-            return Err(HostError::InvalidConfiguration(
-                "map runtime item no longer matches its immutable source item".into(),
-            ));
-        }
-        let item = plain_source_map_item_to_inventory_item(&runtime_item)?;
-        if removed_source_items.contains(&source_identity) {
-            return Err(HostError::InvalidConfiguration(
-                "map source item identity has already been removed".into(),
-            ));
-        }
-        let equipment = world
-            .player_equipment(player_id)
-            .cloned()
-            .map_err(HostError::Core)?;
-        let mut containers = world
-            .player_containers(player_id)
-            .cloned()
-            .map_err(HostError::Core)?;
-        let mut container = containers.remove(container_id).ok_or_else(|| {
-            HostError::InvalidConfiguration("map item destination container is not owned".into())
-        })?;
-        if container.has_parent {
-            return Err(HostError::InvalidConfiguration(
-                "map item destination container must be top-level".into(),
-            ));
-        }
-        container
-            .items
-            .merge_or_insert_stack(item.clone())
-            .map_err(HostError::Core)?;
-        containers.insert(container).map_err(HostError::Core)?;
-        let mut next_map = map.clone();
-        let mut next_items = next_map
-            .tile_items(position)
-            .map(ToOwned::to_owned)
-            .expect("validated runtime item list exists");
-        next_items.remove(runtime_item_index);
-        next_map
-            .set_tile_items(position, next_items)
-            .map_err(HostError::Core)?;
-        let mut next_removed_source_items = removed_source_items.clone();
-        next_removed_source_items.insert(source_identity);
-        let next_journal = MapItemRemovalJournal {
-            map_revision: self.source_revision(),
-            removed_items: next_removed_source_items.iter().copied().collect(),
-        };
-        database.replace_player_inventory_and_map_item_removal_journal(
-            player_id,
-            &equipment,
-            &containers,
-            &next_journal,
-        )?;
-        *map = next_map;
-        let changed = world
-            .replace_player_containers(player_id, containers)
-            .expect("validated player remains present while shared-world lock is held");
-        debug_assert!(changed);
-        let source_indices = source_item_indices
-            .get_mut(&position)
-            .expect("validated source index list exists");
-        source_indices.remove(runtime_item_index);
-        if source_indices.is_empty() {
-            source_item_indices.remove(&position);
-        }
-        *removed_source_items = next_removed_source_items;
-        let map_revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
-        shared_world.containers_epoch.fetch_add(1, Ordering::SeqCst);
-        Ok(SourceMapItemToContainerTransferOutcome {
-            player_id,
-            source_identity,
-            item,
-            container_id,
-            map_revision,
-        })
-    }
-
-    /// Transfers one exact plain source-bound map stack count into one existing owned top-level
-    /// container. A whole-count request preserves the established complete-removal path, while a
-    /// smaller bounded request persists the remaining source count through the override journal in
-    /// the same SQLite transaction as the container change.
-    #[allow(clippy::too_many_arguments)] // Explicit map identity and destination fields preserve the authoritative transfer contract.
-    pub fn move_source_item_stack_to_top_level_container(
-        &self,
-        shared_world: &SharedNativeWorld,
-        database: &mut EngineDatabase,
-        player_id: u64,
-        position: Position,
-        runtime_item_index: usize,
-        requested_count: u16,
-        container_id: u8,
-    ) -> Result<SourceMapItemToContainerTransferOutcome, HostError> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let mut world = shared_world.lock()?;
-        let mut source_item_indices = self
-            .source_item_indices
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let mut removed_source_items = self
-            .removed_source_items
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let mut source_item_count_overrides = self
-            .source_item_count_overrides
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
-        let runtime_item = map
-            .tile_items(position)
-            .and_then(|items| items.get(runtime_item_index))
-            .cloned()
-            .ok_or(HostError::Core(forgotten_core::CoreError::UnknownMapItem {
-                position,
-                stack_index: u8::try_from(runtime_item_index).unwrap_or(u8::MAX),
-                expected_server_id: 0,
-            }))?;
-        let source_item_index = source_item_indices
-            .get(&position)
-            .and_then(|indices| indices.get(runtime_item_index))
-            .copied()
-            .ok_or_else(|| {
-                HostError::InvalidConfiguration(
-                    "map item has no source-bound runtime identity".into(),
-                )
-            })?;
-        let source_identity = self
-            .source
-            .source_item_identity(position, usize::from(source_item_index))
-            .ok_or_else(|| {
-                HostError::InvalidConfiguration(
-                    "map source item identity no longer resolves".into(),
-                )
-            })?;
-        let source_item = self
-            .source
-            .tile_items(position)
-            .and_then(|items| items.get(usize::from(source_item_index)))
-            .ok_or_else(|| {
-                HostError::InvalidConfiguration("map source item no longer resolves".into())
-            })?;
-        if runtime_item.server_id != source_item.server_id
-            || runtime_item.action_id != source_item.action_id
-            || runtime_item.unique_id != source_item.unique_id
-            || runtime_item.children != source_item.children
-            || runtime_item.text != source_item.text
-            || runtime_item.description != source_item.description
-            || runtime_item.teleport_destination != source_item.teleport_destination
-            || runtime_item.duration != source_item.duration
-            || runtime_item.charges != source_item.charges
-        {
-            return Err(HostError::InvalidConfiguration(
-                "map runtime item no longer matches its immutable source item identity".into(),
-            ));
-        }
-        if removed_source_items.contains(&source_identity) {
-            return Err(HostError::InvalidConfiguration(
-                "map source item identity has already been removed".into(),
-            ));
-        }
-        let available_count = u16::from(runtime_item.count);
-        if requested_count == 0 || requested_count > available_count {
-            return Err(HostError::Core(
-                forgotten_core::CoreError::InvalidItemTransferCount {
-                    requested: requested_count,
-                    available: available_count,
-                },
-            ));
-        }
-        let mut item = plain_source_map_item_to_inventory_item(&runtime_item)?;
-        item.count = requested_count;
-        let equipment = world
-            .player_equipment(player_id)
-            .cloned()
-            .map_err(HostError::Core)?;
-        let mut containers = world
-            .player_containers(player_id)
-            .cloned()
-            .map_err(HostError::Core)?;
-        let mut container = containers.remove(container_id).ok_or_else(|| {
-            HostError::InvalidConfiguration("map item destination container is not owned".into())
-        })?;
-        if container.has_parent {
-            return Err(HostError::InvalidConfiguration(
-                "map item destination container must be top-level".into(),
-            ));
-        }
-        container
-            .items
-            .merge_or_insert_stack(item.clone())
-            .map_err(HostError::Core)?;
-        containers.insert(container).map_err(HostError::Core)?;
-        let mut next_map = map.clone();
-        let mut next_items = next_map
-            .tile_items(position)
-            .map(ToOwned::to_owned)
-            .expect("validated runtime item list exists");
-        let mut next_removed_source_items = removed_source_items.clone();
-        let mut next_source_item_count_overrides = source_item_count_overrides.clone();
-        let whole_source = requested_count == available_count;
-        if whole_source {
-            next_items.remove(runtime_item_index);
-            next_removed_source_items.insert(source_identity);
-            next_source_item_count_overrides.remove(&source_identity);
-        } else {
-            let remaining_count = available_count - requested_count;
-            next_items[runtime_item_index].count =
-                u8::try_from(remaining_count).expect("bounded item-stack count fits map u8");
-            next_source_item_count_overrides.insert(source_identity, remaining_count);
-        }
-        next_map
-            .set_tile_items(position, next_items)
-            .map_err(HostError::Core)?;
-        let next_journal = MapItemRemovalJournal {
-            map_revision: self.source_revision(),
-            removed_items: next_removed_source_items.iter().copied().collect(),
-        };
-        let next_override_records = next_source_item_count_overrides
-            .iter()
-            .map(
-                |(source_identity, remaining_count)| MapItemCountOverrideRecord {
-                    source_identity: *source_identity,
-                    remaining_count: *remaining_count,
-                },
-            )
-            .collect::<Vec<_>>();
-        database.replace_player_inventory_and_map_item_state(
-            player_id,
-            &equipment,
-            &containers,
-            &next_journal,
-            &next_override_records,
-        )?;
-        *map = next_map;
-        let changed = world
-            .replace_player_containers(player_id, containers)
-            .expect("validated player remains present while shared-world lock is held");
-        debug_assert!(changed);
-        if whole_source {
-            let source_indices = source_item_indices
-                .get_mut(&position)
-                .expect("validated source index list exists");
-            source_indices.remove(runtime_item_index);
-            if source_indices.is_empty() {
-                source_item_indices.remove(&position);
-            }
-        }
-        *removed_source_items = next_removed_source_items;
-        *source_item_count_overrides = next_source_item_count_overrides;
-        let map_revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
-        shared_world.containers_epoch.fetch_add(1, Ordering::SeqCst);
-        Ok(SourceMapItemToContainerTransferOutcome {
-            player_id,
-            source_identity,
-            item,
-            container_id,
-            map_revision,
-        })
-    }
-}
-
-fn plain_source_map_item_to_inventory_item(item: &WorldMapItem) -> Result<ItemInstance, HostError> {
-    if !item.children.is_empty()
-        || item.text.is_some()
-        || item.description.is_some()
-        || item.teleport_destination.is_some()
-        || item.duration.is_some()
-        || item.charges.is_some()
-    {
-        return Err(HostError::InvalidConfiguration(
-            "map item carries unsupported runtime attributes for inventory transfer".into(),
-        ));
-    }
-    let mut inventory_item =
-        ItemInstance::new(item.server_id, u16::from(item.count)).map_err(HostError::Core)?;
-    inventory_item.action_id = item.action_id;
-    inventory_item.unique_id = item.unique_id;
-    Ok(inventory_item)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+
 struct SharedPublicChatEvent {
     speaker_name: String,
     speaker_position: NativeOtClientPosition,
@@ -4926,188 +2675,6 @@ struct SharedVipPresenceRecipient {
 struct NativeWorldRenderSnapshot {
     static_spawns: FeTfsStaticSpawnCollection,
     visible_players: Vec<NativeOtClientVisiblePlayer>,
-}
-
-// Staged foundation: production listener integration is deferred until lifecycle and benchmark gates pass.
-#[allow(dead_code)]
-const NATIVE_RENDER_PREPARATION_QUEUE_CAPACITY: usize = 32;
-#[allow(dead_code)]
-const MAX_NATIVE_RENDER_PREPARATION_WORKERS: usize = 8;
-#[allow(dead_code)]
-const MAX_NATIVE_RENDER_PUBLICATION_BATCH: usize =
-    NATIVE_RENDER_PREPARATION_QUEUE_CAPACITY * MAX_NATIVE_RENDER_PREPARATION_WORKERS;
-
-#[allow(dead_code)]
-struct NativeRenderPreparationRequest {
-    profile: NativeOtClientProfile,
-    snapshot: NativeOtClientEmptyWorldSnapshot,
-    world_map: Arc<WorldMap>,
-    render_snapshot: NativeWorldRenderSnapshot,
-    response: mpsc::SyncSender<Result<Frame, ProtocolError>>,
-}
-
-#[allow(dead_code)]
-#[derive(Clone)]
-struct NativeRenderPreparationWorker {
-    requests: mpsc::SyncSender<NativeRenderPreparationRequest>,
-    response_timeout: Duration,
-}
-
-#[allow(dead_code)]
-impl NativeRenderPreparationWorker {
-    fn start(response_timeout: Duration) -> (Self, JoinHandle<()>) {
-        let (requests, receiver) = mpsc::sync_channel::<NativeRenderPreparationRequest>(
-            NATIVE_RENDER_PREPARATION_QUEUE_CAPACITY,
-        );
-        let thread = thread::spawn(move || {
-            while let Ok(request) = receiver.recv() {
-                let frame = encode_native_otclient_map_viewport_with_static_spawns_and_players(
-                    &request.profile,
-                    &request.snapshot,
-                    request.world_map.as_ref(),
-                    Some(&request.render_snapshot.static_spawns),
-                    Some(&request.render_snapshot.visible_players),
-                );
-                let _ = request.response.send(frame);
-            }
-        });
-        (
-            Self {
-                requests,
-                response_timeout,
-            },
-            thread,
-        )
-    }
-
-    fn prepare(
-        &self,
-        profile: NativeOtClientProfile,
-        snapshot: NativeOtClientEmptyWorldSnapshot,
-        world_map: Arc<WorldMap>,
-        render_snapshot: NativeWorldRenderSnapshot,
-    ) -> Result<Frame, HostError> {
-        self.schedule(profile, snapshot, world_map, render_snapshot)?
-            .recv_timeout(self.response_timeout)
-            .map_err(|_| HostError::RenderPreparationUnavailable)?
-            .map_err(HostError::Protocol)
-    }
-
-    fn schedule(
-        &self,
-        profile: NativeOtClientProfile,
-        snapshot: NativeOtClientEmptyWorldSnapshot,
-        world_map: Arc<WorldMap>,
-        render_snapshot: NativeWorldRenderSnapshot,
-    ) -> Result<mpsc::Receiver<Result<Frame, ProtocolError>>, HostError> {
-        let (response, receiver) = mpsc::sync_channel(1);
-        self.requests
-            .try_send(NativeRenderPreparationRequest {
-                profile,
-                snapshot,
-                world_map,
-                render_snapshot,
-                response,
-            })
-            .map_err(|_| HostError::RenderPreparationUnavailable)?;
-        Ok(receiver)
-    }
-}
-
-/// One ordered immutable viewport-publication request. The sequence belongs to the caller's
-/// established publication order; workers only encode its detached inputs.
-#[allow(dead_code)]
-#[derive(Clone)]
-struct NativeRenderPublication {
-    sequence: u64,
-    profile: NativeOtClientProfile,
-    snapshot: NativeOtClientEmptyWorldSnapshot,
-    world_map: Arc<WorldMap>,
-    render_snapshot: NativeWorldRenderSnapshot,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeRenderPublicationError {
-    InvalidWorkerCount(usize),
-    PublicationLimitExceeded { limit: usize },
-    DuplicateSequence(u64),
-    PreparationUnavailable,
-    Protocol,
-}
-
-/// Bounded worker fan-out for detached native viewport snapshots. It deliberately has no shared
-/// world, database, socket, action queue, or mutation callback. `prepare_batch` sorts by the
-/// caller-provided publication sequence before scheduling and returns frames in that same order,
-/// independently of which worker completes first.
-#[allow(dead_code)]
-#[derive(Clone)]
-struct NativeRenderPreparationPool {
-    workers: Vec<NativeRenderPreparationWorker>,
-}
-
-#[allow(dead_code)]
-impl NativeRenderPreparationPool {
-    fn start(
-        worker_count: usize,
-        response_timeout: Duration,
-    ) -> Result<(Self, Vec<JoinHandle<()>>), NativeRenderPublicationError> {
-        if worker_count == 0 || worker_count > MAX_NATIVE_RENDER_PREPARATION_WORKERS {
-            return Err(NativeRenderPublicationError::InvalidWorkerCount(
-                worker_count,
-            ));
-        }
-        let mut workers = Vec::with_capacity(worker_count);
-        let mut worker_threads = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            let (worker, worker_thread) = NativeRenderPreparationWorker::start(response_timeout);
-            workers.push(worker);
-            worker_threads.push(worker_thread);
-        }
-        Ok((Self { workers }, worker_threads))
-    }
-
-    fn prepare_batch(
-        &self,
-        mut publications: Vec<NativeRenderPublication>,
-    ) -> Result<Vec<Frame>, NativeRenderPublicationError> {
-        if publications.len() > MAX_NATIVE_RENDER_PUBLICATION_BATCH {
-            return Err(NativeRenderPublicationError::PublicationLimitExceeded {
-                limit: MAX_NATIVE_RENDER_PUBLICATION_BATCH,
-            });
-        }
-        publications.sort_by_key(|publication| publication.sequence);
-        let mut seen_sequences = BTreeSet::new();
-        for publication in &publications {
-            if !seen_sequences.insert(publication.sequence) {
-                return Err(NativeRenderPublicationError::DuplicateSequence(
-                    publication.sequence,
-                ));
-            }
-        }
-        let mut responses = Vec::with_capacity(publications.len());
-        for (index, publication) in publications.into_iter().enumerate() {
-            let worker = &self.workers[index % self.workers.len()];
-            let response = worker
-                .schedule(
-                    publication.profile,
-                    publication.snapshot,
-                    publication.world_map,
-                    publication.render_snapshot,
-                )
-                .map_err(|_| NativeRenderPublicationError::PreparationUnavailable)?;
-            responses.push((response, worker.response_timeout));
-        }
-        responses
-            .into_iter()
-            .map(|(response, timeout)| {
-                response
-                    .recv_timeout(timeout)
-                    .map_err(|_| NativeRenderPublicationError::PreparationUnavailable)?
-                    .map_err(|_| NativeRenderPublicationError::Protocol)
-            })
-            .collect()
-    }
 }
 
 impl SharedNativeWorld {
@@ -5783,6 +3350,32 @@ impl SharedNativeWorld {
             .player_conditions(player_id)
             .cloned()
             .map_err(HostError::Core)
+    }
+
+    /// Active haste modifier percent for one player (0 when none) â€” plan v49 slice 12.
+    pub fn player_speed_bonus_percent(&self, player_id: u64) -> u16 {
+        self.lock()
+            .map_or(0, |world| world.player_speed_bonus_percent(player_id))
+    }
+
+    /// Deterministic loot-split recipient order for one killer (plan v49 slice 14): the party
+    /// leader first, then members in ascending id order; the killer is included wherever they
+    /// sit in that order. Empty output means the killer has no party and nothing is distributed.
+    /// Unknown players yield empty output too — the corpse path must never fail on a vanished
+    /// killer, so this helper fails open instead of propagating the unknown-player error.
+    pub fn party_loot_split_targets(&self, player_id: u64) -> Result<Vec<u64>, HostError> {
+        let world = self.lock()?;
+        let Ok(Some(leader)) = world
+            .player_party_leader(player_id)
+            .map_err(HostError::Core)
+        else {
+            return Ok(Vec::new());
+        };
+        let mut targets = vec![leader];
+        if let Ok(members) = world.player_party_members(leader) {
+            targets.extend(members);
+        }
+        Ok(targets)
     }
 
     pub fn replace_player_conditions(
@@ -7470,7 +5063,11 @@ impl HostHandle {
 
     pub fn shutdown(mut self) -> Result<(), HostError> {
         self.shutdown.store(true, Ordering::SeqCst);
-        match self.thread.take().expect("host thread exists").join() {
+        // Double shutdown is treated as an idempotent no-op rather than a panic.
+        let Some(handle) = self.thread.take() else {
+            return Ok(());
+        };
+        match handle.join() {
             Ok(result) => result,
             Err(_) => Err(HostError::HostThreadPanicked),
         }
@@ -8302,10 +5899,11 @@ impl NativeAuthRateLimiter {
     }
 
     fn register_failure(&self, peer: IpAddr) {
-        if self.failures.lock().is_err() {
+        // A poisoned mutex must not crash the accept loop; skipping one failure record
+        // degrades rate-limiting accuracy but keeps the listener alive.
+        let Ok(mut failures) = self.failures.lock() else {
             return;
-        }
-        let mut failures = self.failures.lock().expect("poisoned rate-limiter mutex");
+        };
         let now = Instant::now();
         let entry = failures.entry(peer).or_insert((0, now));
         if entry.1.elapsed() >= NATIVE_AUTH_WINDOW {
@@ -9116,6 +6714,11 @@ fn handle_native_otclient_game(
                                 config.corpse_server_id_by_creature_name.as_deref(),
                                 creature_name,
                             );
+                            let loot_split_targets = if config.party_loot_split_enabled {
+                                shared_world.party_loot_split_targets(character.id)?
+                            } else {
+                                Vec::new()
+                            };
                             if let Some(corpse_position) = spawn_native_static_defeat_corpse(
                                 shared_world,
                                 map_owner,
@@ -9124,6 +6727,7 @@ fn handle_native_otclient_game(
                                 shared_world.tick()?,
                                 corpse_server_id,
                                 config.corpse_despawn_seconds,
+                                &loot_split_targets,
                             )? {
                                 native_diagnostic(
                                     config.extended_diagnostics,
@@ -9355,10 +6959,13 @@ fn handle_native_otclient_game(
                             observed_visibility_epoch = shared_world.visibility_epoch();
                             if let Some(task) = active_click_walk.as_mut() {
                                 let equipment = shared_world.player_equipment(character.id)?;
-                                let effective_speed = native_effective_player_speed(
-                                    snapshot.player_speed,
-                                    &equipment,
-                                    config.item_speed_bonus_by_server_id.as_deref(),
+                                let effective_speed = native_hasted_speed(
+                                    native_effective_player_speed(
+                                        snapshot.player_speed,
+                                        &equipment,
+                                        config.item_speed_bonus_by_server_id.as_deref(),
+                                    ),
+                                    shared_world.player_speed_bonus_percent(character.id),
                                 );
                                 task.next_step_deadline = Instant::now()
                                     + native_autowalk_step_delay(
@@ -10270,7 +7877,7 @@ fn handle_native_otclient_game(
                             Err(error) => return Err(error),
                         }
                         continue;
-                    } // All containerĂ˘â€ â€ťequipment and containerĂ˘â€ â€ťcontainer throw paths below
+                    } // All containerĂ„â€šĂ˘â‚¬ĹľÄ‚ËĂ˘â€šÂ¬ÄąË‡Ă„â€šĂ˘â‚¬Ä…Ä‚â€šĂ‚ÂÄ‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â€šÂ¬ÄąË‡Ä‚â€šĂ‚Â¬Ă„â€šĂ˘â‚¬ĹˇÄ‚â€šĂ‚Â Ä‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â€šÂ¬ÄąË‡Ä‚â€šĂ‚Â¬Ä‚â€žĂ„â€¦Ä‚â€žĂ˘â‚¬Ĺľequipment and containerĂ„â€šĂ˘â‚¬ĹľÄ‚ËĂ˘â€šÂ¬ÄąË‡Ă„â€šĂ˘â‚¬Ä…Ä‚â€šĂ‚ÂÄ‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â€šÂ¬ÄąË‡Ä‚â€šĂ‚Â¬Ă„â€šĂ˘â‚¬ĹˇÄ‚â€šĂ‚Â Ä‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â€šÂ¬ÄąË‡Ä‚â€šĂ‚Â¬Ä‚â€žĂ„â€¦Ä‚â€žĂ˘â‚¬Ĺľcontainer throw paths below
                       // persist through the atomic replace_player_inventory boundary so a
                       // torn two-transaction inventory can never be observed or crash-duplicated.
                     if let Some(target_container_id) = target_container_id {
@@ -11057,8 +8664,7 @@ fn handle_native_otclient_game(
                                 }
                             }
                             shared_world
-                                .replace_player_equipment(character.id, equipment.clone())
-                                .expect("validated player remains present while consuming");
+                                .replace_player_equipment(character.id, equipment.clone())?;
                             database
                                 .replace_player_equipment(u64::from(character.id), &equipment)
                                 .map_err(HostError::Persistence)?;
@@ -12510,7 +10116,7 @@ fn handle_native_otclient_game(
                             // GM talkactions mutate authoritative state (summons, teleports,
                             // deliveries), so this session resends its full viewport from live
                             // shared state instead of silently adopting the bumped visibility
-                            // epoch — that swallow left summons invisible until relog
+                            // epoch Ă„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ä‚ËĂ˘â€šÂ¬ÄąÄ„ that swallow left summons invisible until relog
                             // (live-test regression A1). Other sessions refresh through their
                             // own epoch comparison.
                             shared_world.mark_visibility_changed();
@@ -12577,16 +10183,16 @@ fn handle_native_otclient_game(
                             );
                             continue;
                         }
+                        let Some(progression_rules) = config.progression_rules.as_deref() else {
+                            continue;
+                        };
                         match apply_and_persist_native_declarative_spell_cast(
                             &mut database,
                             shared_world,
                             character.id,
                             definition.spell_id,
                             catalog,
-                            config
-                                .progression_rules
-                                .as_deref()
-                                .expect("progression rules were gated above"),
+                            progression_rules,
                             config.magic_rate,
                         ) {
                             Ok((cast, magic)) => {
@@ -12949,10 +10555,13 @@ fn handle_native_otclient_game(
                     );
                 } else {
                     let equipment = shared_world.player_equipment(character.id)?;
-                    let effective_speed = native_effective_player_speed(
-                        snapshot.player_speed,
-                        &equipment,
-                        config.item_speed_bonus_by_server_id.as_deref(),
+                    let effective_speed = native_hasted_speed(
+                        native_effective_player_speed(
+                            snapshot.player_speed,
+                            &equipment,
+                            config.item_speed_bonus_by_server_id.as_deref(),
+                        ),
+                        shared_world.player_speed_bonus_percent(character.id),
                     );
                     let step_delay =
                         native_autowalk_step_delay(effective_speed, snapshot.server_beat);
@@ -12971,10 +10580,9 @@ fn handle_native_otclient_game(
                         continue;
                     }
                     if task.queued_steps.len() == 1 {
-                        let direction = task
-                            .queued_steps
-                            .pop_front()
-                            .expect("single queued click-walk step");
+                        let Some(direction) = task.queued_steps.pop_front() else {
+                            continue;
+                        };
                         if move_native_map_player(
                             stream,
                             &config.client_profile,
@@ -13920,6 +11528,19 @@ pub fn native_effective_player_speed(
     speed.clamp(1, 2_000)
 }
 
+/// Applies the active haste condition (plan v49 slice 12): additive percent on the effective
+/// speed, re-clamped so no bonus can push past the same sane ceiling.
+pub fn native_hasted_speed(effective_speed: u16, speed_bonus_percent: u16) -> u16 {
+    if speed_bonus_percent == 0 {
+        return effective_speed;
+    }
+    let hasted = (u32::from(effective_speed) * (100 + u32::from(speed_bonus_percent))) / 100;
+    u16::try_from(hasted).unwrap_or(2_000).clamp(1, 2_000)
+}
+
+/// Classic haste duration for spell-granted speed conditions (utani hur family).
+const NATIVE_HASTE_DURATION_SECONDS: u16 = 25;
+
 fn native_player_id(character_id: u64) -> Result<u32, HostError> {
     let character_id = u32::try_from(character_id).map_err(|_| {
         HostError::InvalidConfiguration("character ID exceeds the native player-ID range".into())
@@ -13980,7 +11601,7 @@ fn native_click_walk_steps(
         .collect()
 }
 
-/// The selected 740 map encoder renders an 18Ä‚â€”14 same-floor viewport centered at offset (8, 6),
+/// The selected 740 map encoder renders an 18Ä‚â€žĂ˘â‚¬ĹˇÄ‚ËĂ˘â€šÂ¬ÄąÄľĂ„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă‹â€ˇÄ‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â€šÂ¬ÄąË‡Ä‚â€šĂ‚Â¬Ă„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă„â€ž14 same-floor viewport centered at offset (8, 6),
 /// which yields horizontal offsets -8 through +9 and vertical offsets -6 through +7. Creature
 /// inspection is intentionally no broader than that already encoded viewport.
 fn native_classic_viewport_contains(observer: Position, target: Position) -> bool {
@@ -14232,6 +11853,7 @@ fn apply_and_persist_native_declarative_spell_cast(
     let definition = catalog.get(spell_id).ok_or_else(|| {
         HostError::InvalidConfiguration("declared spell ID is not present in host catalog".into())
     })?;
+    let speed_percent = definition.speed_percent;
     let event = definition.cast_event(caster_id).map_err(|_| {
         HostError::InvalidConfiguration(
             "validated declarative spell did not build a cast event".into(),
@@ -14271,7 +11893,20 @@ fn apply_and_persist_native_declarative_spell_cast(
         },
         attempts,
     )?;
+    // Haste self-effect (plan v49 slice 12): a spell with a speed declaration applies the bounded
+    // timed condition to the caster; the regular heartbeat persists and expires it.
+    if let Some(percent) = speed_percent {
+        world
+            .apply_player_speed_condition(caster_id, percent, NATIVE_HASTE_DURATION_SECONDS)
+            .map_err(HostError::Core)?;
+    }
     drop(world);
+    if speed_percent.is_some() {
+        let conditions = shared_world.player_conditions(caster_id)?;
+        database
+            .replace_player_conditions(caster_id, &conditions)
+            .map_err(HostError::Persistence)?;
+    }
     shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
     Ok((cast, magic))
 }
@@ -14550,6 +12185,9 @@ fn native_condition_state_bits(
             Kind::Poison => 0x0001,
             Kind::Burning => 0x0002,
             Kind::Energy => 0x0004,
+            // Classic 740 has no haste icon bit; the modifier is felt through walk cadence
+            // (plan v49 slice 12). Zero contribution keeps the state record unchanged.
+            Kind::Haste => 0x0000,
         };
     }
     bits
@@ -14594,6 +12232,7 @@ fn spawn_native_static_defeat_corpse(
     seed: u64,
     corpse_server_id: u16,
     corpse_despawn_seconds: u32,
+    loot_split_targets: &[u64],
 ) -> Result<Option<Position>, HostError> {
     let roll = shared_world.roll_defeated_static_creature_loot(creature_id, seed)?;
     // Plan v49 slice 6: defeated creatures always leave their declared corpse, even when the
@@ -14611,8 +12250,38 @@ fn spawn_native_static_defeat_corpse(
     } else {
         None
     };
-    let children = roll
-        .items
+    // Party loot split (plan v49 slice 14): each rolled stack goes to the next party member
+    // (deterministic round-robin) whose owned top-level containers can hold it; stacks that no
+    // member can carry stay in the corpse. Persists per member immediately, matching /give.
+    let mut leftovers = Vec::new();
+    if loot_split_targets.is_empty() {
+        leftovers = roll.items.clone();
+    } else {
+        let mut cursor = 0_usize;
+        for (item_id, count) in &roll.items {
+            let mut placed = false;
+            for attempt in 0..loot_split_targets.len() {
+                let member = loot_split_targets[(cursor + attempt) % loot_split_targets.len()];
+                let containers = shared_world.player_containers(member)?;
+                let (staged, unplaced) =
+                    insert_units_into_containers(containers.clone(), *item_id, u64::from(*count));
+                if unplaced > 0 {
+                    continue;
+                }
+                shared_world.replace_player_containers(member, staged.clone())?;
+                database
+                    .replace_player_containers(member, &staged)
+                    .map_err(HostError::Persistence)?;
+                cursor = (cursor + attempt + 1) % loot_split_targets.len();
+                placed = true;
+                break;
+            }
+            if !placed {
+                leftovers.push((*item_id, *count));
+            }
+        }
+    };
+    let children = leftovers
         .iter()
         .map(|(item_id, count)| WorldMapItem {
             server_id: *item_id,
@@ -15070,20 +12739,26 @@ fn handle_session(
     stream.set_write_timeout(Some(config.session_timeout))?;
 
     let request = read_frame(stream)?;
-    if decode_probe(&request).is_ok() {
-        write_frame(stream, &probe_response(config.profile))?;
-        record_event(
-            database_path,
-            "info",
-            &format!("probe accepted peer={peer} profile={}", config.profile.id),
-        );
-        Ok(())
-    } else if let Some(login) = &config.legacy_login {
-        handle_legacy_login(stream, peer, config, login, database_path, &request)
-    } else {
-        let error = decode_probe(&request).expect_err("non-probe request must be rejected");
-        let _ = write_frame(stream, &error_frame(error.code()));
-        Err(error)
+    // Single decode: the probe arm and the rejection arm share one parse instead of the
+    // previous is_ok()/expect_err double-decode (which had a panic path on the rejection arm).
+    match decode_probe(&request) {
+        Ok(_) => {
+            write_frame(stream, &probe_response(config.profile))?;
+            record_event(
+                database_path,
+                "info",
+                &format!("probe accepted peer={peer} profile={}", config.profile.id),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(login) = &config.legacy_login {
+                handle_legacy_login(stream, peer, config, login, database_path, &request)
+            } else {
+                let _ = write_frame(stream, &error_frame(error.code()));
+                Err(error)
+            }
+        }
     }
 }
 
@@ -15388,6 +13063,7 @@ mod tests {
             magic_rate: 1,
             experience_award_policy: None,
             party_shared_experience_rules: None,
+            party_loot_split_enabled: false,
             death_loss_policy: DeathLossPolicy::DefaultFormula,
             declarative_weapon_catalog: None,
             declarative_spell_catalog: None,
@@ -16205,6 +13881,7 @@ mod tests {
             1,
             NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
             0,
+            &[],
         )
         .unwrap()
         .expect("a deterministic always-chance loot roll spawns a corpse");
@@ -16258,6 +13935,185 @@ mod tests {
             vec![(2148_u16, 3_u16)],
             "equal seeds must produce equal loot"
         );
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn party_loot_split_distributes_stacks_round_robin_and_leftovers_stay_in_corpse() {
+        // Three deterministic always-chance loot stacks; two party members receive alternating
+        // stacks, and a corpse still spawns (always leaves the declared corpse) with no
+        // leftover loot because every stack found a member container.
+        let creature_id = NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let static_spawns = FeTfsStaticSpawnCollection::with_loot_tables(
+            vec![forgotten_core::FeTfsStaticEntity {
+                id: creature_id,
+                name: "Splitter".into(),
+                name_description: String::new(),
+                position: Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 134,
+                health_percent: 15,
+                direction: 2,
+            }],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+            BTreeMap::from([(
+                creature_id,
+                vec![
+                    forgotten_core::StaticCreatureLootEntry {
+                        item_id: 2148,
+                        chance: 100_000,
+                        min_count: 1,
+                        max_count: 1,
+                    },
+                    forgotten_core::StaticCreatureLootEntry {
+                        item_id: 2675,
+                        chance: 100_000,
+                        min_count: 2,
+                        max_count: 2,
+                    },
+                    forgotten_core::StaticCreatureLootEntry {
+                        item_id: 2676,
+                        chance: 100_000,
+                        min_count: 3,
+                        max_count: 3,
+                    },
+                ],
+            )]),
+        )
+        .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        let source_map = (*native_world_map()).clone();
+        let map_owner =
+            SharedNativeMap::recover_complete_map_item_state(source_map, None, None, None).unwrap();
+        let database_path = database_path("party-loot-split-round-robin");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        // Two persisted characters in one party; split deliveries persist through the same
+        // replace_player_containers path as /give, so the rows must exist.
+        let leader_account = database.create_account("leader", "password").unwrap();
+        let leader_character = database
+            .create_player_for_account(leader_account as u32, "Leader")
+            .unwrap();
+        let member_account = database.create_account("member", "password").unwrap();
+        let member_character = database
+            .create_player_for_account(member_account as u32, "Member")
+            .unwrap();
+        let (leader_id, member_id) = (leader_character.id, member_character.id);
+        for (player_id, name, account_id) in [
+            (leader_id, "Leader", leader_account),
+            (member_id, "Member", member_account),
+        ] {
+            shared
+                .register_player_at_available_position(
+                    Player {
+                        id: player_id,
+                        account_id: account_id as u64,
+                        name: name.into(),
+                        position: Position {
+                            x: 100,
+                            y: 100,
+                            z: 7,
+                        },
+                        level: 8,
+                        experience: 0,
+                        skill_points: 0,
+                    },
+                    &native_world_map(),
+                )
+                .unwrap();
+        }
+        shared.invite_to_party(leader_id, member_id).unwrap();
+        shared
+            .accept_party_invitation(member_id, leader_id)
+            .unwrap();
+        // Each member needs an owned top-level container with space, like the login
+        // provisioning path gives every character.
+        for player_id in [leader_id, member_id] {
+            let backpack = forgotten_core::PlayerContainer::new(
+                0_u8,
+                ItemInstance::new(2854_u16, 1_u16).unwrap(),
+                "Backpack",
+                false,
+                20_u16,
+            )
+            .unwrap();
+            shared
+                .replace_player_containers(player_id, {
+                    let mut containers = forgotten_core::PlayerContainers::default();
+                    containers.insert(backpack).unwrap();
+                    containers
+                })
+                .unwrap();
+        }
+        // Deterministic recipient order: leader first, then ascending members.
+        assert_eq!(
+            shared.party_loot_split_targets(member_id).unwrap(),
+            vec![leader_id, member_id]
+        );
+        assert_eq!(
+            shared.party_loot_split_targets(999).unwrap(),
+            Vec::<u64>::new(),
+            "a player without a party never triggers distribution"
+        );
+
+        let roll = shared
+            .roll_defeated_static_creature_loot(creature_id, 1)
+            .unwrap();
+        assert_eq!(roll.items.len(), 3, "all three entries must always roll");
+
+        let corpse_position = spawn_native_static_defeat_corpse(
+            &shared,
+            &map_owner,
+            &mut database,
+            creature_id,
+            1,
+            NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
+            0,
+            &[leader_id, member_id],
+        )
+        .unwrap()
+        .expect("split defeat still spawns the declared corpse");
+
+        // Round-robin: stack 1 -> leader(101), stack 2 -> member(102), stack 3 -> leader(101).
+        let container_items = |containers: &forgotten_core::PlayerContainers| -> Vec<(u16, u16)> {
+            let mut items = Vec::new();
+            for (_, container) in containers.iter() {
+                for item in container.items.iter() {
+                    items.push((item.server_id, item.count));
+                }
+            }
+            items
+        };
+        let leader_items = container_items(&shared.player_containers(leader_id).unwrap());
+        let member_items = container_items(&shared.player_containers(member_id).unwrap());
+        assert_eq!(
+            leader_items,
+            vec![(2148_u16, 1_u16), (2676, 3)],
+            "leader receives stacks 1 and 3"
+        );
+        assert_eq!(
+            member_items,
+            vec![(2675_u16, 2_u16)],
+            "member receives stack 2"
+        );
+
+        // The corpse still exists (always leaves the declared corpse) with no leftover loot.
+        let snapshot = map_owner.render_snapshot().unwrap();
+        let tile_items = snapshot.tile_items(corpse_position).unwrap();
+        assert_eq!(tile_items.len(), 1);
+        assert!(tile_items[0].children.is_empty());
         let _ = fs::remove_file(database_path);
     }
 
@@ -16412,6 +14268,7 @@ mod tests {
             7,
             NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
             0,
+            &[],
         )
         .unwrap()
         .expect("defeated summons leave their declared corpse");
@@ -16851,6 +14708,7 @@ mod tests {
             1,
             3073,
             0,
+            &[],
         )
         .unwrap()
         .expect("defeated creatures always leave their declared corpse");
@@ -19779,7 +17637,7 @@ mod tests {
                 .get(&PlayerConditionKind::Poison)
                 .copied()
                 .unwrap(),
-            PlayerCondition::from_persisted(PlayerConditionKind::Poison, 3, 7, 5, 1).unwrap()
+            PlayerCondition::from_persisted(PlayerConditionKind::Poison, 3, 7, 0, 5, 1).unwrap()
         );
 
         let relogged_character = database
@@ -19831,7 +17689,7 @@ mod tests {
                 .get(&PlayerConditionKind::Poison)
                 .copied()
                 .unwrap(),
-            PlayerCondition::from_persisted(PlayerConditionKind::Poison, 3, 7, 3, 0).unwrap()
+            PlayerCondition::from_persisted(PlayerConditionKind::Poison, 3, 7, 0, 3, 0).unwrap()
         );
 
         let expired = relogged.apply_player_conditions(107, 3).unwrap();
@@ -31475,6 +29333,18 @@ mod gm_talkaction_tests {
 #[cfg(test)]
 mod effective_speed_tests {
     use super::*;
+
+    #[test]
+    fn hasted_speed_applies_bounded_percent_and_keeps_ceiling() {
+        // Zero bonus is the identity.
+        assert_eq!(native_hasted_speed(220, 0), 220);
+        // Additive percent: 40% haste on 220 -> 308.
+        assert_eq!(native_hasted_speed(220, 40), 308);
+        // The ceiling holds even at the maximum bonus.
+        assert_eq!(native_hasted_speed(2_000, 100), 2_000);
+        // Small bases round down deterministically (integer arithmetic).
+        assert_eq!(native_hasted_speed(3, 40), 4);
+    }
 
     #[test]
     fn boots_speed_bonus_stacks_onto_base_and_unknown_items_do_not() {

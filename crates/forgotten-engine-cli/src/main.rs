@@ -884,6 +884,7 @@ fn run_host(
             magic_rate: config.magic_rate,
             experience_award_policy: Some(experience_award_policy),
             party_shared_experience_rules: config.party_shared_experience_rules,
+            party_loot_split_enabled: config.party_loot_split_enabled,
             death_loss_policy,
             declarative_weapon_catalog,
             declarative_spell_catalog,

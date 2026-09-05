@@ -128,6 +128,9 @@ pub struct EngineConfig {
     /// The current FE party model is session-local; these values do not imply persistence or
     /// complete TFS party behavior.
     pub party_shared_experience_rules: Option<PartySharedExperienceRules>,
+    /// Party loot split (plan v49 slice 14): round-robin distribution of rolled defeat loot
+    /// stacks across online party members when a party member lands the killing blow.
+    pub party_loot_split_enabled: bool,
     pub experience_stages: Option<ExperienceStages>,
     pub experience_stages_source: Option<ExperienceStagesSource>,
     pub death_loss_percent: i32,
@@ -375,6 +378,10 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         } else {
             None
         };
+    // Optional party loot split (plan v49 slice 14): when enabled, a party member's killing
+    // blow distributes the rolled loot stacks round-robin across online party members' owned
+    // containers; leftovers stay in the corpse.
+    let party_loot_split_enabled = optional_boolean(&values, "partyLootSplitEnabled", false)?;
     let content_directory = world_directory.join("data");
     let (experience_stages, experience_stages_source) = match configured_experience_stages {
         Some(Some(stages)) => (Some(stages), Some(ExperienceStagesSource::LegacyConfigLua)),
@@ -513,6 +520,7 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         animated_damage_text_enabled,
         corpse_despawn_seconds,
         party_shared_experience_rules,
+        party_loot_split_enabled,
         experience_stages,
         experience_stages_source,
         death_loss_percent,
@@ -904,12 +912,17 @@ pub fn apply_legacy_item_metadata(
                 item.client_thing_id = Some(
                     catalog
                         .definition(item.server_id)
-                        .expect("item definitions were validated above")
+                        .ok_or_else(|| {
+                            ConfigError::InvalidContent(format!(
+                                "items.otb has no definition for map item {} at {},{},{}",
+                                item.server_id, position.x, position.y, position.z
+                            ))
+                        })?
                         .client_id,
                 );
-                item
+                Ok(item)
             })
-            .collect();
+            .collect::<Result<Vec<_>, ConfigError>>()?;
         normalized
             .set_tile_items(position, mapped_items)
             .map_err(|error| {
@@ -1484,6 +1497,7 @@ fn is_recognized_config_key(key: &str) -> bool {
             | "partySharedExperienceRange"
             | "partySharedExperienceFloorDelta"
             | "partySharedExperienceActivityTicks"
+            | "partyLootSplitEnabled"
             | "deathLosePercent"
             | "serverName"
             | "mapName"

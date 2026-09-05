@@ -367,9 +367,20 @@ fn xtea(payload: &mut [u8], key: XteaKey, decrypt: bool) -> Result<(), ProtocolE
         return Err(ProtocolError::InvalidXteaLength(payload.len()));
     }
     for block in payload.chunks_exact_mut(8) {
+        let block: &mut [u8; 8] = block
+            .try_into()
+            .map_err(|_| ProtocolError::InvalidXteaLength(8))?;
         let (mut left, mut right) = (
-            u32::from_le_bytes(block[..4].try_into().expect("8-byte block")),
-            u32::from_le_bytes(block[4..].try_into().expect("8-byte block")),
+            u32::from_le_bytes(
+                block[..4]
+                    .try_into()
+                    .map_err(|_| ProtocolError::InvalidXteaLength(4))?,
+            ),
+            u32::from_le_bytes(
+                block[4..]
+                    .try_into()
+                    .map_err(|_| ProtocolError::InvalidXteaLength(4))?,
+            ),
         );
         const DELTA: u32 = 0x9e37_79b9;
         let mut sum = if decrypt { DELTA.wrapping_mul(32) } else { 0 };
@@ -3883,14 +3894,18 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
     fn u16(&mut self) -> Result<u16, ProtocolError> {
-        Ok(u16::from_le_bytes(
-            self.take(2)?.try_into().expect("two bytes"),
-        ))
+        let bytes: [u8; 2] = self
+            .take(2)?
+            .try_into()
+            .map_err(|_| ProtocolError::Truncated)?;
+        Ok(u16::from_le_bytes(bytes))
     }
     fn u32(&mut self) -> Result<u32, ProtocolError> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?.try_into().expect("four bytes"),
-        ))
+        let bytes: [u8; 4] = self
+            .take(4)?
+            .try_into()
+            .map_err(|_| ProtocolError::Truncated)?;
+        Ok(u32::from_le_bytes(bytes))
     }
     fn string(&mut self, max: usize) -> Result<String, ProtocolError> {
         let length = self.u16()? as usize;

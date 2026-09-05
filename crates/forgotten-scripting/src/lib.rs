@@ -409,8 +409,9 @@ impl SandboxedLuaCallbackDispatcher {
             },
         );
         let result = lua.load(source).eval::<Function>().and_then(|callback| {
-            let subject_id = i64::try_from(input.subject_id)
-                .expect("validated callback subject ID fits signed Lua integer range");
+            let subject_id = i64::try_from(input.subject_id).map_err(|_| {
+                mlua::Error::RuntimeError("callback subject ID out of signed integer range".into())
+            })?;
             callback.call::<_, Value>((input.event_kind.as_str(), subject_id, input.value))
         });
         let instruction_checks = instruction_checks.load(Ordering::Relaxed);
