@@ -5,6 +5,7 @@
 pub mod operator;
 
 mod bank;
+mod world_party;
 mod gm_commands;
 mod map_transfers;
 mod native_diagnostics;
@@ -1130,7 +1131,7 @@ fn native_rendered_container_windows(
 /// Emits the minimal classic CreateInContainer / ChangeInContainer / DeleteInContainer records
 /// transforming what the client currently shows (`sent`) into the authoritative rendering
 /// (`current`). Windows the session never sent, whose capacity changed, or whose mutation is not
-/// representable as bounded slot deltas fall back to one full OpenContainer resend Ă„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ä‚ËĂ˘â€šÂ¬ÄąÄ„ the exact
+/// representable as bounded slot deltas fall back to one full OpenContainer resend Ä‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â€šÂ¬ÄąË‡Ä‚â€šĂ‚Â¬Ă„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă„â€ž the exact
 /// frame the previous blanket refresh emitted. Closed and vanished windows drop their baseline.
 /// Slot-index semantics respect classic client behavior: DeleteInContainer removes the slot and
 /// shifts the remainder, so a contiguous removed block is emitted as descending deletes.
@@ -2741,33 +2742,6 @@ impl SharedNativeWorld {
         Ok(self.lock()?.registered_player_ids())
     }
 
-    /// Returns every live party as deterministic (leader, non-leader members) records for
-    /// bounded persistence flushes.
-    pub fn party_snapshots(&self) -> Result<Vec<(u64, Vec<u64>)>, HostError> {
-        Ok(self.lock()?.party_snapshots())
-    }
-
-    /// Attaches an unaffiliated player directly to a live leader's party (hydration path).
-    pub fn add_existing_party_member(
-        &self,
-        leader_id: u64,
-        player_id: u64,
-    ) -> Result<(), HostError> {
-        self.lock()?
-            .add_existing_party_member(leader_id, player_id)
-            .map_err(HostError::Core)?;
-        self.party_epoch.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Rebuilds one persisted party when neither participant holds live party state.
-    pub fn restore_party_snapshot(&self, leader_id: u64, members: &[u64]) -> Result<(), HostError> {
-        self.lock()?
-            .restore_party_snapshot(leader_id, members)
-            .map_err(HostError::Core)?;
-        self.party_epoch.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
 
     pub fn vitals_epoch(&self) -> u64 {
         self.vitals_epoch.load(Ordering::SeqCst)
@@ -2799,107 +2773,6 @@ impl SharedNativeWorld {
         Arc::clone(&self.online_players)
     }
 
-    fn party_display_frames(
-        &self,
-        profile: &NativeOtClientProfile,
-        observer_id: u64,
-    ) -> Result<Vec<Frame>, HostError> {
-        self.lock()?
-            .party_display_relations(observer_id)
-            .map_err(HostError::Core)?
-            .into_iter()
-            .map(|(target_id, relation)| {
-                let shield = match relation {
-                    PartyDisplayRelation::None => NativeOtClientClassicPartyShield::None,
-                    PartyDisplayRelation::InvitationFromLeader => {
-                        NativeOtClientClassicPartyShield::InvitationFromLeader
-                    }
-                    PartyDisplayRelation::InvitationToLeader => {
-                        NativeOtClientClassicPartyShield::InvitationToLeader
-                    }
-                    PartyDisplayRelation::Member => NativeOtClientClassicPartyShield::Member,
-                    PartyDisplayRelation::Leader => NativeOtClientClassicPartyShield::Leader,
-                };
-                encode_native_otclient_creature_party_shield(
-                    profile,
-                    native_player_id(target_id)?,
-                    shield,
-                )
-                .map_err(HostError::Protocol)
-            })
-            .collect()
-    }
-
-    fn invite_to_party(&self, leader_id: u64, invitee_id: u64) -> Result<(), HostError> {
-        self.lock()?
-            .invite_to_party(leader_id, invitee_id)
-            .map_err(HostError::Core)?;
-        self.party_epoch.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn accept_party_invitation(&self, invitee_id: u64, leader_id: u64) -> Result<(), HostError> {
-        self.lock()?
-            .accept_party_invitation(invitee_id, leader_id)
-            .map_err(HostError::Core)?;
-        self.party_epoch.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn revoke_party_invitation(&self, leader_id: u64, invitee_id: u64) -> Result<(), HostError> {
-        self.lock()?
-            .revoke_party_invitation(leader_id, invitee_id)
-            .map_err(HostError::Core)?;
-        self.party_epoch.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn transfer_party_leadership(
-        &self,
-        leader_id: u64,
-        new_leader_id: u64,
-    ) -> Result<(), HostError> {
-        self.lock()?
-            .transfer_party_leadership(leader_id, new_leader_id)
-            .map_err(HostError::Core)?;
-        self.party_epoch.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn leave_party(&self, player_id: u64) -> Result<(), HostError> {
-        self.lock()?
-            .leave_party(player_id)
-            .map_err(HostError::Core)?;
-        self.party_epoch.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn set_party_shared_experience_requested(
-        &self,
-        leader_id: u64,
-        requested: bool,
-        rules: PartySharedExperienceRules,
-    ) -> Result<(), HostError> {
-        self.lock()?
-            .set_party_shared_experience_requested(leader_id, requested, rules)
-            .map_err(HostError::Core)?;
-        Ok(())
-    }
-
-    fn record_party_shared_experience_activity(&self, player_id: u64) -> Result<bool, HostError> {
-        let mut world = self.lock()?;
-        if world
-            .player_party_leader(player_id)
-            .map_err(HostError::Core)?
-            .is_none()
-        {
-            return Ok(false);
-        }
-        world
-            .record_party_shared_experience_activity(player_id)
-            .map_err(HostError::Core)?;
-        Ok(true)
-    }
 
     pub fn player_vitals(&self, player_id: u64) -> Result<PlayerVitals, HostError> {
         self.lock()?
@@ -3352,7 +3225,7 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)
     }
 
-    /// Active haste modifier percent for one player (0 when none) â€” plan v49 slice 12.
+    /// Active haste modifier percent for one player (0 when none) Ă˘â‚¬â€ť plan v49 slice 12.
     pub fn player_speed_bonus_percent(&self, player_id: u64) -> u16 {
         self.lock()
             .map_or(0, |world| world.player_speed_bonus_percent(player_id))
@@ -3361,7 +3234,7 @@ impl SharedNativeWorld {
     /// Deterministic loot-split recipient order for one killer (plan v49 slice 14): the party
     /// leader first, then members in ascending id order; the killer is included wherever they
     /// sit in that order. Empty output means the killer has no party and nothing is distributed.
-    /// Unknown players yield empty output too — the corpse path must never fail on a vanished
+    /// Unknown players yield empty output too â€” the corpse path must never fail on a vanished
     /// killer, so this helper fails open instead of propagating the unknown-player error.
     pub fn party_loot_split_targets(&self, player_id: u64) -> Result<Vec<u64>, HostError> {
         let world = self.lock()?;
@@ -7877,7 +7750,7 @@ fn handle_native_otclient_game(
                             Err(error) => return Err(error),
                         }
                         continue;
-                    } // All containerĂ„â€šĂ˘â‚¬ĹľÄ‚ËĂ˘â€šÂ¬ÄąË‡Ă„â€šĂ˘â‚¬Ä…Ä‚â€šĂ‚ÂÄ‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â€šÂ¬ÄąË‡Ä‚â€šĂ‚Â¬Ă„â€šĂ˘â‚¬ĹˇÄ‚â€šĂ‚Â Ä‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â€šÂ¬ÄąË‡Ä‚â€šĂ‚Â¬Ä‚â€žĂ„â€¦Ä‚â€žĂ˘â‚¬Ĺľequipment and containerĂ„â€šĂ˘â‚¬ĹľÄ‚ËĂ˘â€šÂ¬ÄąË‡Ă„â€šĂ˘â‚¬Ä…Ä‚â€šĂ‚ÂÄ‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â€šÂ¬ÄąË‡Ä‚â€šĂ‚Â¬Ă„â€šĂ˘â‚¬ĹˇÄ‚â€šĂ‚Â Ä‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â€šÂ¬ÄąË‡Ä‚â€šĂ‚Â¬Ä‚â€žĂ„â€¦Ä‚â€žĂ˘â‚¬Ĺľcontainer throw paths below
+                    } // All containerÄ‚â€žĂ˘â‚¬ĹˇÄ‚ËĂ˘â€šÂ¬ÄąÄľĂ„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă‹â€ˇÄ‚â€žĂ˘â‚¬ĹˇÄ‚ËĂ˘â€šÂ¬Ă„â€¦Ă„â€šĂ˘â‚¬ĹˇÄ‚â€šĂ‚ÂĂ„â€šĂ˘â‚¬ĹľÄ‚ËĂ˘â€šÂ¬ÄąË‡Ă„â€šĂ˘â‚¬Ä…Ä‚â€šĂ‚ÂÄ‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă‹â€ˇĂ„â€šĂ˘â‚¬ĹˇÄ‚â€šĂ‚Â¬Ä‚â€žĂ˘â‚¬ĹˇÄ‚ËĂ˘â€šÂ¬ÄąË‡Ă„â€šĂ˘â‚¬ĹˇÄ‚â€šĂ‚Â Ă„â€šĂ˘â‚¬ĹľÄ‚ËĂ˘â€šÂ¬ÄąË‡Ă„â€šĂ˘â‚¬Ä…Ä‚â€šĂ‚ÂÄ‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă‹â€ˇĂ„â€šĂ˘â‚¬ĹˇÄ‚â€šĂ‚Â¬Ă„â€šĂ˘â‚¬ĹľÄ‚â€žĂ˘â‚¬Â¦Ă„â€šĂ˘â‚¬ĹľÄ‚ËĂ˘â€šÂ¬ÄąÄľequipment and containerÄ‚â€žĂ˘â‚¬ĹˇÄ‚ËĂ˘â€šÂ¬ÄąÄľĂ„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă‹â€ˇÄ‚â€žĂ˘â‚¬ĹˇÄ‚ËĂ˘â€šÂ¬Ă„â€¦Ă„â€šĂ˘â‚¬ĹˇÄ‚â€šĂ‚ÂĂ„â€šĂ˘â‚¬ĹľÄ‚ËĂ˘â€šÂ¬ÄąË‡Ă„â€šĂ˘â‚¬Ä…Ä‚â€šĂ‚ÂÄ‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă‹â€ˇĂ„â€šĂ˘â‚¬ĹˇÄ‚â€šĂ‚Â¬Ä‚â€žĂ˘â‚¬ĹˇÄ‚ËĂ˘â€šÂ¬ÄąË‡Ă„â€šĂ˘â‚¬ĹˇÄ‚â€šĂ‚Â Ă„â€šĂ˘â‚¬ĹľÄ‚ËĂ˘â€šÂ¬ÄąË‡Ă„â€šĂ˘â‚¬Ä…Ä‚â€šĂ‚ÂÄ‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă‹â€ˇĂ„â€šĂ˘â‚¬ĹˇÄ‚â€šĂ‚Â¬Ă„â€šĂ˘â‚¬ĹľÄ‚â€žĂ˘â‚¬Â¦Ă„â€šĂ˘â‚¬ĹľÄ‚ËĂ˘â€šÂ¬ÄąÄľcontainer throw paths below
                       // persist through the atomic replace_player_inventory boundary so a
                       // torn two-transaction inventory can never be observed or crash-duplicated.
                     if let Some(target_container_id) = target_container_id {
@@ -10116,7 +9989,7 @@ fn handle_native_otclient_game(
                             // GM talkactions mutate authoritative state (summons, teleports,
                             // deliveries), so this session resends its full viewport from live
                             // shared state instead of silently adopting the bumped visibility
-                            // epoch Ă„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ä‚ËĂ˘â€šÂ¬ÄąÄ„ that swallow left summons invisible until relog
+                            // epoch Ä‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â€šÂ¬ÄąË‡Ä‚â€šĂ‚Â¬Ă„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă„â€ž that swallow left summons invisible until relog
                             // (live-test regression A1). Other sessions refresh through their
                             // own epoch comparison.
                             shared_world.mark_visibility_changed();
@@ -11601,7 +11474,7 @@ fn native_click_walk_steps(
         .collect()
 }
 
-/// The selected 740 map encoder renders an 18Ä‚â€žĂ˘â‚¬ĹˇÄ‚ËĂ˘â€šÂ¬ÄąÄľĂ„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă‹â€ˇÄ‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â€šÂ¬ÄąË‡Ä‚â€šĂ‚Â¬Ă„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă„â€ž14 same-floor viewport centered at offset (8, 6),
+/// The selected 740 map encoder renders an 18Ă„â€šĂ˘â‚¬ĹľÄ‚ËĂ˘â€šÂ¬ÄąË‡Ă„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă„ÄľÄ‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â€šÂ¬ÄąË‡Ä‚â€šĂ‚Â¬Ä‚â€žĂ„â€¦Ä‚â€ąĂ˘â‚¬Ë‡Ă„â€šĂ˘â‚¬ĹľÄ‚ËĂ˘â€šÂ¬ÄąË‡Ă„â€šĂ˘â‚¬Ä…Ä‚â€šĂ‚ÂÄ‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â‚¬ĹˇĂ‚Â¬Ă„Ä…Ă‹â€ˇĂ„â€šĂ˘â‚¬ĹˇÄ‚â€šĂ‚Â¬Ä‚â€žĂ˘â‚¬ĹˇÄ‚â€ąĂ‚ÂĂ„â€šĂ‹ÂÄ‚ËĂ˘â€šÂ¬ÄąË‡Ä‚â€šĂ‚Â¬Ä‚â€žĂ„â€¦Ä‚â€žĂ˘â‚¬Ĺľ14 same-floor viewport centered at offset (8, 6),
 /// which yields horizontal offsets -8 through +9 and vertical offsets -6 through +7. Creature
 /// inspection is intentionally no broader than that already encoded viewport.
 fn native_classic_viewport_contains(observer: Position, target: Position) -> bool {
