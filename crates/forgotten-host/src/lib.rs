@@ -40,6 +40,7 @@ mod trade;
 pub(crate) use frames::*;
 pub use heartbeat::*;
 mod world_chat;
+pub(crate) use world_chat::PrivateChatDelivery;
 mod world_combat;
 mod world_equipment;
 mod world_interaction;
@@ -11785,6 +11786,90 @@ mod tests {
             ]
         );
 
+        // Sender ack: PMing a player with no online session returns the classic "not online"
+        // status line to the sender (plan 1.5); the delivered case sends no ack.
+        write_frame(
+            &mut knight,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_TALK,
+                5,
+                8,
+                0,
+                b'O',
+                b'f',
+                b'f',
+                b'l',
+                b'i',
+                b'n',
+                b'e',
+                b'r',
+                2,
+                0,
+                b'h',
+                b'u',
+            ]),
+        )
+        .unwrap();
+        knight
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let not_online_ack = (0..4)
+            .map(|_| read_data_frame(&mut knight))
+            .find(|frame| {
+                frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE)
+            })
+            .expect("sender did not receive the offline-recipient ack");
+        assert_eq!(
+            not_online_ack.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_TEXT_MESSAGE,
+                forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_STATUS_DEFAULT,
+                41,
+                0,
+                b'A',
+                b' ',
+                b'p',
+                b'l',
+                b'a',
+                b'y',
+                b'e',
+                b'r',
+                b' ',
+                b'c',
+                b'a',
+                b'l',
+                b'l',
+                b'e',
+                b'd',
+                b' ',
+                b'\'',
+                b'O',
+                b'f',
+                b'f',
+                b'l',
+                b'i',
+                b'n',
+                b'e',
+                b'r',
+                b'\'',
+                b' ',
+                b'i',
+                b's',
+                b' ',
+                b'n',
+                b'o',
+                b't',
+                b' ',
+                b'o',
+                b'n',
+                b'l',
+                b'i',
+                b'n',
+                b'e',
+                b'.',
+            ]
+        );
+
         drop(knight);
         drop(druid);
         game.shutdown().unwrap();
@@ -13493,7 +13578,7 @@ mod tests {
             shared
                 .send_private_chat(101, "Druid", "  private\n hello  ")
                 .unwrap(),
-            1
+            PrivateChatDelivery::Delivered
         );
         assert!(matches!(
             knight_events.try_recv(),
@@ -13510,7 +13595,10 @@ mod tests {
                 text: "private hello".into(),
             }
         );
-        assert_eq!(shared.send_private_chat(101, "druid", "miss").unwrap(), 0);
+        assert_eq!(
+            shared.send_private_chat(101, "druid", "miss").unwrap(),
+            PrivateChatDelivery::NotOnline
+        );
         assert!(matches!(
             druid_events.try_recv(),
             Err(mpsc::TryRecvError::Empty)

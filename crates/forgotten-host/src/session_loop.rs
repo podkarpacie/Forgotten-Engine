@@ -4456,11 +4456,29 @@ pub(crate) fn handle_native_otclient_game(
                         );
                         continue;
                     };
-                    shared_world.send_private_chat(
+                    match shared_world.send_private_chat(
                         character.id,
                         recipient_name,
                         &request.message,
-                    )?
+                    )? {
+                        // Sender ack (plan 1.5): when the recipient has no online session, the
+                        // sender immediately hears the classic "not online" status line.
+                        PrivateChatDelivery::NotOnline => {
+                            let not_online = encode_native_otclient_status_message(
+                                &config.client_profile,
+                                &format!("A player called '{recipient_name}' is not online."),
+                            )
+                            .map_err(HostError::Protocol)?;
+                            write_frame(stream, &not_online)?;
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=talk outcome=private-recipient-not-online",
+                            );
+                            0
+                        }
+                        PrivateChatDelivery::Delivered => 1,
+                    }
                 } else if request.mode == 7 {
                     let Some(channel_id) = request.channel_id else {
                         native_diagnostic(

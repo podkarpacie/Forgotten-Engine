@@ -4,6 +4,14 @@
 
 use super::*;
 
+/// Outcome of one authenticated private-chat delivery. `NotOnline` means no matching online
+/// session owns that player name; callers surface the classic "not online" ack to the sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrivateChatDelivery {
+    Delivered,
+    NotOnline,
+}
+
 impl SharedNativeWorld {
     pub(crate) fn register_public_chat_recipient(
         &self,
@@ -227,7 +235,7 @@ impl SharedNativeWorld {
         sender_id: u64,
         recipient_name: &str,
         message: &str,
-    ) -> Result<usize, HostError> {
+    ) -> Result<PrivateChatDelivery, HostError> {
         let sender = self
             .lock()?
             .player(sender_id)
@@ -236,7 +244,7 @@ impl SharedNativeWorld {
             .map_err(HostError::Core)?;
         let body = message.split_whitespace().collect::<Vec<_>>().join(" ");
         if body.is_empty() {
-            return Ok(0);
+            return Ok(PrivateChatDelivery::NotOnline);
         }
         let event = SharedPublicChatEvent {
             speaker_name: sender.name,
@@ -255,14 +263,14 @@ impl SharedNativeWorld {
             .find(|(_, recipient)| recipient.player_name == recipient_name)
             .map(|(player_id, recipient)| (*player_id, recipient.sender.clone()))
         else {
-            return Ok(0);
+            return Ok(PrivateChatDelivery::NotOnline);
         };
         match recipient.try_send(event) {
-            Ok(()) => Ok(1),
-            Err(mpsc::TrySendError::Full(_)) => Ok(0),
+            Ok(()) => Ok(PrivateChatDelivery::Delivered),
+            Err(mpsc::TrySendError::Full(_)) => Ok(PrivateChatDelivery::NotOnline),
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 recipients.remove(&recipient_id);
-                Ok(0)
+                Ok(PrivateChatDelivery::NotOnline)
             }
         }
     }
