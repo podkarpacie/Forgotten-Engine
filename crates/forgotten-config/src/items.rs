@@ -1302,7 +1302,7 @@ mod speed_bonus_tests {
             Some(40)
         );
         assert_eq!(catalog.xml_speed_bonus_by_server_id().get(&2195), Some(&40));
-        assert!(catalog.xml_speed_bonus_by_server_id().get(&9999).is_none());
+        assert!(!catalog.xml_speed_bonus_by_server_id().contains_key(&9999));
 
         // Zero bonuses are filtered from the delivery map but retained verbatim on the row.
         set_speed_attribute(&mut catalog, &[2195], "0").unwrap();

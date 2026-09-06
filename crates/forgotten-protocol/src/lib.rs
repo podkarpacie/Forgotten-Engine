@@ -3999,7 +3999,6 @@ mod tests {
         assert_eq!(profile_by_id("fe-7.4"), Some(FE_7_4_PROFILE));
         assert_eq!(profile_by_id("fe-8.0"), None);
         assert_eq!(profile_by_id("fe-1.2"), None);
-        assert!(!FE_7_4_PROFILE.complete_protocol_emulation);
     }
 
     #[test]

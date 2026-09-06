@@ -1,6 +1,6 @@
 use super::{ConfigError, EngineConfig};
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use std::collections::BTreeMap;
 use std::fs;
 
@@ -167,7 +167,7 @@ fn required_string(event: &BytesStart<'_>, key: &[u8]) -> Result<String, ConfigE
         })
         .ok_or_else(|| invalid("shop element is missing a required attribute"))?;
     let value = attribute
-        .unescape_value()
+        .normalized_value(XmlVersion::Implicit1_0)
         .map_err(|error| invalid(format!("invalid shop attribute: {error}")))?;
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.len() > 64 {
@@ -187,7 +187,7 @@ fn parse_shop_entry(event: &BytesStart<'_>) -> Result<DeclarativeShopEntry, Conf
         match attribute.key.as_ref() {
             b"id" => {
                 let value = attribute
-                    .unescape_value()
+                    .normalized_value(XmlVersion::Implicit1_0)
                     .map_err(|error| invalid(format!("invalid shop id: {error}")))?;
                 server_id =
                     Some(value.parse::<u16>().map_err(|_| {
@@ -197,7 +197,7 @@ fn parse_shop_entry(event: &BytesStart<'_>) -> Result<DeclarativeShopEntry, Conf
             }
             b"buy" => {
                 let value = attribute
-                    .unescape_value()
+                    .normalized_value(XmlVersion::Implicit1_0)
                     .map_err(|error| invalid(format!("invalid shop price: {error}")))?;
                 buy_price =
                     Some(value.parse::<u64>().map_err(|_| {
@@ -207,7 +207,7 @@ fn parse_shop_entry(event: &BytesStart<'_>) -> Result<DeclarativeShopEntry, Conf
             }
             b"sell" => {
                 let value = attribute
-                    .unescape_value()
+                    .normalized_value(XmlVersion::Implicit1_0)
                     .map_err(|error| invalid(format!("invalid shop price: {error}")))?;
                 sell_price =
                     Some(value.parse::<u64>().map_err(|_| {

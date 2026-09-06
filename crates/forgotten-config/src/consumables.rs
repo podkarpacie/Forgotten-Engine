@@ -1,6 +1,6 @@
 use super::{ConfigError, EngineConfig};
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use std::collections::BTreeMap;
 use std::fs;
 
@@ -146,7 +146,7 @@ fn optional_u16(event: &BytesStart<'_>, key: &[u8]) -> Result<Option<u16>, Confi
         })
         .map(|attribute| {
             let value = attribute
-                .unescape_value()
+                .normalized_value(XmlVersion::Implicit1_0)
                 .map_err(|error| invalid(format!("invalid consumable attribute: {error}")))?;
             value
                 .parse::<u16>()
@@ -174,7 +174,7 @@ fn parse_consumable(event: &BytesStart<'_>) -> Result<(u16, ConsumableEffect), C
         })
         .ok_or_else(|| invalid("consumable entry is missing its id attribute"))?;
     let value = id_attr
-        .unescape_value()
+        .normalized_value(XmlVersion::Implicit1_0)
         .map_err(|error| invalid(format!("invalid consumable id: {error}")))?;
     let server_id = value
         .parse::<u16>()

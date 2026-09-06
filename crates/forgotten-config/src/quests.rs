@@ -1,6 +1,6 @@
 use super::{ConfigError, EngineConfig};
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use std::collections::BTreeMap;
 use std::fs;
 
@@ -195,7 +195,7 @@ fn optional_u16_attr(event: &BytesStart<'_>, key: &[u8]) -> Result<Option<u16>, 
         })
         .map(|attribute| {
             let value = attribute
-                .unescape_value()
+                .normalized_value(XmlVersion::Implicit1_0)
                 .map_err(|error| invalid(format!("invalid quest reward value: {error}")))?;
             value
                 .trim()
@@ -223,10 +223,10 @@ fn parse_mission(event: &BytesStart<'_>) -> Result<(String, String), ConfigError
         })
         .ok_or_else(|| invalid("quest mission is missing its description attribute"))?;
     let name_value = name
-        .unescape_value()
+        .normalized_value(XmlVersion::Implicit1_0)
         .map_err(|error| invalid(format!("invalid mission name: {error}")))?;
     let description_value = description
-        .unescape_value()
+        .normalized_value(XmlVersion::Implicit1_0)
         .map_err(|error| invalid(format!("invalid mission description: {error}")))?;
     let name_value = name_value.trim();
     let description_value = description_value.trim();
@@ -252,7 +252,7 @@ fn parse_quest(event: &BytesStart<'_>) -> Result<(u16, String), ConfigError> {
         match attribute.key.as_ref() {
             b"id" => {
                 let value = attribute
-                    .unescape_value()
+                    .normalized_value(XmlVersion::Implicit1_0)
                     .map_err(|error| invalid(format!("invalid quest id: {error}")))?;
                 quest_id = Some(
                     value
@@ -263,7 +263,7 @@ fn parse_quest(event: &BytesStart<'_>) -> Result<(u16, String), ConfigError> {
             }
             b"name" => {
                 let value = attribute
-                    .unescape_value()
+                    .normalized_value(XmlVersion::Implicit1_0)
                     .map_err(|error| invalid(format!("invalid quest name: {error}")))?;
                 let trimmed = value.trim();
                 if trimmed.is_empty() || trimmed.len() > MAX_QUEST_NAME_BYTES {

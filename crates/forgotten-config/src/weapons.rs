@@ -257,7 +257,7 @@ fn parse_weapon(event: &BytesStart<'_>) -> Result<DeclarativeWeaponDefinition, C
             b"intervalticks" => known[2] = true,
             b"distance" => {
                 let raw = attribute
-                    .unescape_value()
+                    .normalized_value(XmlVersion::Implicit1_0)
                     .map_err(|error| invalid(format!("invalid weapon attribute: {error}")))?;
                 let parsed: u16 = raw
                     .trim()
@@ -272,7 +272,7 @@ fn parse_weapon(event: &BytesStart<'_>) -> Result<DeclarativeWeaponDefinition, C
             }
             b"shoteffect" => {
                 let raw = attribute
-                    .unescape_value()
+                    .normalized_value(XmlVersion::Implicit1_0)
                     .map_err(|error| invalid(format!("invalid weapon attribute: {error}")))?;
                 let parsed: u8 = raw
                     .trim()
@@ -285,7 +285,7 @@ fn parse_weapon(event: &BytesStart<'_>) -> Result<DeclarativeWeaponDefinition, C
             }
             b"hiteffect" => {
                 let raw = attribute
-                    .unescape_value()
+                    .normalized_value(XmlVersion::Implicit1_0)
                     .map_err(|error| invalid(format!("invalid weapon attribute: {error}")))?;
                 let parsed: u8 = raw
                     .trim()
