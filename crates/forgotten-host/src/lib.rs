@@ -15406,6 +15406,19 @@ mod tests {
             ]),
         )
         .unwrap();
+        let teleport_effect = read_data_frame(&mut stream);
+        assert_eq!(
+            teleport_effect.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_MAGIC_EFFECT,
+                110,
+                0,
+                110,
+                0,
+                7,
+                10,
+            ]
+        );
         let teleport_viewport = read_data_frame(&mut stream);
         assert_eq!(
             teleport_viewport.0[0],
@@ -15426,6 +15439,19 @@ mod tests {
             &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_SOUTH]),
         )
         .unwrap();
+        let stepped_effect = read_data_frame(&mut stream);
+        assert_eq!(
+            stepped_effect.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_MAGIC_EFFECT,
+                108,
+                0,
+                108,
+                0,
+                7,
+                10,
+            ]
+        );
         let stepped_teleport_viewport = read_data_frame(&mut stream);
         assert_eq!(
             stepped_teleport_viewport.0[0],
@@ -15448,6 +15474,19 @@ mod tests {
             ]),
         )
         .unwrap();
+        let diagonal_effect = read_data_frame(&mut stream);
+        assert_eq!(
+            diagonal_effect.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_MAGIC_EFFECT,
+                106,
+                0,
+                106,
+                0,
+                7,
+                10,
+            ]
+        );
         let diagonal_teleport_viewport = read_data_frame(&mut stream);
         assert_eq!(
             diagonal_teleport_viewport.0[0],
@@ -15468,6 +15507,19 @@ mod tests {
             &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_NORTH]),
         )
         .unwrap();
+        let chain_effect = read_data_frame(&mut stream);
+        assert_eq!(
+            chain_effect.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_MAGIC_EFFECT,
+                104,
+                0,
+                104,
+                0,
+                7,
+                10,
+            ]
+        );
         let chain_teleport_viewport = read_data_frame(&mut stream);
         assert_eq!(
             chain_teleport_viewport.0[0],
@@ -15488,6 +15540,19 @@ mod tests {
             &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_NORTH]),
         )
         .unwrap();
+        let cycle_effect = read_data_frame(&mut stream);
+        assert_eq!(
+            cycle_effect.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_MAGIC_EFFECT,
+                104,
+                0,
+                103,
+                0,
+                7,
+                10,
+            ]
+        );
         let cycle_teleport_viewport = read_data_frame(&mut stream);
         assert_eq!(
             cycle_teleport_viewport.0[0],

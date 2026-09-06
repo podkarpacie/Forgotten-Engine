@@ -4,6 +4,10 @@
 
 use super::*;
 
+/// Classic teleport pad arrival visual. `10` is the standard public-client magic-effect id for
+/// teleportation (TFS `CONST_ME_TELEPORT`); FE emits it without asserting client-asset specifics.
+const NATIVE_OTCLIENT_TELEPORT_EFFECT_ID: u8 = 10;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn move_native_map_player(
     stream: &mut TcpStream,
@@ -183,6 +187,13 @@ pub(crate) fn activate_native_map_teleport_item(
     let mut refreshed_snapshot = snapshot.clone();
     refreshed_snapshot.player_position = native_position(destination);
     refreshed_snapshot.player_direction = facing.protocol_direction();
+    let teleport_effect = encode_native_otclient_magic_effect(
+        profile,
+        native_position(destination),
+        NATIVE_OTCLIENT_TELEPORT_EFFECT_ID,
+    )
+    .map_err(HostError::Protocol)?;
+    write_frame(stream, &teleport_effect)?;
     write_frame(
         stream,
         &encode_shared_native_world_viewport(
