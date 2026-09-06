@@ -148,3 +148,82 @@ pub(crate) fn native_item_inspection_metadata_details(
     }
     message
 }
+
+/// Resolves one current native creature ID into a bounded status sentence only when the requested
+/// entity is active and already inside the observer's parser-verified classic map viewport. It
+/// does not expose off-screen, inactive, absent, or cross-floor state and changes no target,
+/// combat, visibility, persistence, or packet state by itself.
+pub(crate) fn native_creature_inspection_message(
+    shared_world: &SharedNativeWorld,
+    observer_id: u64,
+    native_creature_id: u32,
+) -> Result<Option<String>, HostError> {
+    let world = shared_world.lock()?;
+    let observer = world.player(observer_id).ok_or(HostError::Core(
+        forgotten_core::CoreError::UnknownPlayer(observer_id),
+    ))?;
+    if native_player_id(observer_id).is_ok_and(|native_id| native_id == native_creature_id) {
+        // Self-look: the client addresses the observer's own creature id at its tile
+        // stack position; classic servers answer with the fixed self sentence.
+        return Ok(Some("You see yourself.".into()));
+    }
+    let message = if let Some(player_id) = native_player_id_to_character_id(native_creature_id) {
+        let Some(target) = world.player(player_id) else {
+            return Ok(None);
+        };
+        let level = target.level;
+        native_classic_viewport_contains(observer.position, target.position).then(|| {
+            format!(
+                "You see {target_name}. (Level {level})",
+                target_name = target.name
+            )
+        })
+    } else if let Some(lifecycle) = world.static_creature_lifecycle(native_creature_id) {
+        if !lifecycle.active
+            || !native_classic_viewport_contains(observer.position, lifecycle.position)
+        {
+            return Ok(None);
+        }
+        world.static_creature(native_creature_id).map(|creature| {
+            if creature.name_description.is_empty() {
+                format!("You see {}.", creature.name)
+            } else {
+                // TFS nameDescription carries its own article ("a rat").
+                format!("You see {}.", creature.name_description)
+            }
+        })
+    } else {
+        // Unresolved creature ids (stale client cache, unmapped ranges) still get an answer:
+        // classic servers never leave a look unanswered.
+        Some(format!("You see a creature (id {native_creature_id})."))
+    };
+    Ok(message.filter(|message| message.len() <= NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES))
+}
+
+/// Bounded non-numeric look reply for bare ground and unmapped decorations. Resolves the
+/// topmost tile item's imported item name when the operator catalog provides one, degrades to
+/// a generic item sentence without one, and answers plain ground tiles with "You see ground."
+/// Raw numeric ids are never echoed back to clients (live-test regression A2).
+pub(crate) fn native_ground_look_message(
+    world_map: &WorldMap,
+    position: Position,
+    name_by_server_id: Option<&BTreeMap<u16, String>>,
+) -> String {
+    let resolved_name = world_map
+        .tile_items(position)
+        .and_then(|items| items.last())
+        .and_then(|item| name_by_server_id.and_then(|names| names.get(&item.server_id).cloned()));
+    match resolved_name {
+        Some(name) => format!("You see {name}."),
+        None => {
+            if world_map
+                .tile_items(position)
+                .is_some_and(|items| !items.is_empty())
+            {
+                "You see an item.".into()
+            } else {
+                "You see ground.".into()
+            }
+        }
+    }
+}
