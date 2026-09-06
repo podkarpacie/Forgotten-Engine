@@ -3,6 +3,14 @@
 
 use super::*;
 
+/// A resolved consumable item location for one UseItem request: the item's server id plus the
+/// single owning inventory position it was addressed from (equipment slot or container content).
+struct ConsumableSource {
+    server_id: u16,
+    slot: Option<EquipmentSlot>,
+    container_ref: Option<(u8, usize)>,
+}
+
 pub(crate) fn handle_native_otclient_game(
     stream: &mut TcpStream,
     peer: SocketAddr,
@@ -809,16 +817,18 @@ pub(crate) fn handle_native_otclient_game(
                             } else {
                                 Vec::new()
                             };
-                            if let Some(corpse_position) = spawn_native_static_defeat_corpse(
-                                shared_world,
-                                map_owner,
-                                &mut database,
-                                outcome.target_id,
-                                shared_world.tick()?,
-                                corpse_server_id,
-                                config.corpse_despawn_seconds,
-                                &loot_split_targets,
-                            )? {
+                            if let Some(corpse_position) =
+                                spawn_native_static_defeat_corpse(NativeDefeatCorpseRequest {
+                                    shared_world,
+                                    map_owner,
+                                    database: &mut database,
+                                    creature_id: outcome.target_id,
+                                    seed: shared_world.tick()?,
+                                    corpse_server_id,
+                                    corpse_despawn_seconds: config.corpse_despawn_seconds,
+                                    loot_split_targets: &loot_split_targets,
+                                })?
+                            {
                                 native_diagnostic(
                                     config.extended_diagnostics,
                                     peer,
@@ -1967,7 +1977,7 @@ pub(crate) fn handle_native_otclient_game(
                             Err(error) => return Err(error),
                         }
                         continue;
-                    } // All container↔equipment and container↔container throw paths below
+                    } // All containerâ†”equipment and containerâ†”container throw paths below
                       // persist through the atomic replace_player_inventory boundary so a
                       // torn two-transaction inventory can never be observed or crash-duplicated.
                     if let Some(target_container_id) = target_container_id {
@@ -2666,29 +2676,38 @@ pub(crate) fn handle_native_otclient_game(
                         );
                         continue;
                     }
-                    let consumable_target: Option<(
-                        u16,
-                        Option<EquipmentSlot>,
-                        Option<(u8, usize)>,
-                    )> = if position.x == 0xffff && position.y & 0x40 == 0 {
-                        EquipmentSlot::from_code(position.y as u8).and_then(|slot| {
-                            let equipment = shared_world.player_equipment(character.id).ok()?;
-                            let item = equipment.item(slot)?;
-                            Some((item.server_id, Some(slot), None::<(u8, usize)>))
-                        })
-                    } else if position.x == 0xffff && position.y & 0x40 != 0 {
-                        let container_id = (position.y & 0x0f) as u8;
-                        let child_index = usize::from(position.z);
-                        shared_world
-                            .player_containers(character.id)
-                            .ok()
-                            .and_then(|containers| containers.container(container_id).cloned())
-                            .and_then(|container| container.items.item(child_index).cloned())
-                            .map(|item| (item.server_id, None, Some((container_id, child_index))))
-                    } else {
-                        None
-                    };
-                    let Some((consumable_server_id, slot, container_ref)) = consumable_target
+                    let consumable_target: Option<ConsumableSource> =
+                        if position.x == 0xffff && position.y & 0x40 == 0 {
+                            EquipmentSlot::from_code(position.y as u8).and_then(|slot| {
+                                let equipment = shared_world.player_equipment(character.id).ok()?;
+                                let item = equipment.item(slot)?;
+                                Some(ConsumableSource {
+                                    server_id: item.server_id,
+                                    slot: Some(slot),
+                                    container_ref: None,
+                                })
+                            })
+                        } else if position.x == 0xffff && position.y & 0x40 != 0 {
+                            let container_id = (position.y & 0x0f) as u8;
+                            let child_index = usize::from(position.z);
+                            shared_world
+                                .player_containers(character.id)
+                                .ok()
+                                .and_then(|containers| containers.container(container_id).cloned())
+                                .and_then(|container| container.items.item(child_index).cloned())
+                                .map(|item| ConsumableSource {
+                                    server_id: item.server_id,
+                                    slot: None,
+                                    container_ref: Some((container_id, child_index)),
+                                })
+                        } else {
+                            None
+                        };
+                    let Some(ConsumableSource {
+                        server_id: consumable_server_id,
+                        slot,
+                        container_ref,
+                    }) = consumable_target
                     else {
                         continue;
                     };
@@ -2727,18 +2746,13 @@ pub(crate) fn handle_native_otclient_game(
                     }
                     let mut vitals = shared_world.player_vitals(character.id)?;
                     if heal > 0 {
-                        vitals.health = vitals
-                            .health
-                            .saturating_add(heal)
-                            .min(vitals.max_health)
-                            .min(u16::MAX);
+                        vitals.health = vitals.health.saturating_add(heal).min(vitals.max_health);
                     }
                     if mana_restore > 0 {
                         vitals.mana = vitals
                             .mana
                             .saturating_add(mana_restore)
-                            .min(vitals.max_mana)
-                            .min(u16::MAX);
+                            .min(vitals.max_mana);
                     }
                     // Consume one unit from the resolved inventory location.
                     match (&slot, &container_ref) {
@@ -2756,7 +2770,7 @@ pub(crate) fn handle_native_otclient_game(
                             shared_world
                                 .replace_player_equipment(character.id, equipment.clone())?;
                             database
-                                .replace_player_equipment(u64::from(character.id), &equipment)
+                                .replace_player_equipment(character.id, &equipment)
                                 .map_err(HostError::Persistence)?;
                         }
                         (_, Some((container_id, child_index))) => {
@@ -2770,7 +2784,7 @@ pub(crate) fn handle_native_otclient_game(
                             }
                             containers.insert(container).map_err(HostError::Core)?;
                             database
-                                .replace_player_containers(u64::from(character.id), &containers)
+                                .replace_player_containers(character.id, &containers)
                                 .map_err(HostError::Persistence)?;
                         }
                         _ => {}
@@ -2797,8 +2811,8 @@ pub(crate) fn handle_native_otclient_game(
                     let health_update = encode_native_otclient_creature_health(
                         &config.client_profile,
                         self_native_id,
-                        u16::from(vitals.health.min(u16::MAX)),
-                        u16::from(vitals.max_health),
+                        vitals.health,
+                        vitals.max_health,
                     )
                     .map_err(HostError::Protocol)?;
                     write_frame(stream, &health_update)?;
@@ -2842,7 +2856,6 @@ pub(crate) fn handle_native_otclient_game(
                     let containers = shared_world.player_containers(character.id)?;
                     let open_container = containers
                         .iter()
-                        .map(|(id, container)| (id, container))
                         .find(|(_, container)| !container.has_parent)
                         .map(|(id, _)| id);
                     let Some(container_id) = open_container else {
@@ -3554,7 +3567,7 @@ pub(crate) fn handle_native_otclient_game(
                     Some(catalog) if !catalog.is_empty() => {
                         let mut entries = Vec::new();
                         for (quest_id, completed) in database
-                            .player_quests(u64::from(character.id))
+                            .player_quests(character.id)
                             .map_err(HostError::Persistence)?
                         {
                             if let Some(definition) = catalog.get(quest_id) {
@@ -3590,7 +3603,7 @@ pub(crate) fn handle_native_otclient_game(
                 let missions = match config.quest_catalog.as_deref() {
                     Some(catalog) => {
                         let started = database
-                            .player_quests(u64::from(character.id))
+                            .player_quests(character.id)
                             .map_err(HostError::Persistence)?
                             .iter()
                             .any(|(started_id, _)| *started_id == quest_id);
@@ -4206,7 +4219,7 @@ pub(crate) fn handle_native_otclient_game(
                             // GM talkactions mutate authoritative state (summons, teleports,
                             // deliveries), so this session resends its full viewport from live
                             // shared state instead of silently adopting the bumped visibility
-                            // epoch — that swallow left summons invisible until relog
+                            // epoch â€” that swallow left summons invisible until relog
                             // (live-test regression A1). Other sessions refresh through their
                             // own epoch comparison.
                             shared_world.mark_visibility_changed();

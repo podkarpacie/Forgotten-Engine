@@ -185,8 +185,8 @@ pub(crate) fn handle_native_bank_keyword(
     }
     let mut staged_containers = containers.clone();
     for chunk in &chunks {
-        let item = ItemInstance::new(NATIVE_CURRENCY_COINS[0].0, u16::from(*chunk))
-            .map_err(HostError::Core)?;
+        let item =
+            ItemInstance::new(NATIVE_CURRENCY_COINS[0].0, *chunk).map_err(HostError::Core)?;
         let container_ids: Vec<u8> = staged_containers.iter().map(|(id, _)| id).collect();
         let mut placed = false;
         for container_id in container_ids {

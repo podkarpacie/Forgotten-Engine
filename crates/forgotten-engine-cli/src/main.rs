@@ -777,7 +777,6 @@ fn run_host(
             Arc::new(
                 catalog
                     .iter()
-                    .map(|(server_id, effect)| (server_id, effect))
                     .collect::<std::collections::BTreeMap<u16, forgotten_config::ConsumableEffect>>(
                     ),
             )
@@ -1132,7 +1131,7 @@ fn command_line(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             Ok(())
         }
         "give" => {
-            let player = required_argument(&arguments, 3, "player name")?;
+            let player = required_argument(arguments, 3, "player name")?;
             let item_id: u16 = arguments
                 .get(4)
                 .and_then(|value| value.parse().ok())
@@ -1156,8 +1155,8 @@ fn command_line(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             .into())
         }
         "tp" => {
-            let from = required_argument(&arguments, 3, "source player name")?;
-            let to = required_argument(&arguments, 4, "target player name")?;
+            let from = required_argument(arguments, 3, "source player name")?;
+            let to = required_argument(arguments, 4, "target player name")?;
             let scope = arguments.get(5).map(String::as_str).unwrap_or("");
             if let Some(response) = try_live_operator_command(
                 &directory,
@@ -1174,7 +1173,7 @@ fn command_line(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             .into())
         }
         "gm" => {
-            let player = required_argument(&arguments, 3, "player name")?;
+            let player = required_argument(arguments, 3, "player name")?;
             let scope = arguments.get(4).map(String::as_str).unwrap_or("");
             let level: u8 = arguments
                 .get(5)
@@ -1192,14 +1191,14 @@ fn command_line(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             let config = load(&directory)?;
             let database = EngineDatabase::open(&config.database_path)?;
             let player_id = database
-                .player_id_by_name(&player)?
+                .player_id_by_name(player)?
                 .ok_or_else(|| format!("player `{player}` does not exist"))?;
             database.update_player_gm_level(player_id, level)?;
             println!("set gm level {level} for {player} (player-id={player_id})");
             Ok(())
         }
         "spawn" => {
-            let entity = required_argument(&arguments, 3, "entity name")?;
+            let entity = required_argument(arguments, 3, "entity name")?;
             let player = arguments.get(4).cloned().unwrap_or_default();
             if let Some(response) = try_live_operator_command(
                 &directory,
@@ -1214,7 +1213,7 @@ fn command_line(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             .into())
         }
         "kick" => {
-            let player = required_argument(&arguments, 3, "player name")?;
+            let player = required_argument(arguments, 3, "player name")?;
             if let Some(response) = try_live_operator_command(
                 &directory,
                 &serde_json::json!({ "op": "kick", "player": player }),
@@ -1243,7 +1242,7 @@ fn required_argument<'a>(
 /// Reads the live operator-bridge port recorded by a running host and sends one JSON request.
 /// Returns None when no live server is reachable. The port file lives in the world directory.
 fn try_live_operator_command(
-    directory: &PathBuf,
+    directory: &Path,
     payload: &serde_json::Value,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let port_file = directory.join(".fe-operator-port");

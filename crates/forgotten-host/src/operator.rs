@@ -160,7 +160,7 @@ pub struct OperatorBridgeConfig {
     pub database_path: PathBuf,
 }
 
-struct BridgeRuntime {
+pub(crate) struct BridgeRuntime {
     config: OperatorBridgeConfig,
     shutdown: Arc<AtomicBool>,
 }
@@ -236,7 +236,7 @@ fn write_response(
 }
 
 /// Applies one validated operator request against the live shared world and database.
-pub fn apply_operator_request(
+pub(crate) fn apply_operator_request(
     runtime: &BridgeRuntime,
     request: OperatorRequest,
 ) -> OperatorResponse {
@@ -563,7 +563,7 @@ fn apply_player_info(runtime: &BridgeRuntime, player: &str, scope: &str) -> Oper
         Ok(id) => id,
         Err(error) => return OperatorResponse::failure(error),
     };
-    let mut database = match open_database(&runtime.config.database_path) {
+    let database = match open_database(&runtime.config.database_path) {
         Ok(database) => database,
         Err(error) => return OperatorResponse::failure(error),
     };

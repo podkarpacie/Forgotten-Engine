@@ -27,7 +27,7 @@ pub(crate) struct SharedPublicChatEvent {
 }
 pub(crate) use npc_shop::{
     complete_native_player_quest, deliver_native_npc_shop_windows, give_items_to_player,
-    handle_native_depot_open, handle_native_shop_keyword, insert_units_into_containers,
+    handle_native_shop_keyword, insert_units_into_containers,
 };
 mod native_render;
 mod session_drain;
@@ -53,21 +53,22 @@ pub(crate) use bank::{
 };
 pub(crate) use gm_commands::handle_native_gm_talkaction;
 pub(crate) use inspection::{
-    encode_shared_native_world_viewport, native_classic_weight_description,
-    native_creature_inspection_message, native_ground_look_message,
-    native_item_inspection_metadata_details, native_map_item_inspection_message,
-    native_static_creature_health_frames, native_validated_map_item_text,
+    encode_shared_native_world_viewport, native_creature_inspection_message,
+    native_ground_look_message, native_item_inspection_metadata_details,
+    native_map_item_inspection_message, native_static_creature_health_frames,
+    native_validated_map_item_text,
 };
 pub(crate) use movement::*;
 pub(crate) use native_combat::*;
+#[cfg(test)]
+pub(crate) use native_diagnostics::native_diagnostic_record;
 pub(crate) use native_diagnostics::{
-    native_action_diagnostic_summary, native_diagnostic, native_diagnostic_record,
-    NATIVE_GUILD_CHAT_CHANNEL_ID,
+    native_action_diagnostic_summary, native_diagnostic, NATIVE_GUILD_CHAT_CHANNEL_ID,
 };
 #[cfg(test)]
 pub(crate) use native_render::{
-    NativeRenderPreparationPool, NativeRenderPreparationRequest, NativeRenderPreparationWorker,
-    NativeRenderPublication, NativeRenderPublicationError, MAX_NATIVE_RENDER_PUBLICATION_BATCH,
+    NativeRenderPreparationPool, NativeRenderPreparationWorker, NativeRenderPublication,
+    NativeRenderPublicationError, MAX_NATIVE_RENDER_PUBLICATION_BATCH,
 };
 pub(crate) use session_drain::{
     drain_shared_public_chat, drain_shared_vip_presence, refresh_native_party_shields,
@@ -75,15 +76,17 @@ pub(crate) use session_drain::{
 pub(crate) use session_handlers::*;
 pub(crate) use session_loop::handle_native_otclient_game;
 pub(crate) use session_serve::*;
+#[cfg(test)]
 pub(crate) use static_creature::{
     apply_native_static_creature_policy_and_refresh, move_native_static_creature_and_refresh,
-    persist_runtime_player_conditions, persist_static_target_attack_vitals,
     reset_native_static_creatures_and_refresh,
     step_shared_native_static_creature_toward_target_and_refresh,
 };
+pub(crate) use static_creature::{
+    persist_runtime_player_conditions, persist_static_target_attack_vitals,
+};
 pub(crate) use trade::{
-    deliver_native_trade_windows, handle_native_player_trade_request, handle_native_trade_accept,
-    handle_native_trade_reject, resolve_native_trade_offer_item,
+    handle_native_player_trade_request, handle_native_trade_accept, handle_native_trade_reject,
 };
 
 use forgotten_config::{
@@ -111,10 +114,10 @@ use forgotten_core::{
     StaticCreatureResetSummary, StaticCreatureRuntimeRestoreSummary, StaticCreatureRuntimeSnapshot,
     StaticCreatureTargetAttackOutcome, StaticCreatureTargetStepOutcome, VocationId,
     VocationLevelUpGains, WorldMap, WorldMapItem, WorldMapItemSourceIdentity,
-    WorldMapSourceRevision, WorldState, MAX_COMBAT_EVENT_DAMAGE, MAX_ITEM_STACK_COUNT,
+    WorldMapSourceRevision, WorldState, MAX_COMBAT_EVENT_DAMAGE,
 };
 use forgotten_persistence::{
-    EngineDatabase, MapItemCountOverrideRecord, MapItemRemovalJournal, PersistenceError,
+    EngineDatabase, MapItemCountOverrideRecord, MapItemRemovalJournal,
     PlayerExperienceVitalsUpdate, PlayerFixedDeathLossSnapshot, PlayerOutfit,
     PlayerVitals as PersistedPlayerVitals, RuntimeMapItemChildRecord, RuntimeMapItemRecord,
     StaticCreatureRuntimeRecord,
@@ -1952,16 +1955,16 @@ mod tests {
                 .unwrap();
         assert!(final_hit.deactivated);
 
-        let corpse_position = spawn_native_static_defeat_corpse(
-            &shared,
-            &map_owner,
-            &mut database,
+        let corpse_position = spawn_native_static_defeat_corpse(NativeDefeatCorpseRequest {
+            shared_world: &shared,
+            map_owner: &map_owner,
+            database: &mut database,
             creature_id,
-            1,
-            NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
-            0,
-            &[],
-        )
+            seed: 1,
+            corpse_server_id: NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
+            corpse_despawn_seconds: 0,
+            loot_split_targets: &[],
+        })
         .unwrap()
         .expect("a deterministic always-chance loot roll spawns a corpse");
         assert_eq!(
@@ -2152,16 +2155,16 @@ mod tests {
             .unwrap();
         assert_eq!(roll.items.len(), 3, "all three entries must always roll");
 
-        let corpse_position = spawn_native_static_defeat_corpse(
-            &shared,
-            &map_owner,
-            &mut database,
+        let corpse_position = spawn_native_static_defeat_corpse(NativeDefeatCorpseRequest {
+            shared_world: &shared,
+            map_owner: &map_owner,
+            database: &mut database,
             creature_id,
-            1,
-            NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
-            0,
-            &[leader_id, member_id],
-        )
+            seed: 1,
+            corpse_server_id: NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
+            corpse_despawn_seconds: 0,
+            loot_split_targets: &[leader_id, member_id],
+        })
         .unwrap()
         .expect("split defeat still spawns the declared corpse");
 
@@ -2339,16 +2342,16 @@ mod tests {
         }
         assert!(deactivated, "the summoned creature must reach defeat");
 
-        let corpse_position = spawn_native_static_defeat_corpse(
-            &shared,
-            &map_owner,
-            &mut database,
-            dynamic_id,
-            7,
-            NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
-            0,
-            &[],
-        )
+        let corpse_position = spawn_native_static_defeat_corpse(NativeDefeatCorpseRequest {
+            shared_world: &shared,
+            map_owner: &map_owner,
+            database: &mut database,
+            creature_id: dynamic_id,
+            seed: 7,
+            corpse_server_id: NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
+            corpse_despawn_seconds: 0,
+            loot_split_targets: &[],
+        })
         .unwrap()
         .expect("defeated summons leave their declared corpse");
         let runtime_corpse = map_owner
@@ -2529,7 +2532,7 @@ mod tests {
         shared
             .register_player_at_available_position(
                 Player {
-                    id: u64::from(character.id),
+                    id: character.id,
                     account_id: account_id as u64,
                     name: "Knight".into(),
                     position: Position {
@@ -2563,16 +2566,16 @@ mod tests {
             containers
         };
         database
-            .replace_player_containers(u64::from(character.id), &starter_containers)
+            .replace_player_containers(character.id, &starter_containers)
             .unwrap();
         shared
-            .replace_player_containers(u64::from(character.id), starter_containers)
+            .replace_player_containers(character.id, starter_containers)
             .unwrap();
 
         let reply = handle_native_gm_talkaction(
             &shared,
             &mut database,
-            u64::from(character.id),
+            character.id,
             "/item 2148 100",
             2,
             None,
@@ -2581,7 +2584,7 @@ mod tests {
         .unwrap();
         assert!(reply.contains("Delivered"));
         assert!(database
-            .player_containers(u64::from(character.id))
+            .player_containers(character.id)
             .unwrap()
             .container(0)
             .unwrap()
@@ -2593,7 +2596,7 @@ mod tests {
         handle_native_gm_talkaction(
             &shared,
             &mut database,
-            u64::from(character.id),
+            character.id,
             "/unfreeze Knight",
             1,
             None,
@@ -2602,7 +2605,7 @@ mod tests {
         let frozen_reply = handle_native_gm_talkaction(
             &shared,
             &mut database,
-            u64::from(character.id),
+            character.id,
             "/freeze Knight",
             1,
             None,
@@ -2610,22 +2613,21 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(frozen_reply.contains("Froze Knight"));
-        assert!(database.player_frozen(u64::from(character.id)).unwrap());
+        assert!(database.player_frozen(character.id).unwrap());
 
         // Quest completion flips the flag and grants declared rewards into the backpack.
-        let mut quest_catalog = QuestCatalog::default();
-        let mut quest_bytes = Vec::new();
-        quest_bytes.extend_from_slice(
+        let mut quest_reward_bytes = Vec::new();
+        quest_reward_bytes.extend_from_slice(
             br#"<fe-quests><fe-quest id="7" name="Rat Hunt"><fe-reward itemid="2148" count="50"/></fe-quest></fe-quests>"#,
         );
-        quest_catalog = parse_quests_xml(&quest_bytes).unwrap();
+        let quest_catalog = parse_quests_xml(&quest_reward_bytes).unwrap();
         database
-            .replace_player_quests(u64::from(character.id), &[(7_u16, false)])
+            .replace_player_quests(character.id, &[(7_u16, false)])
             .unwrap();
         let granted = complete_native_player_quest(
             &shared,
             &mut database,
-            u64::from(character.id),
+            character.id,
             7,
             Some(&quest_catalog),
         )
@@ -2633,7 +2635,7 @@ mod tests {
         .expect("first completion grants");
         assert_eq!(granted, vec![(2148, 50)]);
         assert!(database
-            .player_quests(u64::from(character.id))
+            .player_quests(character.id)
             .unwrap()
             .iter()
             .any(|(id, completed)| *id == 7 && *completed));
@@ -2641,7 +2643,7 @@ mod tests {
         assert!(complete_native_player_quest(
             &shared,
             &mut database,
-            u64::from(character.id),
+            character.id,
             7,
             Some(&quest_catalog)
         )
@@ -2779,16 +2781,16 @@ mod tests {
         }
         assert!(deactivated, "creature must reach its death transition");
 
-        let corpse_position = spawn_native_static_defeat_corpse(
-            &shared,
-            &map_owner,
-            &mut database,
+        let corpse_position = spawn_native_static_defeat_corpse(NativeDefeatCorpseRequest {
+            shared_world: &shared,
+            map_owner: &map_owner,
+            database: &mut database,
             creature_id,
-            1,
-            3073,
-            0,
-            &[],
-        )
+            seed: 1,
+            corpse_server_id: 3073,
+            corpse_despawn_seconds: 0,
+            loot_split_targets: &[],
+        })
         .unwrap()
         .expect("defeated creatures always leave their declared corpse");
         let snapshot = map_owner.render_snapshot().unwrap();
@@ -6426,7 +6428,7 @@ mod tests {
     #[test]
     fn native_gm_talkaction_reply_is_followed_by_a_full_viewport_resend() {
         let database_path = database_path("native-gm-spawn-viewport");
-        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let database = EngineDatabase::open(&database_path).unwrap();
         let account_id = database
             .create_account_with_password("operator", "correct horse battery staple")
             .unwrap();
@@ -17208,10 +17210,7 @@ mod gm_talkaction_tests {
                 .unwrap()
                 .unwrap();
         assert!(promoted.contains("level 2"));
-        assert_eq!(
-            database.player_gm_level(u64::from(character.id)).unwrap(),
-            2
-        );
+        assert_eq!(database.player_gm_level(character.id).unwrap(), 2);
         let _ = fs::remove_file(&path);
     }
 
@@ -17284,7 +17283,7 @@ mod gm_talkaction_tests {
         let character = database
             .create_player_for_account(account_id as u32, "Summoner")
             .unwrap();
-        let player_id = u64::from(character.id);
+        let player_id = character.id;
         let monster_id = 0x4000_0001_u32;
         let collection = FeTfsStaticSpawnCollection::with_combat_metadata_and_npc_ids(
             vec![forgotten_core::FeTfsStaticEntity {

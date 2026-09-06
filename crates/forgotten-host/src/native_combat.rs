@@ -493,7 +493,7 @@ pub(crate) fn native_condition_state_bits(
 ) -> u16 {
     use forgotten_core::PlayerConditionKind as Kind;
     let mut bits = 0_u16;
-    for (kind, _) in conditions {
+    for kind in conditions.keys() {
         bits |= match kind {
             Kind::Poison => 0x0001,
             Kind::Burning => 0x0002,
@@ -537,16 +537,33 @@ pub(crate) fn native_declared_corpse_server_id(
         .unwrap_or(NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID)
 }
 
+/// Grouped inputs for spawning one valid defeat corpse. Bundling the shared-world handles,
+/// loot-roll seed, corpse identity, and party-loot split targets keeps the call boundary one
+/// context rather than eight positional arguments.
+pub(crate) struct NativeDefeatCorpseRequest<'a> {
+    pub(crate) shared_world: &'a SharedNativeWorld,
+    pub(crate) map_owner: &'a SharedNativeMap,
+    pub(crate) database: &'a mut EngineDatabase,
+    pub(crate) creature_id: u32,
+    pub(crate) seed: u64,
+    pub(crate) corpse_server_id: u16,
+    pub(crate) corpse_despawn_seconds: u32,
+    pub(crate) loot_split_targets: &'a [u64],
+}
+
 pub(crate) fn spawn_native_static_defeat_corpse(
-    shared_world: &SharedNativeWorld,
-    map_owner: &SharedNativeMap,
-    database: &mut EngineDatabase,
-    creature_id: u32,
-    seed: u64,
-    corpse_server_id: u16,
-    corpse_despawn_seconds: u32,
-    loot_split_targets: &[u64],
+    request: NativeDefeatCorpseRequest<'_>,
 ) -> Result<Option<Position>, HostError> {
+    let NativeDefeatCorpseRequest {
+        shared_world,
+        map_owner,
+        database,
+        creature_id,
+        seed,
+        corpse_server_id,
+        corpse_despawn_seconds,
+        loot_split_targets,
+    } = request;
     let roll = shared_world.roll_defeated_static_creature_loot(creature_id, seed)?;
     // Plan v49 slice 6: defeated creatures always leave their declared corpse, even when the
     // loot roll is empty; the roll only fills the corpse container's children.

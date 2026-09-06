@@ -366,6 +366,7 @@ pub(crate) fn write_legacy_login_response(
     write_frame(stream, &Frame(encrypted))
 }
 
+#[allow(dead_code)] // public probe-protocol helper; exercised by socket regressions
 pub fn probe_request() -> Frame {
     Frame([PROBE_MAGIC.as_slice(), &[PROBE_VERSION]].concat())
 }

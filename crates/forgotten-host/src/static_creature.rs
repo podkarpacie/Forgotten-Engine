@@ -4,6 +4,11 @@
 
 use super::*;
 
+// Server-owner static-creature step/policy/reset commands. These are public host-runtime API
+// exercised by socket regressions; the shared heartbeat drives the advance_* primitives, so
+// these stay wired as the deterministic test-facing surface (staged conventions per
+// docs/benchmarks/native-render-preparation-v7.4.44.md).
+#[allow(dead_code)]
 pub fn move_native_static_creature_and_refresh(
     profile: &NativeOtClientProfile,
     snapshot: &NativeOtClientEmptyWorldSnapshot,
@@ -27,6 +32,7 @@ pub fn move_native_static_creature_and_refresh(
 
 /// Applies a caller-triggered deterministic static creature policy and emits a native map refresh
 /// only if that policy made at least one move. It does not create an autonomous scheduler.
+#[allow(dead_code)] // surfaced through socket regressions; heartbeat drives the advance_* primitives internally
 pub fn apply_native_static_creature_policy_and_refresh(
     profile: &NativeOtClientProfile,
     snapshot: &NativeOtClientEmptyWorldSnapshot,
@@ -54,6 +60,7 @@ pub fn apply_native_static_creature_policy_and_refresh(
 /// Applies one explicitly requested target-directed creature step through the shared world and
 /// refreshes the selected native session only after a real move. It creates no autonomous task,
 /// protocol-specific target state, combat action, or pathfinding behavior.
+#[allow(dead_code)] // surfaced through socket regressions; heartbeat drives the advance_* primitives internally
 pub fn step_shared_native_static_creature_toward_target_and_refresh(
     profile: &NativeOtClientProfile,
     snapshot: &NativeOtClientEmptyWorldSnapshot,
@@ -79,6 +86,7 @@ pub fn step_shared_native_static_creature_toward_target_and_refresh(
 /// Reactivates inactive imported static entities at their validated spawn positions and emits a
 /// native map refresh only when the active entity set changed. This is caller-triggered and adds
 /// no timed respawn scheduler, AI, combat, drops, corpse, Lua, or action behavior.
+#[allow(dead_code)] // surfaced through socket regressions; heartbeat drives the advance_* primitives internally
 pub fn reset_native_static_creatures_and_refresh(
     profile: &NativeOtClientProfile,
     snapshot: &NativeOtClientEmptyWorldSnapshot,

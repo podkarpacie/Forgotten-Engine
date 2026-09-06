@@ -5,6 +5,9 @@
 use super::*;
 
 impl SharedNativeWorld {
+    // Live-session melee goes through apply_player_combat_event_with_death; these wrappers are
+    // the deterministic primitives exercised by socket regressions.
+    #[allow(dead_code)]
     pub(crate) fn apply_player_melee_damage(
         &self,
         attacker_id: u64,
@@ -45,6 +48,7 @@ impl SharedNativeWorld {
     /// validated hydrated town, enters the authoritative death state in the same world lock.
     /// Client death screens, loss application, persistence of death state, and respawn packets
     /// remain outside this transition.
+    #[allow(dead_code)] // deterministic primitive behind the live combat-event path
     pub(crate) fn apply_player_melee_damage_with_death(
         &self,
         attacker_id: u64,
@@ -118,7 +122,7 @@ impl SharedNativeWorld {
             } else {
                 world.player_frag_count(event.target_id)
             };
-            let mut state = world
+            let state = world
                 .apply_player_death(event.target_id, town_id, world_map)
                 .map_err(HostError::Core)?;
             let _ = frags;
@@ -138,6 +142,7 @@ impl SharedNativeWorld {
     /// Resolves one scriptless declared spell into the core's resource-and-cooldown event. This
     /// method has no protocol route and makes no target, formula, effect, persistence, or Lua
     /// claim; it is a synchronized host boundary for later profile-approved invocation paths.
+    #[allow(dead_code)] // deterministic spell-cast primitive exercised by socket regressions
     pub(crate) fn apply_declarative_spell_cast(
         &self,
         caster_id: u64,

@@ -72,6 +72,7 @@ pub(crate) fn complete_native_player_quest(
 /// hydrated from SQLite. Window ids for depots live in a dedicated high range so they never
 /// collide with owned-container or corpse windows. Item movement out of depots remains a
 /// deferred slice; this opens the window and shows contents.
+#[allow(dead_code)] // staged depot-window slice (plan 1.2); not yet routed from UseItem
 pub fn handle_native_depot_open(
     stream: &mut TcpStream,
     profile: &NativeOtClientProfile,
@@ -130,7 +131,7 @@ pub(crate) fn deliver_native_npc_shop_windows(
     npc_name: &str,
     shop_catalog: &DeclarativeShopCatalog,
     item_presentation_catalog: Option<&NativeItemPresentationCatalog>,
-    stackable_item_server_ids: Option<&BTreeSet<u16>>,
+    _stackable_item_server_ids: Option<&BTreeSet<u16>>,
     item_weight_by_server_id: Option<&BTreeMap<u16, u32>>,
     item_name_by_server_id: Option<&BTreeMap<u16, String>>,
 ) -> Result<bool, HostError> {
@@ -154,12 +155,8 @@ pub(crate) fn deliver_native_npc_shop_windows(
             .and_then(|weights| weights.get(&entry.server_id))
             .copied()
             .unwrap_or(0);
-        let subtype = if stackable_item_server_ids.is_some_and(|ids| ids.contains(&entry.server_id))
-        {
-            None // classic stackables carry their count at buy time, not a subtype here
-        } else {
-            None
-        };
+        // Classic stackables carry their count at buy time, not a subtype here.
+        let subtype = None;
         shop_items.push(NativeOtClientShopItem {
             client_thing_id: presented.client_thing_id,
             subtype,
