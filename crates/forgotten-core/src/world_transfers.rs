@@ -5,6 +5,9 @@
 use super::*;
 
 impl WorldState {
+    /// Moves one complete item instance from a known player's fixed equipment slot into one of
+    /// that same player's already-owned bounded containers. All checks occur on cloned state, so
+    /// a missing source, missing container, or full container leaves the world unchanged.
     pub fn move_equipment_item_to_container(
         &mut self,
         player_id: u64,

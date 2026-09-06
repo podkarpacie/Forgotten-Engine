@@ -624,16 +624,6 @@ impl EngineDatabase {
             .ok_or(PersistenceError::UnknownPlayer(player_id))
     }
 
-    /// Returns the exact durable player bank balance. FE retains the TFS-style nonnegative balance
-    /// concept but bounds it to SQLite's signed integer range; money items and client bank packets
-    /// remain outside this persistence query.
-
-    /// Adds one exact persisted character to an account-owned VIP list. The target name is matched
-    /// against persisted character identity, not an online session or account name.
-
-    /// Creates a durable guild and atomically provisions the TFS-style leader, vice-leader, and
-    /// member ranks. The owner becomes the leader and cannot already belong to another guild.
-
     pub fn save_player(&self, player: &Player) -> Result<(), PersistenceError> {
         self.connection.execute(
             "INSERT INTO players (id, account_id, name, x, y, z, level, experience, skill_points)\
@@ -709,8 +699,6 @@ impl EngineDatabase {
             None => Ok(None),
         }
     }
-
-    /// Lifts any account mute immediately. Returns 1 when a row was removed.
 
     /// Resolves one character row by exact case-insensitive name for operator commands.
     /// Returns the durable player ID when found.

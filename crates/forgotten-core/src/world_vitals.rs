@@ -175,8 +175,7 @@ impl WorldState {
         if let Some(window) = self.player_food_windows.get_mut(&player_id) {
             if window.until_tick > self.tick {
                 window.elapsed_seconds = window.elapsed_seconds.saturating_add(elapsed_seconds);
-                let intervals =
-                    (window.elapsed_seconds / FOOD_REGENERATION_INTERVAL_SECONDS) as u16;
+                let intervals = window.elapsed_seconds / FOOD_REGENERATION_INTERVAL_SECONDS;
                 if intervals > 0 {
                     window.elapsed_seconds %= FOOD_REGENERATION_INTERVAL_SECONDS;
                     food_gained = (FOOD_REGENERATION_HEALTH_PER_INTERVAL)

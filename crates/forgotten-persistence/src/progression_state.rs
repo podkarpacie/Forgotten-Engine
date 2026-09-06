@@ -98,10 +98,7 @@ impl EngineDatabase {
                 "bless count exceeds {MAX_PLAYER_BLESSINGS}"
             )));
         }
-        let promoted = match promoted_raw {
-            0 => false,
-            _ => true,
-        };
+        let promoted = promoted_raw != 0;
         Ok((bless_count, promoted))
     }
 

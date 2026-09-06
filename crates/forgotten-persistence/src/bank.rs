@@ -4,6 +4,9 @@
 use super::*;
 
 impl EngineDatabase {
+    /// Returns the exact durable player bank balance. FE retains the TFS-style nonnegative balance
+    /// concept but bounds it to SQLite's signed integer range; money items and client bank packets
+    /// remain outside this persistence query.
     pub fn player_bank_balance(&self, player_id: u64) -> Result<u64, PersistenceError> {
         let balance = self
             .connection

@@ -5,6 +5,8 @@
 use super::*;
 
 impl EngineDatabase {
+    /// Adds one exact persisted character to an account-owned VIP list. The target name is matched
+    /// against persisted character identity, not an online session or account name.
     pub fn add_account_vip_entry(
         &self,
         account_id: u32,

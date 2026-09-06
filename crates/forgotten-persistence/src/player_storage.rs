@@ -6,7 +6,7 @@ use super::*;
 
 impl EngineDatabase {
     /// Replaces all durable top-level depot items owned by one player in one transaction. FE
-    /// validates the audited 0Ä‚ËĂ˘â€šÂ¬Ă˘â‚¬Ĺ›19 TFS-shaped depot ID range and ordered complete items, but does
+    /// validates the audited 0–19 TFS-shaped depot ID range and ordered complete items, but does
     /// not yet serialize nested containers, arbitrary attribute blobs, capacity, or client views.
     pub fn replace_player_depots(
         &mut self,

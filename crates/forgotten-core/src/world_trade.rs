@@ -141,7 +141,7 @@ impl WorldState {
         Ok(())
     }
 
-    /// Records one side's acceptance. Returns true only when both sides have now accepted Ă˘â‚¬â€ť
+    /// Records one side's acceptance. Returns true only when both sides have now accepted —
     /// the caller must still perform the authoritative atomic swap before closing.
     pub fn accept_player_trade(&mut self, player_id: u64) -> Result<bool, CoreError> {
         let session = self.active_trade_entry_mut(player_id)?;

@@ -324,7 +324,6 @@ impl WorldState {
     /// Replaces the immutable display-only static creature set. Per-spawn reactivation intervals
     /// are retained as data, but this installation path starts no scheduler and adds no AI,
     /// combat, movement, or script behavior.
-
     pub fn player(&self, id: u64) -> Option<&Player> {
         self.players.get(&id)
     }

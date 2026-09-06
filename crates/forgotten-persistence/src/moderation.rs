@@ -5,6 +5,7 @@
 use super::*;
 
 impl EngineDatabase {
+    /// Lifts any account mute immediately. Returns 1 when a row was removed.
     pub fn clear_account_mute(&self, account_id: u64) -> Result<usize, PersistenceError> {
         let affected = self.connection.execute(
             "DELETE FROM account_mutes WHERE account_id = ?1",

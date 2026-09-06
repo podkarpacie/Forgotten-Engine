@@ -5,6 +5,8 @@
 use super::*;
 
 impl EngineDatabase {
+    /// Creates a durable guild and atomically provisions the TFS-style leader, vice-leader, and
+    /// member ranks. The owner becomes the leader and cannot already belong to another guild.
     pub fn create_guild(
         &mut self,
         owner_player_id: u64,

@@ -1969,7 +1969,7 @@ impl NativeOtClientTradeItem {
 fn trade_item_list_fits(items: &[NativeOtClientTradeItem]) -> bool {
     items.len() <= u8::MAX as usize
         && items.iter().all(|item| item.client_thing_id != 0)
-        && items.iter().map(|item| item.encoded_len()).sum::<usize>() + 1 <= MAX_FRAME_SIZE
+        && items.iter().map(|item| item.encoded_len()).sum::<usize>() < MAX_FRAME_SIZE
 }
 
 fn write_trade_items(writer: &mut Writer, items: &[NativeOtClientTradeItem]) {
@@ -2524,7 +2524,7 @@ pub fn encode_native_otclient_empty_world_map(
     Ok(frame)
 }
 
-/// Encodes an 18Ă—14Ă—8 classic viewport using original operator-supplied map data.
+/// Encodes an 18×14×8 classic viewport using original operator-supplied map data.
 /// A map tile with `ground_thing_id = 0` inherits the profile-configured fallback so a world
 /// document can remain portable across lawful client asset sets.
 pub fn encode_native_otclient_map_viewport(
