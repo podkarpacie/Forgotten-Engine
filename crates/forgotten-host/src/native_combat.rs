@@ -5,6 +5,15 @@
 
 use super::*;
 
+/// One authoritative world tick equals one whole second for these timings; vocation attack
+/// cadence in milliseconds rounds up to the next whole tick (1500ms -> 2 ticks), bounded to the
+/// core's validated 1..=60 interval window.
+fn native_melee_interval_ticks(millis: u32) -> u16 {
+    let ticks = millis.saturating_add(999) / 1000;
+    let bounded = ticks.min(u32::from(forgotten_core::MAX_COMBAT_INTERVAL_TICKS));
+    bounded.max(1) as u16
+}
+
 pub(crate) fn apply_native_player_interaction(
     shared_world: &SharedNativeWorld,
     source_player_id: u64,
@@ -232,6 +241,9 @@ pub(crate) struct NativeSelectedPlayerMeleePolicy<'a> {
     pub(crate) shield_defense_by_server_id: Option<&'a BTreeMap<u16, u16>>,
     pub(crate) armor_multiplier_by_vocation: Option<&'a BTreeMap<VocationId, u32>>,
     pub(crate) declarative_weapon_catalog: Option<&'a DeclarativeWeaponCatalog>,
+    /// Per-vocation attack cadence in whole milliseconds (TFS `attackspeed`). A present map
+    /// drives the fallback melee timing; a missing entry keeps the one-tick cadence.
+    pub(crate) attack_speed_millis_by_vocation: Option<&'a BTreeMap<VocationId, u32>>,
 }
 
 pub(crate) fn apply_native_selected_player_melee(
@@ -289,12 +301,22 @@ pub(crate) fn apply_native_selected_player_melee(
             .apply_player_combat_event_with_death(event, world_map)
             .map(|(outcome, vitals, death_state)| (outcome.damage, vitals, death_state))
     } else {
+        let attacker_vocation = shared_world
+            .lock()?
+            .player_progression(attacker_id)
+            .map_err(HostError::Core)?
+            .vocation;
+        let interval_ticks = policy
+            .attack_speed_millis_by_vocation
+            .and_then(|map| map.get(&attacker_vocation).copied())
+            .map(native_melee_interval_ticks)
+            .unwrap_or(1_u16);
         let event = PlayerCombatEvent::adjacent_melee(
             attacker_id,
             target_id,
             CombatDamageType::Physical,
             NATIVE_OTCLIENT_SELECTED_PLAYER_MELEE_DAMAGE,
-            CombatAttackTiming::new(1).map_err(HostError::Core)?,
+            CombatAttackTiming::new(interval_ticks).map_err(HostError::Core)?,
         )
         .map_err(HostError::Core)?;
         shared_world
@@ -803,5 +825,26 @@ pub(crate) fn native_cardinal_direction(
         NativeOtClientCardinalDirection::East => CardinalDirection::East,
         NativeOtClientCardinalDirection::South => CardinalDirection::South,
         NativeOtClientCardinalDirection::West => CardinalDirection::West,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::native_melee_interval_ticks;
+
+    #[test]
+    fn vocation_attack_speed_rounds_up_to_the_next_whole_tick() {
+        assert_eq!(native_melee_interval_ticks(1_500), 2);
+        assert_eq!(native_melee_interval_ticks(1_000), 1);
+        assert_eq!(native_melee_interval_ticks(0), 1);
+        assert_eq!(native_melee_interval_ticks(2_500), 3);
+    }
+
+    #[test]
+    fn vocation_attack_speed_is_bounded_to_the_valid_interval_window() {
+        assert_eq!(
+            native_melee_interval_ticks(500_000),
+            forgotten_core::MAX_COMBAT_INTERVAL_TICKS
+        );
     }
 }

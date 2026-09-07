@@ -734,6 +734,9 @@ pub(crate) fn handle_native_otclient_game(
                                 declarative_weapon_catalog: config
                                     .declarative_weapon_catalog
                                     .as_deref(),
+                                attack_speed_millis_by_vocation: config
+                                    .attack_speed_millis_by_vocation
+                                    .as_deref(),
                             },
                         )?
                     {

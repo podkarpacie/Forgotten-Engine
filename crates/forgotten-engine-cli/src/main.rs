@@ -752,6 +752,14 @@ fn run_host(
                     .collect::<std::collections::BTreeMap<_, _>>(),
             )
         });
+        let attack_speed_millis_by_vocation = vocation_registry.as_ref().map(|registry| {
+            Arc::new(
+                registry
+                    .iter()
+                    .map(|(id, definition)| (*id, definition.attack_speed_millis))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+        });
         let experience_award_policy = Arc::new(config.experience_award_policy()?);
         let death_loss_policy = DeathLossPolicy::from_config(config.death_loss_percent)?;
         let declarative_weapon_catalog = declarative_weapon_catalog
@@ -842,6 +850,7 @@ fn run_host(
             stackable_item_server_ids: stackable_item_server_ids.map(Arc::new),
             item_speed_bonus_by_server_id: item_speed_bonus_by_server_id.map(Arc::new),
             armor_multiplier_by_vocation,
+            attack_speed_millis_by_vocation,
             static_spawns: (!static_spawns.entities.is_empty()).then(|| Arc::new(static_spawns)),
             corpse_server_id_by_creature_name: Some(Arc::new(
                 entity_catalog

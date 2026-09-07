@@ -398,6 +398,10 @@ pub struct NativeOtClientHostConfig {
     /// inputs for explicit authoritative awards; weapons, spells, training, and Lua are not yet
     /// event sources.
     pub progression_rules: Option<Arc<BTreeMap<VocationId, PlayerProgressionRules>>>,
+    /// Validated per-vocation attack-speed in whole milliseconds (TFS `attackspeed`, default
+    /// 1500). The native selected-melee cadence derives its interval ticks from this map when a
+    /// vocation is present; a missing map keeps the existing one-tick fallback.
+    pub attack_speed_millis_by_vocation: Option<Arc<BTreeMap<VocationId, u32>>>,
     /// Validated legacy vocation health, mana, and capacity gains for explicit level-up sources.
     pub vocation_level_up_gains: Option<Arc<BTreeMap<VocationId, VocationLevelUpGains>>>,
     /// Validated TFS-style global skill rate used only by the existing fixed selected-player
@@ -1131,6 +1135,7 @@ mod tests {
             stackable_item_server_ids: None,
             item_speed_bonus_by_server_id: None,
             armor_multiplier_by_vocation: None,
+            attack_speed_millis_by_vocation: None,
             static_spawns: None,
             corpse_server_id_by_creature_name: None,
             animated_damage_text_enabled: false,
@@ -7870,6 +7875,8 @@ mod tests {
                 shield_defense_by_server_id: None,
                 armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: None,
+
+                attack_speed_millis_by_vocation: None,
             },
         )
         .unwrap()
@@ -7905,6 +7912,8 @@ mod tests {
                 shield_defense_by_server_id: None,
                 armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: None,
+
+                attack_speed_millis_by_vocation: None,
             },
         )
         .unwrap()
@@ -8947,6 +8956,8 @@ mod tests {
                 shield_defense_by_server_id: None,
                 armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: None,
+
+                attack_speed_millis_by_vocation: None,
             },
         )
         .unwrap()
@@ -9073,6 +9084,8 @@ mod tests {
                 shield_defense_by_server_id: None,
                 armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: Some(&catalog),
+
+                attack_speed_millis_by_vocation: None,
             },
         )
         .unwrap()
@@ -9104,6 +9117,8 @@ mod tests {
                 shield_defense_by_server_id: None,
                 armor_multiplier_by_vocation: Some(&armor_multiplier_by_vocation),
                 declarative_weapon_catalog: Some(&catalog),
+
+                attack_speed_millis_by_vocation: None,
             },
         )
         .unwrap()
@@ -9273,6 +9288,8 @@ mod tests {
                     shield_defense_by_server_id: None,
                     armor_multiplier_by_vocation: None,
                     declarative_weapon_catalog: Some(&catalog),
+
+                    attack_speed_millis_by_vocation: None,
                 },
             )
             .unwrap()
@@ -9374,6 +9391,8 @@ mod tests {
                 shield_defense_by_server_id: None,
                 armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: None,
+
+                attack_speed_millis_by_vocation: None,
             },
         )
         .unwrap()
@@ -9484,6 +9503,8 @@ mod tests {
                 shield_defense_by_server_id: None,
                 armor_multiplier_by_vocation: None,
                 declarative_weapon_catalog: None,
+
+                attack_speed_millis_by_vocation: None,
             },
         )
         .unwrap()
