@@ -156,8 +156,10 @@ loot corpses, equip gear, chat, die and respawn.*
 - [ ] **Default-formula death loss (50%)** — implement the audited default formula path alongside
       fixed-percent *(est. 3 days)*
 - [ ] **Blessings & promotion (0%)** — bless charges reduce loss; promotion vocation tier *(est. 5 days)*
-- [ ] **Vocation attackspeed/basespeed enforcement (30%)** — metadata exists; wire into combat
-      cadence *(est. 2 days)*
+- [x] **Vocation attackspeed enforcement (60%)** — per-vocation `attackspeed` (TFS, default
+      1500ms) now drives the native selected-melee interval cadence (rounded up to whole
+      one-second ticks, bounded to the core 1..=60 window); `basespeed` remains data-only for
+      movement *(est. remainder: 1 day)*
 - [ ] **Outfit change window (40%)** — outfit frame accepted; add server-side outfit storage +
       addon gating *(est. 2 days)*
 
@@ -233,7 +235,9 @@ its simple Lua scripts (talkaction hello, action door) run unmodified through th
 - [x] **Operator metrics endpoint (new)** — fe-metrics status request returns authoritative
       counters without touching classic-client responses
 - [x] **Official Docker image + compose** — non-root runtime, /data world contract
-- [ ] **Auto-save cadence (0%)** — periodic world snapshot flush *(est. 2 days)*
+- [x] **Auto-save cadence** — the shared heartbeat persists the static-creature runtime snapshot,
+      parties, positions, and vitals on a 30s cadence (todo 549), so hard kills/panel stops lose at
+      most one interval of runtime state *(est. remainder: full world-state journal 2 days)*
 - [ ] **Watchdog/self-heal (0%)** — session leak detection, stuck-lock breaker *(est. 3 days)*
 
 #### 3.3 Security — ~65%
