@@ -3,13 +3,14 @@ use forgotten_config::{
     load_declarative_npc_dialogue_catalog, load_declarative_shop_catalog,
     load_declarative_spell_catalog, load_declarative_weapon_catalog, load_legacy_item_catalog,
     load_quest_catalog, load_tfs_content_inventory, load_tfs_entity_catalog,
-    load_tfs_public_channel_catalog, load_tfs_vocation_registry, load_world_companions,
-    load_world_map, materialize_tfs_spawn_templates, materialize_tfs_static_spawns,
-    resolve_tfs_registry_script_reference, resolve_tfs_spawn_references, validate_content,
-    world_map_path, write_template, ConsumableCatalog, DeclarativeNpcDialogueCatalog,
-    DeclarativeShopCatalog, DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig,
-    LegacyPublicChannelCatalog, LegacyWorldCompanionData, QuestCatalog, TfsEntityCatalog,
-    TfsRegistryCategory, TfsVocationRegistry,
+    load_tfs_public_channel_catalog, load_tfs_talkaction_registry, load_tfs_vocation_registry,
+    load_world_companions, load_world_map, materialize_tfs_spawn_templates,
+    materialize_tfs_static_spawns, resolve_tfs_registry_script_reference,
+    resolve_tfs_spawn_references, validate_content, world_map_path, write_template,
+    ConsumableCatalog, DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog,
+    DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig, LegacyPublicChannelCatalog,
+    LegacyWorldCompanionData, QuestCatalog, TfsEntityCatalog, TfsRegistryCategory,
+    TfsVocationRegistry,
 };
 use forgotten_core::{
     DeathLossPolicy, EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
@@ -1340,6 +1341,48 @@ fn script_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                 reference.registry_path.display(),
                 reference.relative_path.display(),
                 callback_name,
+                outcome.state,
+                outcome.instruction_checks,
+                outcome.value,
+            );
+            Ok(())
+        }
+        "dispatch-talkaction" => {
+            if arguments.len() < 4 || arguments.len() > 5 {
+                return Err(
+                    "usage: script dispatch-talkaction <directory> <words> [argument]".into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let words = arguments
+                .get(3)
+                .map(String::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("a talkaction words trigger is required")?;
+            let argument = arguments.get(4).map(String::as_str).unwrap_or_default();
+            let config = load(&directory)?;
+            let registry = load_tfs_talkaction_registry(&config)?;
+            let entry = registry
+                .get(words)
+                .ok_or_else(|| format!("talkaction registry declares no `{words}` trigger"))?;
+            // TFS talkaction scripts resolve relative to the world content directory.
+            let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+            dispatcher
+                .register_callback_file(words, &config.content_directory, &entry.script)
+                .map_err(|error| format!("talkaction callback registration rejected: {error:?}"))?;
+            let outcome = dispatcher.dispatch(
+                words,
+                &SandboxedLuaCallbackInput {
+                    event_kind: "talkaction".into(),
+                    subject_id: 0,
+                    value: 0,
+                    argument: argument.to_owned(),
+                },
+            );
+            println!(
+                "talkaction words={} script={} state={:?} instruction-checks={} value={:?}",
+                words,
+                entry.script.display(),
                 outcome.state,
                 outcome.instruction_checks,
                 outcome.value,
