@@ -1,8 +1,9 @@
 use crate::legacy_xml::{LegacySpawnKind, LegacyWorldCompanionData};
 use crate::{ConfigError, EngineConfig};
 use forgotten_core::{
-    FeTfsStaticEntity, FeTfsStaticSpawnCollection, Position, StaticCreatureDirectMeleeDamageRange,
-    StaticCreatureLootEntry, StaticCreatureSpawnArea,
+    FeTfsStaticEntity, FeTfsStaticSpawnCollection, PlayerConditionKind, Position,
+    StaticCreatureDirectMeleeDamageRange, StaticCreatureLootEntry, StaticCreatureMeleeCondition,
+    StaticCreatureSpawnArea,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
@@ -21,6 +22,15 @@ const MAX_ENTITY_DEFINITIONS: usize = 200_000;
 const MAX_ENTITY_NAME_DESCRIPTION_BYTES: usize = 128;
 const STATIC_TFS_ENTITY_ID_START: u32 = 0x4000_0001;
 const DEFAULT_STATIC_ENTITY_SPEED: u16 = 220;
+
+/// Bounds for the legacy flat `poison="NNN"` melee attribute. Old TFS files encode a single
+/// non-negative strength integer on the `attack name="melee"` element; FE decodes it
+/// deterministically into a bounded poison condition (10 ticks of 2 seconds each, i.e. 20 seconds)
+/// where each tick deals `ceil(value / 10)` damage. The exact TFS poison-parameter formula is not
+/// claimed; this is a bounded, operator-visible approximation.
+const LEGACY_MELEE_POISON_VALUE_MAX: u32 = 65_535;
+const LEGACY_MELEE_POISON_TICK_SECONDS: u16 = 2;
+const LEGACY_MELEE_POISON_DURATION_SECONDS: u16 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TfsEntityKind {
@@ -82,6 +92,10 @@ pub struct TfsDirectMeleeAttack {
     pub interval_millis: u32,
     pub min_damage: u16,
     pub max_damage: u16,
+    /// Optional legacy flat `poison="NNN"` attribute decoded into a bounded poison condition.
+    /// Fire/energy conditions are only declared as separate ranged attacks in old TFS data, so
+    /// the melee slice retains poison alone.
+    pub melee_condition: Option<StaticCreatureMeleeCondition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +191,7 @@ pub fn materialize_tfs_static_spawns(
     let mut experience_rewards = BTreeMap::new();
     let mut direct_melee_intervals_millis = BTreeMap::new();
     let mut direct_melee_damage_ranges = BTreeMap::new();
+    let mut melee_conditions = BTreeMap::new();
     let mut loot_tables = BTreeMap::new();
     let mut npc_ids = BTreeSet::new();
     let mut monster_spawn_areas = BTreeMap::new();
@@ -220,6 +235,9 @@ pub fn materialize_tfs_static_spawns(
                             max_damage: direct_melee.min_damage.max(direct_melee.max_damage),
                         },
                     );
+                    if let Some(condition) = direct_melee.melee_condition {
+                        melee_conditions.insert(next_id, condition);
+                    }
                 }
                 if !definition.loot.is_empty() {
                     loot_tables.insert(
@@ -283,6 +301,7 @@ pub fn materialize_tfs_static_spawns(
         loot_tables,
     )
     .and_then(|collection| collection.with_monster_spawn_areas(monster_spawn_areas))
+    .and_then(|collection| collection.with_melee_conditions(melee_conditions))
     .map_err(|error| invalid(format!("invalid static TFS spawn collection: {error}")))
 }
 
@@ -299,6 +318,7 @@ pub fn materialize_tfs_spawn_templates(
     let mut experience_rewards = BTreeMap::new();
     let mut direct_melee_intervals_millis = BTreeMap::new();
     let direct_melee_damage_ranges = BTreeMap::new();
+    let mut melee_conditions = BTreeMap::new();
     let mut loot_tables = BTreeMap::new();
     let mut next_id = TEMPLATE_ID_START;
     // Deterministic order: catalog monsters are already file-sorted; deduplicate by name so a
@@ -329,6 +349,9 @@ pub fn materialize_tfs_spawn_templates(
         }
         if let Some(direct_melee) = &definition.direct_melee {
             direct_melee_intervals_millis.insert(next_id, direct_melee.interval_millis);
+            if let Some(condition) = direct_melee.melee_condition {
+                melee_conditions.insert(next_id, condition);
+            }
         }
         if !definition.loot.is_empty() {
             loot_tables.insert(
@@ -375,6 +398,7 @@ pub fn materialize_tfs_spawn_templates(
         BTreeSet::new(),
         loot_tables,
     )
+    .and_then(|collection| collection.with_melee_conditions(melee_conditions))
     .map_err(|error| invalid(format!("invalid TFS spawn template collection: {error}")))
 }
 
@@ -795,6 +819,10 @@ fn parse_direct_melee_event(
             "monster melee interval exceeds the supported bound",
         ));
     }
+    let melee_condition = match optional_attribute_string(event, b"poison")? {
+        Some(raw) => decode_legacy_melee_poison(&raw)?,
+        None => None,
+    };
     // Classic TFS files come in two shapes: explicit `min`/`max` damage bounds, or the older
     // `skill`/`attack` pair (damage derived from attacker skill). Both are accepted here; the
     // skill/attack form maps to a deterministic bounded range so downstream combat code never
@@ -821,6 +849,7 @@ fn parse_direct_melee_event(
                 interval_millis,
                 min_damage: min_damage.min(max_damage),
                 max_damage: min_damage.max(max_damage),
+                melee_condition,
             });
         }
         _ => {
@@ -842,10 +871,40 @@ fn parse_direct_melee_event(
                 interval_millis,
                 min_damage,
                 max_damage: max_damage.max(min_damage),
+                melee_condition,
             });
         }
     }
     Ok(())
+}
+
+/// Decodes the legacy flat `poison="NNN"` melee attribute into a bounded poison condition. A
+/// zero value (and absence) means no condition. The value is capped and converted via
+/// `ceil(value / 10)` damage per 2-second tick over a 20-second window; full TFS formula parity
+/// is explicitly not claimed.
+fn decode_legacy_melee_poison(
+    value_raw: &str,
+) -> Result<Option<StaticCreatureMeleeCondition>, ConfigError> {
+    let value: u32 = value_raw
+        .trim()
+        .parse()
+        .map_err(|_| invalid("monster melee poison must be an unsigned integer"))?;
+    if value > LEGACY_MELEE_POISON_VALUE_MAX {
+        return Err(invalid("monster melee poison exceeds the supported bound"));
+    }
+    if value == 0 {
+        return Ok(None);
+    }
+    let damage = u16::try_from(value.div_ceil(10)).unwrap_or(u16::MAX);
+    let condition = StaticCreatureMeleeCondition::new(
+        PlayerConditionKind::Poison,
+        LEGACY_MELEE_POISON_TICK_SECONDS,
+        damage,
+        LEGACY_MELEE_POISON_DURATION_SECONDS,
+        100,
+    )
+    .map_err(|_| invalid("monster melee poison decodes to an invalid condition"))?;
+    Ok(Some(condition))
 }
 
 /// Retains one bounded flat monster `<loot><item id=".." chance=".." [count|maxcount]/>` entry.
@@ -1109,6 +1168,7 @@ mod tests {
                 interval_millis: 2_000,
                 min_damage: 0,
                 max_damage: 40,
+                melee_condition: None,
             })
         );
         assert_eq!(catalog.npcs[0].experience, 0);
@@ -1137,6 +1197,76 @@ mod tests {
         assert_eq!(rendered.name_description, "a rat");
 
         let _ = fs::remove_dir_all(data.parent().unwrap());
+    }
+
+    #[test]
+    fn legacy_melee_poison_decodes_and_materializes_as_a_melee_condition() {
+        let data = temporary_data_directory("tfs-melee-poison");
+        fs::create_dir_all(data.join("monster")).unwrap();
+        fs::write(
+            data.join("monster/Rat.xml"),
+            r#"<monster name="Rat" nameDescription="a rat" corpse="3073" speed="134" experience="25"><health now="20" max="20"/><look type="21"/><attacks><attack name="melee" interval="2000" min="0" max="-40" poison="150"/></attacks></monster>"#,
+        )
+        .unwrap();
+
+        let catalog = load_tfs_entity_catalog_from_data(&data).unwrap();
+        let melee = catalog.monsters[0].direct_melee.unwrap();
+        assert_eq!(melee.min_damage, 0);
+        assert_eq!(melee.max_damage, 40);
+        let condition = melee.melee_condition.unwrap();
+        assert_eq!(condition.kind, PlayerConditionKind::Poison);
+        assert_eq!(condition.interval_seconds, 2);
+        assert_eq!(condition.damage, 15);
+        assert_eq!(condition.duration_seconds, 20);
+        assert_eq!(condition.chance_percent, 100);
+
+        let companions = LegacyWorldCompanionData {
+            spawn_file: None,
+            house_file: None,
+            houses: Vec::new(),
+            spawns: vec![LegacySpawnArea {
+                center: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                radius: 0,
+                creatures: vec![LegacySpawnCreature {
+                    kind: LegacySpawnKind::Monster,
+                    name: "rat".into(),
+                    position: Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    spawn_interval_seconds: 60,
+                    direction: 0,
+                    chance: 100,
+                }],
+            }],
+        };
+        let spawns = materialize_tfs_static_spawns(&companions, &catalog).unwrap();
+        assert_eq!(spawns.entities.len(), 1);
+        assert_eq!(
+            spawns.melee_condition(STATIC_TFS_ENTITY_ID_START),
+            Some(condition)
+        );
+
+        let _ = fs::remove_dir_all(data.parent().unwrap());
+    }
+
+    #[test]
+    fn legacy_melee_poison_rejects_malformed_and_zero_keeps_no_condition() {
+        assert_eq!(decode_legacy_melee_poison("0").unwrap(), None);
+        assert!(decode_legacy_melee_poison("65000").is_ok());
+        assert!(matches!(
+            decode_legacy_melee_poison("65536"),
+            Err(ConfigError::InvalidContent(_))
+        ));
+        assert!(matches!(
+            decode_legacy_melee_poison("not-a-number"),
+            Err(ConfigError::InvalidContent(_))
+        ));
     }
 
     #[test]
@@ -1274,6 +1404,7 @@ mod tests {
                     interval_millis: 2_000,
                     min_damage: 1,
                     max_damage: 4,
+                    melee_condition: None,
                 }),
                 loot: Vec::new(),
                 definition_path: PathBuf::from("rat.xml"),

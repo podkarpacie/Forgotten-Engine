@@ -189,6 +189,28 @@ impl SharedNativeWorld {
                         summary.applied_attacks += 1;
                         summary.total_applied_damage += u64::from(applied_damage);
                         summary.affected_player_ids.insert(target_player_id);
+                        // A landed hit may carry a declared melee damage-over-time condition
+                        // (legacy `poison`). The deterministic chance gate is host-owned; the
+                        // resulting player condition persists through the session condition path.
+                        if let Some(condition) = world.static_creature_melee_condition(creature_id)
+                        {
+                            if melee_condition_roll(
+                                condition.chance_percent,
+                                creature_id,
+                                world.tick(),
+                            ) {
+                                let player_condition = PlayerCondition::new(
+                                    condition.kind,
+                                    condition.interval_seconds,
+                                    condition.damage,
+                                    condition.duration_seconds,
+                                )
+                                .map_err(HostError::Core)?;
+                                world
+                                    .apply_player_condition(target_player_id, player_condition)
+                                    .map_err(HostError::Core)?;
+                            }
+                        }
                     }
                 }
                 StaticCreatureTargetAttackOutcome::NoTarget
@@ -326,4 +348,21 @@ impl SharedNativeWorld {
         }
         Ok(outcome)
     }
+}
+
+/// Deterministic chance gate for one landed static melee condition. `100` always applies (the
+/// legacy melee `poison` case) and `0` never does; intermediate percentages resolve through a
+/// bounded mixed-seed LCG so equal creature/tick inputs produce equal gate outcomes.
+fn melee_condition_roll(chance_percent: u8, creature_id: u32, tick: u64) -> bool {
+    if chance_percent == 0 {
+        return false;
+    }
+    if chance_percent >= 100 {
+        return true;
+    }
+    let state = u64::from(creature_id)
+        .wrapping_add(tick.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (state >> 33) % 100 < u64::from(chance_percent)
 }

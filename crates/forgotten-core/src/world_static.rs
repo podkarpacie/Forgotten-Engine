@@ -38,6 +38,7 @@ impl WorldState {
                             .map(|interval| u64::from(interval).div_ceil(1_000)),
                         next_melee_due_tick: self.tick,
                         direct_melee_damage_range: collection.direct_melee_damage_range(entity.id),
+                        melee_condition: collection.melee_condition(entity.id),
                         direct_melee_damage_sequence: 0,
                         target_player_id: None,
                     },
@@ -155,6 +156,7 @@ impl WorldState {
             melee_cooldown_ticks: template.melee_cooldown_ticks,
             next_melee_due_tick: self.tick,
             direct_melee_damage_range: template.direct_melee_damage_range,
+            melee_condition: template.melee_condition,
             direct_melee_damage_sequence: 0,
             target_player_id: None,
         };
@@ -552,6 +554,16 @@ impl WorldState {
                     runtime
                         .active
                         .then_some(runtime.direct_melee_damage_range.map(|range| (*id, range)))
+                        .flatten()
+                })
+                .collect(),
+            melee_conditions: self
+                .static_creatures
+                .iter()
+                .filter_map(|(id, runtime)| {
+                    runtime
+                        .active
+                        .then_some(runtime.melee_condition.map(|condition| (*id, condition)))
                         .flatten()
                 })
                 .collect(),
@@ -1035,6 +1047,15 @@ impl WorldState {
         self.static_creatures
             .get(&id)
             .is_some_and(|runtime| runtime.direct_melee_damage_range.is_some())
+    }
+
+    /// Reads one installed static creature's declared direct-melee damage-over-time condition, if
+    /// any. Turning this metadata into an applied player condition is a deterministic host-owned
+    /// roll transition, not a core state change.
+    pub fn static_creature_melee_condition(&self, id: u32) -> Option<StaticCreatureMeleeCondition> {
+        self.static_creatures
+            .get(&id)
+            .and_then(|runtime| runtime.melee_condition)
     }
 
     /// Marks a static creature inactive without moving it. The deterministic world tick is

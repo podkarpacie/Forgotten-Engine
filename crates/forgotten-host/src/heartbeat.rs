@@ -276,6 +276,11 @@ pub(crate) fn run_native_shared_world_heartbeat(
                 config.death_loss_policy,
                 config.progression_rules.as_deref(),
             )?;
+            // Any landed melee condition changes the player's authoritative condition set, so
+            // persist it alongside vitals rather than waiting for the auto-save cadence.
+            for &player_id in &outcome.static_target_attack_player_ids {
+                persist_runtime_player_conditions(&mut database, &shared_world, player_id)?;
+            }
         }
         if !outcome.followed_player_ids.is_empty() {
             let database = EngineDatabase::open(&config.database_path)?;

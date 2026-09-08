@@ -144,6 +144,7 @@ pub struct FeTfsStaticSpawnCollection {
     experience_rewards: BTreeMap<u32, u64>,
     direct_melee_intervals_millis: BTreeMap<u32, u32>,
     direct_melee_damage_ranges: BTreeMap<u32, StaticCreatureDirectMeleeDamageRange>,
+    melee_conditions: BTreeMap<u32, StaticCreatureMeleeCondition>,
     loot_tables: BTreeMap<u32, Vec<StaticCreatureLootEntry>>,
     npc_ids: BTreeSet<u32>,
     monster_spawn_areas: BTreeMap<u32, StaticCreatureSpawnArea>,
@@ -156,6 +157,49 @@ pub struct FeTfsStaticSpawnCollection {
 pub struct StaticCreatureDirectMeleeDamageRange {
     pub min_damage: u16,
     pub max_damage: u16,
+}
+
+/// One operator-declared damage-over-time condition a monster's landed melee may apply to its
+/// player target. `chance_percent` is the deterministic 1..=100 gate the host rolls per hit; the
+/// host, not the core, owns the roll schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticCreatureMeleeCondition {
+    pub kind: PlayerConditionKind,
+    pub interval_seconds: u16,
+    pub damage: u16,
+    pub duration_seconds: u16,
+    pub chance_percent: u8,
+}
+
+impl StaticCreatureMeleeCondition {
+    pub fn new(
+        kind: PlayerConditionKind,
+        interval_seconds: u16,
+        damage: u16,
+        duration_seconds: u16,
+        chance_percent: u8,
+    ) -> Result<Self, CoreError> {
+        if !kind.is_damage_over_time() {
+            return Err(CoreError::InvalidPlayerCondition);
+        }
+        if interval_seconds == 0
+            || damage == 0
+            || duration_seconds == 0
+            || duration_seconds > MAX_CONDITION_DURATION_SECONDS
+        {
+            return Err(CoreError::InvalidPlayerCondition);
+        }
+        if !(1..=100).contains(&chance_percent) {
+            return Err(CoreError::InvalidPlayerCondition);
+        }
+        Ok(Self {
+            kind,
+            interval_seconds,
+            damage,
+            duration_seconds,
+            chance_percent,
+        })
+    }
 }
 
 /// One bounded declarative loot entry retained per static monster. `chance` uses the legacy
@@ -228,6 +272,9 @@ impl FeTfsStaticSpawnCollection {
             if let Some(damage_range) = templates.direct_melee_damage_ranges.get(&template.id) {
                 self.direct_melee_damage_ranges
                     .insert(template.id, *damage_range);
+            }
+            if let Some(melee_condition) = templates.melee_conditions.get(&template.id) {
+                self.melee_conditions.insert(template.id, *melee_condition);
             }
             if let Some(loot_table) = templates.loot_tables.get(&template.id) {
                 self.loot_tables.insert(template.id, loot_table.clone());
@@ -386,6 +433,7 @@ impl FeTfsStaticSpawnCollection {
             experience_rewards,
             direct_melee_intervals_millis,
             direct_melee_damage_ranges,
+            melee_conditions: BTreeMap::new(),
             loot_tables,
             npc_ids,
             monster_spawn_areas: BTreeMap::new(),
@@ -410,6 +458,29 @@ impl FeTfsStaticSpawnCollection {
             return Err(CoreError::UnknownStaticCreatureSchedule);
         }
         self.monster_spawn_areas = monster_spawn_areas;
+        Ok(self)
+    }
+
+    /// Attaches one validated direct-melee damage-over-time condition per materialized monster
+    /// ID. The condition itself is already bounded by `StaticCreatureMeleeCondition::new`; this
+    /// builder only validates that each declared ID names a known non-NPC monster. Chance-roll
+    /// scheduling remains a deterministic host-owned transition.
+    pub fn with_melee_conditions(
+        mut self,
+        melee_conditions: BTreeMap<u32, StaticCreatureMeleeCondition>,
+    ) -> Result<Self, CoreError> {
+        let ids = self
+            .entities
+            .iter()
+            .map(|entity| entity.id)
+            .collect::<BTreeSet<_>>();
+        if melee_conditions
+            .keys()
+            .any(|id| !ids.contains(id) || self.npc_ids.contains(id))
+        {
+            return Err(CoreError::UnknownStaticCreatureSchedule);
+        }
+        self.melee_conditions = melee_conditions;
         Ok(self)
     }
 
@@ -440,6 +511,10 @@ impl FeTfsStaticSpawnCollection {
         id: u32,
     ) -> Option<StaticCreatureDirectMeleeDamageRange> {
         self.direct_melee_damage_ranges.get(&id).copied()
+    }
+
+    pub fn melee_condition(&self, id: u32) -> Option<StaticCreatureMeleeCondition> {
+        self.melee_conditions.get(&id).copied()
     }
 
     pub fn loot_table(&self, id: u32) -> &[StaticCreatureLootEntry] {
@@ -590,6 +665,7 @@ struct StaticCreatureRuntime {
     melee_cooldown_ticks: Option<u64>,
     next_melee_due_tick: u64,
     direct_melee_damage_range: Option<StaticCreatureDirectMeleeDamageRange>,
+    melee_condition: Option<StaticCreatureMeleeCondition>,
     direct_melee_damage_sequence: u64,
     target_player_id: Option<u64>,
 }
@@ -8193,6 +8269,88 @@ mod tests {
             ));
         }
         assert_eq!(world.player_vitals(7).unwrap().health, 39);
+    }
+
+    #[test]
+    fn static_creature_melee_condition_validates_and_is_carried_to_runtime() {
+        let poison =
+            StaticCreatureMeleeCondition::new(PlayerConditionKind::Poison, 2, 7, 20, 100).unwrap();
+        assert_eq!(poison.kind, PlayerConditionKind::Poison);
+        assert_eq!(poison.damage, 7);
+        assert_eq!(poison.chance_percent, 100);
+
+        // Haste is not a damage-over-time condition and is rejected.
+        assert!(matches!(
+            StaticCreatureMeleeCondition::new(PlayerConditionKind::Haste, 2, 7, 20, 100),
+            Err(CoreError::InvalidPlayerCondition)
+        ));
+        // Zero bounds, oversized durations, and out-of-range chances are rejected.
+        assert!(matches!(
+            StaticCreatureMeleeCondition::new(PlayerConditionKind::Poison, 0, 7, 20, 100),
+            Err(CoreError::InvalidPlayerCondition)
+        ));
+        assert!(matches!(
+            StaticCreatureMeleeCondition::new(PlayerConditionKind::Poison, 2, 0, 20, 100),
+            Err(CoreError::InvalidPlayerCondition)
+        ));
+        assert!(matches!(
+            StaticCreatureMeleeCondition::new(
+                PlayerConditionKind::Poison,
+                2,
+                7,
+                MAX_CONDITION_DURATION_SECONDS + 1,
+                100
+            ),
+            Err(CoreError::InvalidPlayerCondition)
+        ));
+        assert!(matches!(
+            StaticCreatureMeleeCondition::new(PlayerConditionKind::Poison, 2, 7, 20, 0),
+            Err(CoreError::InvalidPlayerCondition)
+        ));
+
+        let creature_id = 0x4000_0004;
+        let creature = loot_test_creature(creature_id);
+        let collection = FeTfsStaticSpawnCollection::new(vec![creature])
+            .unwrap()
+            .with_melee_conditions(BTreeMap::from([(creature_id, poison)]))
+            .unwrap();
+        assert_eq!(collection.melee_condition(creature_id), Some(poison));
+        assert_eq!(collection.melee_condition(0x4000_0009), None);
+
+        let mut world = WorldState::default();
+        world.install_static_creatures(&collection).unwrap();
+        assert_eq!(
+            world.static_creature_melee_condition(creature_id),
+            Some(poison)
+        );
+    }
+
+    #[test]
+    fn static_creature_melee_condition_rejects_unknown_and_npc_ids() {
+        let monster_id = 0x4000_0001;
+        let npc_id = 0x4000_0002;
+        let mut npc = loot_test_creature(npc_id);
+        npc.name = "Guide".into();
+        let poison =
+            StaticCreatureMeleeCondition::new(PlayerConditionKind::Poison, 2, 7, 20, 100).unwrap();
+        let collection = FeTfsStaticSpawnCollection::with_loot_tables(
+            vec![loot_test_creature(monster_id), npc],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::from([npc_id]),
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert!(collection
+            .clone()
+            .with_melee_conditions(BTreeMap::from([(0x4000_0009, poison)]))
+            .is_err());
+        assert!(collection
+            .with_melee_conditions(BTreeMap::from([(npc_id, poison)]))
+            .is_err());
     }
 
     #[test]

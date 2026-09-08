@@ -16460,6 +16460,126 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_declared_melee_applies_declared_poison_condition() {
+        let declared_id = 0x4000_0001;
+        let entity = forgotten_core::FeTfsStaticEntity {
+            id: declared_id,
+            name: "Rat".into(),
+            name_description: String::new(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut map = WorldMap::new(
+            "declared-melee-condition",
+            Position {
+                x: 100,
+                y: 100,
+                z: 7,
+            },
+        );
+        for x in 99..=103 {
+            for y in 99..=101 {
+                map.set_tile(
+                    Position { x, y, z: 7 },
+                    WorldMapTile {
+                        ground_thing_id: 102,
+                        walkable: true,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let poison = forgotten_core::StaticCreatureMeleeCondition::new(
+            forgotten_core::PlayerConditionKind::Poison,
+            2,
+            7,
+            20,
+            100,
+        )
+        .unwrap();
+        let static_spawns = FeTfsStaticSpawnCollection::with_combat_metadata(
+            vec![entity],
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([(declared_id, 2_000_u32)]),
+            std::collections::BTreeMap::from([(
+                declared_id,
+                forgotten_core::StaticCreatureDirectMeleeDamageRange {
+                    min_damage: 2,
+                    max_damage: 2,
+                },
+            )]),
+        )
+        .unwrap()
+        .with_melee_conditions(std::collections::BTreeMap::from([(declared_id, poison)]))
+        .unwrap();
+        let shared = SharedNativeWorld::from_static_spawns(Some(&static_spawns)).unwrap();
+        shared
+            .register_player_at_available_position(
+                Player {
+                    id: 101,
+                    account_id: 1,
+                    name: "Knight".into(),
+                    position: map.spawn(),
+                    level: 8,
+                    experience: 0,
+                    skill_points: 0,
+                },
+                &map,
+            )
+            .unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .update_player_vitals(
+                101,
+                forgotten_core::PlayerVitals {
+                    health: 50,
+                    max_health: 50,
+                    ..forgotten_core::PlayerVitals::default()
+                },
+            )
+            .unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .select_static_creature_target(declared_id, 1)
+            .unwrap();
+
+        let outcome = advance_native_shared_world_heartbeat_with_static_target_policies(
+            &shared,
+            1,
+            StaticTargetAcquisitionPolicy::NearestLivingPlayer { max_range: 1 },
+            StaticTargetPursuitPolicy::Disabled,
+            StaticTargetAttackPolicy::DeclaredMeleeCycling { max_range: 1 },
+            forgotten_core::StaticCreatureDecisionPolicy::Disabled,
+            0,
+            Some(&map),
+        )
+        .unwrap();
+        assert_eq!(outcome.static_target_attacks, 1);
+
+        let world = shared.lock().unwrap();
+        let conditions = world.player_conditions(101).unwrap();
+        let poison_applied = &conditions[&forgotten_core::PlayerConditionKind::Poison];
+        assert_eq!(poison_applied.damage, 7);
+        assert_eq!(poison_applied.interval_seconds, 2);
+        assert_eq!(poison_applied.remaining_seconds, 20);
+    }
+
+    #[test]
     fn heartbeat_wander_moves_active_creatures_on_configured_ticks_and_bumps_visibility() {
         let creature_id = 0x4000_0001;
         let mut map = WorldMap::new(
