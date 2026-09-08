@@ -2,6 +2,8 @@
 //!
 //! This crate deliberately exposes an engine probe protocol, not a claimed Tibia wire protocol.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 pub mod operator;
 
 mod bank;
@@ -1047,6 +1049,7 @@ impl std::fmt::Display for HostError {
 impl std::error::Error for HostError {}
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use forgotten_config::{
@@ -17281,6 +17284,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod native_timing_tests {
     use super::{native_autowalk_step_delay, NATIVE_OTCLIENT_AUTOWALK_MAX_DELAY};
     use std::time::Duration;
@@ -17304,6 +17308,7 @@ mod native_timing_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod native_diagnostics_tests {
     use super::{
         native_action_diagnostic_summary, native_classic_viewport_contains,
@@ -17439,6 +17444,7 @@ mod native_diagnostics_tests {
 /// Gamemaster talkaction and dynamic-spawn coverage: command recognition, GM promotion
 /// persistence, spawn authorization against imported templates, and the operator bridge.
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod gm_talkaction_tests {
     use super::*;
     use forgotten_core::WorldMapTile;
@@ -17703,6 +17709,7 @@ mod gm_talkaction_tests {
 /// Dynamic per-player speed coverage: boots-slot speed bonuses stack onto the configured base,
 /// non-boot items never contribute, and unknown item IDs leave the base unchanged.
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod effective_speed_tests {
     use super::*;
 

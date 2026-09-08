@@ -2,6 +2,8 @@
 //!
 //! The legacy 7.4 types below are a tested foundation, not a claim of official-client support.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use forgotten_core::{
     CardinalDirection, EmptyWorldViewport, EquipmentSlot, FeTfsStaticEntity,
     FeTfsStaticSpawnCollection, PlayerSkills, Position, WorldMap,
@@ -286,6 +288,7 @@ fn xml(value: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     #[test]
@@ -2705,6 +2708,7 @@ mod tests {
 /// foundation exists because an unmodified OTCv8 at protocol 740 keeps an empty message-mode
 /// map and discards every 0xAA/0xB4 record; 760 is byte-identical on the wire but renders.
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod classic_760_visible_text_tests {
     use super::*;
 
@@ -2819,6 +2823,7 @@ mod classic_760_visible_text_tests {
 /// NPC shop window coverage: 0x7A catalog record layout, 0x7B player-goods record, and the
 /// close-shop zero-payload frame.
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod npc_shop_window_tests {
     use super::*;
 

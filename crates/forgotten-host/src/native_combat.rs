@@ -829,6 +829,7 @@ pub(crate) fn native_cardinal_direction(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::native_melee_interval_ticks;
 

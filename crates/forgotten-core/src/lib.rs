@@ -1,5 +1,7 @@
 //! Deterministic domain primitives for Forgotten Engine.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 mod world_combat;
 mod world_conditions;
 mod world_death;
@@ -3013,9 +3015,10 @@ impl<T> DeterministicWorldCommandBatch<T> {
 }
 
 impl<T> Default for DeterministicWorldCommandBatch<T> {
+    // MAX_DETERMINISTIC_COMMAND_BATCH is a compile-time constant validated once here; the
+    // default constructor has no error channel, and the constant cannot be invalid.
+    #[allow(clippy::expect_used)]
     fn default() -> Self {
-        // MAX_DETERMINISTIC_COMMAND_BATCH is a compile-time constant validated once here; the
-        // default constructor has no error channel, and the constant cannot be invalid.
         Self::new(MAX_DETERMINISTIC_COMMAND_BATCH)
             .expect("the built-in deterministic command-batch limit is valid")
     }
@@ -4130,6 +4133,7 @@ impl std::fmt::Display for CoreError {
 impl std::error::Error for CoreError {}
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -10569,6 +10573,7 @@ mod tests {
 
 /// Protection-zone flag semantics: OTBM bit 0x01 detection and the two-player PvP gate.
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod protection_zone_tests {
     use super::*;
 
@@ -10654,6 +10659,7 @@ mod protection_zone_tests {
 /// Player-to-player trade state-machine coverage: open gating, staging bounds, atomic swap
 /// success, and the anti-dupe abort when a staged reference no longer resolves.
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod player_trade_tests {
     use super::*;
 
@@ -10879,6 +10885,7 @@ mod player_trade_tests {
 /// Frag tracking coverage: kills accumulate per killer, white-skull classification flips at
 /// one unjustified kill, and non-killers stay clean.
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod frag_tests {
     use super::*;
 

@@ -8,6 +8,7 @@ impl SharedNativeMap {
     /// and cannot fail, so the expect documents a construction invariant rather than a runtime
     /// risk. The network-facing path goes through `recover_from_removal_journal`, which returns
     /// `Result` and fails closed.
+    #[allow(clippy::expect_used)]
     pub fn new(map: WorldMap) -> Self {
         Self::recover_from_removal_journal(map, None)
             .expect("an empty map-item removal journal cannot invalidate a world map")
