@@ -15,6 +15,7 @@ mod spells;
 mod stages;
 mod tfs_entities;
 mod tfs_registry;
+mod tfs_talkactions;
 mod vocations;
 mod weapons;
 
@@ -65,6 +66,10 @@ pub use tfs_entities::{
 pub use tfs_registry::{
     resolve_tfs_registry_script_reference, TfsContentInventory, TfsRegistryCategory,
     TfsRegistryInventory, TfsRegistryScriptReference,
+};
+pub use tfs_talkactions::{
+    load_tfs_talkaction_registry, parse_tfs_talkactions_xml, TfsTalkActionEntry,
+    TfsTalkActionRegistry,
 };
 pub use vocations::{
     load_tfs_vocation_registry, parse_tfs_vocations_xml, TfsVocationDefinition,
