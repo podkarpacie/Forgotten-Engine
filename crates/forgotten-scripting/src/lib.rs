@@ -19,6 +19,7 @@ pub const MAX_SANDBOXED_LUA_INSTRUCTIONS: u32 = 10_000;
 pub const MAX_SANDBOXED_LUA_CALLBACKS: usize = 64;
 pub const MAX_SANDBOXED_LUA_CALLBACK_NAME_BYTES: usize = 64;
 pub const MAX_SANDBOXED_LUA_CALLBACK_EVENT_KIND_BYTES: usize = 64;
+pub const MAX_SANDBOXED_LUA_CALLBACK_ARGUMENT_BYTES: usize = 255;
 pub const MAX_SANDBOXED_LUA_TABLE_CREATE_ARRAY_CAPACITY: usize = 256;
 pub const MAX_SANDBOXED_LUA_TABLE_CREATE_RECORD_CAPACITY: usize = 256;
 pub const MAX_SANDBOXED_LUA_MATH_ARGUMENTS: usize = 256;
@@ -194,12 +195,16 @@ pub struct SandboxedLuaCallbackInput {
     pub event_kind: String,
     pub subject_id: u64,
     pub value: i64,
+    /// Optional bounded string payload (for example a talkaction argument after the trigger).
+    /// The callback receives it as a fourth argument; three-parameter callbacks simply ignore it.
+    pub argument: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxedLuaCallbackInputError {
     InvalidEventKind,
     SubjectIdOutOfRange,
+    ArgumentTooLong,
 }
 
 impl SandboxedLuaCallbackInput {
@@ -211,6 +216,9 @@ impl SandboxedLuaCallbackInput {
         }
         if self.subject_id > i64::MAX as u64 {
             return Err(SandboxedLuaCallbackInputError::SubjectIdOutOfRange);
+        }
+        if self.argument.len() > MAX_SANDBOXED_LUA_CALLBACK_ARGUMENT_BYTES {
+            return Err(SandboxedLuaCallbackInputError::ArgumentTooLong);
         }
         Ok(())
     }
@@ -412,7 +420,12 @@ impl SandboxedLuaCallbackDispatcher {
             let subject_id = i64::try_from(input.subject_id).map_err(|_| {
                 mlua::Error::RuntimeError("callback subject ID out of signed integer range".into())
             })?;
-            callback.call::<_, Value>((input.event_kind.as_str(), subject_id, input.value))
+            callback.call::<_, Value>((
+                input.event_kind.as_str(),
+                subject_id,
+                input.value,
+                input.argument.as_str(),
+            ))
         });
         let instruction_checks = instruction_checks.load(Ordering::Relaxed);
         let instruction_limit_reached = instruction_checks > self.limits.max_instructions;
@@ -819,6 +832,7 @@ mod tests {
             event_kind: "award".into(),
             subject_id: 7,
             value: 41,
+            argument: String::new(),
         };
         let outcome = dispatcher.dispatch("award", &input);
         assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
@@ -852,6 +866,57 @@ mod tests {
     }
 
     #[test]
+    fn callback_dispatcher_passes_a_bounded_string_argument_and_rejects_oversized_ones() {
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "echo-arg",
+                "return function(kind, id, value, argument) if kind == 'talkaction' then return argument end return value end",
+            )
+            .unwrap();
+        let input = SandboxedLuaCallbackInput {
+            event_kind: "talkaction".into(),
+            subject_id: 9,
+            value: 0,
+            argument: "100 100".into(),
+        };
+        assert_eq!(
+            dispatcher.dispatch("echo-arg", &input).value,
+            Some(SandboxedLuaValue::Text("100 100".into()))
+        );
+
+        // A three-parameter callback ignores the fourth argument, preserving backward access.
+        dispatcher
+            .register_callback("legacy", "return function(kind, _, value) return value end")
+            .unwrap();
+        let legacy = SandboxedLuaCallbackInput {
+            event_kind: "talkaction".into(),
+            subject_id: 1,
+            value: 7,
+            argument: "ignored".into(),
+        };
+        assert_eq!(
+            dispatcher.dispatch("legacy", &legacy).value,
+            Some(SandboxedLuaValue::Integer(7))
+        );
+
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    "echo-arg",
+                    &SandboxedLuaCallbackInput {
+                        event_kind: "talkaction".into(),
+                        subject_id: 1,
+                        value: 0,
+                        argument: "x".repeat(MAX_SANDBOXED_LUA_CALLBACK_ARGUMENT_BYTES + 1),
+                    },
+                )
+                .state,
+            SandboxedLuaCallbackDispatchState::InputRejected
+        );
+    }
+
+    #[test]
     fn callback_dispatcher_enforces_registration_and_execution_boundaries() {
         let limits = SandboxedLuaLimits::new(96, MAX_SANDBOXED_LUA_MEMORY_BYTES, 32).unwrap();
         let mut dispatcher = SandboxedLuaCallbackDispatcher::new(limits);
@@ -879,6 +944,7 @@ mod tests {
             event_kind: "test".into(),
             subject_id: 1,
             value: 0,
+            argument: String::new(),
         };
         assert_eq!(
             dispatcher.dispatch("typed", &input).state,
@@ -896,6 +962,7 @@ mod tests {
                         event_kind: "test".into(),
                         subject_id: u64::MAX,
                         value: 0,
+                        argument: String::new(),
                     }
                 )
                 .state,
@@ -909,6 +976,7 @@ mod tests {
                         event_kind: " ".into(),
                         subject_id: 1,
                         value: 0,
+                        argument: String::new(),
                     }
                 )
                 .state,
@@ -922,6 +990,7 @@ mod tests {
                         event_kind: "a".repeat(MAX_SANDBOXED_LUA_CALLBACK_EVENT_KIND_BYTES + 1),
                         subject_id: 1,
                         value: 0,
+                        argument: String::new(),
                     }
                 )
                 .state,
@@ -954,6 +1023,7 @@ mod tests {
                         event_kind: "award".into(),
                         subject_id: 7,
                         value: 41,
+                        argument: String::new(),
                     },
                 )
                 .value,

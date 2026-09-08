@@ -1331,6 +1331,7 @@ fn script_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                     event_kind,
                     subject_id,
                     value,
+                    argument: String::new(),
                 },
             );
             println!(
