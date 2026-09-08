@@ -96,6 +96,7 @@ struct IndependentNativeStartupContent {
     declarative_weapon_catalog: Option<DeclarativeWeaponCatalog>,
     declarative_spell_catalog: Option<DeclarativeSpellCatalog>,
     declarative_npc_dialogue_catalog: Option<DeclarativeNpcDialogueCatalog>,
+    talkaction_dispatcher: Option<SandboxedLuaCallbackDispatcher>,
     consumable_catalog: Option<ConsumableCatalog>,
     shop_catalog: Option<DeclarativeShopCatalog>,
     quest_catalog: QuestCatalog,
@@ -120,6 +121,7 @@ fn load_independent_native_startup_content(
             let declarative_spell_catalog = scope.spawn(|| load_declarative_spell_catalog(config));
             let declarative_npc_dialogue_catalog =
                 scope.spawn(|| load_declarative_npc_dialogue_catalog(config));
+            let talkaction_dispatcher = scope.spawn(|| build_talkaction_dispatcher(config));
             let consumable_catalog = scope.spawn(|| load_consumable_catalog(config));
             let shop_catalog = scope.spawn(|| load_declarative_shop_catalog(config));
             let quest_catalog = scope.spawn(|| load_quest_catalog(config));
@@ -145,6 +147,9 @@ fn load_independent_native_startup_content(
             let declarative_npc_dialogue_catalog = declarative_npc_dialogue_catalog
                 .join()
                 .map_err(|_| "NPC dialogue catalog loader worker panicked")??;
+            let talkaction_dispatcher = talkaction_dispatcher
+                .join()
+                .map_err(|_| "talkaction dispatcher worker panicked")??;
             let consumable_catalog = consumable_catalog
                 .join()
                 .map_err(|_| "consumable catalog loader worker panicked")??;
@@ -162,12 +167,38 @@ fn load_independent_native_startup_content(
                 declarative_weapon_catalog,
                 declarative_spell_catalog,
                 declarative_npc_dialogue_catalog,
+                talkaction_dispatcher,
                 consumable_catalog,
                 shop_catalog,
                 quest_catalog,
             })
         },
     )
+}
+
+fn build_talkaction_dispatcher(
+    config: &EngineConfig,
+) -> Result<Option<SandboxedLuaCallbackDispatcher>, String> {
+    let registry = load_tfs_talkaction_registry(config).map_err(|error| error.to_string())?;
+    if registry.is_empty() {
+        return Ok(None);
+    }
+    let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+    for entry in registry.iter() {
+        dispatcher
+            .register_callback_file(
+                entry.words.as_str(),
+                &config.content_directory,
+                &entry.script,
+            )
+            .map_err(|error| {
+                format!(
+                    "talkaction `{}` registration rejected: {error:?}",
+                    entry.words
+                )
+            })?;
+    }
+    Ok(Some(dispatcher))
 }
 
 fn required_path(
@@ -701,6 +732,7 @@ fn run_host(
         let consumable_catalog = startup_content.consumable_catalog;
         let shop_catalog = startup_content.shop_catalog;
         let quest_catalog = startup_content.quest_catalog;
+        let talkaction_dispatcher = startup_content.talkaction_dispatcher;
         let regeneration_rules = vocation_registry
             .as_ref()
             .map(|registry| {
@@ -898,6 +930,7 @@ fn run_host(
             declarative_weapon_catalog,
             declarative_spell_catalog,
             declarative_npc_dialogue_catalog,
+            talkaction_dispatcher: talkaction_dispatcher.map(Arc::new),
             consumable_effects,
             shop_catalog: shop_catalog.map(Arc::new),
             quest_catalog: Some(Arc::new(quest_catalog)),

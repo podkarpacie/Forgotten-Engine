@@ -4259,6 +4259,35 @@ pub(crate) fn handle_native_otclient_game(
                         }
                     }
                 }
+                // Operator-registered Lua talkactions dispatch through the resource-capped
+                // sandbox. A script cannot mutate authoritative state, read files, open sockets,
+                // or exhaust memory/instructions without a bounded rejection; only a non-empty
+                // text return is sent back as a status message.
+                if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
+                    && request.channel_id.is_none()
+                    && request.recipient.is_none()
+                {
+                    if let Some(dispatcher) = config.talkaction_dispatcher.as_ref() {
+                        if let Some(reply) = dispatch_native_lua_talkaction(
+                            dispatcher,
+                            &request.message,
+                            character.id,
+                        ) {
+                            let reply_frame = encode_native_otclient_status_message(
+                                &config.client_profile,
+                                &reply,
+                            )
+                            .map_err(HostError::Protocol)?;
+                            write_frame(stream, &reply_frame)?;
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                "action=talk outcome=lua-talkaction",
+                            );
+                            continue;
+                        }
+                    }
+                }
                 if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
                     && request.channel_id.is_none()
                     && request.recipient.is_none()

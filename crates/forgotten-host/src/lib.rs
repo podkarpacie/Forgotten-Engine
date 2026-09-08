@@ -38,6 +38,7 @@ mod session_loop;
 mod session_serve;
 mod shared_native_map;
 mod static_creature;
+mod talkactions;
 mod trade;
 pub(crate) use frames::*;
 pub use heartbeat::*;
@@ -88,6 +89,7 @@ pub(crate) use static_creature::{
 pub(crate) use static_creature::{
     persist_runtime_player_conditions, persist_static_target_attack_vitals,
 };
+pub(crate) use talkactions::dispatch_native_lua_talkaction;
 pub(crate) use trade::{
     handle_native_player_trade_request, handle_native_trade_accept, handle_native_trade_reject,
 };
@@ -180,6 +182,7 @@ use forgotten_protocol::{
     NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
+use forgotten_scripting::SandboxedLuaCallbackDispatcher;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -438,6 +441,10 @@ pub struct NativeOtClientHostConfig {
     /// Optional operator-owned exact static-NPC dialogue catalog. Until the bounded proximity
     /// resolver is enabled, this validated data remains inert and cannot execute scripts.
     pub declarative_npc_dialogue_catalog: Option<Arc<DeclarativeNpcDialogueCatalog>>,
+    /// Optional pre-built sandboxed TFS talkaction dispatcher keyed by trigger word. Say messages
+    /// route only through this resource-capped dispatcher; a script cannot read files, open
+    /// sockets, mutate world state, or exhaust memory/instructions without a bounded rejection.
+    pub talkaction_dispatcher: Option<Arc<SandboxedLuaCallbackDispatcher>>,
     /// Configured corpse despawn delay in authoritative world-tick seconds. `0` (the default)
     /// disables decay; a positive value expires each placed runtime corpse after the delay on a
     /// later heartbeat, removing it from the map and the durable registry together.
@@ -1159,6 +1166,7 @@ mod tests {
             declarative_weapon_catalog: None,
             declarative_spell_catalog: None,
             declarative_npc_dialogue_catalog: None,
+            talkaction_dispatcher: None,
             corpse_despawn_seconds: 0,
         }
     }
