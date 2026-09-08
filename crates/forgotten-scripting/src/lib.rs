@@ -4,7 +4,7 @@
 //! only typed aggregate inventory metadata; it cannot receive a script path or source body and
 //! always returns a deferred no-op outcome.
 
-use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Value, Variadic};
+use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, Value, Variadic};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -262,6 +262,26 @@ pub struct SandboxedLuaCallbackDispatchOutcome {
     pub instruction_checks: u32,
 }
 
+/// Bounded number of typed effects one callback may request in a single dispatch.
+pub const MAX_SANDBOXED_LUA_EFFECTS: usize = 8;
+pub const MAX_SANDBOXED_LUA_EFFECT_TEXT_BYTES: usize = 255;
+
+/// One bounded, side-effect-free intent a sandbox callback may return. It carries no authority:
+/// the host must validate and apply it against authoritative state, so a script can never mutate
+/// the world or the process directly.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SandboxedLuaEffect {
+    Say(String),
+    Teleport { x: u16, y: u16, z: u8 },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SandboxedLuaEffectDispatchOutcome {
+    pub state: SandboxedLuaCallbackDispatchState,
+    pub effects: Vec<SandboxedLuaEffect>,
+    pub instruction_checks: u32,
+}
+
 /// A bounded trusted-source callback registry. Registration is explicit and in-memory: it does
 /// not discover files, load TFS registries, preserve global Lua state, or resolve modules. Every
 /// dispatch creates a new VM and expects the source to evaluate to a function accepting exactly
@@ -450,12 +470,111 @@ impl SandboxedLuaCallbackDispatcher {
             Err(_) => rejected_callback_outcome(instruction_checks),
         }
     }
+
+    /// Invokes one registered callback and extracts a bounded list of typed effects (say text,
+    /// teleport) from an array-of-effect-table return. The same fresh-VM, memory, instruction,
+    /// and primitive-only boundaries as `dispatch` apply; returned effects are intents that the
+    /// caller must validate and apply, never direct world mutation.
+    pub fn dispatch_effects(
+        &self,
+        callback_name: &str,
+        input: &SandboxedLuaCallbackInput,
+    ) -> SandboxedLuaEffectDispatchOutcome {
+        if input.validate().is_err() {
+            return SandboxedLuaEffectDispatchOutcome {
+                state: SandboxedLuaCallbackDispatchState::InputRejected,
+                effects: Vec::new(),
+                instruction_checks: 0,
+            };
+        }
+        let Some(source) = self.callbacks.get(callback_name) else {
+            return SandboxedLuaEffectDispatchOutcome {
+                state: SandboxedLuaCallbackDispatchState::CallbackNotFound,
+                effects: Vec::new(),
+                instruction_checks: 0,
+            };
+        };
+        if source.len() > self.limits.max_source_bytes {
+            return SandboxedLuaEffectDispatchOutcome {
+                state: SandboxedLuaCallbackDispatchState::SourceRejected,
+                effects: Vec::new(),
+                instruction_checks: 0,
+            };
+        }
+        let lua = match Lua::new_with(StdLib::NONE, LuaOptions::default()) {
+            Ok(lua) => lua,
+            Err(_) => return rejected_effect_outcome(0),
+        };
+        if lua.set_memory_limit(self.limits.max_memory_bytes).is_err() {
+            return rejected_effect_outcome(0);
+        }
+        if install_sandboxed_tfs_compatibility_globals(&lua).is_err() {
+            return rejected_effect_outcome(0);
+        }
+        let instruction_checks = Arc::new(AtomicU32::new(0));
+        let hook_checks = Arc::clone(&instruction_checks);
+        let instruction_limit = self.limits.max_instructions;
+        lua.set_hook(
+            HookTriggers {
+                every_nth_instruction: Some(1),
+                ..HookTriggers::default()
+            },
+            move |_, _| {
+                if hook_checks.fetch_add(1, Ordering::Relaxed) >= instruction_limit {
+                    Err(mlua::Error::RuntimeError(INSTRUCTION_LIMIT_MARKER.into()))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let result = lua.load(source).eval::<Function>().and_then(|callback| {
+            let subject_id = i64::try_from(input.subject_id).map_err(|_| {
+                mlua::Error::RuntimeError("callback subject ID out of signed integer range".into())
+            })?;
+            callback.call::<_, Value>((
+                input.event_kind.as_str(),
+                subject_id,
+                input.value,
+                input.argument.as_str(),
+            ))
+        });
+        let instruction_checks = instruction_checks.load(Ordering::Relaxed);
+        let instruction_limit_reached = instruction_checks > self.limits.max_instructions;
+        match result {
+            Ok(value) => match sandboxed_lua_effects(value) {
+                Some(effects) => SandboxedLuaEffectDispatchOutcome {
+                    state: SandboxedLuaCallbackDispatchState::Completed,
+                    effects,
+                    instruction_checks,
+                },
+                None => SandboxedLuaEffectDispatchOutcome {
+                    state: SandboxedLuaCallbackDispatchState::UnsupportedValue,
+                    effects: Vec::new(),
+                    instruction_checks,
+                },
+            },
+            Err(_) if instruction_limit_reached => SandboxedLuaEffectDispatchOutcome {
+                state: SandboxedLuaCallbackDispatchState::InstructionLimitReached,
+                effects: Vec::new(),
+                instruction_checks,
+            },
+            Err(_) => rejected_effect_outcome(instruction_checks),
+        }
+    }
 }
 
 fn rejected_callback_outcome(instruction_checks: u32) -> SandboxedLuaCallbackDispatchOutcome {
     SandboxedLuaCallbackDispatchOutcome {
         state: SandboxedLuaCallbackDispatchState::RuntimeRejected,
         value: None,
+        instruction_checks,
+    }
+}
+
+fn rejected_effect_outcome(instruction_checks: u32) -> SandboxedLuaEffectDispatchOutcome {
+    SandboxedLuaEffectDispatchOutcome {
+        state: SandboxedLuaCallbackDispatchState::RuntimeRejected,
+        effects: Vec::new(),
         instruction_checks,
     }
 }
@@ -614,6 +733,60 @@ fn sandboxed_lua_value(value: Value) -> Option<SandboxedLuaValue> {
         | Value::UserData(_)
         | Value::Error(_) => None,
     }
+}
+
+/// Extracts a bounded list of typed effects from an array-of-effect-table return:
+/// `{ { say = "text" }, { teleport = { x = 1, y = 2, z = 7 } } }`. Any non-table value, a
+/// non-sequence element, an effect entry with no recognized field, an oversize/control text, an
+/// out-of-range coordinate, or more than the bounded effect count rejects the whole return.
+fn sandboxed_lua_effects(value: Value) -> Option<Vec<SandboxedLuaEffect>> {
+    let Value::Table(table) = value else {
+        return None;
+    };
+    let mut effects = Vec::new();
+    for entry in table.sequence_values::<Value>() {
+        let entry = entry.ok()?;
+        if effects.len() >= MAX_SANDBOXED_LUA_EFFECTS {
+            return None;
+        }
+        let Value::Table(effect) = entry else {
+            return None;
+        };
+        let mut produced = false;
+        let say: Option<String> = match effect.get("say") {
+            Ok(value) => value,
+            Err(_) => return None,
+        };
+        if let Some(say) = say {
+            if say.is_empty()
+                || say.len() > MAX_SANDBOXED_LUA_EFFECT_TEXT_BYTES
+                || say.chars().any(char::is_control)
+            {
+                return None;
+            }
+            effects.push(SandboxedLuaEffect::Say(say));
+            produced = true;
+        }
+        let teleport: Option<Table> = match effect.get("teleport") {
+            Ok(value) => value,
+            Err(_) => return None,
+        };
+        if let Some(position) = teleport {
+            effects.push(parse_teleport_effect(position)?);
+            produced = true;
+        }
+        if !produced {
+            return None;
+        }
+    }
+    Some(effects)
+}
+
+fn parse_teleport_effect(position: Table) -> Option<SandboxedLuaEffect> {
+    let x: u16 = position.get("x").ok()?;
+    let y: u16 = position.get("y").ok()?;
+    let z: u8 = position.get("z").ok()?;
+    Some(SandboxedLuaEffect::Teleport { x, y, z })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -995,6 +1168,55 @@ mod tests {
                 )
                 .state,
             SandboxedLuaCallbackDispatchState::InputRejected
+        );
+    }
+
+    #[test]
+    fn callback_dispatcher_extracts_bounded_effect_intents() {
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "go",
+                "return function() return { { say = 'Teleported!' }, { teleport = { x = 100, y = 100, z = 7 } } } end",
+            )
+            .unwrap();
+        let input = SandboxedLuaCallbackInput {
+            event_kind: "talkaction".into(),
+            subject_id: 9,
+            value: 0,
+            argument: String::new(),
+        };
+        let outcome = dispatcher.dispatch_effects("go", &input);
+        assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
+        assert_eq!(
+            outcome.effects,
+            vec![
+                SandboxedLuaEffect::Say("Teleported!".into()),
+                SandboxedLuaEffect::Teleport {
+                    x: 100,
+                    y: 100,
+                    z: 7
+                },
+            ]
+        );
+
+        dispatcher
+            .register_callback("bad", "return function() return 'not-a-table' end")
+            .unwrap();
+        assert_eq!(
+            dispatcher.dispatch_effects("bad", &input).state,
+            SandboxedLuaCallbackDispatchState::UnsupportedValue
+        );
+
+        dispatcher
+            .register_callback(
+                "bad-coord",
+                "return function() return { { teleport = { x = 1, y = 2, z = 999 } } } end",
+            )
+            .unwrap();
+        assert_eq!(
+            dispatcher.dispatch_effects("bad-coord", &input).state,
+            SandboxedLuaCallbackDispatchState::UnsupportedValue
         );
     }
 
