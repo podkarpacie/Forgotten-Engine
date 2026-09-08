@@ -28,6 +28,8 @@ pub use legacy74::*;
 mod fe_otclient;
 pub use fe_otclient::*;
 
+mod native_types;
+pub use native_types::*;
 mod native;
 pub use native::*;
 
