@@ -182,7 +182,7 @@ use forgotten_protocol::{
     NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
-use forgotten_scripting::SandboxedLuaCallbackDispatcher;
+use forgotten_scripting::{SandboxedLuaCallbackDispatcher, SandboxedLuaEffect};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};

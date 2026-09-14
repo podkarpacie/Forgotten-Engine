@@ -4261,24 +4261,75 @@ pub(crate) fn handle_native_otclient_game(
                 }
                 // Operator-registered Lua talkactions dispatch through the resource-capped
                 // sandbox. A script cannot mutate authoritative state, read files, open sockets,
-                // or exhaust memory/instructions without a bounded rejection; only a non-empty
-                // text return is sent back as a status message.
+                // or exhaust memory/instructions without a bounded rejection; only bounded typed
+                // effects (say text, teleport) cross back and are validated/applied here.
                 if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
                     && request.channel_id.is_none()
                     && request.recipient.is_none()
                 {
                     if let Some(dispatcher) = config.talkaction_dispatcher.as_ref() {
-                        if let Some(reply) = dispatch_native_lua_talkaction(
+                        if let Some(effects) = dispatch_native_lua_talkaction(
                             dispatcher,
                             &request.message,
                             character.id,
                         ) {
-                            let reply_frame = encode_native_otclient_status_message(
-                                &config.client_profile,
-                                &reply,
-                            )
-                            .map_err(HostError::Protocol)?;
-                            write_frame(stream, &reply_frame)?;
+                            let mut teleported = false;
+                            for effect in effects {
+                                match effect {
+                                    SandboxedLuaEffect::Say(text) => {
+                                        let reply_frame = encode_native_otclient_status_message(
+                                            &config.client_profile,
+                                            &text,
+                                        )
+                                        .map_err(HostError::Protocol)?;
+                                        write_frame(stream, &reply_frame)?;
+                                    }
+                                    SandboxedLuaEffect::Teleport { x, y, z } => {
+                                        let destination = Position { x, y, z };
+                                        if shared_world
+                                            .teleport_player_for_operator(character.id, destination)
+                                            .is_ok()
+                                        {
+                                            player_position = destination;
+                                            teleported = true;
+                                        } else {
+                                            let reply_frame =
+                                                encode_native_otclient_status_message(
+                                                    &config.client_profile,
+                                                    "That destination is blocked.",
+                                                )
+                                                .map_err(HostError::Protocol)?;
+                                            write_frame(stream, &reply_frame)?;
+                                        }
+                                    }
+                                }
+                            }
+                            if teleported {
+                                shared_world.mark_visibility_changed();
+                                let mut refreshed_snapshot = snapshot.clone();
+                                refreshed_snapshot.player_position =
+                                    native_position(player_position);
+                                refreshed_snapshot.player_direction = facing.protocol_direction();
+                                let refreshed_viewport = encode_shared_native_world_viewport(
+                                    &config.client_profile,
+                                    &refreshed_snapshot,
+                                    world_map.as_ref(),
+                                    shared_world,
+                                    character.id,
+                                )?;
+                                let refreshed_static_spawns =
+                                    shared_world.active_static_spawns()?;
+                                let refreshed_static_health_frames =
+                                    native_static_creature_health_frames(
+                                        &config.client_profile,
+                                        &refreshed_static_spawns,
+                                    )?;
+                                write_frame(stream, &refreshed_viewport)?;
+                                for frame in &refreshed_static_health_frames {
+                                    write_frame(stream, frame)?;
+                                }
+                                observed_visibility_epoch = shared_world.visibility_epoch();
+                            }
                             native_diagnostic(
                                 config.extended_diagnostics,
                                 peer,

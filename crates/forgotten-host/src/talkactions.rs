@@ -1,20 +1,21 @@
 //! Bounded sandboxed TFS talkaction dispatch. Splits a Say message into a trigger word and
-//! argument, then routes the word through the resource-capped callback dispatcher. Only a
-//! non-empty text return produces a reply; a script can never reach filesystem, network,
-//! package/debug modules, or authoritative world state.
+//! argument, then routes the word through the resource-capped callback dispatcher. Returned
+//! effects are neutral intents the caller must validate and apply; a script can never reach
+//! filesystem, network, package/debug modules, or authoritative world state.
 
 use forgotten_scripting::{
-    SandboxedLuaCallbackDispatcher, SandboxedLuaCallbackInput, SandboxedLuaValue,
+    SandboxedLuaCallbackDispatchState, SandboxedLuaCallbackDispatcher, SandboxedLuaCallbackInput,
+    SandboxedLuaEffect,
 };
 
-/// Dispatches one operator-registered talkaction word. Returns the script's reply text only when
-/// the word is registered and the sandbox returns a non-empty string; an unknown word, rejected
-/// input, instruction/memory exhaustion, a runtime error, or a non-text return all yield `None`.
+/// Dispatches one operator-registered talkaction word. Returns `Some(effects)` when the word is a
+/// registered callback (the effect list may be empty if the script requested none or failed a
+/// bound); returns `None` only for an unknown word so the caller can fall through to normal chat.
 pub(crate) fn dispatch_native_lua_talkaction(
     dispatcher: &SandboxedLuaCallbackDispatcher,
     message: &str,
     player_id: u64,
-) -> Option<String> {
+) -> Option<Vec<SandboxedLuaEffect>> {
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return None;
@@ -23,7 +24,7 @@ pub(crate) fn dispatch_native_lua_talkaction(
         Some(index) => (&trimmed[..index], trimmed[index..].trim().to_owned()),
         None => (trimmed, String::new()),
     };
-    let outcome = dispatcher.dispatch(
+    let outcome = dispatcher.dispatch_effects(
         words,
         &SandboxedLuaCallbackInput {
             event_kind: "talkaction".into(),
@@ -32,9 +33,9 @@ pub(crate) fn dispatch_native_lua_talkaction(
             argument,
         },
     );
-    match outcome.value {
-        Some(SandboxedLuaValue::Text(text)) if !text.trim().is_empty() => Some(text),
-        _ => None,
+    match outcome.state {
+        SandboxedLuaCallbackDispatchState::CallbackNotFound => None,
+        _ => Some(outcome.effects),
     }
 }
 
@@ -44,53 +45,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn talkaction_returns_text_only_for_registered_words() {
+    fn talkaction_returns_effects_only_for_registered_words() {
         let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
         dispatcher
             .register_callback(
                 "/echo",
-                "return function(kind, _, _, argument) return argument end",
+                "return function(kind, _, _, argument) return { { say = argument } } end",
             )
             .unwrap();
         dispatcher
-            .register_callback("/silent", "return function() return 42 end")
+            .register_callback(
+                "/goto",
+                "return function() return { { teleport = { x = 1, y = 2, z = 7 } } } end",
+            )
+            .unwrap();
+        dispatcher
+            .register_callback("/silent", "return function() return {} end")
             .unwrap();
 
         assert_eq!(
             dispatch_native_lua_talkaction(&dispatcher, "/echo 100 100", 7),
-            Some("100 100".to_owned())
+            Some(vec![SandboxedLuaEffect::Say("100 100".into())])
         );
         assert_eq!(
-            dispatch_native_lua_talkaction(&dispatcher, "/echo", 7),
-            None // empty text reply is suppressed
+            dispatch_native_lua_talkaction(&dispatcher, "/goto", 7),
+            Some(vec![SandboxedLuaEffect::Teleport { x: 1, y: 2, z: 7 }])
         );
         assert_eq!(
             dispatch_native_lua_talkaction(&dispatcher, "/silent", 7),
-            None
+            Some(vec![])
         );
         assert_eq!(
             dispatch_native_lua_talkaction(&dispatcher, "/missing", 7),
             None
         );
-        assert_eq!(dispatch_native_lua_talkaction(&dispatcher, "", 7), None);
-    }
-
-    #[test]
-    fn talkaction_splits_first_word_from_the_argument() {
-        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
-        dispatcher
-            .register_callback(
-                "/word",
-                "return function(kind, _, _, argument) return '[' .. argument .. ']' end",
-            )
-            .unwrap();
+        // A registered word whose argument is over the bound is still handled, with no effects.
+        let long = "x".repeat(256);
         assert_eq!(
-            dispatch_native_lua_talkaction(&dispatcher, "/word a b c", 1),
-            Some("[a b c]".to_owned())
-        );
-        assert_eq!(
-            dispatch_native_lua_talkaction(&dispatcher, "/word", 1),
-            Some("[]".to_owned()) // no whitespace -> empty argument, still a non-empty reply
+            dispatch_native_lua_talkaction(&dispatcher, &format!("/silent {long}"), 7),
+            Some(vec![])
         );
     }
 }
