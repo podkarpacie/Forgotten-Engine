@@ -6,6 +6,68 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Opens a nested content window when the addressed item inside an owned-container
+/// window itself holds content. Returns `Handled` when a content-bearing item consumes the
+/// record (never a consumable afterwards); returns `Unhandled` for non-container positions
+/// or content-less items so consumable handling still runs.
+pub(crate) fn apply_native_nested_content_use_action(
+    ctx: &mut SessionContext<'_>,
+    position: NativeOtClientPosition,
+    open_corpse_windows: &BTreeMap<u8, (Position, usize)>,
+    open_content_windows: &mut BTreeMap<u8, (u8, usize)>,
+) -> Result<SessionActionOutcome, HostError> {
+    // Nested content window: using an item inside an owned-container window that
+    // itself holds content presents those contents as a child window. Items without
+    // contents fall through to the consumable handler below.
+    if !(position.x == 0xffff && position.y & 0x40 != 0) {
+        return Ok(SessionActionOutcome::Unhandled);
+    }
+    let parent_container_id = (position.y & 0x0f) as u8;
+    let item_index = usize::from(position.z);
+    let containers = ctx.shared_world.player_containers(ctx.character_id)?;
+    let Some(item) = containers
+        .container(parent_container_id)
+        .and_then(|container| container.items.item(item_index))
+        .filter(|item| !item.contents().is_empty())
+        .cloned()
+    else {
+        // No contents on this item: fall through to consumable handling.
+        return Ok(SessionActionOutcome::Unhandled);
+    };
+    let mut busy: BTreeSet<u8> = containers
+        .iter()
+        .map(|(_, container)| container.container_id)
+        .collect();
+    busy.extend(open_corpse_windows.keys().copied());
+    busy.extend(open_content_windows.keys().copied());
+    if let Some(window_id) = (0..=15u8).find(|id| !busy.contains(id)) {
+        if let Some(frame) = native_nested_content_window_frame(
+            &ctx.config.client_profile,
+            ctx.config.item_presentation_catalog.as_deref(),
+            window_id,
+            parent_container_id,
+            &item,
+        )
+        .map_err(HostError::Protocol)?
+        {
+            write_frame(&mut *ctx.stream, &frame)?;
+            open_content_windows.insert(window_id, (parent_container_id, item_index));
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                &format!(
+                    "action=use-item outcome=content-window-opened parent={} item-index={item_index} window-id={window_id} contents={}",
+                    parent_container_id,
+                    item.contents().len()
+                ),
+            );
+        }
+    }
+    // A content-bearing item is a container-open action, never a consumable:
+    // stop here so the consumable handler does not also process it.
+    Ok(SessionActionOutcome::Handled)
+}
+
 /// Opens the lowest owned top-level container when the equipped backpack itself is used.
 /// Returns `Handled` for backpack positions (with or without effect), `Unhandled` otherwise
 /// so corpse and map routing still run.

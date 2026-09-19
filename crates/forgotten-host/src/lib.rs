@@ -54,7 +54,7 @@ pub(crate) use frames::*;
 pub use heartbeat::*;
 pub(crate) use use_item::{
     apply_native_backpack_use_action, apply_native_corpse_use_action,
-    apply_native_map_item_use_action,
+    apply_native_map_item_use_action, apply_native_nested_content_use_action,
 };
 mod world_chat;
 #[cfg(test)]

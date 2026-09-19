@@ -2595,54 +2595,34 @@ pub(crate) fn handle_native_otclient_game(
                 stack_position,
                 index,
             } => {
-                // Nested content window: using an item inside an owned-container window that
-                // itself holds content presents those contents as a child window. Items without
-                // contents fall through to the consumable handler below.
-                if position.x == 0xffff && position.y & 0x40 != 0 {
-                    let parent_container_id = (position.y & 0x0f) as u8;
-                    let item_index = usize::from(position.z);
-                    let containers = shared_world.player_containers(character.id)?;
-                    if let Some(item) = containers
-                        .container(parent_container_id)
-                        .and_then(|container| container.items.item(item_index))
-                        .filter(|item| !item.contents().is_empty())
-                        .cloned()
+                // Nested content window; see use_item.rs. A content-bearing item
+                // consumes the record; anything else falls through to consumables.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    if apply_native_nested_content_use_action(
+                        &mut ctx,
+                        position,
+                        &open_corpse_windows,
+                        &mut open_content_windows,
+                    )? == SessionActionOutcome::Handled
                     {
-                        let mut busy: BTreeSet<u8> = containers
-                            .iter()
-                            .map(|(_, container)| container.container_id)
-                            .collect();
-                        busy.extend(open_corpse_windows.keys().copied());
-                        busy.extend(open_content_windows.keys().copied());
-                        if let Some(window_id) = (0..=15u8).find(|id| !busy.contains(id)) {
-                            if let Some(frame) = native_nested_content_window_frame(
-                                &config.client_profile,
-                                config.item_presentation_catalog.as_deref(),
-                                window_id,
-                                parent_container_id,
-                                &item,
-                            )
-                            .map_err(HostError::Protocol)?
-                            {
-                                write_frame(stream, &frame)?;
-                                open_content_windows
-                                    .insert(window_id, (parent_container_id, item_index));
-                                native_diagnostic(
-                                    config.extended_diagnostics,
-                                    peer,
-                                    &format!(
-                                        "action=use-item outcome=content-window-opened parent={} item-index={item_index} window-id={window_id} contents={}",
-                                        parent_container_id,
-                                        item.contents().len()
-                                    ),
-                                );
-                            }
-                        }
-                        // A content-bearing item is a container-open action, never a consumable:
-                        // stop here so the consumable handler does not also process it.
                         continue;
                     }
-                    // No contents on this item: fall through to consumable handling.
                 }
 
                 // Owned-inventory consumable use runs before map-item routing; see
