@@ -13,7 +13,11 @@ mod quests;
 mod shops;
 mod spells;
 mod stages;
+mod tfs_actions;
+mod tfs_creaturescripts;
 mod tfs_entities;
+mod tfs_globalevents;
+mod tfs_movements;
 mod tfs_registry;
 mod tfs_talkactions;
 mod vocations;
@@ -59,9 +63,25 @@ pub use stages::{
     parse_tfs_config_experience_stages_table, parse_tfs_stages_xml, ExperienceStage,
     ExperienceStages,
 };
+pub use tfs_actions::{
+    load_tfs_action_registry, parse_tfs_actions_xml, TfsActionEntry, TfsActionKey,
+    TfsActionRegistry,
+};
+pub use tfs_creaturescripts::{
+    load_tfs_creaturescript_registry, parse_tfs_creaturescripts_xml, TfsCreatureScriptEntry,
+    TfsCreatureScriptRegistry,
+};
 pub use tfs_entities::{
     materialize_tfs_spawn_templates, materialize_tfs_static_spawns, TfsEntityAppearance,
     TfsEntityCatalog, TfsEntityDefinition, TfsEntityKind, TfsSpawnResolution,
+};
+pub use tfs_globalevents::{
+    load_tfs_globalevent_registry, parse_tfs_globalevents_xml, TfsGlobalEventEntry,
+    TfsGlobalEventRegistry,
+};
+pub use tfs_movements::{
+    load_tfs_movement_registry, parse_tfs_movements_xml, TfsMoveEventEntry, TfsMoveEventRegistry,
+    TfsMoveEventType,
 };
 pub use tfs_registry::{
     resolve_tfs_registry_script_reference, TfsContentInventory, TfsRegistryCategory,
