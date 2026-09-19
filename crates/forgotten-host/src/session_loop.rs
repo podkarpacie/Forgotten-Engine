@@ -4262,7 +4262,8 @@ pub(crate) fn handle_native_otclient_game(
                 // Operator-registered Lua talkactions dispatch through the resource-capped
                 // sandbox. A script cannot mutate authoritative state, read files, open sockets,
                 // or exhaust memory/instructions without a bounded rejection; only bounded typed
-                // effects (say text, teleport) cross back and are validated/applied here.
+                // effects (say text, teleport, heal, give-item) cross back and are validated and
+                // applied here against authoritative state.
                 if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
                     && request.channel_id.is_none()
                     && request.recipient.is_none()
@@ -4297,6 +4298,65 @@ pub(crate) fn handle_native_otclient_game(
                                                 encode_native_otclient_status_message(
                                                     &config.client_profile,
                                                     "That destination is blocked.",
+                                                )
+                                                .map_err(HostError::Protocol)?;
+                                            write_frame(stream, &reply_frame)?;
+                                        }
+                                    }
+                                    SandboxedLuaEffect::Heal { health, mana } => {
+                                        let mut vitals =
+                                            shared_world.player_vitals(character.id)?;
+                                        if health > 0 {
+                                            vitals.health = vitals
+                                                .health
+                                                .saturating_add(health)
+                                                .min(vitals.max_health);
+                                        }
+                                        if mana > 0 {
+                                            vitals.mana = vitals
+                                                .mana
+                                                .saturating_add(mana)
+                                                .min(vitals.max_mana);
+                                        }
+                                        shared_world
+                                            .lock()?
+                                            .update_player_vitals(character.id, vitals)
+                                            .map_err(HostError::Core)?;
+                                        shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
+                                        database.update_player_vitals(
+                                            character.id,
+                                            PersistedPlayerVitals {
+                                                health: vitals.health,
+                                                max_health: vitals.max_health,
+                                                mana: vitals.mana,
+                                                max_mana: vitals.max_mana,
+                                                capacity: vitals.capacity,
+                                                magic_level: vitals.magic_level,
+                                            },
+                                        )?;
+                                        let self_native_id = native_player_id(character.id)?;
+                                        let health_update = encode_native_otclient_creature_health(
+                                            &config.client_profile,
+                                            self_native_id,
+                                            vitals.health,
+                                            vitals.max_health,
+                                        )
+                                        .map_err(HostError::Protocol)?;
+                                        write_frame(stream, &health_update)?;
+                                        observed_vitals_epoch = shared_world.vitals_epoch();
+                                    }
+                                    SandboxedLuaEffect::GiveItem { id, count } => {
+                                        if let Some(message) = give_items_to_player(
+                                            shared_world,
+                                            &mut database,
+                                            character.id,
+                                            id,
+                                            u64::from(count),
+                                        )? {
+                                            let reply_frame =
+                                                encode_native_otclient_status_message(
+                                                    &config.client_profile,
+                                                    &message,
                                                 )
                                                 .map_err(HostError::Protocol)?;
                                             write_frame(stream, &reply_frame)?;

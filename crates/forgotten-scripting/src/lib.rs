@@ -265,6 +265,9 @@ pub struct SandboxedLuaCallbackDispatchOutcome {
 /// Bounded number of typed effects one callback may request in a single dispatch.
 pub const MAX_SANDBOXED_LUA_EFFECTS: usize = 8;
 pub const MAX_SANDBOXED_LUA_EFFECT_TEXT_BYTES: usize = 255;
+/// Maximum unit count one give-item effect may request. A request above this is rejected outright
+/// rather than admitted to the host's container-staging loop.
+pub const MAX_SANDBOXED_LUA_EFFECT_ITEM_COUNT: u16 = 100;
 
 /// One bounded, side-effect-free intent a sandbox callback may return. It carries no authority:
 /// the host must validate and apply it against authoritative state, so a script can never mutate
@@ -272,7 +275,22 @@ pub const MAX_SANDBOXED_LUA_EFFECT_TEXT_BYTES: usize = 255;
 #[derive(Debug, Clone, PartialEq)]
 pub enum SandboxedLuaEffect {
     Say(String),
-    Teleport { x: u16, y: u16, z: u8 },
+    Teleport {
+        x: u16,
+        y: u16,
+        z: u8,
+    },
+    /// Capped health/mana restore applied to the dispatch subject. Values are u16 and the host
+    /// clamps to the subject's current maximums; both zero is rejected as a no-op intent.
+    Heal {
+        health: u16,
+        mana: u16,
+    },
+    /// Bounded unit delivery of one server item id to the dispatch subject's owned containers.
+    GiveItem {
+        id: u16,
+        count: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -736,9 +754,10 @@ fn sandboxed_lua_value(value: Value) -> Option<SandboxedLuaValue> {
 }
 
 /// Extracts a bounded list of typed effects from an array-of-effect-table return:
-/// `{ { say = "text" }, { teleport = { x = 1, y = 2, z = 7 } } }`. Any non-table value, a
-/// non-sequence element, an effect entry with no recognized field, an oversize/control text, an
-/// out-of-range coordinate, or more than the bounded effect count rejects the whole return.
+/// `{ { say = "text" }, { teleport = { x = 1, y = 2, z = 7 } }, { heal = { health = 10, mana = 0 } },
+/// { give_item = { id = 2160, count = 1 } } }`. Any non-table value, a non-sequence element, an
+/// effect entry with no recognized field, an oversize/control text, an out-of-range coordinate, a
+/// zero heal/give-item, or more than the bounded effect count rejects the whole return.
 fn sandboxed_lua_effects(value: Value) -> Option<Vec<SandboxedLuaEffect>> {
     let Value::Table(table) = value else {
         return None;
@@ -775,6 +794,22 @@ fn sandboxed_lua_effects(value: Value) -> Option<Vec<SandboxedLuaEffect>> {
             effects.push(parse_teleport_effect(position)?);
             produced = true;
         }
+        let heal: Option<Table> = match effect.get("heal") {
+            Ok(value) => value,
+            Err(_) => return None,
+        };
+        if let Some(amounts) = heal {
+            effects.push(parse_heal_effect(amounts)?);
+            produced = true;
+        }
+        let give_item: Option<Table> = match effect.get("give_item") {
+            Ok(value) => value,
+            Err(_) => return None,
+        };
+        if let Some(item) = give_item {
+            effects.push(parse_give_item_effect(item)?);
+            produced = true;
+        }
         if !produced {
             return None;
         }
@@ -787,6 +822,24 @@ fn parse_teleport_effect(position: Table) -> Option<SandboxedLuaEffect> {
     let y: u16 = position.get("y").ok()?;
     let z: u8 = position.get("z").ok()?;
     Some(SandboxedLuaEffect::Teleport { x, y, z })
+}
+
+fn parse_heal_effect(amounts: Table) -> Option<SandboxedLuaEffect> {
+    let health: u16 = amounts.get("health").ok()?;
+    let mana: u16 = amounts.get("mana").ok()?;
+    if health == 0 && mana == 0 {
+        return None;
+    }
+    Some(SandboxedLuaEffect::Heal { health, mana })
+}
+
+fn parse_give_item_effect(item: Table) -> Option<SandboxedLuaEffect> {
+    let id: u16 = item.get("id").ok()?;
+    let count: u16 = item.get("count").ok()?;
+    if id == 0 || count == 0 || count > MAX_SANDBOXED_LUA_EFFECT_ITEM_COUNT {
+        return None;
+    }
+    Some(SandboxedLuaEffect::GiveItem { id, count })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1216,6 +1269,71 @@ mod tests {
             .unwrap();
         assert_eq!(
             dispatcher.dispatch_effects("bad-coord", &input).state,
+            SandboxedLuaCallbackDispatchState::UnsupportedValue
+        );
+    }
+
+    #[test]
+    fn callback_dispatcher_extracts_heal_and_give_item_effect_intents() {
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "recover",
+                "return function() return { { heal = { health = 25, mana = 0 } }, { give_item = { id = 2160, count = 2 } } } end",
+            )
+            .unwrap();
+        let input = SandboxedLuaCallbackInput {
+            event_kind: "talkaction".into(),
+            subject_id: 9,
+            value: 0,
+            argument: String::new(),
+        };
+        let outcome = dispatcher.dispatch_effects("recover", &input);
+        assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
+        assert_eq!(
+            outcome.effects,
+            vec![
+                SandboxedLuaEffect::Heal {
+                    health: 25,
+                    mana: 0
+                },
+                SandboxedLuaEffect::GiveItem { id: 2160, count: 2 },
+            ]
+        );
+
+        dispatcher
+            .register_callback(
+                "zero-heal",
+                "return function() return { { heal = { health = 0, mana = 0 } } } end",
+            )
+            .unwrap();
+        assert_eq!(
+            dispatcher.dispatch_effects("zero-heal", &input).state,
+            SandboxedLuaCallbackDispatchState::UnsupportedValue
+        );
+
+        dispatcher
+            .register_callback(
+                "oversized-give",
+                format!(
+                    "return function() return {{ {{ give_item = {{ id = 2160, count = {} }} }} }} end",
+                    MAX_SANDBOXED_LUA_EFFECT_ITEM_COUNT + 1
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            dispatcher.dispatch_effects("oversized-give", &input).state,
+            SandboxedLuaCallbackDispatchState::UnsupportedValue
+        );
+
+        dispatcher
+            .register_callback(
+                "zero-give",
+                "return function() return { { give_item = { id = 2160, count = 0 } } } end",
+            )
+            .unwrap();
+        assert_eq!(
+            dispatcher.dispatch_effects("zero-give", &input).state,
             SandboxedLuaCallbackDispatchState::UnsupportedValue
         );
     }
