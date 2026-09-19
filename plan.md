@@ -207,6 +207,18 @@ temple → relog retains everything. All under stock OTCv8 7.4.
 - [ ] **Perf guardrails (0%)** — budget enforcement under load, script timeouts don't stall world
       tick *(est. 4 days)*
 
+> **Architectural decision (2026-09-19, Option B — bound-function API, decided by operator):**
+> the closed typed-intent enum (`SandboxedLuaEffect`) does not amortise — every TFS function
+> costs a new variant plus session-loop wiring, a fixed unit of work that cannot reach the exit
+> criterion ("simple Lua scripts run unmodified"). Phase 2 therefore reworks the dispatcher to
+> register bounded host functions directly into the sandboxed Lua state, keeping the existing
+> instruction/memory budgets, traversal rejection, and primitive-only boundaries. After the
+> rework each new API function is a small registration, not a variant plus branch. The six
+> existing intents (Say/Teleport/Heal/GiveItem/RemoveItem/MagicEffect) plus the subject-position
+> read remain as the proven safe core. Reason: drop-in TFS compatibility is core to the product
+> thesis, and every variant added before the rework is work the rework discards. Phase 2 time
+> estimates below are suspended pending the rework landing; they will be re-baselined after.
+
 #### 2.2 Data Migration Tooling — ~55%
 - [x] `tfs-audit`: config/world/items/spawns/houses/registries/entities inventory + diagnostics
 - [x] Conversion-readiness report distinguishing importable vs deferred content
