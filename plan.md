@@ -238,6 +238,14 @@ temple → relog retains everything. All under stock OTCv8 7.4.
 > consumables, then reassess. Checkpoint after increment 3: stocktake what remains (one more
 > cohesive chunk vs. several unrelated ones) before picking increment 4 on momentum.
 >
+> Prioritization (2026-09-19, operator direction: hardest first, 2-month playable horizon):
+> remaining Bug #5 work orders by difficulty, not size — ThrowItem matrix restructure (needs a
+> dispatcher plus per-source handlers; interleaved source-by-target branches cannot split
+> cleanly) before the bootstrap/drain head (sequential infrastructure, hardest to move), with
+> small fry (flood/mute gates, LeaveGame/Stop, nested one-offs) explicitly last. Easy wins do
+> not jump the queue. Full-vision scope (frozen profiles, hardening evidence, guides) stays
+> cut; the horizon is max playable scope, not 100%.
+>
 > Refinement (2026-09-19, trade increment): `SessionContext` is for handlers needing broad
 > session state (five or more items). Narrow handlers needing four or fewer (trade rejection,
 > NPC close) take direct parameters instead — an 18-line context literal where it fits nothing
