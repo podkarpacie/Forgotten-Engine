@@ -186,6 +186,17 @@ impl SandboxedLuaExecutor {
     }
 }
 
+/// An authoritative subject position the host may attach to one callback invocation so scripts
+/// can read a `getThingPos`-style coordinate without any world access. It crosses as a fifth
+/// `{ x, y, z }` argument (or nil when the caller has no game position); callbacks written for
+/// fewer arguments simply ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxedLuaPosition {
+    pub x: u16,
+    pub y: u16,
+    pub z: u8,
+}
+
 /// Typed primitive arguments admitted to one explicitly registered callback. The dispatcher does
 /// not expose world state, host objects, Lua tables, paths, files, network access, modules, or
 /// mutable server APIs. The event kind is a nonempty operator-chosen label bounded to 64 bytes,
@@ -198,6 +209,8 @@ pub struct SandboxedLuaCallbackInput {
     /// Optional bounded string payload (for example a talkaction argument after the trigger).
     /// The callback receives it as a fourth argument; three-parameter callbacks simply ignore it.
     pub argument: String,
+    /// Optional authoritative subject position, received as a fifth `{ x, y, z }` argument.
+    pub position: Option<SandboxedLuaPosition>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,6 +303,20 @@ pub enum SandboxedLuaEffect {
     GiveItem {
         id: u16,
         count: u16,
+    },
+    /// Bounded unit removal of one server item id from the dispatch subject's owned equipment
+    /// and containers. The host applies it atomically and reports insufficiency instead.
+    RemoveItem {
+        id: u16,
+        count: u16,
+    },
+    /// A client-visible tile effect at an explicit coordinate. The host emits it to the dispatch
+    /// subject's session only; broadcast to spectators stays deferred.
+    MagicEffect {
+        x: u16,
+        y: u16,
+        z: u8,
+        kind: u8,
     },
 }
 
@@ -400,8 +427,8 @@ impl SandboxedLuaCallbackDispatcher {
     }
 
     /// Invokes one registered callback in a new no-standard-library VM. Callback state cannot
-    /// carry across invocations, and only the explicitly supplied primitive input crosses the
-    /// sandbox boundary.
+    /// carry across invocations, and only the explicitly supplied primitive input plus an
+    /// optional subject position cross the sandbox boundary.
     pub fn dispatch(
         &self,
         callback_name: &str,
@@ -458,11 +485,13 @@ impl SandboxedLuaCallbackDispatcher {
             let subject_id = i64::try_from(input.subject_id).map_err(|_| {
                 mlua::Error::RuntimeError("callback subject ID out of signed integer range".into())
             })?;
+            let position = sandboxed_lua_position_value(&lua, input.position)?;
             callback.call::<_, Value>((
                 input.event_kind.as_str(),
                 subject_id,
                 input.value,
                 input.argument.as_str(),
+                position,
             ))
         });
         let instruction_checks = instruction_checks.load(Ordering::Relaxed);
@@ -549,11 +578,13 @@ impl SandboxedLuaCallbackDispatcher {
             let subject_id = i64::try_from(input.subject_id).map_err(|_| {
                 mlua::Error::RuntimeError("callback subject ID out of signed integer range".into())
             })?;
+            let position = sandboxed_lua_position_value(&lua, input.position)?;
             callback.call::<_, Value>((
                 input.event_kind.as_str(),
                 subject_id,
                 input.value,
                 input.argument.as_str(),
+                position,
             ))
         });
         let instruction_checks = instruction_checks.load(Ordering::Relaxed);
@@ -753,11 +784,29 @@ fn sandboxed_lua_value(value: Value) -> Option<SandboxedLuaValue> {
     }
 }
 
+/// Builds the fifth callback argument from an optional authoritative subject position: a
+/// `{ x, y, z }` table, or nil when the caller has no game position.
+fn sandboxed_lua_position_value(
+    lua: &Lua,
+    position: Option<SandboxedLuaPosition>,
+) -> Result<Value<'_>, mlua::Error> {
+    let Some(position) = position else {
+        return Ok(Value::Nil);
+    };
+    let table = lua.create_table()?;
+    table.set("x", position.x)?;
+    table.set("y", position.y)?;
+    table.set("z", position.z)?;
+    Ok(Value::Table(table))
+}
+
 /// Extracts a bounded list of typed effects from an array-of-effect-table return:
 /// `{ { say = "text" }, { teleport = { x = 1, y = 2, z = 7 } }, { heal = { health = 10, mana = 0 } },
-/// { give_item = { id = 2160, count = 1 } } }`. Any non-table value, a non-sequence element, an
-/// effect entry with no recognized field, an oversize/control text, an out-of-range coordinate, a
-/// zero heal/give-item, or more than the bounded effect count rejects the whole return.
+/// { give_item = { id = 2160, count = 1 } }, { remove_item = { id = 2160, count = 1 } },
+/// { magic_effect = { x = 1, y = 2, z = 7, kind = 10 } } }`. Any non-table value, a non-sequence
+/// element, an effect entry with no recognized field, an oversize/control text, an out-of-range
+/// coordinate, a zero heal/give-item/remove-item, a zero magic-effect kind, or more than the
+/// bounded effect count rejects the whole return.
 fn sandboxed_lua_effects(value: Value) -> Option<Vec<SandboxedLuaEffect>> {
     let Value::Table(table) = value else {
         return None;
@@ -810,6 +859,22 @@ fn sandboxed_lua_effects(value: Value) -> Option<Vec<SandboxedLuaEffect>> {
             effects.push(parse_give_item_effect(item)?);
             produced = true;
         }
+        let remove_item: Option<Table> = match effect.get("remove_item") {
+            Ok(value) => value,
+            Err(_) => return None,
+        };
+        if let Some(item) = remove_item {
+            effects.push(parse_remove_item_effect(item)?);
+            produced = true;
+        }
+        let magic_effect: Option<Table> = match effect.get("magic_effect") {
+            Ok(value) => value,
+            Err(_) => return None,
+        };
+        if let Some(effect_table) = magic_effect {
+            effects.push(parse_magic_effect(effect_table)?);
+            produced = true;
+        }
         if !produced {
             return None;
         }
@@ -840,6 +905,26 @@ fn parse_give_item_effect(item: Table) -> Option<SandboxedLuaEffect> {
         return None;
     }
     Some(SandboxedLuaEffect::GiveItem { id, count })
+}
+
+fn parse_remove_item_effect(item: Table) -> Option<SandboxedLuaEffect> {
+    let id: u16 = item.get("id").ok()?;
+    let count: u16 = item.get("count").ok()?;
+    if id == 0 || count == 0 || count > MAX_SANDBOXED_LUA_EFFECT_ITEM_COUNT {
+        return None;
+    }
+    Some(SandboxedLuaEffect::RemoveItem { id, count })
+}
+
+fn parse_magic_effect(effect_table: Table) -> Option<SandboxedLuaEffect> {
+    let x: u16 = effect_table.get("x").ok()?;
+    let y: u16 = effect_table.get("y").ok()?;
+    let z: u8 = effect_table.get("z").ok()?;
+    let kind: u8 = effect_table.get("kind").ok()?;
+    if kind == 0 {
+        return None;
+    }
+    Some(SandboxedLuaEffect::MagicEffect { x, y, z, kind })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1059,6 +1144,7 @@ mod tests {
             subject_id: 7,
             value: 41,
             argument: String::new(),
+            position: None,
         };
         let outcome = dispatcher.dispatch("award", &input);
         assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
@@ -1105,6 +1191,7 @@ mod tests {
             subject_id: 9,
             value: 0,
             argument: "100 100".into(),
+            position: None,
         };
         assert_eq!(
             dispatcher.dispatch("echo-arg", &input).value,
@@ -1120,6 +1207,7 @@ mod tests {
             subject_id: 1,
             value: 7,
             argument: "ignored".into(),
+            position: None,
         };
         assert_eq!(
             dispatcher.dispatch("legacy", &legacy).value,
@@ -1135,6 +1223,7 @@ mod tests {
                         subject_id: 1,
                         value: 0,
                         argument: "x".repeat(MAX_SANDBOXED_LUA_CALLBACK_ARGUMENT_BYTES + 1),
+                        position: None,
                     },
                 )
                 .state,
@@ -1171,6 +1260,7 @@ mod tests {
             subject_id: 1,
             value: 0,
             argument: String::new(),
+            position: None,
         };
         assert_eq!(
             dispatcher.dispatch("typed", &input).state,
@@ -1189,6 +1279,7 @@ mod tests {
                         subject_id: u64::MAX,
                         value: 0,
                         argument: String::new(),
+                        position: None,
                     }
                 )
                 .state,
@@ -1203,6 +1294,7 @@ mod tests {
                         subject_id: 1,
                         value: 0,
                         argument: String::new(),
+                        position: None,
                     }
                 )
                 .state,
@@ -1217,6 +1309,7 @@ mod tests {
                         subject_id: 1,
                         value: 0,
                         argument: String::new(),
+                        position: None,
                     }
                 )
                 .state,
@@ -1238,6 +1331,7 @@ mod tests {
             subject_id: 9,
             value: 0,
             argument: String::new(),
+            position: None,
         };
         let outcome = dispatcher.dispatch_effects("go", &input);
         assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
@@ -1287,6 +1381,7 @@ mod tests {
             subject_id: 9,
             value: 0,
             argument: String::new(),
+            position: None,
         };
         let outcome = dispatcher.dispatch_effects("recover", &input);
         assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
@@ -1339,6 +1434,109 @@ mod tests {
     }
 
     #[test]
+    fn callback_dispatcher_extracts_remove_item_and_magic_effect_intents() {
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "consume",
+                "return function() return { { remove_item = { id = 2160, count = 3 } }, { magic_effect = { x = 10, y = 20, z = 7, kind = 10 } } } end",
+            )
+            .unwrap();
+        let input = SandboxedLuaCallbackInput {
+            event_kind: "talkaction".into(),
+            subject_id: 9,
+            value: 0,
+            argument: String::new(),
+            position: None,
+        };
+        let outcome = dispatcher.dispatch_effects("consume", &input);
+        assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
+        assert_eq!(
+            outcome.effects,
+            vec![
+                SandboxedLuaEffect::RemoveItem { id: 2160, count: 3 },
+                SandboxedLuaEffect::MagicEffect {
+                    x: 10,
+                    y: 20,
+                    z: 7,
+                    kind: 10
+                },
+            ]
+        );
+
+        dispatcher
+            .register_callback(
+                "zero-kind",
+                "return function() return { { magic_effect = { x = 1, y = 2, z = 7, kind = 0 } } } end",
+            )
+            .unwrap();
+        assert_eq!(
+            dispatcher.dispatch_effects("zero-kind", &input).state,
+            SandboxedLuaCallbackDispatchState::UnsupportedValue
+        );
+
+        dispatcher
+            .register_callback(
+                "zero-remove",
+                "return function() return { { remove_item = { id = 2160, count = 0 } } } end",
+            )
+            .unwrap();
+        assert_eq!(
+            dispatcher.dispatch_effects("zero-remove", &input).state,
+            SandboxedLuaCallbackDispatchState::UnsupportedValue
+        );
+    }
+
+    #[test]
+    fn callback_dispatcher_passes_subject_position_as_an_optional_fifth_argument() {
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "where",
+                "return function(_, _, _, _, position) if position == nil then return 'none' end return position.x + position.y + position.z end",
+            )
+            .unwrap();
+        let positioned = SandboxedLuaCallbackInput {
+            event_kind: "talkaction".into(),
+            subject_id: 9,
+            value: 0,
+            argument: String::new(),
+            position: Some(SandboxedLuaPosition {
+                x: 100,
+                y: 200,
+                z: 7,
+            }),
+        };
+        assert_eq!(
+            dispatcher.dispatch("where", &positioned).value,
+            Some(SandboxedLuaValue::Integer(307))
+        );
+        let unpositioned = SandboxedLuaCallbackInput {
+            position: None,
+            ..positioned.clone()
+        };
+        // A callback written for fewer arguments ignores the trailing position.
+        dispatcher
+            .register_callback("legacy", "return function(kind, _, value) return value end")
+            .unwrap();
+        let legacy = SandboxedLuaCallbackInput {
+            event_kind: "talkaction".into(),
+            subject_id: 1,
+            value: 7,
+            argument: "ignored".into(),
+            position: Some(SandboxedLuaPosition { x: 1, y: 2, z: 3 }),
+        };
+        assert_eq!(
+            dispatcher.dispatch("legacy", &legacy).value,
+            Some(SandboxedLuaValue::Integer(7))
+        );
+        assert_eq!(
+            dispatcher.dispatch("where", &unpositioned).value,
+            Some(SandboxedLuaValue::Text("none".into()))
+        );
+    }
+
+    #[test]
     fn callback_dispatcher_loads_only_bounded_callback_files_under_its_root() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1364,6 +1562,7 @@ mod tests {
                         subject_id: 7,
                         value: 41,
                         argument: String::new(),
+                        position: None,
                     },
                 )
                 .value,
