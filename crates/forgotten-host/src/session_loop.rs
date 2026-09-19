@@ -2506,90 +2506,88 @@ pub(crate) fn handle_native_otclient_game(
                 }
             }
             NativeOtClientGameAction::ChangeFightModes(request) => {
-                let mode = match request.mode {
-                    NativeOtClientFightMode::Attack => PlayerFightMode::Attack,
-                    NativeOtClientFightMode::Balanced => PlayerFightMode::Balanced,
-                    NativeOtClientFightMode::Defense => PlayerFightMode::Defense,
-                };
-                let changed = shared_world.replace_player_fight_mode_state(
-                    character.id,
-                    PlayerFightModeState {
-                        mode,
-                        chase: request.chase,
-                        secure: request.secure,
-                    },
-                )?;
-                if changed {
-                    let player_modes =
-                        encode_native_otclient_player_modes(&config.client_profile, request)
-                            .map_err(HostError::Protocol)?;
-                    write_frame(stream, &player_modes)?;
+                // Fight-mode change; see native_combat.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_change_fight_modes_action(&mut ctx, request)?;
                 }
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "action=change-fight-modes outcome=applied changed={changed} delivery={}",
-                        if changed { "player-modes" } else { "unchanged" }
-                    ),
-                );
             }
             NativeOtClientGameAction::CloseContainer(container_id) => {
-                closed_container_ids.insert(container_id);
-                open_corpse_windows.remove(&container_id);
-                open_content_windows.remove(&container_id);
-                let close =
-                    encode_native_otclient_close_container(&config.client_profile, container_id)
-                        .map_err(HostError::Protocol)?;
-                write_frame(stream, &close)?;
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "action=close-container outcome=session-view-closed container-id={container_id}"
-                    ),
-                );
+                // Container view close; see container_views.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_close_container_action(
+                        &mut ctx,
+                        container_id,
+                        &mut closed_container_ids,
+                        &mut open_corpse_windows,
+                        &mut open_content_windows,
+                    )?;
+                }
             }
             NativeOtClientGameAction::UpArrowContainer(container_id) => {
-                native_diagnostic(
+                // Container up-arrow (deferred); see container_views.rs.
+                apply_native_up_arrow_container_action(
                     config.extended_diagnostics,
                     peer,
-                    &format!(
-                        "action=up-arrow-container outcome=deferred-no-supported-parent container-id={container_id}"
-                    ),
-                );
+                    container_id,
+                )?;
             }
             NativeOtClientGameAction::UpdateContainer(container_id) => {
-                let containers = shared_world.player_containers(character.id)?;
-                let frame = containers
-                    .container(container_id)
-                    .map(|container| {
-                        native_classic_container_frame(
-                            &config.client_profile,
-                            config.item_presentation_catalog.as_deref(),
-                            container,
-                        )
-                    })
-                    .transpose()
-                    .map_err(HostError::Protocol)?
-                    .flatten();
-                let refreshed = frame.is_some();
-                if let Some(frame) = frame {
-                    closed_container_ids.remove(&container_id);
-                    write_frame(stream, &frame)?;
+                // Container view refresh; see container_views.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_update_container_action(
+                        &mut ctx,
+                        container_id,
+                        &mut closed_container_ids,
+                    )?;
                 }
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "action=update-container outcome={} container-id={container_id}",
-                        if refreshed {
-                            "session-view-refreshed"
-                        } else {
-                            "deferred-unavailable-or-unmapped"
-                        }
-                    ),
-                );
             }
             NativeOtClientGameAction::UseItem {
                 position,

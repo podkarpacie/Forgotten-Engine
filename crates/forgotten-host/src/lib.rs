@@ -8,6 +8,7 @@ pub mod operator;
 
 mod bank;
 mod consumables;
+mod container_views;
 mod frames;
 mod gm_commands;
 mod heartbeat;
@@ -72,6 +73,10 @@ pub(crate) use bank::{
     apply_native_bank_keyword_talk, native_carried_weight, NATIVE_BANK_NPC_RANGE_TILES,
 };
 pub(crate) use consumables::apply_native_owned_consumable_use;
+pub(crate) use container_views::{
+    apply_native_close_container_action, apply_native_up_arrow_container_action,
+    apply_native_update_container_action,
+};
 pub(crate) use gm_commands::apply_native_gm_talkaction_talk;
 #[cfg(test)]
 pub(crate) use gm_commands::handle_native_gm_talkaction;

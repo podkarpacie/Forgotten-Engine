@@ -1034,6 +1034,41 @@ pub(crate) fn apply_native_cancel_attack_and_follow_action(
     Ok(())
 }
 
+/// Applies one fight-mode change: persists the mode/chase/secure state and emits the
+/// player-modes record only on a real change. Never fails the session.
+pub(crate) fn apply_native_change_fight_modes_action(
+    ctx: &mut SessionContext<'_>,
+    request: NativeOtClientFightModeRequest,
+) -> Result<(), HostError> {
+    let mode = match request.mode {
+        NativeOtClientFightMode::Attack => PlayerFightMode::Attack,
+        NativeOtClientFightMode::Balanced => PlayerFightMode::Balanced,
+        NativeOtClientFightMode::Defense => PlayerFightMode::Defense,
+    };
+    let changed = ctx.shared_world.replace_player_fight_mode_state(
+        ctx.character_id,
+        PlayerFightModeState {
+            mode,
+            chase: request.chase,
+            secure: request.secure,
+        },
+    )?;
+    if changed {
+        let player_modes = encode_native_otclient_player_modes(&ctx.config.client_profile, request)
+            .map_err(HostError::Protocol)?;
+        write_frame(&mut *ctx.stream, &player_modes)?;
+    }
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!(
+            "action=change-fight-modes outcome=applied changed={changed} delivery={}",
+            if changed { "player-modes" } else { "unchanged" }
+        ),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
