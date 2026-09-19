@@ -3,14 +3,6 @@
 
 use super::*;
 
-/// A resolved consumable item location for one UseItem request: the item's server id plus the
-/// single owning inventory position it was addressed from (equipment slot or container content).
-struct ConsumableSource {
-    server_id: u16,
-    slot: Option<EquipmentSlot>,
-    container_ref: Option<(u8, usize)>,
-}
-
 pub(crate) fn handle_native_otclient_game(
     stream: &mut TcpStream,
     peer: SocketAddr,
@@ -2666,173 +2658,29 @@ pub(crate) fn handle_native_otclient_game(
                     // No contents on this item: fall through to consumable handling.
                 }
 
-                let source_is_own_inventory = position.x == 0xffff;
-                // Owned-inventory consumable use runs before map-item routing: classic clients
-                // address own equipment with x=0xFFFF and a plain slot code in y, and own
-                // container items with the container flag plus the child index in z.
-                if source_is_own_inventory {
-                    if observed_dead {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=use-item outcome=deferred-consume-while-dead",
-                        );
-                        continue;
-                    }
-                    let consumable_target: Option<ConsumableSource> =
-                        if position.x == 0xffff && position.y & 0x40 == 0 {
-                            EquipmentSlot::from_code(position.y as u8).and_then(|slot| {
-                                let equipment = shared_world.player_equipment(character.id).ok()?;
-                                let item = equipment.item(slot)?;
-                                Some(ConsumableSource {
-                                    server_id: item.server_id,
-                                    slot: Some(slot),
-                                    container_ref: None,
-                                })
-                            })
-                        } else if position.x == 0xffff && position.y & 0x40 != 0 {
-                            let container_id = (position.y & 0x0f) as u8;
-                            let child_index = usize::from(position.z);
-                            shared_world
-                                .player_containers(character.id)
-                                .ok()
-                                .and_then(|containers| containers.container(container_id).cloned())
-                                .and_then(|container| container.items.item(child_index).cloned())
-                                .map(|item| ConsumableSource {
-                                    server_id: item.server_id,
-                                    slot: None,
-                                    container_ref: Some((container_id, child_index)),
-                                })
-                        } else {
-                            None
-                        };
-                    let Some(ConsumableSource {
-                        server_id: consumable_server_id,
-                        slot,
-                        container_ref,
-                    }) = consumable_target
-                    else {
-                        continue;
-                    };
-                    let _ = client_thing_id;
-                    let Some(&effect) = config
-                        .consumable_effects
-                        .as_deref()
-                        .and_then(|effects| effects.get(&consumable_server_id))
-                    else {
-                        continue;
-                    };
-                    let (heal, mana_restore) = (effect.health, effect.mana);
-                    // Classic fed state (plan v49 slice 16): eating while a food window is
-                    // active answers "You are full." and leaves the item untouched.
-                    if effect.regeneration_seconds > 0 {
-                        let granted = shared_world
-                            .lock()?
-                            .grant_player_food_window(character.id, effect.regeneration_seconds)
-                            .map_err(HostError::Core)?;
-                        if !granted {
-                            let full_notice = encode_native_otclient_status_message(
-                                &config.client_profile,
-                                "You are full.",
-                            )
-                            .map_err(HostError::Protocol)?;
-                            write_frame(stream, &full_notice)?;
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                &format!(
-                                    "action=use-item outcome=too-full server-id={consumable_server_id}"
-                                ),
-                            );
-                            continue;
-                        }
-                    }
-                    let mut vitals = shared_world.player_vitals(character.id)?;
-                    if heal > 0 {
-                        vitals.health = vitals.health.saturating_add(heal).min(vitals.max_health);
-                    }
-                    if mana_restore > 0 {
-                        vitals.mana = vitals
-                            .mana
-                            .saturating_add(mana_restore)
-                            .min(vitals.max_mana);
-                    }
-                    // Consume one unit from the resolved inventory location.
-                    match (&slot, &container_ref) {
-                        (Some(slot), _) => {
-                            let mut equipment = shared_world.player_equipment(character.id)?;
-                            if let Some(item) = equipment.item(*slot).cloned() {
-                                if item.count > 1 {
-                                    let mut remaining = item;
-                                    remaining.count -= 1;
-                                    equipment.equip(*slot, remaining);
-                                } else {
-                                    equipment.unequip(*slot);
-                                }
-                            }
-                            shared_world
-                                .replace_player_equipment(character.id, equipment.clone())?;
-                            database
-                                .replace_player_equipment(character.id, &equipment)
-                                .map_err(HostError::Persistence)?;
-                        }
-                        (_, Some((container_id, child_index))) => {
-                            let mut containers = shared_world.player_containers(character.id)?;
-                            let mut container = match containers.remove(*container_id) {
-                                Some(container) => container,
-                                None => continue,
-                            };
-                            if !container.items.consume_item_unit(*child_index) {
-                                continue;
-                            }
-                            containers.insert(container).map_err(HostError::Core)?;
-                            database
-                                .replace_player_containers(character.id, &containers)
-                                .map_err(HostError::Persistence)?;
-                        }
-                        _ => {}
-                    }
-                    shared_world
-                        .lock()?
-                        .update_player_vitals(character.id, vitals)
-                        .map_err(HostError::Core)?;
-                    shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
-                    database
-                        .update_player_vitals(
-                            character.id,
-                            PersistedPlayerVitals {
-                                health: vitals.health,
-                                max_health: vitals.max_health,
-                                mana: vitals.mana,
-                                max_mana: vitals.max_mana,
-                                capacity: vitals.capacity,
-                                magic_level: vitals.magic_level,
-                            },
-                        )
-                        .map_err(HostError::Persistence)?;
-                    let self_native_id = native_player_id(character.id)?;
-                    let health_update = encode_native_otclient_creature_health(
-                        &config.client_profile,
-                        self_native_id,
-                        vitals.health,
-                        vitals.max_health,
-                    )
-                    .map_err(HostError::Protocol)?;
-                    write_frame(stream, &health_update)?;
-                    observed_vitals_epoch = shared_world.vitals_epoch();
-                    native_diagnostic(
-                        config.extended_diagnostics,
+                // Owned-inventory consumable use runs before map-item routing; see
+                // consumables.rs. A consumed record never reaches map-item routing.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
                         peer,
-                        &format!(
-                            "action=use-item outcome=consumed server-id={} heal={} mana={} health={} mana={}",
-                            consumable_server_id,
-                            heal,
-                            mana_restore,
-                            vitals.health,
-                            vitals.mana,
-                        ),
-                    );
-                    continue;
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing,
+                        player_position: &mut player_position,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    if apply_native_owned_consumable_use(&mut ctx, position)?
+                        == SessionActionOutcome::Handled
+                    {
+                        continue;
+                    }
                 }
                 // Backpack-in-hand: using the equipped backpack item opens the lowest owned
                 // top-level container as a client window. FE links one backpack to one

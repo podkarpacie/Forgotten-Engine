@@ -7,6 +7,7 @@
 pub mod operator;
 
 mod bank;
+mod consumables;
 mod frames;
 mod gm_commands;
 mod heartbeat;
@@ -56,6 +57,7 @@ mod world_static_creatures;
 pub(crate) use bank::{
     handle_native_bank_keyword, native_carried_weight, NATIVE_BANK_NPC_RANGE_TILES,
 };
+pub(crate) use consumables::apply_native_owned_consumable_use;
 pub(crate) use gm_commands::handle_native_gm_talkaction;
 pub(crate) use inspection::{
     encode_shared_native_world_viewport, native_creature_inspection_message,
