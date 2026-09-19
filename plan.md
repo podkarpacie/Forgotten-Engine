@@ -218,6 +218,25 @@ temple → relog retains everything. All under stock OTCv8 7.4.
 > read remain as the proven safe core. Reason: drop-in TFS compatibility is core to the product
 > thesis, and every variant added before the rework is work the rework discards. Phase 2 time
 > estimates below are suspended pending the rework landing; they will be re-baselined after.
+>
+> **Structural finding (2026-09-19, session_loop.rs):** the 4,988-line remainder is a SINGLE
+> function (`handle_native_otclient_game`), not a large file of small items. That is a different,
+> worse problem than the monoliths already split: one scope holds every session local at once,
+> no piece is testable in isolation, and every branch is mutually reachable. The verbatim-move +
+> glob re-export discipline that worked for the crate splits does NOT apply here; this needs
+> function-level extraction, and "no logic changes" claims rest on tests-green, not textual
+> identity — commit messages on these increments say "extracted, tests green", never "verbatim".
+> Increment 1 (Lua talkaction apply → `talkactions.rs` via a context struct, `4261b9d`) proves
+> the pattern. Decisions for the remaining increments, settled now rather than at increment 8:
+> (a) handlers converge on ONE shared `SessionContext` for universal plumbing (stream, peer,
+> character, world/db/map handles, snapshot, facing, position, epochs, profile, diagnostics)
+> plus per-handler specific args — not one near-identical struct per handler;
+> (b) the `bool` handled-flag becomes a `Handled`/`Unhandled` outcome enum at increment 2
+> (before a chain of `if handled { continue }` accretes), extended if a handler ever needs a
+> third control-flow case; (c) next increment is the declarative-spell block (adjacent
+> fall-through after talkactions, exercises the shared context with different config), then
+> consumables, then reassess. Checkpoint after increment 3: stocktake what remains (one more
+> cohesive chunk vs. several unrelated ones) before picking increment 4 on momentum.
 
 #### 2.2 Data Migration Tooling — ~55%
 - [x] `tfs-audit`: config/world/items/spawns/houses/registries/entities inventory + diagnostics
