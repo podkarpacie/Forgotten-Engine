@@ -3049,222 +3049,143 @@ pub(crate) fn handle_native_otclient_game(
                 }
             }
             NativeOtClientGameAction::RequestOutfit => {
-                // A missing or misconfigured chooser range must degrade to a client-visible
-                // rejection instead of tearing down the session.
-                match encode_native_otclient_choose_outfit(
-                    &config.client_profile,
+                // Outfit chooser; see outfits.rs.
+                apply_native_request_outfit_action(
                     player_outfit,
-                    empty_world.outfit_first_look_type,
-                    empty_world.outfit_last_look_type,
-                ) {
-                    Ok(outfit_window) => {
-                        write_frame(stream, &outfit_window)?;
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            &format!(
-                                "outbound=choose-outfit opcode=0xc8 bytes={} look-type={}",
-                                outfit_window.0.len(),
-                                player_outfit.look_type
-                            ),
-                        );
-                    }
-                    Err(error) => {
-                        let rejection = encode_native_otclient_failure_message(
-                            &config.client_profile,
-                            "The outfit window is not configured on this server.",
-                        )
-                        .map_err(HostError::Protocol)?;
-                        write_frame(stream, &rejection)?;
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            &format!("action=request-outfit outcome=rejected reason={error}"),
-                        );
-                    }
-                }
+                    empty_world,
+                    &config.client_profile,
+                    &mut *stream,
+                    peer,
+                    config.extended_diagnostics,
+                )?;
             }
             NativeOtClientGameAction::LeaveChannel(channel_id) => {
-                let removed = open_public_channel_ids.remove(&channel_id);
-                native_diagnostic(
+                // Public-channel leave; see world_chat.rs.
+                apply_native_leave_channel_action(
+                    &mut open_public_channel_ids,
                     config.extended_diagnostics,
                     peer,
-                    &format!(
-                        "action=leave-channel channel-id={channel_id} outcome=session-local-removed-{removed}"
-                    ),
-                );
+                    channel_id,
+                )?;
             }
             NativeOtClientGameAction::JoinChannel(channel_id) => {
-                let Some(channel) = native_configured_public_channel(
-                    config.public_channel_catalog.as_deref(),
-                    channel_id,
-                ) else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
+                // Public-channel join; see world_chat.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
                         peer,
-                        "action=join-channel outcome=deferred-unknown-or-unconfigured-channel",
-                    );
-                    continue;
-                };
-                open_public_channel_ids.insert(channel.id);
-                let open_channel =
-                    encode_native_otclient_open_public_channel(&config.client_profile, &channel)
-                        .map_err(HostError::Protocol)?;
-                write_frame(stream, &open_channel)?;
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "outbound=open-public-channel opcode=0xac channel-id={} bytes={}",
-                        channel.id,
-                        open_channel.0.len(),
-                    ),
-                );
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_join_channel_action(
+                        &mut ctx,
+                        channel_id,
+                        &mut open_public_channel_ids,
+                    )?;
+                }
             }
             NativeOtClientGameAction::RequestChannels => {
-                let mut entries =
-                    native_classic_channel_list_entries(config.public_channel_catalog.as_deref());
-                // Plan v49 slice 19: guild members see the reserved guild channel (0x00F1).
-                let guild_context = native_guild_channel_context(&database, character.id);
-                if let Some((channel, _)) = &guild_context {
-                    entries.push(channel.clone());
+                // Public-channel list; see world_chat.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_request_channels_action(&mut ctx)?;
                 }
-                let channels =
-                    encode_native_otclient_channel_list(&config.client_profile, &entries)
-                        .map_err(HostError::Protocol)?;
-                write_frame(stream, &channels)?;
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "outbound=channel-list opcode=0xab entries={} bytes={}",
-                        entries.len(),
-                        channels.0.len(),
-                    ),
-                );
             }
             NativeOtClientGameAction::RequestQuestLog => {
-                // With an operator quest catalog, only started persisted quests appear, resolved
-                // through catalog display names; without one the parser-shaped empty response
-                // keeps prior behavior.
-                let quest_entries = match config.quest_catalog.as_deref() {
-                    Some(catalog) if !catalog.is_empty() => {
-                        let mut entries = Vec::new();
-                        for (quest_id, completed) in database
-                            .player_quests(character.id)
-                            .map_err(HostError::Persistence)?
-                        {
-                            if let Some(definition) = catalog.get(quest_id) {
-                                let _ = completed;
-                                entries.push((quest_id, definition.name.clone()));
-                            }
-                        }
-                        entries
-                    }
-                    _ => Vec::new(),
-                };
-                let quest_log = if quest_entries.is_empty() {
-                    encode_native_otclient_empty_quest_log(&config.client_profile)
-                        .map_err(HostError::Protocol)?
-                } else {
-                    encode_native_otclient_quest_list(&config.client_profile, &quest_entries)
-                        .map_err(HostError::Protocol)?
-                };
-                write_frame(stream, &quest_log)?;
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "outbound=quest-log opcode=0xf0 entries={} bytes={}",
-                        quest_entries.len(),
-                        quest_log.0.len()
-                    ),
-                );
+                // Quest log; see quests.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_request_quest_log_action(&mut ctx)?;
+                }
             }
             NativeOtClientGameAction::RequestQuestLine { quest_id } => {
-                // The quest line window opens for started persisted quests with declared
-                // missions; unknown or not-started quests receive an empty mission list.
-                let missions = match config.quest_catalog.as_deref() {
-                    Some(catalog) => {
-                        let started = database
-                            .player_quests(character.id)
-                            .map_err(HostError::Persistence)?
-                            .iter()
-                            .any(|(started_id, _)| *started_id == quest_id);
-                        match catalog.get(quest_id).filter(|_| started) {
-                            Some(definition) => definition.missions.clone(),
-                            None => Vec::new(),
-                        }
-                    }
-                    None => Vec::new(),
-                };
-                let line_frame =
-                    encode_native_otclient_quest_line(&config.client_profile, quest_id, &missions)
-                        .map_err(HostError::Protocol)?;
-                write_frame(stream, &line_frame)?;
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "outbound=quest-line opcode=0xf1 quest-id={quest_id} missions={} bytes={}",
-                        missions.len(),
-                        line_frame.0.len()
-                    ),
-                );
+                // Quest mission lines; see quests.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_request_quest_line_action(&mut ctx, quest_id)?;
+                }
             }
             NativeOtClientGameAction::ChangeOutfit(requested_outfit) => {
-                let accepted = native_classic_outfit_is_allowed(
-                    requested_outfit,
-                    empty_world.outfit_first_look_type,
-                    empty_world.outfit_last_look_type,
-                );
-                if accepted {
-                    database.update_player_outfit(
-                        character.id,
-                        PlayerOutfit {
-                            look_type: requested_outfit.look_type,
-                            head: requested_outfit.head,
-                            body: requested_outfit.body,
-                            legs: requested_outfit.legs,
-                            feet: requested_outfit.feet,
-                        },
+                // Outfit change; see outfits.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_change_outfit_action(
+                        &mut ctx,
+                        &mut player_outfit,
+                        empty_world,
+                        requested_outfit,
                     )?;
-                    player_outfit = requested_outfit;
-                    shared_world.update_player_outfit(character.id, player_outfit)?;
-                    observed_visibility_epoch = shared_world.visibility_epoch();
                 }
-                // The applied-outfit echo must never fail the session; a rejected or
-                // unencodable change degrades to a client-visible failure text.
-                match encode_native_otclient_creature_outfit(
-                    &config.client_profile,
-                    snapshot.player_id,
-                    player_outfit,
-                ) {
-                    Ok(applied_outfit) => {
-                        write_frame(stream, &applied_outfit)?;
-                    }
-                    Err(error) => {
-                        let rejection = encode_native_otclient_failure_message(
-                            &config.client_profile,
-                            "The selected outfit could not be applied on this server.",
-                        )
-                        .map_err(HostError::Protocol)?;
-                        write_frame(stream, &rejection)?;
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            &format!("action=change-outfit outcome=echo-rejected reason={error}"),
-                        );
-                    }
-                }
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "outbound=creature-outfit opcode=0x8e accepted={} look-type={}",
-                        accepted, player_outfit.look_type
-                    ),
-                );
             }
             NativeOtClientGameAction::LookMap {
                 position,

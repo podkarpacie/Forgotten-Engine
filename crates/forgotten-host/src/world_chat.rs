@@ -658,3 +658,84 @@ pub(crate) fn apply_native_edit_vip_action(
     }
     Ok(())
 }
+
+/// Removes one channel id from the session-local open public-channel set. Pure session view
+/// bookkeeping; no frames, no persistence.
+pub(crate) fn apply_native_leave_channel_action(
+    open_public_channel_ids: &mut BTreeSet<u16>,
+    extended_diagnostics: bool,
+    peer: SocketAddr,
+    channel_id: u16,
+) -> Result<(), HostError> {
+    let removed = open_public_channel_ids.remove(&channel_id);
+    native_diagnostic(
+        extended_diagnostics,
+        peer,
+        &format!(
+            "action=leave-channel channel-id={channel_id} outcome=session-local-removed-{removed}"
+        ),
+    );
+    Ok(())
+}
+
+/// Opens one configured public channel for the session: validates against the operator catalog,
+/// records membership locally, and emits the open-channel frame. Unknown channels emit a
+/// diagnostic without effect.
+pub(crate) fn apply_native_join_channel_action(
+    ctx: &mut SessionContext<'_>,
+    channel_id: u16,
+    open_public_channel_ids: &mut BTreeSet<u16>,
+) -> Result<(), HostError> {
+    let Some(channel) =
+        native_configured_public_channel(ctx.config.public_channel_catalog.as_deref(), channel_id)
+    else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=join-channel outcome=deferred-unknown-or-unconfigured-channel",
+        );
+        return Ok(());
+    };
+    open_public_channel_ids.insert(channel.id);
+    let open_channel =
+        encode_native_otclient_open_public_channel(&ctx.config.client_profile, &channel)
+            .map_err(HostError::Protocol)?;
+    write_frame(&mut *ctx.stream, &open_channel)?;
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!(
+            "outbound=open-public-channel opcode=0xac channel-id={} bytes={}",
+            channel.id,
+            open_channel.0.len(),
+        ),
+    );
+    Ok(())
+}
+
+/// Delivers the configured public-channel list, appending the reserved guild channel for guild
+/// members. Never fails the session.
+pub(crate) fn apply_native_request_channels_action(
+    ctx: &mut SessionContext<'_>,
+) -> Result<(), HostError> {
+    let mut entries =
+        native_classic_channel_list_entries(ctx.config.public_channel_catalog.as_deref());
+    // Plan v49 slice 19: guild members see the reserved guild channel (0x00F1).
+    let guild_context = native_guild_channel_context(&*ctx.database, ctx.character_id);
+    if let Some((channel, _)) = &guild_context {
+        entries.push(channel.clone());
+    }
+    let channels = encode_native_otclient_channel_list(&ctx.config.client_profile, &entries)
+        .map_err(HostError::Protocol)?;
+    write_frame(&mut *ctx.stream, &channels)?;
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!(
+            "outbound=channel-list opcode=0xab entries={} bytes={}",
+            entries.len(),
+            channels.0.len(),
+        ),
+    );
+    Ok(())
+}

@@ -18,6 +18,8 @@ mod movement;
 mod native_combat;
 mod native_diagnostics;
 mod npc_shop;
+mod outfits;
+mod quests;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SharedPublicChatEvent {
     speaker_name: String,
@@ -32,6 +34,10 @@ pub(crate) struct SharedPublicChatEvent {
 pub(crate) use npc_shop::{
     apply_native_shop_keyword_talk, complete_native_player_quest, deliver_native_npc_shop_windows,
     give_items_to_player, insert_units_into_containers, remove_items_from_player,
+};
+pub(crate) use outfits::{apply_native_change_outfit_action, apply_native_request_outfit_action};
+pub(crate) use quests::{
+    apply_native_request_quest_line_action, apply_native_request_quest_log_action,
 };
 mod native_render;
 mod session_context;
@@ -50,7 +56,8 @@ mod world_chat;
 pub(crate) use world_chat::PrivateChatDelivery;
 pub(crate) use world_chat::{
     apply_native_add_vip_action, apply_native_chat_routing, apply_native_edit_vip_action,
-    apply_native_remove_vip_action,
+    apply_native_join_channel_action, apply_native_leave_channel_action,
+    apply_native_remove_vip_action, apply_native_request_channels_action,
 };
 mod world_combat;
 mod world_equipment;
