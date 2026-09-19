@@ -7,11 +7,10 @@ use forgotten_persistence::PersistenceError;
 use forgotten_protocol::NativeOtClientTalkRequest;
 
 use super::{
-    complete_native_player_quest, give_items_to_player, EngineDatabase, HostError,
-    SessionActionOutcome, SessionContext, SharedNativeWorld,
-    NATIVE_OTCLIENT_MESSAGE_SAY, encode_native_otclient_status_message,
-    encode_shared_native_world_viewport, native_diagnostic,
-    native_position, native_static_creature_health_frames, write_frame,
+    complete_native_player_quest, encode_native_otclient_status_message,
+    encode_shared_native_world_viewport, give_items_to_player, native_diagnostic, native_position,
+    native_static_creature_health_frames, write_frame, EngineDatabase, HostError,
+    SessionActionOutcome, SessionContext, SharedNativeWorld, NATIVE_OTCLIENT_MESSAGE_SAY,
 };
 
 pub(crate) fn handle_native_gm_talkaction(
@@ -502,9 +501,8 @@ pub(crate) fn apply_native_gm_talkaction_talk(
     else {
         return Ok(SessionActionOutcome::Unhandled);
     };
-    let reply_frame =
-        encode_native_otclient_status_message(&ctx.config.client_profile, &reply)
-            .map_err(HostError::Protocol)?;
+    let reply_frame = encode_native_otclient_status_message(&ctx.config.client_profile, &reply)
+        .map_err(HostError::Protocol)?;
     write_frame(&mut *ctx.stream, &reply_frame)?;
     // GM talkactions mutate authoritative state (summons, teleports,
     // deliveries), so this session resends its full viewport from live
