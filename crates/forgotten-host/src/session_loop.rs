@@ -3599,42 +3599,67 @@ pub(crate) fn handle_native_otclient_game(
                 stack_position,
                 target_creature_id,
             } => {
-                handle_native_player_trade_request(
-                    stream,
-                    &config.client_profile,
-                    shared_world,
-                    character.id,
-                    position,
-                    client_thing_id,
-                    stack_position,
-                    target_creature_id,
-                    config.item_presentation_catalog.as_deref(),
-                    config.stackable_item_server_ids.as_deref(),
-                )?;
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    "action=request-trade outcome=processed",
-                );
+                // Player trade request; see trade.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_request_trade_action(
+                        &mut ctx,
+                        position,
+                        client_thing_id,
+                        stack_position,
+                        target_creature_id,
+                    )?;
+                }
             }
             NativeOtClientGameAction::AcceptTrade => {
-                handle_native_trade_accept(
-                    stream,
-                    &config.client_profile,
-                    shared_world,
-                    &mut database,
-                    character.id,
-                    config.item_presentation_catalog.as_deref(),
-                    config.stackable_item_server_ids.as_deref(),
-                )?;
-                native_diagnostic(config.extended_diagnostics, peer, "action=accept-trade");
+                // Trade acceptance; see trade.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_accept_trade_action(&mut ctx)?;
+                }
             }
             NativeOtClientGameAction::RejectTrade => {
-                handle_native_trade_reject(shared_world, character.id)?;
-                native_diagnostic(config.extended_diagnostics, peer, "action=reject-trade");
+                // Trade rejection; see trade.rs.
+                apply_native_reject_trade_action(
+                    shared_world,
+                    character.id,
+                    config.extended_diagnostics,
+                    peer,
+                )?;
             }
             NativeOtClientGameAction::NpcTradeClose => {
-                native_diagnostic(config.extended_diagnostics, peer, "action=npc-trade-close");
+                // NPC trade-window closure; see trade.rs.
+                apply_native_npc_trade_close_action(config.extended_diagnostics, peer)?;
             }
             NativeOtClientGameAction::NpcBuy {
                 client_thing_id,
@@ -3643,44 +3668,26 @@ pub(crate) fn handle_native_otclient_game(
                 _ignore_capacity: _,
                 _buy_with_backpack: _,
             } => {
-                // Buy flows through the existing declarative shop keyword path by mapping the
-                // client thing id back to a server item via the presentation catalog.
-                let server_id = config
-                    .item_presentation_catalog
-                    .as_ref()
-                    .and_then(|catalog| {
-                        catalog.unique_server_id_for_client_thing_id(client_thing_id)
-                    });
-                let Some(server_id) = server_id else {
-                    let failure = encode_native_otclient_failure_message(
-                        &config.client_profile,
-                        "You cannot buy this item.",
-                    )
-                    .map_err(HostError::Protocol)?;
-                    write_frame(stream, &failure)?;
-                    continue;
-                };
-                let message = handle_native_shop_keyword(
-                    shared_world,
-                    &mut database,
-                    character.id,
-                    &format!("buy {server_id} {amount}"),
-                    config
-                        .shop_catalog
-                        .as_deref()
-                        .unwrap_or(&DeclarativeShopCatalog::default()),
-                )?;
-                let reply_frame = encode_native_otclient_status_message(
-                    &config.client_profile,
-                    &message.unwrap_or_else(|| "Nothing to buy here.".into()),
-                )
-                .map_err(HostError::Protocol)?;
-                write_frame(stream, &reply_frame)?;
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!("action=npc-buy item={server_id} amount={amount}"),
-                );
+                // NPC buy through the shop path; see trade.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_npc_buy_action(&mut ctx, client_thing_id, amount)?;
+                }
             }
             NativeOtClientGameAction::NpcSell {
                 client_thing_id,
@@ -3688,42 +3695,26 @@ pub(crate) fn handle_native_otclient_game(
                 amount,
                 _ignore_equipped: _,
             } => {
-                let server_id = config
-                    .item_presentation_catalog
-                    .as_ref()
-                    .and_then(|catalog| {
-                        catalog.unique_server_id_for_client_thing_id(client_thing_id)
-                    });
-                let Some(server_id) = server_id else {
-                    let failure = encode_native_otclient_failure_message(
-                        &config.client_profile,
-                        "You cannot sell this item.",
-                    )
-                    .map_err(HostError::Protocol)?;
-                    write_frame(stream, &failure)?;
-                    continue;
-                };
-                let message = handle_native_shop_keyword(
-                    shared_world,
-                    &mut database,
-                    character.id,
-                    &format!("sell {server_id} {amount}"),
-                    config
-                        .shop_catalog
-                        .as_deref()
-                        .unwrap_or(&DeclarativeShopCatalog::default()),
-                )?;
-                let reply_frame = encode_native_otclient_status_message(
-                    &config.client_profile,
-                    &message.unwrap_or_else(|| "Nothing to sell here.".into()),
-                )
-                .map_err(HostError::Protocol)?;
-                write_frame(stream, &reply_frame)?;
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!("action=npc-sell item={server_id} amount={amount}"),
-                );
+                // NPC sell through the shop path; see trade.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_npc_sell_action(&mut ctx, client_thing_id, amount)?;
+                }
             }
             NativeOtClientGameAction::SelectTarget(native_selected_id) => {
                 let outcome = apply_native_player_interaction(

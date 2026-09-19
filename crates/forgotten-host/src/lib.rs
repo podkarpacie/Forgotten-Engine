@@ -30,8 +30,7 @@ pub(crate) struct SharedPublicChatEvent {
 }
 pub(crate) use npc_shop::{
     apply_native_shop_keyword_talk, complete_native_player_quest, deliver_native_npc_shop_windows,
-    give_items_to_player, handle_native_shop_keyword, insert_units_into_containers,
-    remove_items_from_player,
+    give_items_to_player, insert_units_into_containers, remove_items_from_player,
 };
 mod native_render;
 mod session_context;
@@ -104,7 +103,9 @@ pub(crate) use static_creature::{
 };
 pub(crate) use talkactions::apply_native_lua_talkaction;
 pub(crate) use trade::{
-    handle_native_player_trade_request, handle_native_trade_accept, handle_native_trade_reject,
+    apply_native_accept_trade_action, apply_native_npc_buy_action, apply_native_npc_sell_action,
+    apply_native_npc_trade_close_action, apply_native_reject_trade_action,
+    apply_native_request_trade_action,
 };
 
 use forgotten_config::{

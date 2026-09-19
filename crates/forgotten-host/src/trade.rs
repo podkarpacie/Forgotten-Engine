@@ -3,15 +3,17 @@
 //! this module owns the socket-facing sequence around them.
 
 use std::collections::BTreeSet;
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 
 use forgotten_core::ItemInstance;
 
+use super::npc_shop::handle_native_shop_keyword;
 use super::{
     encode_native_otclient_counter_trade, encode_native_otclient_failure_message,
-    encode_native_otclient_own_trade, native_player_id_to_character_id, write_frame,
-    EngineDatabase, HostError, NativeItemPresentationCatalog, NativeOtClientPosition,
-    NativeOtClientProfile, NativeOtClientTradeItem, SharedNativeWorld,
+    encode_native_otclient_own_trade, encode_native_otclient_status_message, native_diagnostic,
+    native_player_id_to_character_id, write_frame, DeclarativeShopCatalog, EngineDatabase,
+    HostError, NativeItemPresentationCatalog, NativeOtClientPosition, NativeOtClientProfile,
+    NativeOtClientTradeItem, SessionContext, SharedNativeWorld,
 };
 /// Handles a classic request-trade action: resolves the offered item from the sender's own
 /// authoritative inventory, validates the target is an adjacent live player, opens the trade
@@ -304,5 +306,169 @@ pub(crate) fn handle_native_trade_reject(
     player_id: u64,
 ) -> Result<(), HostError> {
     shared_world.cancel_player_trade_and_signal(player_id)?;
+    Ok(())
+}
+
+/// Applies one player-trade request: validates the offered item and target, then delivers the
+/// trade window. Failures travel via `Err(HostError)`; the record is always consumed.
+pub(crate) fn apply_native_request_trade_action(
+    ctx: &mut SessionContext<'_>,
+    position: NativeOtClientPosition,
+    client_thing_id: u16,
+    stack_position: u8,
+    target_creature_id: u32,
+) -> Result<(), HostError> {
+    handle_native_player_trade_request(
+        &mut *ctx.stream,
+        &ctx.config.client_profile,
+        ctx.shared_world,
+        ctx.character_id,
+        position,
+        client_thing_id,
+        stack_position,
+        target_creature_id,
+        ctx.config.item_presentation_catalog.as_deref(),
+        ctx.config.stackable_item_server_ids.as_deref(),
+    )?;
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        "action=request-trade outcome=processed",
+    );
+    Ok(())
+}
+
+/// Applies one trade acceptance: swaps the staged offers and persists both sides.
+pub(crate) fn apply_native_accept_trade_action(
+    ctx: &mut SessionContext<'_>,
+) -> Result<(), HostError> {
+    handle_native_trade_accept(
+        &mut *ctx.stream,
+        &ctx.config.client_profile,
+        ctx.shared_world,
+        &mut *ctx.database,
+        ctx.character_id,
+        ctx.config.item_presentation_catalog.as_deref(),
+        ctx.config.stackable_item_server_ids.as_deref(),
+    )?;
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        "action=accept-trade",
+    );
+    Ok(())
+}
+
+/// Applies one trade rejection: clears the caller's trade intent and signals the window shut.
+/// Takes direct parameters (three session items) rather than the shared context, which would
+/// be pure overhead for this narrow handler.
+pub(crate) fn apply_native_reject_trade_action(
+    shared_world: &SharedNativeWorld,
+    character_id: u64,
+    extended_diagnostics: bool,
+    peer: SocketAddr,
+) -> Result<(), HostError> {
+    handle_native_trade_reject(shared_world, character_id)?;
+    native_diagnostic(extended_diagnostics, peer, "action=reject-trade");
+    Ok(())
+}
+
+/// Records one NPC trade-window closure. Purely diagnostic; no state changes.
+pub(crate) fn apply_native_npc_trade_close_action(
+    extended_diagnostics: bool,
+    peer: SocketAddr,
+) -> Result<(), HostError> {
+    native_diagnostic(extended_diagnostics, peer, "action=npc-trade-close");
+    Ok(())
+}
+
+/// Applies one NPC buy: maps the client thing id back to a server item, then routes through
+/// the declarative shop keyword path. An unmapped id answers with a failure frame.
+pub(crate) fn apply_native_npc_buy_action(
+    ctx: &mut SessionContext<'_>,
+    client_thing_id: u16,
+    amount: u8,
+) -> Result<(), HostError> {
+    // Buy flows through the existing declarative shop keyword path by mapping the
+    // client thing id back to a server item via the presentation catalog.
+    let server_id = ctx
+        .config
+        .item_presentation_catalog
+        .as_ref()
+        .and_then(|catalog| catalog.unique_server_id_for_client_thing_id(client_thing_id));
+    let Some(server_id) = server_id else {
+        let failure = encode_native_otclient_failure_message(
+            &ctx.config.client_profile,
+            "You cannot buy this item.",
+        )
+        .map_err(HostError::Protocol)?;
+        write_frame(&mut *ctx.stream, &failure)?;
+        return Ok(());
+    };
+    let message = handle_native_shop_keyword(
+        ctx.shared_world,
+        &mut *ctx.database,
+        ctx.character_id,
+        &format!("buy {server_id} {amount}"),
+        ctx.config
+            .shop_catalog
+            .as_deref()
+            .unwrap_or(&DeclarativeShopCatalog::default()),
+    )?;
+    let reply_frame = encode_native_otclient_status_message(
+        &ctx.config.client_profile,
+        &message.unwrap_or_else(|| "Nothing to buy here.".into()),
+    )
+    .map_err(HostError::Protocol)?;
+    write_frame(&mut *ctx.stream, &reply_frame)?;
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!("action=npc-buy item={server_id} amount={amount}"),
+    );
+    Ok(())
+}
+
+/// Applies one NPC sell: mirrors the buy path through the declarative shop keyword path.
+pub(crate) fn apply_native_npc_sell_action(
+    ctx: &mut SessionContext<'_>,
+    client_thing_id: u16,
+    amount: u8,
+) -> Result<(), HostError> {
+    let server_id = ctx
+        .config
+        .item_presentation_catalog
+        .as_ref()
+        .and_then(|catalog| catalog.unique_server_id_for_client_thing_id(client_thing_id));
+    let Some(server_id) = server_id else {
+        let failure = encode_native_otclient_failure_message(
+            &ctx.config.client_profile,
+            "You cannot sell this item.",
+        )
+        .map_err(HostError::Protocol)?;
+        write_frame(&mut *ctx.stream, &failure)?;
+        return Ok(());
+    };
+    let message = handle_native_shop_keyword(
+        ctx.shared_world,
+        &mut *ctx.database,
+        ctx.character_id,
+        &format!("sell {server_id} {amount}"),
+        ctx.config
+            .shop_catalog
+            .as_deref()
+            .unwrap_or(&DeclarativeShopCatalog::default()),
+    )?;
+    let reply_frame = encode_native_otclient_status_message(
+        &ctx.config.client_profile,
+        &message.unwrap_or_else(|| "Nothing to sell here.".into()),
+    )
+    .map_err(HostError::Protocol)?;
+    write_frame(&mut *ctx.stream, &reply_frame)?;
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!("action=npc-sell item={server_id} amount={amount}"),
+    );
     Ok(())
 }
