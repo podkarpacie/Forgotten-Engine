@@ -1119,58 +1119,36 @@ pub(crate) fn handle_native_otclient_game(
             )?,
             NativeOtClientGameAction::PingBack | NativeOtClientGameAction::EnterGame => {}
             NativeOtClientGameAction::AddVip(target_player_name) => {
-                let entry = match database.add_account_vip_entry(
-                    request.account_id,
-                    &target_player_name,
-                    "",
-                    0,
-                    false,
-                ) {
-                    Ok(entry) => entry,
-                    Err(_) => {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=vip-add outcome=rejected",
-                        );
-                        continue;
-                    }
-                };
-                let target_player_id = match u32::try_from(entry.target_player_id) {
-                    Ok(target_player_id) if target_player_id != 0 => target_player_id,
-                    _ => {
-                        let _ = database
-                            .remove_account_vip_entry(request.account_id, entry.target_player_id);
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=vip-add outcome=deferred-target-id-out-of-classic-range",
-                        );
-                        continue;
-                    }
-                };
-                write_frame(
-                    stream,
-                    &encode_native_otclient_classic_vip_entry(
-                        &config.client_profile,
-                        target_player_id,
-                        &entry.target_player_name,
-                        false,
-                    )
-                    .map_err(HostError::Protocol)?,
-                )?;
+                // Account VIP add; see world_chat.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_add_vip_action(&mut ctx, request.account_id, &target_player_name)?;
+                }
             }
             NativeOtClientGameAction::RemoveVip(target_player_id) => {
-                if database
-                    .remove_account_vip_entry(request.account_id, u64::from(target_player_id))
-                    .is_err()
-                {
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=vip-remove outcome=rejected",
-                    );
-                }
+                // Account VIP remove; see world_chat.rs.
+                apply_native_remove_vip_action(
+                    &mut database,
+                    request.account_id,
+                    target_player_id,
+                    config.extended_diagnostics,
+                    peer,
+                )?;
             }
             NativeOtClientGameAction::EditVip {
                 target_player_id,
@@ -1178,21 +1156,32 @@ pub(crate) fn handle_native_otclient_game(
                 icon,
                 notify,
             } => {
-                if database
-                    .edit_account_vip_entry(
+                // Account VIP edit; see world_chat.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_edit_vip_action(
+                        &mut ctx,
                         request.account_id,
-                        u64::from(target_player_id),
+                        target_player_id,
                         &description,
                         icon,
                         notify,
-                    )
-                    .is_err()
-                {
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=vip-edit outcome=rejected",
-                    );
+                    )?;
                 }
             }
             NativeOtClientGameAction::ThrowItem {

@@ -45,9 +45,12 @@ mod trade;
 pub(crate) use frames::*;
 pub use heartbeat::*;
 mod world_chat;
-pub(crate) use world_chat::apply_native_chat_routing;
 #[cfg(test)]
 pub(crate) use world_chat::PrivateChatDelivery;
+pub(crate) use world_chat::{
+    apply_native_add_vip_action, apply_native_chat_routing, apply_native_edit_vip_action,
+    apply_native_remove_vip_action,
+};
 mod world_combat;
 mod world_equipment;
 mod world_interaction;

@@ -556,3 +556,105 @@ pub(crate) fn apply_native_chat_routing(
     }
     Ok(())
 }
+
+/// Adds one account VIP entry, then delivers the classic no-additional-info entry frame with
+/// fixed offline status. Rejected adds and out-of-range target ids emit diagnostics without
+/// effect.
+pub(crate) fn apply_native_add_vip_action(
+    ctx: &mut SessionContext<'_>,
+    account_id: u32,
+    target_player_name: &str,
+) -> Result<(), HostError> {
+    let entry =
+        match ctx
+            .database
+            .add_account_vip_entry(account_id, target_player_name, "", 0, false)
+        {
+            Ok(entry) => entry,
+            Err(_) => {
+                native_diagnostic(
+                    ctx.config.extended_diagnostics,
+                    ctx.peer,
+                    "action=vip-add outcome=rejected",
+                );
+                return Ok(());
+            }
+        };
+    let target_player_id = match u32::try_from(entry.target_player_id) {
+        Ok(target_player_id) if target_player_id != 0 => target_player_id,
+        _ => {
+            let _ = ctx
+                .database
+                .remove_account_vip_entry(account_id, entry.target_player_id);
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                "action=vip-add outcome=deferred-target-id-out-of-classic-range",
+            );
+            return Ok(());
+        }
+    };
+    write_frame(
+        &mut *ctx.stream,
+        &encode_native_otclient_classic_vip_entry(
+            &ctx.config.client_profile,
+            target_player_id,
+            &entry.target_player_name,
+            false,
+        )
+        .map_err(HostError::Protocol)?,
+    )?;
+    Ok(())
+}
+
+/// Removes one account VIP entry. Failures emit a diagnostic without effect. Narrow
+/// enough for direct parameters.
+pub(crate) fn apply_native_remove_vip_action(
+    database: &mut EngineDatabase,
+    account_id: u32,
+    target_player_id: u32,
+    extended_diagnostics: bool,
+    peer: SocketAddr,
+) -> Result<(), HostError> {
+    if database
+        .remove_account_vip_entry(account_id, u64::from(target_player_id))
+        .is_err()
+    {
+        native_diagnostic(
+            extended_diagnostics,
+            peer,
+            "action=vip-remove outcome=rejected",
+        );
+    }
+    Ok(())
+}
+
+/// Edits one account VIP entry's description, icon, and notify flag. Failures emit a
+/// diagnostic without effect.
+pub(crate) fn apply_native_edit_vip_action(
+    ctx: &mut SessionContext<'_>,
+    account_id: u32,
+    target_player_id: u32,
+    description: &str,
+    icon: u32,
+    notify: bool,
+) -> Result<(), HostError> {
+    if ctx
+        .database
+        .edit_account_vip_entry(
+            account_id,
+            u64::from(target_player_id),
+            description,
+            icon,
+            notify,
+        )
+        .is_err()
+    {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=vip-edit outcome=rejected",
+        );
+    }
+    Ok(())
+}
