@@ -4260,177 +4260,28 @@ pub(crate) fn handle_native_otclient_game(
                     }
                 }
                 // Operator-registered Lua talkactions dispatch through the resource-capped
-                // sandbox. A script cannot mutate authoritative state, read files, open sockets,
-                // or exhaust memory/instructions without a bounded rejection; only bounded typed
-                // effects (say text, teleport, heal, give/remove-item, magic effect) cross back
-                // and are validated and applied here against authoritative state. The subject's
-                // authoritative position crosses as a read-only fifth argument.
-                if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
-                    && request.channel_id.is_none()
-                    && request.recipient.is_none()
-                {
-                    if let Some(dispatcher) = config.talkaction_dispatcher.as_ref() {
-                        let subject_position = shared_world.player_position(character.id)?;
-                        let subject_position = Some(SandboxedLuaPosition {
-                            x: subject_position.x,
-                            y: subject_position.y,
-                            z: subject_position.z,
-                        });
-                        if let Some(effects) = dispatch_native_lua_talkaction(
-                            dispatcher,
-                            &request.message,
-                            character.id,
-                            subject_position,
-                        ) {
-                            let mut teleported = false;
-                            for effect in effects {
-                                match effect {
-                                    SandboxedLuaEffect::Say(text) => {
-                                        let reply_frame = encode_native_otclient_status_message(
-                                            &config.client_profile,
-                                            &text,
-                                        )
-                                        .map_err(HostError::Protocol)?;
-                                        write_frame(stream, &reply_frame)?;
-                                    }
-                                    SandboxedLuaEffect::Teleport { x, y, z } => {
-                                        let destination = Position { x, y, z };
-                                        if shared_world
-                                            .teleport_player_for_operator(character.id, destination)
-                                            .is_ok()
-                                        {
-                                            player_position = destination;
-                                            teleported = true;
-                                        } else {
-                                            let reply_frame =
-                                                encode_native_otclient_status_message(
-                                                    &config.client_profile,
-                                                    "That destination is blocked.",
-                                                )
-                                                .map_err(HostError::Protocol)?;
-                                            write_frame(stream, &reply_frame)?;
-                                        }
-                                    }
-                                    SandboxedLuaEffect::Heal { health, mana } => {
-                                        let mut vitals =
-                                            shared_world.player_vitals(character.id)?;
-                                        if health > 0 {
-                                            vitals.health = vitals
-                                                .health
-                                                .saturating_add(health)
-                                                .min(vitals.max_health);
-                                        }
-                                        if mana > 0 {
-                                            vitals.mana = vitals
-                                                .mana
-                                                .saturating_add(mana)
-                                                .min(vitals.max_mana);
-                                        }
-                                        shared_world
-                                            .lock()?
-                                            .update_player_vitals(character.id, vitals)
-                                            .map_err(HostError::Core)?;
-                                        shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
-                                        database.update_player_vitals(
-                                            character.id,
-                                            PersistedPlayerVitals {
-                                                health: vitals.health,
-                                                max_health: vitals.max_health,
-                                                mana: vitals.mana,
-                                                max_mana: vitals.max_mana,
-                                                capacity: vitals.capacity,
-                                                magic_level: vitals.magic_level,
-                                            },
-                                        )?;
-                                        let self_native_id = native_player_id(character.id)?;
-                                        let health_update = encode_native_otclient_creature_health(
-                                            &config.client_profile,
-                                            self_native_id,
-                                            vitals.health,
-                                            vitals.max_health,
-                                        )
-                                        .map_err(HostError::Protocol)?;
-                                        write_frame(stream, &health_update)?;
-                                        observed_vitals_epoch = shared_world.vitals_epoch();
-                                    }
-                                    SandboxedLuaEffect::GiveItem { id, count } => {
-                                        if let Some(message) = give_items_to_player(
-                                            shared_world,
-                                            &mut database,
-                                            character.id,
-                                            id,
-                                            u64::from(count),
-                                        )? {
-                                            let reply_frame =
-                                                encode_native_otclient_status_message(
-                                                    &config.client_profile,
-                                                    &message,
-                                                )
-                                                .map_err(HostError::Protocol)?;
-                                            write_frame(stream, &reply_frame)?;
-                                        }
-                                    }
-                                    SandboxedLuaEffect::RemoveItem { id, count } => {
-                                        if let Some(message) = remove_items_from_player(
-                                            shared_world,
-                                            &mut database,
-                                            character.id,
-                                            id,
-                                            u64::from(count),
-                                        )? {
-                                            let reply_frame =
-                                                encode_native_otclient_status_message(
-                                                    &config.client_profile,
-                                                    &message,
-                                                )
-                                                .map_err(HostError::Protocol)?;
-                                            write_frame(stream, &reply_frame)?;
-                                        }
-                                    }
-                                    SandboxedLuaEffect::MagicEffect { x, y, z, kind } => {
-                                        let effect_frame = encode_native_otclient_magic_effect(
-                                            &config.client_profile,
-                                            native_position(Position { x, y, z }),
-                                            kind,
-                                        )
-                                        .map_err(HostError::Protocol)?;
-                                        write_frame(stream, &effect_frame)?;
-                                    }
-                                }
-                            }
-                            if teleported {
-                                shared_world.mark_visibility_changed();
-                                let mut refreshed_snapshot = snapshot.clone();
-                                refreshed_snapshot.player_position =
-                                    native_position(player_position);
-                                refreshed_snapshot.player_direction = facing.protocol_direction();
-                                let refreshed_viewport = encode_shared_native_world_viewport(
-                                    &config.client_profile,
-                                    &refreshed_snapshot,
-                                    world_map.as_ref(),
-                                    shared_world,
-                                    character.id,
-                                )?;
-                                let refreshed_static_spawns =
-                                    shared_world.active_static_spawns()?;
-                                let refreshed_static_health_frames =
-                                    native_static_creature_health_frames(
-                                        &config.client_profile,
-                                        &refreshed_static_spawns,
-                                    )?;
-                                write_frame(stream, &refreshed_viewport)?;
-                                for frame in &refreshed_static_health_frames {
-                                    write_frame(stream, frame)?;
-                                }
-                                observed_visibility_epoch = shared_world.visibility_epoch();
-                            }
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=talk outcome=lua-talkaction",
-                            );
-                            continue;
-                        }
+                // sandbox; dispatch and effect application live in talkactions.rs. A handled word
+                // consumes the record; anything else falls through to ordinary routing.
+                if let Some(dispatcher) = config.talkaction_dispatcher.as_ref() {
+                    let handled = apply_native_lua_talkaction(NativeLuaTalkactionApply {
+                        request: &request,
+                        dispatcher,
+                        character_id: character.id,
+                        stream: &mut *stream,
+                        peer,
+                        client_profile: &config.client_profile,
+                        extended_diagnostics: config.extended_diagnostics,
+                        database: &mut database,
+                        shared_world,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing,
+                        player_position: &mut player_position,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    })?;
+                    if handled {
+                        continue;
                     }
                 }
                 if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY

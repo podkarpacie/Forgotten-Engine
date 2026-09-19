@@ -89,7 +89,7 @@ pub(crate) use static_creature::{
 pub(crate) use static_creature::{
     persist_runtime_player_conditions, persist_static_target_attack_vitals,
 };
-pub(crate) use talkactions::dispatch_native_lua_talkaction;
+pub(crate) use talkactions::{apply_native_lua_talkaction, NativeLuaTalkactionApply};
 pub(crate) use trade::{
     handle_native_player_trade_request, handle_native_trade_accept, handle_native_trade_reject,
 };
@@ -182,9 +182,7 @@ use forgotten_protocol::{
     NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
-use forgotten_scripting::{
-    SandboxedLuaCallbackDispatcher, SandboxedLuaEffect, SandboxedLuaPosition,
-};
+use forgotten_scripting::SandboxedLuaCallbackDispatcher;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
