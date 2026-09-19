@@ -153,24 +153,28 @@ fn parse_globalevent_entry(event: &BytesStart<'_>) -> Result<TfsGlobalEventEntry
             .into_owned();
         match attribute.key.as_ref() {
             b"name" => {
-                if name.replace(value).is_some() {
+                if name.is_some() {
                     return Err(invalid("duplicate TFS globalevent name attribute"));
                 }
+                name = Some(value);
             }
             b"interval" => {
-                if interval.replace(value).is_some() {
+                if interval.is_some() {
                     return Err(invalid("duplicate TFS globalevent interval attribute"));
                 }
+                interval = Some(value);
             }
             b"type" => {
-                if event_type.replace(value).is_some() {
+                if event_type.is_some() {
                     return Err(invalid("duplicate TFS globalevent type attribute"));
                 }
+                event_type = Some(value);
             }
             b"script" => {
-                if script.replace(value).is_some() {
+                if script.is_some() {
                     return Err(invalid("duplicate TFS globalevent script attribute"));
                 }
+                script = Some(value);
             }
             _ => {}
         }

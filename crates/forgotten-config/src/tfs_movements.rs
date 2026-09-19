@@ -199,22 +199,25 @@ fn parse_movement_entry(event: &BytesStart<'_>) -> Result<TfsMoveEventEntry, Con
             .into_owned();
         match attribute.key.as_ref() {
             b"type" => {
-                if movement_type.replace(value).is_some() {
+                if movement_type.is_some() {
                     return Err(invalid("duplicate TFS movement type attribute"));
                 }
+                movement_type = Some(value);
             }
             b"itemid" => set_unique_u16(&mut item_id, &value, "duplicate TFS movement itemid")?,
             b"fromid" => set_unique_u16(&mut item_from, &value, "duplicate TFS movement fromid")?,
             b"toid" => set_unique_u16(&mut item_to, &value, "duplicate TFS movement toid")?,
             b"slot" => {
-                if slot.replace(value).is_some() {
+                if slot.is_some() {
                     return Err(invalid("duplicate TFS movement slot attribute"));
                 }
+                slot = Some(value);
             }
             b"script" => {
-                if script.replace(value).is_some() {
+                if script.is_some() {
                     return Err(invalid("duplicate TFS movement script attribute"));
                 }
+                script = Some(value);
             }
             // `event` and `function` are legacy handler names; runtime dispatch is deferred.
             _ => {}

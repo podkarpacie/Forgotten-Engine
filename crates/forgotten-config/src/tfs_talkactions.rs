@@ -154,19 +154,22 @@ fn parse_talkaction_entry(event: &BytesStart<'_>) -> Result<TfsTalkActionEntry, 
             .into_owned();
         match attribute.key.as_ref() {
             b"words" => {
-                if words.replace(value).is_some() {
+                if words.is_some() {
                     return Err(invalid("duplicate TFS talkaction words attribute"));
                 }
+                words = Some(value);
             }
             b"script" => {
-                if script.replace(value).is_some() {
+                if script.is_some() {
                     return Err(invalid("duplicate TFS talkaction script attribute"));
                 }
+                script = Some(value);
             }
             b"separator" => {
-                if separator.replace(value).is_some() {
+                if separator.is_some() {
                     return Err(invalid("duplicate TFS talkaction separator attribute"));
                 }
+                separator = Some(value);
             }
             // `access`, `groups`, `log`, `hidden`, and `caseSensitive` are authorization or
             // matching metadata deferred to the routing boundary; ignored here, not executed.

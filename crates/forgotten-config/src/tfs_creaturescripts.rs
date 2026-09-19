@@ -161,19 +161,22 @@ fn parse_creaturescript_entry(
             .into_owned();
         match attribute.key.as_ref() {
             b"type" => {
-                if event_type.replace(value).is_some() {
+                if event_type.is_some() {
                     return Err(invalid("duplicate TFS creaturescript type attribute"));
                 }
+                event_type = Some(value);
             }
             b"name" => {
-                if name.replace(value).is_some() {
+                if name.is_some() {
                     return Err(invalid("duplicate TFS creaturescript name attribute"));
                 }
+                name = Some(value);
             }
             b"script" => {
-                if script.replace(value).is_some() {
+                if script.is_some() {
                     return Err(invalid("duplicate TFS creaturescript script attribute"));
                 }
+                script = Some(value);
             }
             _ => {}
         }

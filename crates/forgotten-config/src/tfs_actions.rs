@@ -165,9 +165,10 @@ fn parse_action_entry(event: &BytesStart<'_>) -> Result<TfsActionEntry, ConfigEr
             }
             b"uniqueid" => set_unique_u16(&mut unique_id, &value, "duplicate TFS action uniqueid")?,
             b"script" => {
-                if script.replace(value).is_some() {
+                if script.is_some() {
                     return Err(invalid("duplicate TFS action script attribute"));
                 }
+                script = Some(value);
             }
             // `event`, `allowfaruse`, `blockwalls`, `checkfloor`, `checklineofsight` are action
             // flags or legacy function names deferred to the routing boundary.
