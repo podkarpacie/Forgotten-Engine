@@ -4,10 +4,14 @@
 
 use forgotten_config::QuestCatalog;
 use forgotten_persistence::PersistenceError;
+use forgotten_protocol::NativeOtClientTalkRequest;
 
 use super::{
     complete_native_player_quest, give_items_to_player, EngineDatabase, HostError,
-    SharedNativeWorld,
+    SessionActionOutcome, SessionContext, SharedNativeWorld,
+    NATIVE_OTCLIENT_MESSAGE_SAY, encode_native_otclient_status_message,
+    encode_shared_native_world_viewport, native_diagnostic,
+    native_position, native_static_creature_health_frames, write_frame,
 };
 
 pub(crate) fn handle_native_gm_talkaction(
@@ -463,4 +467,77 @@ pub(crate) fn handle_native_gm_talkaction(
             "Unknown GM command `/{verb}`; available: spawn, give, tp, kick, gm, broadcast, heal, playerinfo, goto, tome."
         ))),
     }
+}
+
+/// Applies one gamemaster talkaction for a Say record. Only characters with a persisted GM tier
+/// may trigger verbs; a handled verb replies, resends the full viewport from live shared state
+/// (so summons stay visible without relog), and consumes the record. Returns
+/// `SessionActionOutcome::Handled` on a handled verb, `Unhandled` for non-Say records,
+/// non-GM speakers, or unrecognized verbs.
+pub(crate) fn apply_native_gm_talkaction_talk(
+    ctx: &mut SessionContext<'_>,
+    request: &NativeOtClientTalkRequest,
+) -> Result<SessionActionOutcome, HostError> {
+    if !(request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
+        && request.channel_id.is_none()
+        && request.recipient.is_none())
+    {
+        return Ok(SessionActionOutcome::Unhandled);
+    }
+    let gm_level = ctx
+        .database
+        .player_gm_level(ctx.character_id)
+        .map_err(HostError::Persistence)?;
+    if gm_level == 0 {
+        return Ok(SessionActionOutcome::Unhandled);
+    }
+    let Some(reply) = handle_native_gm_talkaction(
+        ctx.shared_world,
+        &mut *ctx.database,
+        ctx.character_id,
+        &request.message,
+        gm_level,
+        ctx.config.quest_catalog.as_deref(),
+    )?
+    else {
+        return Ok(SessionActionOutcome::Unhandled);
+    };
+    let reply_frame =
+        encode_native_otclient_status_message(&ctx.config.client_profile, &reply)
+            .map_err(HostError::Protocol)?;
+    write_frame(&mut *ctx.stream, &reply_frame)?;
+    // GM talkactions mutate authoritative state (summons, teleports,
+    // deliveries), so this session resends its full viewport from live
+    // shared state instead of silently adopting the bumped visibility
+    // epoch — that swallow left summons invisible until relog
+    // (live-test regression A1). Other sessions refresh through their
+    // own epoch comparison.
+    ctx.shared_world.mark_visibility_changed();
+    let mut refreshed_snapshot = ctx.snapshot.clone();
+    refreshed_snapshot.player_position = native_position(*ctx.player_position);
+    refreshed_snapshot.player_direction = ctx.facing.protocol_direction();
+    let refreshed_viewport = encode_shared_native_world_viewport(
+        &ctx.config.client_profile,
+        &refreshed_snapshot,
+        ctx.world_map.as_ref(),
+        ctx.shared_world,
+        ctx.character_id,
+    )?;
+    let refreshed_static_spawns = ctx.shared_world.active_static_spawns()?;
+    let refreshed_static_health_frames =
+        native_static_creature_health_frames(&ctx.config.client_profile, &refreshed_static_spawns)?;
+    write_frame(&mut *ctx.stream, &refreshed_viewport)?;
+    for frame in &refreshed_static_health_frames {
+        write_frame(&mut *ctx.stream, frame)?;
+    }
+    *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!(
+            "action=talk outcome=gm-talkaction reply-bytes={}",
+            reply.len()
+        ),
+    );
+    Ok(SessionActionOutcome::Handled)
 }

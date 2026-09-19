@@ -4044,68 +4044,29 @@ pub(crate) fn handle_native_otclient_game(
                         continue;
                     }
                 }
-                // Gamemaster talkactions ("/give", "/tp", "/spawn", ...) run before every other
-                // keyword router and are only available to characters with a persisted GM tier.
-                if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
-                    && request.channel_id.is_none()
-                    && request.recipient.is_none()
+                // Gamemaster talkactions run before every other keyword router; see
+                // gm_commands.rs. A handled verb consumes the record.
                 {
-                    let gm_level = database
-                        .player_gm_level(character.id)
-                        .map_err(HostError::Persistence)?;
-                    if gm_level > 0 {
-                        if let Some(reply) = handle_native_gm_talkaction(
-                            shared_world,
-                            &mut database,
-                            character.id,
-                            &request.message,
-                            gm_level,
-                            config.quest_catalog.as_deref(),
-                        )? {
-                            let reply_frame = encode_native_otclient_status_message(
-                                &config.client_profile,
-                                &reply,
-                            )
-                            .map_err(HostError::Protocol)?;
-                            write_frame(stream, &reply_frame)?;
-                            // GM talkactions mutate authoritative state (summons, teleports,
-                            // deliveries), so this session resends its full viewport from live
-                            // shared state instead of silently adopting the bumped visibility
-                            // epoch â€” that swallow left summons invisible until relog
-                            // (live-test regression A1). Other sessions refresh through their
-                            // own epoch comparison.
-                            shared_world.mark_visibility_changed();
-                            let mut refreshed_snapshot = snapshot.clone();
-                            refreshed_snapshot.player_position = native_position(player_position);
-                            refreshed_snapshot.player_direction = facing.protocol_direction();
-                            let refreshed_viewport = encode_shared_native_world_viewport(
-                                &config.client_profile,
-                                &refreshed_snapshot,
-                                world_map.as_ref(),
-                                shared_world,
-                                character.id,
-                            )?;
-                            let refreshed_static_spawns = shared_world.active_static_spawns()?;
-                            let refreshed_static_health_frames =
-                                native_static_creature_health_frames(
-                                    &config.client_profile,
-                                    &refreshed_static_spawns,
-                                )?;
-                            write_frame(stream, &refreshed_viewport)?;
-                            for frame in &refreshed_static_health_frames {
-                                write_frame(stream, frame)?;
-                            }
-                            observed_visibility_epoch = shared_world.visibility_epoch();
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                &format!(
-                                    "action=talk outcome=gm-talkaction reply-bytes={}",
-                                    reply.len()
-                                ),
-                            );
-                            continue;
-                        }
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    if apply_native_gm_talkaction_talk(&mut ctx, &request)?
+                        == SessionActionOutcome::Handled
+                    {
+                        continue;
                     }
                 }
                 // Operator-registered Lua talkactions dispatch through the resource-capped
