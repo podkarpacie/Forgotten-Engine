@@ -2670,277 +2670,54 @@ pub(crate) fn handle_native_otclient_game(
                         continue;
                     }
                 }
-                // Backpack-in-hand: using the equipped backpack item opens the lowest owned
-                // top-level container as a client window. FE links one backpack to one
-                // container by convention until full nesting lands.
-                if position.x == 0xffff
-                    && position.y & 0x40 == 0
-                    && EquipmentSlot::from_code(position.y as u8) == Some(EquipmentSlot::Backpack)
+                // Backpack, corpse, and map-item routing; see use_item.rs. Each consumes
+                // its record on match; anything unmatched falls to the next router.
                 {
-                    if observed_dead {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=use-item outcome=deferred-backpack-while-dead",
-                        );
-                        continue;
-                    }
-                    let equipped_backpack = shared_world
-                        .player_equipment(character.id)
-                        .ok()
-                        .and_then(|equipment| equipment.item(EquipmentSlot::Backpack).cloned());
-                    if equipped_backpack.is_none() {
-                        continue;
-                    }
-                    let containers = shared_world.player_containers(character.id)?;
-                    let open_container = containers
-                        .iter()
-                        .find(|(_, container)| !container.has_parent)
-                        .map(|(id, _)| id);
-                    let Some(container_id) = open_container else {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=use-item outcome=deferred-backpack-no-container",
-                        );
-                        continue;
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
                     };
-                    if closed_container_ids.contains(&container_id) {
-                        closed_container_ids.remove(&container_id);
-                    }
-                    if let Some(container) = containers.container(container_id) {
-                        if let Some(frame) = native_classic_container_frame(
-                            &config.client_profile,
-                            config.item_presentation_catalog.as_deref(),
-                            container,
-                        )
-                        .map_err(HostError::Protocol)?
-                        {
-                            write_frame(stream, &frame)?;
-                            sent_container_windows.insert(
-                                container_id,
-                                native_rendered_container_window(
-                                    &config.client_profile,
-                                    config.item_presentation_catalog.as_deref(),
-                                    container,
-                                ),
-                            );
-                            observed_containers_epoch = shared_world.containers_epoch();
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                &format!(
-                                    "action=use-item outcome=backpack-window-opened container-id={container_id}"
-                                ),
-                            );
-                        }
-                    }
-                    continue;
-                }
-                // Runtime-corpse opening runs first because identity comes from FE's own durable
-                // registry rather than the operator presentation catalog.
-                let corpse_attempt = map_owner.runtime_tile_item(
-                    Position {
-                        x: position.x,
-                        y: position.y,
-                        z: position.z,
-                    },
-                    usize::from(stack_position),
-                )?;
-                if let Some(corpse) = corpse_attempt {
-                    let core_position = Position {
-                        x: position.x,
-                        y: position.y,
-                        z: position.z,
-                    };
-                    if observed_dead {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=use-item outcome=deferred-corpse-use-while-dead",
-                        );
+                    if apply_native_backpack_use_action(
+                        &mut ctx,
+                        position,
+                        &mut closed_container_ids,
+                        &mut sent_container_windows,
+                        &mut observed_containers_epoch,
+                    )? == SessionActionOutcome::Handled
+                    {
                         continue;
                     }
-                    if client_thing_id != corpse.server_id {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=use-item outcome=deferred-runtime-item-identity-mismatch",
-                        );
-                        continue;
-                    }
-                    let shared_snapshot = map_owner.render_snapshot()?;
-                    let intent = PlayerItemUseIntent::new(
-                        character.id,
-                        core_position,
+                    if apply_native_corpse_use_action(
+                        &mut ctx,
+                        position,
+                        client_thing_id,
                         stack_position,
-                        corpse.server_id,
-                    )
-                    .map_err(HostError::Core)?;
-                    match shared_world.validate_player_item_use(shared_snapshot.as_ref(), intent) {
-                        Ok(_) => {}
-                        Err(HostError::Core(_)) => {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=use-item outcome=deferred-corpse-unreachable",
-                            );
-                            continue;
-                        }
-                        Err(error) => return Err(error),
+                        index,
+                        map_owner,
+                        &mut open_corpse_windows,
+                    )? == SessionActionOutcome::Handled
+                    {
+                        continue;
                     }
-                    let open_container_ids = shared_world
-                        .player_containers(character.id)?
-                        .iter()
-                        .map(|(_, container)| container.container_id)
-                        .collect::<BTreeSet<_>>();
-                    match native_corpse_window_id(
-                        &open_container_ids,
-                        &open_corpse_windows.keys().copied().collect(),
-                    ) {
-                        Some(window_id) => {
-                            match native_corpse_window_frame(
-                                &config.client_profile,
-                                config.item_presentation_catalog.as_deref(),
-                                window_id,
-                                &corpse,
-                                config.item_name_by_server_id.as_deref(),
-                            )
-                            .map_err(HostError::Protocol)?
-                            {
-                                Some(frame) => {
-                                    write_frame(stream, &frame)?;
-                                    open_corpse_windows.insert(
-                                        window_id,
-                                        (core_position, usize::from(stack_position)),
-                                    );
-                                    native_diagnostic(
-                                        config.extended_diagnostics,
-                                        peer,
-                                        &format!(
-                                            "action=use-item outcome=corpse-window-opened server-id={} children={} window-id={window_id} index={index}",
-                                            corpse.server_id,
-                                            corpse.children.len(),
-                                        ),
-                                    );
-                                }
-                                None => native_diagnostic(
-                                    config.extended_diagnostics,
-                                    peer,
-                                    "action=use-item outcome=deferred-corpse-window-unsupported",
-                                ),
-                            }
-                        }
-                        None => native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=use-item outcome=deferred-corpse-window-capacity",
-                        ),
-                    }
-                    continue;
-                }
-                let Some(world_map) = config.world_map.as_deref() else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=use-item outcome=deferred-no-world-map",
-                    );
-                    continue;
-                };
-                let Some(intent) = native_map_item_use_intent(
-                    config.item_presentation_catalog.as_deref(),
-                    character.id,
-                    position,
-                    client_thing_id,
-                    stack_position,
-                ) else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        &format!(
-                            "action=use-item outcome=deferred-unmapped-or-ambiguous-client-thing-id client-thing-id={client_thing_id}"
-                        ),
-                    );
-                    continue;
-                };
-                match shared_world.validate_player_item_use(world_map, intent) {
-                    Ok(outcome) => {
-                        if let Some(destination) = outcome.teleport_destination {
-                            let teleported = activate_native_map_teleport_item(
-                                stream,
-                                &config.client_profile,
-                                &snapshot,
-                                &database,
-                                shared_world,
-                                character.id,
-                                world_map,
-                                &mut player_position,
-                                facing,
-                                destination,
-                            )?;
-                            if teleported {
-                                active_click_walk = None;
-                                observed_visibility_epoch = shared_world.visibility_epoch();
-                                native_diagnostic(
-                                    config.extended_diagnostics,
-                                    peer,
-                                    &format!(
-                                        "action=use-item outcome=teleported server-id={} destination={destination:?} index={index}",
-                                        outcome.server_id,
-                                    ),
-                                );
-                            } else {
-                                native_diagnostic(
-                                    config.extended_diagnostics,
-                                    peer,
-                                    &format!(
-                                        "action=use-item outcome=deferred-teleport-destination-blocked server-id={} destination={destination:?} index={index}",
-                                        outcome.server_id,
-                                    ),
-                                );
-                            }
-                        } else if let Some(text) =
-                            native_validated_map_item_text(world_map, &outcome)
-                        {
-                            let text_window = encode_native_otclient_read_only_text_window(
-                                &config.client_profile,
-                                0,
-                                client_thing_id,
-                                text,
-                            )
-                            .map_err(HostError::Protocol)?;
-                            write_frame(stream, &text_window)?;
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                &format!(
-                                    "action=use-item outcome=read-only-text-window server-id={} text-bytes={} index={index}",
-                                    outcome.server_id,
-                                    text.len(),
-                                ),
-                            );
-                        } else {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                &format!(
-                                    "action=use-item outcome=validated server-id={} count={} action-id={:?} unique-id={:?} text={} charges={:?} index={index}",
-                                    outcome.server_id,
-                                    outcome.count,
-                                    outcome.action_id,
-                                    outcome.unique_id,
-                                    outcome.has_text,
-                                    outcome.charges,
-                                ),
-                            );
-                        }
-                    }
-                    Err(HostError::Core(_)) => native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=use-item outcome=deferred-invalid-server-owned-map-item",
-                    ),
-                    Err(error) => return Err(error),
+                    apply_native_map_item_use_action(
+                        &mut ctx,
+                        position,
+                        client_thing_id,
+                        stack_position,
+                        index,
+                    )?;
                 }
             }
             NativeOtClientGameAction::UseItemEx {
