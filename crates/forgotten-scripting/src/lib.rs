@@ -4,6 +4,8 @@
 //! only typed aggregate inventory metadata; it cannot receive a script path or source body and
 //! always returns a deferred no-op outcome.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, Value, Variadic};
 use std::collections::BTreeMap;
 use std::fs;
@@ -1082,6 +1084,7 @@ impl ScriptEventDispatcher for NoopDeferredScriptExecutor {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

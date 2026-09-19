@@ -1,5 +1,7 @@
 //! SQLite persistence, secure account authentication, and backup primitives.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -2595,6 +2597,7 @@ impl std::fmt::Display for PersistenceError {
 impl std::error::Error for PersistenceError {}
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use forgotten_core::Position;
