@@ -4151,179 +4151,31 @@ pub(crate) fn handle_native_otclient_game(
                         continue;
                     }
                 }
-                let recipient_count = if request.mode == 5 {
-                    let Some(recipient_name) = request.recipient.as_deref() else {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=talk outcome=deferred-missing-private-recipient",
-                        );
-                        continue;
-                    };
-                    match shared_world.send_private_chat(
-                        character.id,
-                        recipient_name,
-                        &request.message,
-                    )? {
-                        // Sender ack (plan 1.5): when the recipient has no online session, the
-                        // sender immediately hears the classic "not online" status line.
-                        PrivateChatDelivery::NotOnline => {
-                            let not_online = encode_native_otclient_status_message(
-                                &config.client_profile,
-                                &format!("A player called '{recipient_name}' is not online."),
-                            )
-                            .map_err(HostError::Protocol)?;
-                            write_frame(stream, &not_online)?;
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=talk outcome=private-recipient-not-online",
-                            );
-                            0
-                        }
-                        PrivateChatDelivery::Delivered => 1,
-                    }
-                } else if request.mode == 7 {
-                    let Some(channel_id) = request.channel_id else {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=talk outcome=deferred-missing-channel-id",
-                        );
-                        continue;
-                    };
-                    if !open_public_channel_ids.contains(&channel_id)
-                        || native_configured_public_channel(
-                            config.public_channel_catalog.as_deref(),
-                            channel_id,
-                        )
-                        .is_none()
-                    {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=talk outcome=deferred-unopened-or-unconfigured-channel",
-                        );
-                        continue;
-                    }
-                    shared_world.broadcast_configured_public_channel_chat(
-                        character.id,
-                        channel_id,
-                        &request.message,
-                    )?
-                } else if request.mode == 2 {
-                    shared_world.broadcast_whisper_chat(character.id, &request.message)?
-                } else if request.mode == 3 {
-                    shared_world.broadcast_yell_chat(character.id, &request.message)?
-                } else if request.channel_id == Some(NATIVE_GUILD_CHAT_CHANNEL_ID) {
-                    // Guild chat: deliver to every online member of the sender's guild. The
-                    // open-channel gate above does not apply because the guild channel is
-                    // implicit membership from persisted rows, not a joined public channel.
-                    let membership = database
-                        .guild_membership(character.id)
-                        .map_err(HostError::Persistence)?;
-                    match membership {
-                        Some(record) => {
-                            let member_ids = database
-                                .guild_member_ids(record.guild_id)
-                                .map_err(HostError::Persistence)?;
-                            shared_world.broadcast_guild_chat(
-                                character.id,
-                                &request.message,
-                                &member_ids,
-                            )?
-                        }
-                        None => {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=talk outcome=guild-chat-no-membership",
-                            );
-                            0
-                        }
-                    }
-                } else if request.channel_id.is_some() || request.recipient.is_some() {
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=talk outcome=deferred-unsupported-channel-mode",
-                    );
-                    continue;
-                } else if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY {
-                    shared_world.broadcast_public_chat(character.id, &request.message)?
-                } else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=talk outcome=deferred-unsupported-mode",
-                    );
-                    continue;
-                };
-                if config.extended_diagnostics {
-                    eprintln!(
-                        "> Native OTCv8 chat received mode={} bytes={} recipients={recipient_count}",
-                        request.mode,
-                        request.message.len()
-                    );
-                }
-                drain_shared_public_chat(
-                    stream,
-                    &config.client_profile,
-                    &chat_events,
-                    &open_public_channel_ids,
-                    config.extended_diagnostics,
-                    peer,
-                )?;
-                if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
-                    && request.channel_id.is_none()
-                    && request.recipient.is_none()
+                // Chat delivery (private/channel/whisper/yell/guild/public), inbound
+                // drain, and NPC dialogue; see world_chat.rs. Always ends Talk handling.
                 {
-                    if let Some(catalog) = config.declarative_npc_dialogue_catalog.as_deref() {
-                        if let Some((npc_id, npc_name, npc_position, text)) =
-                            resolve_native_static_npc_dialogue(
-                                shared_world,
-                                character.id,
-                                catalog,
-                                &request.message,
-                            )?
-                        {
-                            let record = encode_native_otclient_public_say(
-                                &config.client_profile,
-                                &npc_name,
-                                npc_position,
-                                &text,
-                            )
-                            .map_err(HostError::Protocol)?;
-                            write_frame(stream, &record)?;
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                &format!(
-                                    "outbound=npc-dialogue opcode=0xaa mode=1 npc-id={} text-bytes={}",
-                                    npc_id,
-                                    text.len()
-                                ),
-                            );
-                            // A greeting near a shop NPC also opens the classic shop windows
-                            // (0x7A catalog + 0x7B player goods) when a declarative shop and
-                            // presentation mapping exist for it.
-                            if let Some(shop_catalog) = config.shop_catalog.as_deref() {
-                                let _ = deliver_native_npc_shop_windows(
-                                    stream,
-                                    &config.client_profile,
-                                    shared_world,
-                                    &database,
-                                    character.id,
-                                    &npc_name,
-                                    shop_catalog,
-                                    config.item_presentation_catalog.as_deref(),
-                                    config.stackable_item_server_ids.as_deref(),
-                                    config.item_weight_by_server_id.as_deref(),
-                                    config.item_name_by_server_id.as_deref(),
-                                )?;
-                            }
-                        }
-                    }
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_chat_routing(
+                        &mut ctx,
+                        &request,
+                        &chat_events,
+                        &open_public_channel_ids,
+                    )?;
                 }
             }
             NativeOtClientGameAction::LeaveGame => break,

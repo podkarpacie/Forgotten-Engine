@@ -46,6 +46,8 @@ mod trade;
 pub(crate) use frames::*;
 pub use heartbeat::*;
 mod world_chat;
+pub(crate) use world_chat::apply_native_chat_routing;
+#[cfg(test)]
 pub(crate) use world_chat::PrivateChatDelivery;
 mod world_combat;
 mod world_equipment;
