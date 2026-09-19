@@ -614,7 +614,8 @@ impl SandboxedLuaCallbackDispatcher {
     }
 
     /// Invokes one registered callback with TFS-shaped bound host functions (`doCreatureSay`,
-    /// `doPlayerAddItem`, `getThingPos`) installed. Scripts CALL these functions instead of
+    /// `doPlayerAddItem`, `doTeleportThing`, `doPlayerAddHealth`, `doPlayerAddMana`,
+    /// `doPlayerRemoveItem`, `doSendMagicEffect`, `getThingPos`) installed. Scripts CALL these
     /// returning an effect table; each call validates its arguments and records one bounded
     /// typed intent that the host must validate and apply. The same fresh-VM, memory,
     /// instruction, and primitive-only boundaries as `dispatch_effects` apply, and the callback
@@ -904,10 +905,12 @@ fn sandboxed_lua_position_value(
     Ok(Value::Table(table))
 }
 
-/// Installs the bound TFS-shaped host API (`doCreatureSay`, `doPlayerAddItem`, `getThingPos`).
-/// Each function validates its arguments and records one bounded `SandboxedLuaEffect` into the
-/// per-dispatch queue; over-budget or invalid calls fail the whole dispatch rather than
-/// partially recording. Nothing here touches world state, files, or the network.
+/// Installs the bound TFS-shaped host API (`doCreatureSay`, `doPlayerAddItem`,
+/// `doTeleportThing`, `doPlayerAddHealth`, `doPlayerAddMana`, `doPlayerRemoveItem`,
+/// `doSendMagicEffect`, `getThingPos`). Each function validates its arguments and records one
+/// bounded `SandboxedLuaEffect` into the per-dispatch queue; over-budget or invalid calls fail
+/// the whole dispatch rather than partially recording. Nothing here touches world state,
+/// files, or the network.
 fn install_sandboxed_host_api(
     lua: &Lua,
     intents: &Arc<Mutex<Vec<SandboxedLuaEffect>>>,
@@ -923,16 +926,7 @@ fn install_sandboxed_host_api(
                 "invalid doCreatureSay text".into(),
             ));
         }
-        let mut intents = say_intents
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if intents.len() >= MAX_SANDBOXED_LUA_EFFECTS {
-            return Err(mlua::Error::RuntimeError(
-                "sandbox effect budget exhausted".into(),
-            ));
-        }
-        intents.push(SandboxedLuaEffect::Say(text));
-        Ok(true)
+        record_sandboxed_intent(&say_intents, SandboxedLuaEffect::Say(text))
     })?;
     let add_item_intents = Arc::clone(intents);
     let do_player_add_item = lua.create_function(move |_, (id, count): (u16, u16)| {
@@ -941,23 +935,100 @@ fn install_sandboxed_host_api(
                 "invalid doPlayerAddItem id or count".into(),
             ));
         }
-        let mut intents = add_item_intents
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if intents.len() >= MAX_SANDBOXED_LUA_EFFECTS {
+        record_sandboxed_intent(
+            &add_item_intents,
+            SandboxedLuaEffect::GiveItem { id, count },
+        )
+    })?;
+    let teleport_intents = Arc::clone(intents);
+    let do_teleport_thing = lua.create_function(move |_, (x, y, z): (u16, u16, u8)| {
+        record_sandboxed_intent(&teleport_intents, SandboxedLuaEffect::Teleport { x, y, z })
+    })?;
+    let health_intents = Arc::clone(intents);
+    let do_player_add_health = lua.create_function(move |_, amount: u16| {
+        if amount == 0 {
             return Err(mlua::Error::RuntimeError(
-                "sandbox effect budget exhausted".into(),
+                "invalid doPlayerAddHealth amount".into(),
             ));
         }
-        intents.push(SandboxedLuaEffect::GiveItem { id, count });
-        Ok(true)
+        record_sandboxed_intent(
+            &health_intents,
+            SandboxedLuaEffect::Heal {
+                health: amount,
+                mana: 0,
+            },
+        )
     })?;
+    let mana_intents = Arc::clone(intents);
+    let do_player_add_mana = lua.create_function(move |_, amount: u16| {
+        if amount == 0 {
+            return Err(mlua::Error::RuntimeError(
+                "invalid doPlayerAddMana amount".into(),
+            ));
+        }
+        record_sandboxed_intent(
+            &mana_intents,
+            SandboxedLuaEffect::Heal {
+                health: 0,
+                mana: amount,
+            },
+        )
+    })?;
+    let remove_item_intents = Arc::clone(intents);
+    let do_player_remove_item = lua.create_function(move |_, (id, count): (u16, u16)| {
+        if id == 0 || count == 0 || count > MAX_SANDBOXED_LUA_EFFECT_ITEM_COUNT {
+            return Err(mlua::Error::RuntimeError(
+                "invalid doPlayerRemoveItem id or count".into(),
+            ));
+        }
+        record_sandboxed_intent(
+            &remove_item_intents,
+            SandboxedLuaEffect::RemoveItem { id, count },
+        )
+    })?;
+    let magic_intents = Arc::clone(intents);
+    let do_send_magic_effect =
+        lua.create_function(move |_, (x, y, z, kind): (u16, u16, u8, u8)| {
+            if kind == 0 {
+                return Err(mlua::Error::RuntimeError(
+                    "invalid doSendMagicEffect kind".into(),
+                ));
+            }
+            record_sandboxed_intent(
+                &magic_intents,
+                SandboxedLuaEffect::MagicEffect { x, y, z, kind },
+            )
+        })?;
     let get_thing_pos =
         lua.create_function(move |lua, (): ()| sandboxed_lua_position_value(lua, position))?;
     lua.globals().set("doCreatureSay", do_creature_say)?;
     lua.globals().set("doPlayerAddItem", do_player_add_item)?;
+    lua.globals().set("doTeleportThing", do_teleport_thing)?;
+    lua.globals()
+        .set("doPlayerAddHealth", do_player_add_health)?;
+    lua.globals().set("doPlayerAddMana", do_player_add_mana)?;
+    lua.globals()
+        .set("doPlayerRemoveItem", do_player_remove_item)?;
+    lua.globals()
+        .set("doSendMagicEffect", do_send_magic_effect)?;
     lua.globals().set("getThingPos", get_thing_pos)?;
     Ok(())
+}
+
+/// Records one validated intent against the per-dispatch budget. Over-budget calls fail
+/// closed so a runaway script cannot queue unbounded work.
+fn record_sandboxed_intent(
+    intents: &Arc<Mutex<Vec<SandboxedLuaEffect>>>,
+    effect: SandboxedLuaEffect,
+) -> Result<bool, mlua::Error> {
+    let mut intents = intents.lock().unwrap_or_else(|poison| poison.into_inner());
+    if intents.len() >= MAX_SANDBOXED_LUA_EFFECTS {
+        return Err(mlua::Error::RuntimeError(
+            "sandbox effect budget exhausted".into(),
+        ));
+    }
+    intents.push(effect);
+    Ok(true)
 }
 
 /// Extracts a bounded list of typed effects from an array-of-effect-table return:
@@ -1762,6 +1833,66 @@ mod tests {
         assert_eq!(
             dispatcher.dispatch_api("missing", &input).state,
             SandboxedLuaCallbackDispatchState::CallbackNotFound
+        );
+    }
+
+    #[test]
+    fn callback_dispatcher_records_teleport_heal_remove_and_magic_calls() {
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "buff",
+                "return function() doTeleportThing(10, 20, 7) doPlayerAddHealth(25) doPlayerAddMana(10) doPlayerRemoveItem(2160, 1) doSendMagicEffect(10, 20, 7, 10) end",
+            )
+            .unwrap();
+        let input = SandboxedLuaCallbackInput {
+            event_kind: "talkaction".into(),
+            subject_id: 9,
+            value: 0,
+            argument: String::new(),
+            position: None,
+        };
+        let outcome = dispatcher.dispatch_api("buff", &input);
+        assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
+        assert_eq!(
+            outcome.effects,
+            vec![
+                SandboxedLuaEffect::Teleport { x: 10, y: 20, z: 7 },
+                SandboxedLuaEffect::Heal {
+                    health: 25,
+                    mana: 0
+                },
+                SandboxedLuaEffect::Heal {
+                    health: 0,
+                    mana: 10
+                },
+                SandboxedLuaEffect::RemoveItem { id: 2160, count: 1 },
+                SandboxedLuaEffect::MagicEffect {
+                    x: 10,
+                    y: 20,
+                    z: 7,
+                    kind: 10
+                },
+            ]
+        );
+
+        dispatcher
+            .register_callback("zero-heal", "return function() doPlayerAddHealth(0) end")
+            .unwrap();
+        assert_eq!(
+            dispatcher.dispatch_api("zero-heal", &input).state,
+            SandboxedLuaCallbackDispatchState::RuntimeRejected
+        );
+
+        dispatcher
+            .register_callback(
+                "zero-kind",
+                "return function() doSendMagicEffect(1, 2, 7, 0) end",
+            )
+            .unwrap();
+        assert_eq!(
+            dispatcher.dispatch_api("zero-kind", &input).state,
+            SandboxedLuaCallbackDispatchState::RuntimeRejected
         );
     }
 
