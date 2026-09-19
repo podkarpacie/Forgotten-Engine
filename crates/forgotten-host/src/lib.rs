@@ -32,6 +32,7 @@ pub(crate) use npc_shop::{
     handle_native_shop_keyword, insert_units_into_containers, remove_items_from_player,
 };
 mod native_render;
+mod session_context;
 mod session_drain;
 mod session_handlers;
 mod session_loop;
@@ -74,6 +75,7 @@ pub(crate) use native_render::{
     NativeRenderPreparationPool, NativeRenderPreparationWorker, NativeRenderPublication,
     NativeRenderPublicationError, MAX_NATIVE_RENDER_PUBLICATION_BATCH,
 };
+pub(crate) use session_context::{SessionActionOutcome, SessionContext};
 pub(crate) use session_drain::{
     drain_shared_public_chat, drain_shared_vip_presence, refresh_native_party_shields,
 };
@@ -89,7 +91,7 @@ pub(crate) use static_creature::{
 pub(crate) use static_creature::{
     persist_runtime_player_conditions, persist_static_target_attack_vitals,
 };
-pub(crate) use talkactions::{apply_native_lua_talkaction, NativeLuaTalkactionApply};
+pub(crate) use talkactions::apply_native_lua_talkaction;
 pub(crate) use trade::{
     handle_native_player_trade_request, handle_native_trade_accept, handle_native_trade_reject,
 };

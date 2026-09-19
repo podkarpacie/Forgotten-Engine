@@ -4,6 +4,7 @@
 //! spawning with experience awards.
 
 use super::*;
+use forgotten_protocol::NativeOtClientTalkRequest;
 
 /// One authoritative world tick equals one whole second for these timings; vocation attack
 /// cadence in milliseconds rounds up to the next whole tick (1500ms -> 2 ticks), bounded to the
@@ -231,6 +232,147 @@ pub(crate) fn apply_and_persist_native_declarative_spell_cast(
     }
     shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
     Ok((cast, magic))
+}
+
+/// Applies one declarative spell invocation for a Say record: an operator command or an exact
+/// declared Say keyword consumes mana/cooldowns identically and may apply one bounded
+/// declared-damage hit to the caster's selected living adjacent static target. Returns
+/// `SessionActionOutcome::Handled` when a cataloged spell was invoked (the caller must
+/// `continue`); returns `Unhandled` for a non-Say record or an unmatched message so the caller
+/// falls through to ordinary routing.
+pub(crate) fn apply_native_declarative_spell_talk(
+    ctx: &mut SessionContext<'_>,
+    request: &NativeOtClientTalkRequest,
+) -> Result<SessionActionOutcome, HostError> {
+    if !(request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
+        && request.channel_id.is_none()
+        && request.recipient.is_none())
+    {
+        return Ok(SessionActionOutcome::Unhandled);
+    }
+    let catalog = ctx.config.declarative_spell_catalog.as_deref();
+    let invoked_spell = match native_declarative_spell_command_id(&request.message) {
+        Some(spell_id) => catalog.and_then(|catalog| {
+            catalog
+                .get(spell_id)
+                .map(|definition| (catalog, definition))
+        }),
+        None => catalog.and_then(|catalog| {
+            catalog
+                .by_words(&request.message)
+                .map(|definition| (catalog, definition))
+        }),
+    };
+    let Some((catalog, definition)) = invoked_spell else {
+        return Ok(SessionActionOutcome::Unhandled);
+    };
+    if ctx.config.progression_rules.is_none() {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=declarative-spell outcome=deferred-missing-catalog-or-progression-rules",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    }
+    let Some(progression_rules) = ctx.config.progression_rules.as_deref() else {
+        return Ok(SessionActionOutcome::Handled);
+    };
+    match apply_and_persist_native_declarative_spell_cast(
+        &mut *ctx.database,
+        ctx.shared_world,
+        ctx.character_id,
+        definition.spell_id,
+        catalog,
+        progression_rules,
+        ctx.config.magic_rate,
+    ) {
+        Ok((cast, magic)) => {
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                &format!(
+                    "action=declarative-spell outcome=accepted spell-id={} mana-spent={} remaining-mana={} awarded-magic-mana={} magic-level={} gained-levels={}",
+                    cast.spell_id,
+                    cast.mana_spent,
+                    cast.remaining_mana,
+                    u64::from(cast.mana_spent)
+                        .saturating_mul(u64::from(ctx.config.magic_rate)),
+                    magic.magic_level,
+                    magic.gained_levels,
+                ),
+            );
+            // One bounded declared-damage hit on the selected living
+            // adjacent static target, sharing the per-player combat cooldown.
+            if let Some(damage) = definition.damage.filter(|_| !ctx.observed_dead) {
+                let target_id = ctx
+                    .shared_world
+                    .player_interaction_intent(ctx.character_id)
+                    .ok()
+                    .and_then(|intent| intent.target_static_creature_id);
+                if let Some(target_id) = target_id {
+                    match ctx.shared_world.apply_static_creature_melee_damage(
+                        ctx.character_id,
+                        target_id,
+                        damage,
+                    ) {
+                        Ok(outcome) if outcome.applied_damage > 0 => {
+                            persist_static_creature_runtime_to_open_database(
+                                ctx.shared_world,
+                                &mut *ctx.database,
+                            )?;
+                            let health_update = encode_native_otclient_creature_health(
+                                &ctx.config.client_profile,
+                                outcome.target_id,
+                                u16::from(outcome.remaining_health_percent),
+                                100,
+                            )
+                            .map_err(HostError::Protocol)?;
+                            write_frame(&mut *ctx.stream, &health_update)?;
+                            if outcome.deactivated {
+                                for frame in native_selected_player_death_target_frames(
+                                    &ctx.config.client_profile,
+                                    true,
+                                )
+                                .map_err(HostError::Protocol)?
+                                {
+                                    write_frame(&mut *ctx.stream, &frame)?;
+                                }
+                            }
+                            *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
+                            native_diagnostic(
+                                ctx.config.extended_diagnostics,
+                                ctx.peer,
+                                &format!(
+                                    "combat=declarative-spell-damage target={} damage={} health-percent={} deactivated={}",
+                                    outcome.target_id,
+                                    outcome.applied_damage,
+                                    outcome.remaining_health_percent,
+                                    outcome.deactivated,
+                                ),
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(HostError::Core(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+        Err(HostError::Core(
+            forgotten_core::CoreError::InsufficientMana { .. }
+            | forgotten_core::CoreError::SpellCooldownActive { .. }
+            | forgotten_core::CoreError::PlayerIsDead(_),
+        ))
+        | Err(HostError::InvalidConfiguration(_)) => {
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                "action=declarative-spell outcome=rejected-authoritative-state-or-catalog",
+            );
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(SessionActionOutcome::Handled)
 }
 
 pub(crate) struct NativeSelectedPlayerMeleePolicy<'a> {

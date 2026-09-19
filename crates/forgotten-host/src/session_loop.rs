@@ -4263,157 +4263,49 @@ pub(crate) fn handle_native_otclient_game(
                 // sandbox; dispatch and effect application live in talkactions.rs. A handled word
                 // consumes the record; anything else falls through to ordinary routing.
                 if let Some(dispatcher) = config.talkaction_dispatcher.as_ref() {
-                    let handled = apply_native_lua_talkaction(NativeLuaTalkactionApply {
-                        request: &request,
-                        dispatcher,
-                        character_id: character.id,
+                    let mut ctx = SessionContext {
                         stream: &mut *stream,
                         peer,
-                        client_profile: &config.client_profile,
-                        extended_diagnostics: config.extended_diagnostics,
+                        character_id: character.id,
                         database: &mut database,
                         shared_world,
+                        config,
                         world_map: &world_map,
                         snapshot: &snapshot,
                         facing,
                         player_position: &mut player_position,
+                        observed_dead,
                         observed_visibility_epoch: &mut observed_visibility_epoch,
                         observed_vitals_epoch: &mut observed_vitals_epoch,
-                    })?;
-                    if handled {
+                    };
+                    if apply_native_lua_talkaction(&mut ctx, &request, dispatcher)?
+                        == SessionActionOutcome::Handled
+                    {
                         continue;
                     }
                 }
-                if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
-                    && request.channel_id.is_none()
-                    && request.recipient.is_none()
+                // Spell invocation resolves through the operator command or an exact
+                // declared Say keyword; see native_combat.rs. A handled invocation consumes
+                // the record; anything else falls through to ordinary routing.
                 {
-                    // Spell invocation resolves either through the operator command or an exact
-                    // declared Say keyword; both consume mana/cooldowns identically and may apply
-                    // one bounded declared-damage hit to the caster's selected adjacent target.
-                    let catalog = config.declarative_spell_catalog.as_deref();
-                    let invoked_spell = match native_declarative_spell_command_id(&request.message)
-                    {
-                        Some(spell_id) => catalog.and_then(|catalog| {
-                            catalog
-                                .get(spell_id)
-                                .map(|definition| (catalog, definition))
-                        }),
-                        None => catalog.and_then(|catalog| {
-                            catalog
-                                .by_words(&request.message)
-                                .map(|definition| (catalog, definition))
-                        }),
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing,
+                        player_position: &mut player_position,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
                     };
-                    if let Some((catalog, definition)) = invoked_spell {
-                        if config.progression_rules.is_none() {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=declarative-spell outcome=deferred-missing-catalog-or-progression-rules",
-                            );
-                            continue;
-                        }
-                        let Some(progression_rules) = config.progression_rules.as_deref() else {
-                            continue;
-                        };
-                        match apply_and_persist_native_declarative_spell_cast(
-                            &mut database,
-                            shared_world,
-                            character.id,
-                            definition.spell_id,
-                            catalog,
-                            progression_rules,
-                            config.magic_rate,
-                        ) {
-                            Ok((cast, magic)) => {
-                                native_diagnostic(
-                                    config.extended_diagnostics,
-                                    peer,
-                                    &format!(
-                                        "action=declarative-spell outcome=accepted spell-id={} mana-spent={} remaining-mana={} awarded-magic-mana={} magic-level={} gained-levels={}",
-                                        cast.spell_id,
-                                        cast.mana_spent,
-                                        cast.remaining_mana,
-                                        u64::from(cast.mana_spent)
-                                            .saturating_mul(u64::from(config.magic_rate)),
-                                        magic.magic_level,
-                                        magic.gained_levels,
-                                    ),
-                                );
-                                // One bounded declared-damage hit on the selected living
-                                // adjacent static target, sharing the per-player combat cooldown.
-                                if let Some(damage) = definition.damage.filter(|_| !observed_dead) {
-                                    let target_id = shared_world
-                                        .player_interaction_intent(character.id)
-                                        .ok()
-                                        .and_then(|intent| intent.target_static_creature_id);
-                                    if let Some(target_id) = target_id {
-                                        match shared_world.apply_static_creature_melee_damage(
-                                            character.id,
-                                            target_id,
-                                            damage,
-                                        ) {
-                                            Ok(outcome) if outcome.applied_damage > 0 => {
-                                                persist_static_creature_runtime_to_open_database(
-                                                    shared_world,
-                                                    &mut database,
-                                                )?;
-                                                let health_update =
-                                                    encode_native_otclient_creature_health(
-                                                        &config.client_profile,
-                                                        outcome.target_id,
-                                                        u16::from(outcome.remaining_health_percent),
-                                                        100,
-                                                    )
-                                                    .map_err(HostError::Protocol)?;
-                                                write_frame(stream, &health_update)?;
-                                                if outcome.deactivated {
-                                                    for frame in
-                                                        native_selected_player_death_target_frames(
-                                                            &config.client_profile,
-                                                            true,
-                                                        )
-                                                        .map_err(HostError::Protocol)?
-                                                    {
-                                                        write_frame(stream, &frame)?;
-                                                    }
-                                                }
-                                                observed_visibility_epoch =
-                                                    shared_world.visibility_epoch();
-                                                native_diagnostic(
-                                                    config.extended_diagnostics,
-                                                    peer,
-                                                    &format!(
-                                                        "combat=declarative-spell-damage target={} damage={} health-percent={} deactivated={}",
-                                                        outcome.target_id,
-                                                        outcome.applied_damage,
-                                                        outcome.remaining_health_percent,
-                                                        outcome.deactivated,
-                                                    ),
-                                                );
-                                            }
-                                            Ok(_) => {}
-                                            Err(HostError::Core(_)) => {}
-                                            Err(error) => return Err(error),
-                                        }
-                                    }
-                                }
-                            }
-                            Err(HostError::Core(
-                                forgotten_core::CoreError::InsufficientMana { .. }
-                                | forgotten_core::CoreError::SpellCooldownActive { .. }
-                                | forgotten_core::CoreError::PlayerIsDead(_),
-                            ))
-                            | Err(HostError::InvalidConfiguration(_)) => {
-                                native_diagnostic(
-                                    config.extended_diagnostics,
-                                    peer,
-                                    "action=declarative-spell outcome=rejected-authoritative-state-or-catalog",
-                                );
-                            }
-                            Err(error) => return Err(error),
-                        }
+                    if apply_native_declarative_spell_talk(&mut ctx, &request)?
+                        == SessionActionOutcome::Handled
+                    {
                         continue;
                     }
                 }

@@ -46,41 +46,23 @@ pub(crate) fn dispatch_native_lua_talkaction(
     }
 }
 
-/// Borrowed session state for one Lua talkaction application. Groups the stream, authoritative
-/// handles, and mutated session locals the effect loop needs, so the session loop stays a thin
-/// dispatcher rather than hosting the whole apply block.
-pub(crate) struct NativeLuaTalkactionApply<'a> {
-    pub request: &'a NativeOtClientTalkRequest,
-    pub dispatcher: &'a SandboxedLuaCallbackDispatcher,
-    pub character_id: u64,
-    pub stream: &'a mut TcpStream,
-    pub peer: SocketAddr,
-    pub client_profile: &'a NativeOtClientProfile,
-    pub extended_diagnostics: bool,
-    pub database: &'a mut EngineDatabase,
-    pub shared_world: &'a SharedNativeWorld,
-    pub world_map: &'a Arc<WorldMap>,
-    pub snapshot: &'a NativeOtClientEmptyWorldSnapshot,
-    pub facing: NativeOtClientCardinalDirection,
-    pub player_position: &'a mut Position,
-    pub observed_visibility_epoch: &'a mut u64,
-    pub observed_vitals_epoch: &'a mut u64,
-}
-
-/// Applies one operator-registered Lua talkaction for a Say record. Returns `true` when the word
-/// was handled (the caller must `continue` to the next session action); returns `false` for a
-/// non-Say record or an unknown word so the caller falls through to ordinary routing. Effect
-/// application is identical to the former inline session-loop block: bounded typed effects are
-/// validated and applied against authoritative state, teleports resend the viewport, and every
-/// mutation persists before any client frame is emitted.
+/// Applies one operator-registered Lua talkaction for a Say record. Returns
+/// `SessionActionOutcome::Handled` when the word was handled (the caller must `continue` to the
+/// next session action); returns `Unhandled` for a non-Say record or an unknown word so the
+/// caller falls through to ordinary routing. Effect application is identical to the former
+/// inline session-loop block: bounded typed effects are validated and applied against
+/// authoritative state, teleports resend the viewport, and every mutation persists before any
+/// client frame is emitted.
 pub(crate) fn apply_native_lua_talkaction(
-    ctx: NativeLuaTalkactionApply<'_>,
-) -> Result<bool, HostError> {
-    if !(ctx.request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
-        && ctx.request.channel_id.is_none()
-        && ctx.request.recipient.is_none())
+    ctx: &mut SessionContext<'_>,
+    request: &NativeOtClientTalkRequest,
+    dispatcher: &SandboxedLuaCallbackDispatcher,
+) -> Result<SessionActionOutcome, HostError> {
+    if !(request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
+        && request.channel_id.is_none()
+        && request.recipient.is_none())
     {
-        return Ok(false);
+        return Ok(SessionActionOutcome::Unhandled);
     }
     let subject_position = ctx.shared_world.player_position(ctx.character_id)?;
     let subject_position = Some(SandboxedLuaPosition {
@@ -89,19 +71,20 @@ pub(crate) fn apply_native_lua_talkaction(
         z: subject_position.z,
     });
     let Some(effects) = dispatch_native_lua_talkaction(
-        ctx.dispatcher,
-        &ctx.request.message,
+        dispatcher,
+        &request.message,
         ctx.character_id,
         subject_position,
     ) else {
-        return Ok(false);
+        return Ok(SessionActionOutcome::Unhandled);
     };
     let mut teleported = false;
     for effect in effects {
         match effect {
             SandboxedLuaEffect::Say(text) => {
-                let reply_frame = encode_native_otclient_status_message(ctx.client_profile, &text)
-                    .map_err(HostError::Protocol)?;
+                let reply_frame =
+                    encode_native_otclient_status_message(&ctx.config.client_profile, &text)
+                        .map_err(HostError::Protocol)?;
                 write_frame(&mut *ctx.stream, &reply_frame)?;
             }
             SandboxedLuaEffect::Teleport { x, y, z } => {
@@ -115,7 +98,7 @@ pub(crate) fn apply_native_lua_talkaction(
                     teleported = true;
                 } else {
                     let reply_frame = encode_native_otclient_status_message(
-                        ctx.client_profile,
+                        &ctx.config.client_profile,
                         "That destination is blocked.",
                     )
                     .map_err(HostError::Protocol)?;
@@ -148,7 +131,7 @@ pub(crate) fn apply_native_lua_talkaction(
                 )?;
                 let self_native_id = native_player_id(ctx.character_id)?;
                 let health_update = encode_native_otclient_creature_health(
-                    ctx.client_profile,
+                    &ctx.config.client_profile,
                     self_native_id,
                     vitals.health,
                     vitals.max_health,
@@ -166,7 +149,7 @@ pub(crate) fn apply_native_lua_talkaction(
                     u64::from(count),
                 )? {
                     let reply_frame =
-                        encode_native_otclient_status_message(ctx.client_profile, &message)
+                        encode_native_otclient_status_message(&ctx.config.client_profile, &message)
                             .map_err(HostError::Protocol)?;
                     write_frame(&mut *ctx.stream, &reply_frame)?;
                 }
@@ -180,14 +163,14 @@ pub(crate) fn apply_native_lua_talkaction(
                     u64::from(count),
                 )? {
                     let reply_frame =
-                        encode_native_otclient_status_message(ctx.client_profile, &message)
+                        encode_native_otclient_status_message(&ctx.config.client_profile, &message)
                             .map_err(HostError::Protocol)?;
                     write_frame(&mut *ctx.stream, &reply_frame)?;
                 }
             }
             SandboxedLuaEffect::MagicEffect { x, y, z, kind } => {
                 let effect_frame = encode_native_otclient_magic_effect(
-                    ctx.client_profile,
+                    &ctx.config.client_profile,
                     native_position(Position { x, y, z }),
                     kind,
                 )
@@ -202,15 +185,17 @@ pub(crate) fn apply_native_lua_talkaction(
         refreshed_snapshot.player_position = native_position(*ctx.player_position);
         refreshed_snapshot.player_direction = ctx.facing.protocol_direction();
         let refreshed_viewport = encode_shared_native_world_viewport(
-            ctx.client_profile,
+            &ctx.config.client_profile,
             &refreshed_snapshot,
             ctx.world_map.as_ref(),
             ctx.shared_world,
             ctx.character_id,
         )?;
         let refreshed_static_spawns = ctx.shared_world.active_static_spawns()?;
-        let refreshed_static_health_frames =
-            native_static_creature_health_frames(ctx.client_profile, &refreshed_static_spawns)?;
+        let refreshed_static_health_frames = native_static_creature_health_frames(
+            &ctx.config.client_profile,
+            &refreshed_static_spawns,
+        )?;
         write_frame(&mut *ctx.stream, &refreshed_viewport)?;
         for frame in &refreshed_static_health_frames {
             write_frame(&mut *ctx.stream, frame)?;
@@ -218,11 +203,11 @@ pub(crate) fn apply_native_lua_talkaction(
         *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
     }
     native_diagnostic(
-        ctx.extended_diagnostics,
+        ctx.config.extended_diagnostics,
         ctx.peer,
         "action=talk outcome=lua-talkaction",
     );
-    Ok(true)
+    Ok(SessionActionOutcome::Handled)
 }
 
 #[cfg(test)]
