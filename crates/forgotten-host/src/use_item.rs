@@ -300,6 +300,32 @@ pub(crate) fn apply_native_map_item_use_action(
     };
     match ctx.shared_world.validate_player_item_use(world_map, intent) {
         Ok(outcome) => {
+            // Registered action scripts run before generic handling and consume the
+            // record, so operator behavior replaces rather than duplicates defaults.
+            // Field-disjoint borrows keep this compatible with the live world-map
+            // reference above; no whole-context borrow is taken.
+            if let Some(dispatcher) = ctx.config.action_dispatcher.as_deref() {
+                if apply_native_action_use(
+                    ctx.config,
+                    &mut *ctx.stream,
+                    &mut *ctx.database,
+                    ctx.shared_world,
+                    ctx.character_id,
+                    ctx.peer,
+                    ctx.snapshot,
+                    *ctx.facing,
+                    &mut *ctx.player_position,
+                    &mut *ctx.observed_visibility_epoch,
+                    &mut *ctx.observed_vitals_epoch,
+                    world_map,
+                    dispatcher,
+                    outcome.server_id,
+                    outcome.action_id,
+                    outcome.unique_id,
+                )? {
+                    return Ok(());
+                }
+            }
             if let Some(destination) = outcome.teleport_destination {
                 let teleported = activate_native_map_teleport_item(
                     &mut *ctx.stream,

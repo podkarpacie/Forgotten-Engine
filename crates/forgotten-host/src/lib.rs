@@ -6,6 +6,7 @@
 
 pub mod operator;
 
+mod actions;
 mod bank;
 mod consumables;
 mod container_views;
@@ -50,6 +51,7 @@ mod static_creature;
 mod talkactions;
 mod trade;
 mod use_item;
+pub(crate) use actions::apply_native_action_use;
 pub(crate) use frames::*;
 pub use heartbeat::*;
 pub(crate) use use_item::{
@@ -488,6 +490,11 @@ pub struct NativeOtClientHostConfig {
     /// route only through this resource-capped dispatcher; a script cannot read files, open
     /// sockets, mutate world state, or exhaust memory/instructions without a bounded rejection.
     pub talkaction_dispatcher: Option<Arc<SandboxedLuaCallbackDispatcher>>,
+    /// Optional pre-built sandboxed TFS action dispatcher keyed by canonical selector names
+    /// (`action:item|action|unique:{id}`). Validated map-item uses whose action or unique id
+    /// matches a registered selector route through this dispatcher before generic handling;
+    /// the same resource caps and intent-only boundaries as talkactions apply.
+    pub action_dispatcher: Option<Arc<SandboxedLuaCallbackDispatcher>>,
     /// Configured corpse despawn delay in authoritative world-tick seconds. `0` (the default)
     /// disables decay; a positive value expires each placed runtime corpse after the delay on a
     /// later heartbeat, removing it from the map and the durable registry together.
@@ -1210,6 +1217,7 @@ mod tests {
             declarative_spell_catalog: None,
             declarative_npc_dialogue_catalog: None,
             talkaction_dispatcher: None,
+            action_dispatcher: None,
             corpse_despawn_seconds: 0,
         }
     }
