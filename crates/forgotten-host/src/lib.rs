@@ -65,10 +65,14 @@ pub(crate) use gm_commands::apply_native_gm_talkaction_talk;
 #[cfg(test)]
 pub(crate) use gm_commands::handle_native_gm_talkaction;
 pub(crate) use inspection::{
-    encode_shared_native_world_viewport, native_creature_inspection_message,
-    native_ground_look_message, native_item_inspection_metadata_details,
-    native_map_item_inspection_message, native_static_creature_health_frames,
-    native_validated_map_item_text,
+    apply_native_look_creature_action, apply_native_look_map_action,
+    encode_shared_native_world_viewport, native_item_inspection_metadata_details,
+    native_static_creature_health_frames, native_validated_map_item_text,
+};
+#[cfg(test)]
+pub(crate) use inspection::{
+    native_creature_inspection_message, native_ground_look_message,
+    native_map_item_inspection_message,
 };
 pub(crate) use movement::*;
 pub(crate) use native_combat::*;

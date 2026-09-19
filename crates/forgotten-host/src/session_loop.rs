@@ -3539,176 +3539,54 @@ pub(crate) fn handle_native_otclient_game(
                 thing_id,
                 stack_position,
             } => {
-                let equipment = shared_world.player_equipment(character.id)?;
-                if let Some((slot, item)) = native_classic_equipment_look_item(
-                    config.item_presentation_catalog.as_deref(),
-                    &equipment,
-                    position,
-                    thing_id,
-                    stack_position,
-                ) {
-                    let response = encode_native_otclient_look_message(
-                        &config.client_profile,
-                        &native_equipment_item_inspection_message(
-                            slot,
-                            &item,
-                            config.item_name_by_server_id.as_deref(),
-                            config.item_weight_by_server_id.as_deref(),
-                            config.stackable_item_server_ids.as_deref(),
-                        ),
-                    )
-                    .map_err(HostError::Protocol)?;
-                    write_frame(stream, &response)?;
-                    native_diagnostic(
-                        config.extended_diagnostics,
+                // Map look (equipment, containers, world, fallback); see inspection.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
                         peer,
-                        &format!(
-                            "action=look-map outcome=equipment-slot-inspection slot={} item-id={}",
-                            slot.code(),
-                            item.server_id
-                        ),
-                    );
-                    continue;
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_look_map_action(
+                        &mut ctx,
+                        position,
+                        thing_id,
+                        stack_position,
+                        &closed_container_ids,
+                    )?;
                 }
-                let containers = shared_world.player_containers(character.id)?;
-                if let Some((container_id, item)) = native_classic_container_look_item(
-                    config.item_presentation_catalog.as_deref(),
-                    &containers,
-                    &closed_container_ids,
-                    position,
-                    thing_id,
-                    stack_position,
-                ) {
-                    let response = encode_native_otclient_look_message(
-                        &config.client_profile,
-                        &native_container_item_inspection_message(
-                            container_id,
-                            &item,
-                            config.item_name_by_server_id.as_deref(),
-                            config.item_weight_by_server_id.as_deref(),
-                            config.stackable_item_server_ids.as_deref(),
-                        ),
-                    )
-                    .map_err(HostError::Protocol)?;
-                    write_frame(stream, &response)?;
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        &format!(
-                            "action=look-map outcome=container-item-inspection container-id={} item-id={}",
-                            container_id, item.server_id
-                        ),
-                    );
-                    continue;
-                }
-                let Some(world_map) = config.world_map.as_deref() else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=look-map outcome=deferred-no-world-map",
-                    );
-                    continue;
-                };
-                let Some(intent) = native_map_item_use_intent(
-                    config.item_presentation_catalog.as_deref(),
-                    character.id,
-                    position,
-                    thing_id,
-                    stack_position,
-                ) else {
-                    // Universal Look fallback: TFS always answers a look. Bare ground and
-                    // unmapped decorations resolve through the imported item name when
-                    // possible; raw numeric ids are never echoed (live-test regression A2).
-                    let message = native_ground_look_message(
-                        world_map,
-                        Position {
-                            x: position.x,
-                            y: position.y,
-                            z: position.z,
-                        },
-                        config.item_name_by_server_id.as_deref(),
-                    );
-                    let response =
-                        encode_native_otclient_look_message(&config.client_profile, &message)
-                            .map_err(HostError::Protocol)?;
-                    write_frame(stream, &response)?;
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=look-map outcome=generic-fallback",
-                    );
-                    continue;
-                };
-                let item = match shared_world.validate_player_item_use(world_map, intent) {
-                    Ok(item) => item,
-                    Err(HostError::Core(_)) => {
-                        // Tile exists but the item reference did not resolve (moved, out of
-                        // range, or stale stackpos). Answer generically like TFS does.
-                        let message = native_ground_look_message(
-                            world_map,
-                            Position {
-                                x: position.x,
-                                y: position.y,
-                                z: position.z,
-                            },
-                            config.item_name_by_server_id.as_deref(),
-                        );
-                        let response =
-                            encode_native_otclient_look_message(&config.client_profile, &message)
-                                .map_err(HostError::Protocol)?;
-                        write_frame(stream, &response)?;
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=look-map outcome=generic-fallback-stale-reference",
-                        );
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                let message = native_map_item_inspection_message(
-                    world_map,
-                    &item,
-                    config.item_name_by_server_id.as_deref(),
-                    config.item_weight_by_server_id.as_deref(),
-                    config.stackable_item_server_ids.as_deref(),
-                );
-                let response =
-                    encode_native_otclient_look_message(&config.client_profile, &message)
-                        .map_err(HostError::Protocol)?;
-                write_frame(stream, &response)?;
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "outbound=look-message opcode=0xb4 class=0x16 bytes={} action=look-map server-id={} count={}",
-                        response.0.len(), item.server_id, item.count
-                    ),
-                );
             }
             NativeOtClientGameAction::LookCreature { creature_id } => {
-                let Some(message) =
-                    native_creature_inspection_message(shared_world, character.id, creature_id)?
-                else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
+                // Creature look; see inspection.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
                         peer,
-                        "action=look-creature outcome=deferred-unavailable-or-outside-viewport",
-                    );
-                    continue;
-                };
-                let response =
-                    encode_native_otclient_look_message(&config.client_profile, &message)
-                        .map_err(HostError::Protocol)?;
-                write_frame(stream, &response)?;
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "outbound=look-message opcode=0xb4 class=0x16 bytes={} action=look-creature native-id={creature_id}",
-                        response.0.len()
-                    ),
-                );
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_look_creature_action(&mut ctx, creature_id)?;
+                }
             }
             NativeOtClientGameAction::IgnoredInteraction(opcode) => {
                 if config.extended_diagnostics {

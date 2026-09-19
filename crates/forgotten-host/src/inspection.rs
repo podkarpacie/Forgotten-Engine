@@ -227,3 +227,190 @@ pub(crate) fn native_ground_look_message(
         }
     }
 }
+
+/// Answers one map look: owned equipment, then owned containers, then the validated world-map
+/// item, falling back to generic ground text like TFS. Every answered look consumes the record;
+/// all paths end LookMap processing, so this returns `Result<(), _>`.
+pub(crate) fn apply_native_look_map_action(
+    ctx: &mut SessionContext<'_>,
+    position: NativeOtClientPosition,
+    thing_id: u16,
+    stack_position: u8,
+    closed_container_ids: &BTreeSet<u8>,
+) -> Result<(), HostError> {
+    let equipment = ctx.shared_world.player_equipment(ctx.character_id)?;
+    if let Some((slot, item)) = native_classic_equipment_look_item(
+        ctx.config.item_presentation_catalog.as_deref(),
+        &equipment,
+        position,
+        thing_id,
+        stack_position,
+    ) {
+        let response = encode_native_otclient_look_message(
+            &ctx.config.client_profile,
+            &native_equipment_item_inspection_message(
+                slot,
+                &item,
+                ctx.config.item_name_by_server_id.as_deref(),
+                ctx.config.item_weight_by_server_id.as_deref(),
+                ctx.config.stackable_item_server_ids.as_deref(),
+            ),
+        )
+        .map_err(HostError::Protocol)?;
+        write_frame(&mut *ctx.stream, &response)?;
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            &format!(
+                "action=look-map outcome=equipment-slot-inspection slot={} item-id={}",
+                slot.code(),
+                item.server_id
+            ),
+        );
+        return Ok(());
+    }
+    let containers = ctx.shared_world.player_containers(ctx.character_id)?;
+    if let Some((container_id, item)) = native_classic_container_look_item(
+        ctx.config.item_presentation_catalog.as_deref(),
+        &containers,
+        closed_container_ids,
+        position,
+        thing_id,
+        stack_position,
+    ) {
+        let response = encode_native_otclient_look_message(
+            &ctx.config.client_profile,
+            &native_container_item_inspection_message(
+                container_id,
+                &item,
+                ctx.config.item_name_by_server_id.as_deref(),
+                ctx.config.item_weight_by_server_id.as_deref(),
+                ctx.config.stackable_item_server_ids.as_deref(),
+            ),
+        )
+        .map_err(HostError::Protocol)?;
+        write_frame(&mut *ctx.stream, &response)?;
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            &format!(
+                "action=look-map outcome=container-item-inspection container-id={} item-id={}",
+                container_id, item.server_id
+            ),
+        );
+        return Ok(());
+    }
+    let Some(world_map) = ctx.config.world_map.as_deref() else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=look-map outcome=deferred-no-world-map",
+        );
+        return Ok(());
+    };
+    let Some(intent) = native_map_item_use_intent(
+        ctx.config.item_presentation_catalog.as_deref(),
+        ctx.character_id,
+        position,
+        thing_id,
+        stack_position,
+    ) else {
+        // Universal Look fallback: TFS always answers a look. Bare ground and
+        // unmapped decorations resolve through the imported item name when
+        // possible; raw numeric ids are never echoed (live-test regression A2).
+        let message = native_ground_look_message(
+            world_map,
+            Position {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+            },
+            ctx.config.item_name_by_server_id.as_deref(),
+        );
+        let response = encode_native_otclient_look_message(&ctx.config.client_profile, &message)
+            .map_err(HostError::Protocol)?;
+        write_frame(&mut *ctx.stream, &response)?;
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=look-map outcome=generic-fallback",
+        );
+        return Ok(());
+    };
+    let item = match ctx.shared_world.validate_player_item_use(world_map, intent) {
+        Ok(item) => item,
+        Err(HostError::Core(_)) => {
+            // Tile exists but the item reference did not resolve (moved, out of
+            // range, or stale stackpos). Answer generically like TFS does.
+            let message = native_ground_look_message(
+                world_map,
+                Position {
+                    x: position.x,
+                    y: position.y,
+                    z: position.z,
+                },
+                ctx.config.item_name_by_server_id.as_deref(),
+            );
+            let response =
+                encode_native_otclient_look_message(&ctx.config.client_profile, &message)
+                    .map_err(HostError::Protocol)?;
+            write_frame(&mut *ctx.stream, &response)?;
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                "action=look-map outcome=generic-fallback-stale-reference",
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let message = native_map_item_inspection_message(
+        world_map,
+        &item,
+        ctx.config.item_name_by_server_id.as_deref(),
+        ctx.config.item_weight_by_server_id.as_deref(),
+        ctx.config.stackable_item_server_ids.as_deref(),
+    );
+    let response = encode_native_otclient_look_message(&ctx.config.client_profile, &message)
+        .map_err(HostError::Protocol)?;
+    write_frame(&mut *ctx.stream, &response)?;
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!(
+            "outbound=look-message opcode=0xb4 class=0x16 bytes={} action=look-map server-id={} count={}",
+            response.0.len(), item.server_id, item.count
+        ),
+    );
+    Ok(())
+}
+
+/// Answers one creature look with verified status text for a visible player or active static
+/// creature. Unavailable targets emit a diagnostic without effect.
+pub(crate) fn apply_native_look_creature_action(
+    ctx: &mut SessionContext<'_>,
+    creature_id: u32,
+) -> Result<(), HostError> {
+    let Some(message) =
+        native_creature_inspection_message(ctx.shared_world, ctx.character_id, creature_id)?
+    else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=look-creature outcome=deferred-unavailable-or-outside-viewport",
+        );
+        return Ok(());
+    };
+    let response = encode_native_otclient_look_message(&ctx.config.client_profile, &message)
+        .map_err(HostError::Protocol)?;
+    write_frame(&mut *ctx.stream, &response)?;
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!(
+            "outbound=look-message opcode=0xb4 class=0x16 bytes={} action=look-creature native-id={creature_id}",
+            response.0.len()
+        ),
+    );
+    Ok(())
+}
