@@ -64,8 +64,8 @@ pub use stages::{
     ExperienceStages,
 };
 pub use tfs_actions::{
-    load_tfs_action_registry, parse_tfs_actions_xml, TfsActionEntry, TfsActionKey,
-    TfsActionRegistry,
+    action_callback_candidates, load_tfs_action_registry, parse_tfs_actions_xml, TfsActionEntry,
+    TfsActionKey, TfsActionRegistry,
 };
 pub use tfs_creaturescripts::{
     load_tfs_creaturescript_registry, parse_tfs_creaturescripts_xml, TfsCreatureScriptEntry,

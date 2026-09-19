@@ -26,6 +26,37 @@ pub enum TfsActionKey {
     UniqueId(u16),
 }
 
+impl TfsActionKey {
+    /// Canonical sandbox callback name for singleton selectors. Ranges have no single name
+    /// and return `None`; range routing stays deferred.
+    pub fn callback_name(self) -> Option<String> {
+        match self {
+            Self::ItemId(id) => Some(format!("action:item:{id}")),
+            Self::ActionId(id) => Some(format!("action:action:{id}")),
+            Self::UniqueId(id) => Some(format!("action:unique:{id}")),
+            Self::ItemIdRange { .. } | Self::ActionIdRange { .. } => None,
+        }
+    }
+}
+
+/// Candidate callback names for one used item, most specific first (unique, action, item).
+/// The host tries each in order against the action dispatcher; the first hit wins.
+pub fn action_callback_candidates(
+    server_id: u16,
+    action_id: Option<u16>,
+    unique_id: Option<u16>,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(id) = unique_id {
+        candidates.push(format!("action:unique:{id}"));
+    }
+    if let Some(id) = action_id {
+        candidates.push(format!("action:action:{id}"));
+    }
+    candidates.push(format!("action:item:{server_id}"));
+    candidates
+}
+
 /// One declared action. `script` is a safe relative path into the operator content tree; matching
 /// precedence, ranges, use flags, and authorization are not represented here.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,5 +357,37 @@ mod tests {
             br#"<actions><action itemid="notanumber" script="a.lua"/></actions>"#,
         )
         .is_err());
+    }
+
+    #[test]
+    fn singleton_keys_name_callbacks_and_candidates_order_by_specificity() {
+        assert_eq!(
+            TfsActionKey::ItemId(2160).callback_name().as_deref(),
+            Some("action:item:2160")
+        );
+        assert_eq!(
+            TfsActionKey::ActionId(1000).callback_name().as_deref(),
+            Some("action:action:1000")
+        );
+        assert_eq!(
+            TfsActionKey::UniqueId(7).callback_name().as_deref(),
+            Some("action:unique:7")
+        );
+        assert_eq!(
+            TfsActionKey::ItemIdRange { from: 1, to: 2 }.callback_name(),
+            None
+        );
+        assert_eq!(
+            action_callback_candidates(2160, Some(1000), Some(7)),
+            vec![
+                "action:unique:7".to_owned(),
+                "action:action:1000".to_owned(),
+                "action:item:2160".to_owned(),
+            ]
+        );
+        assert_eq!(
+            action_callback_candidates(2160, None, None),
+            vec!["action:item:2160".to_owned()]
+        );
     }
 }

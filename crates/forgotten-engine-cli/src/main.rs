@@ -2,15 +2,15 @@ use forgotten_config::{
     apply_legacy_item_metadata, ensure_content_skeleton, load, load_consumable_catalog,
     load_declarative_npc_dialogue_catalog, load_declarative_shop_catalog,
     load_declarative_spell_catalog, load_declarative_weapon_catalog, load_legacy_item_catalog,
-    load_quest_catalog, load_tfs_content_inventory, load_tfs_entity_catalog,
-    load_tfs_public_channel_catalog, load_tfs_talkaction_registry, load_tfs_vocation_registry,
-    load_world_companions, load_world_map, materialize_tfs_spawn_templates,
-    materialize_tfs_static_spawns, resolve_tfs_registry_script_reference,
-    resolve_tfs_spawn_references, validate_content, world_map_path, write_template,
-    ConsumableCatalog, DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog,
-    DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig, LegacyPublicChannelCatalog,
-    LegacyWorldCompanionData, QuestCatalog, TfsEntityCatalog, TfsRegistryCategory,
-    TfsVocationRegistry,
+    load_quest_catalog, load_tfs_action_registry, load_tfs_content_inventory,
+    load_tfs_entity_catalog, load_tfs_public_channel_catalog, load_tfs_talkaction_registry,
+    load_tfs_vocation_registry, load_world_companions, load_world_map,
+    materialize_tfs_spawn_templates, materialize_tfs_static_spawns,
+    resolve_tfs_registry_script_reference, resolve_tfs_spawn_references, validate_content,
+    world_map_path, write_template, ConsumableCatalog, DeclarativeNpcDialogueCatalog,
+    DeclarativeShopCatalog, DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig,
+    LegacyPublicChannelCatalog, LegacyWorldCompanionData, QuestCatalog, TfsActionKey,
+    TfsEntityCatalog, TfsRegistryCategory, TfsVocationRegistry,
 };
 use forgotten_core::{
     DeathLossPolicy, EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
@@ -1424,6 +1424,70 @@ fn script_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             );
             Ok(())
         }
+        "dispatch-action" => {
+            if arguments.len() < 4 || arguments.len() > 7 {
+                return Err(
+                    "usage: script dispatch-action <directory> <item-id> [action-id] [unique-id] [subject-id]"
+                        .into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let item_id: u16 = arguments
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .ok_or("an item id is required")?;
+            let action_id: Option<u16> = arguments.get(4).and_then(|value| value.parse().ok());
+            let unique_id: Option<u16> = arguments.get(5).and_then(|value| value.parse().ok());
+            let subject_id: u64 = arguments
+                .get(6)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let config = load(&directory)?;
+            let registry = load_tfs_action_registry(&config)?;
+            // First-match in registry order over singleton selectors; ranges stay deferred.
+            let mut matched: Option<(String, std::path::PathBuf)> = None;
+            for entry in registry.iter() {
+                let matches = match entry.key {
+                    TfsActionKey::ItemId(id) => id == item_id,
+                    TfsActionKey::ActionId(id) => Some(id) == action_id,
+                    TfsActionKey::UniqueId(id) => Some(id) == unique_id,
+                    TfsActionKey::ItemIdRange { .. } | TfsActionKey::ActionIdRange { .. } => false,
+                };
+                if matches {
+                    if let Some(name) = entry.key.callback_name() {
+                        matched = Some((name, entry.script.clone()));
+                        break;
+                    }
+                }
+            }
+            let (callback_name, script) = matched
+                .ok_or_else(|| format!("action registry declares no match for item {item_id}"))?;
+            // Action scripts resolve relative to the actions registry directory, matching
+            // `resolve_tfs_registry_script_reference` used by the generic dispatch verb.
+            let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+            dispatcher
+                .register_callback_file(
+                    &callback_name,
+                    &config.content_directory.join("actions"),
+                    &script,
+                )
+                .map_err(|error| format!("action callback registration rejected: {error:?}"))?;
+            let outcome = dispatcher.dispatch_api(
+                &callback_name,
+                &SandboxedLuaCallbackInput {
+                    event_kind: "action".into(),
+                    subject_id,
+                    value: u64::from(item_id) as i64,
+                    argument: String::new(),
+                    position: None,
+                },
+            );
+            println!(
+                "action item={} callback={} state={:?} instruction-checks={} effects={:?}",
+                item_id, callback_name, outcome.state, outcome.instruction_checks, outcome.effects,
+            );
+            Ok(())
+        }
         unsupported => Err(format!("unsupported script action `{unsupported}`").into()),
     }
 }
@@ -2680,6 +2744,48 @@ mod tests {
             &"x".repeat(MAX_SANDBOXED_LUA_CALLBACK_NAME_BYTES + 1,)
         ))
         .is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn dispatch_action_command_resolves_registry_entries_to_api_dispatch() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("forgotten-engine-dispatch-action-{nonce}"));
+        fs::create_dir_all(directory.join("data/actions/scripts")).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        fs::write(
+            directory.join("data/actions/actions.xml"),
+            r#"<actions><action actionid="1000" script="scripts/lever.lua"/></actions>"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.join("data/actions/scripts/lever.lua"),
+            "return function() doCreatureSay('clicked') end",
+        )
+        .unwrap();
+
+        // No action-id given: item-only lookup finds nothing (entry keys on actionid).
+        let item_only = vec![
+            "script".into(),
+            "dispatch-action".into(),
+            directory.display().to_string(),
+            "2160".into(),
+        ];
+        assert!(script_command(&item_only).is_err());
+
+        // Matching action-id dispatches through the api and records the Say intent.
+        let matched = vec![
+            "script".into(),
+            "dispatch-action".into(),
+            directory.display().to_string(),
+            "2160".into(),
+            "1000".into(),
+        ];
+        assert!(script_command(&matched).is_ok());
         let _ = fs::remove_dir_all(directory);
     }
 
