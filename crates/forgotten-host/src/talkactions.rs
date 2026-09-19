@@ -5,16 +5,19 @@
 
 use forgotten_scripting::{
     SandboxedLuaCallbackDispatchState, SandboxedLuaCallbackDispatcher, SandboxedLuaCallbackInput,
-    SandboxedLuaEffect,
+    SandboxedLuaEffect, SandboxedLuaPosition,
 };
 
 /// Dispatches one operator-registered talkaction word. Returns `Some(effects)` when the word is a
 /// registered callback (the effect list may be empty if the script requested none or failed a
 /// bound); returns `None` only for an unknown word so the caller can fall through to normal chat.
+/// The optional authoritative subject position is forwarded so scripts can read a
+/// `getThingPos`-style coordinate without any world access.
 pub(crate) fn dispatch_native_lua_talkaction(
     dispatcher: &SandboxedLuaCallbackDispatcher,
     message: &str,
     player_id: u64,
+    position: Option<SandboxedLuaPosition>,
 ) -> Option<Vec<SandboxedLuaEffect>> {
     let trimmed = message.trim();
     if trimmed.is_empty() {
@@ -31,6 +34,7 @@ pub(crate) fn dispatch_native_lua_talkaction(
             subject_id: player_id,
             value: 0,
             argument,
+            position,
         },
     );
     match outcome.state {
@@ -64,25 +68,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            dispatch_native_lua_talkaction(&dispatcher, "/echo 100 100", 7),
+            dispatch_native_lua_talkaction(&dispatcher, "/echo 100 100", 7, None),
             Some(vec![SandboxedLuaEffect::Say("100 100".into())])
         );
         assert_eq!(
-            dispatch_native_lua_talkaction(&dispatcher, "/goto", 7),
+            dispatch_native_lua_talkaction(&dispatcher, "/goto", 7, None),
             Some(vec![SandboxedLuaEffect::Teleport { x: 1, y: 2, z: 7 }])
         );
         assert_eq!(
-            dispatch_native_lua_talkaction(&dispatcher, "/silent", 7),
+            dispatch_native_lua_talkaction(&dispatcher, "/silent", 7, None),
             Some(vec![])
         );
         assert_eq!(
-            dispatch_native_lua_talkaction(&dispatcher, "/missing", 7),
+            dispatch_native_lua_talkaction(&dispatcher, "/missing", 7, None),
             None
         );
         // A registered word whose argument is over the bound is still handled, with no effects.
         let long = "x".repeat(256);
         assert_eq!(
-            dispatch_native_lua_talkaction(&dispatcher, &format!("/silent {long}"), 7),
+            dispatch_native_lua_talkaction(&dispatcher, &format!("/silent {long}"), 7, None),
             Some(vec![])
         );
     }

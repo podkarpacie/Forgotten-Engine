@@ -4262,17 +4262,25 @@ pub(crate) fn handle_native_otclient_game(
                 // Operator-registered Lua talkactions dispatch through the resource-capped
                 // sandbox. A script cannot mutate authoritative state, read files, open sockets,
                 // or exhaust memory/instructions without a bounded rejection; only bounded typed
-                // effects (say text, teleport, heal, give-item) cross back and are validated and
-                // applied here against authoritative state.
+                // effects (say text, teleport, heal, give/remove-item, magic effect) cross back
+                // and are validated and applied here against authoritative state. The subject's
+                // authoritative position crosses as a read-only fifth argument.
                 if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
                     && request.channel_id.is_none()
                     && request.recipient.is_none()
                 {
                     if let Some(dispatcher) = config.talkaction_dispatcher.as_ref() {
+                        let subject_position = shared_world.player_position(character.id)?;
+                        let subject_position = Some(SandboxedLuaPosition {
+                            x: subject_position.x,
+                            y: subject_position.y,
+                            z: subject_position.z,
+                        });
                         if let Some(effects) = dispatch_native_lua_talkaction(
                             dispatcher,
                             &request.message,
                             character.id,
+                            subject_position,
                         ) {
                             let mut teleported = false;
                             for effect in effects {
@@ -4361,6 +4369,32 @@ pub(crate) fn handle_native_otclient_game(
                                                 .map_err(HostError::Protocol)?;
                                             write_frame(stream, &reply_frame)?;
                                         }
+                                    }
+                                    SandboxedLuaEffect::RemoveItem { id, count } => {
+                                        if let Some(message) = remove_items_from_player(
+                                            shared_world,
+                                            &mut database,
+                                            character.id,
+                                            id,
+                                            u64::from(count),
+                                        )? {
+                                            let reply_frame =
+                                                encode_native_otclient_status_message(
+                                                    &config.client_profile,
+                                                    &message,
+                                                )
+                                                .map_err(HostError::Protocol)?;
+                                            write_frame(stream, &reply_frame)?;
+                                        }
+                                    }
+                                    SandboxedLuaEffect::MagicEffect { x, y, z, kind } => {
+                                        let effect_frame = encode_native_otclient_magic_effect(
+                                            &config.client_profile,
+                                            native_position(Position { x, y, z }),
+                                            kind,
+                                        )
+                                        .map_err(HostError::Protocol)?;
+                                        write_frame(stream, &effect_frame)?;
                                     }
                                 }
                             }

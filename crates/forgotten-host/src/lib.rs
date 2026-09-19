@@ -29,7 +29,7 @@ pub(crate) struct SharedPublicChatEvent {
 }
 pub(crate) use npc_shop::{
     complete_native_player_quest, deliver_native_npc_shop_windows, give_items_to_player,
-    handle_native_shop_keyword, insert_units_into_containers,
+    handle_native_shop_keyword, insert_units_into_containers, remove_items_from_player,
 };
 mod native_render;
 mod session_drain;
@@ -182,7 +182,9 @@ use forgotten_protocol::{
     NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
 };
-use forgotten_scripting::{SandboxedLuaCallbackDispatcher, SandboxedLuaEffect};
+use forgotten_scripting::{
+    SandboxedLuaCallbackDispatcher, SandboxedLuaEffect, SandboxedLuaPosition,
+};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};

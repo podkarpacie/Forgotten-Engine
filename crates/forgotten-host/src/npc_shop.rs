@@ -290,6 +290,93 @@ pub(crate) fn give_items_to_player(
     )))
 }
 
+/// Atomically removes bounded units of one server item from an online character's carried
+/// equipment and owned containers. Shared by sandboxed Lua `remove_item` intents. Equipment is
+/// drained in fixed slot order before containers; insufficiency aborts without persisting, so a
+/// failed removal never partially strips the inventory.
+pub(crate) fn remove_items_from_player(
+    shared_world: &SharedNativeWorld,
+    database: &mut EngineDatabase,
+    player_id: u64,
+    server_id: u16,
+    count: u64,
+) -> Result<Option<String>, HostError> {
+    if !shared_world.has_player(player_id)? {
+        return Ok(Some("Target is not online.".into()));
+    }
+    let mut equipment = shared_world.player_equipment(player_id)?;
+    let mut containers = shared_world.player_containers(player_id)?;
+    let mut remaining_units = count;
+    for slot in [
+        EquipmentSlot::Head,
+        EquipmentSlot::Neck,
+        EquipmentSlot::Backpack,
+        EquipmentSlot::Armor,
+        EquipmentSlot::RightHand,
+        EquipmentSlot::LeftHand,
+        EquipmentSlot::Legs,
+        EquipmentSlot::Feet,
+        EquipmentSlot::Ring,
+        EquipmentSlot::Ammo,
+    ] {
+        if remaining_units == 0 {
+            break;
+        }
+        if let Some(item) = equipment.item(slot).cloned() {
+            if item.server_id != server_id {
+                continue;
+            }
+            let take = remaining_units.min(u64::from(item.count)) as u16;
+            let mut kept = item;
+            kept.count -= take;
+            remaining_units -= u64::from(take);
+            if kept.count > 0 {
+                equipment.equip(slot, kept);
+            } else {
+                equipment.unequip(slot);
+            }
+        }
+    }
+    if remaining_units > 0 {
+        let mut next_containers = PlayerContainers::default();
+        for (_, container) in containers.iter() {
+            let mut next = container.clone();
+            while remaining_units > 0 {
+                let mut matched = None;
+                for index in 0..next.items.len() {
+                    if let Some(item) = next.items.item(index) {
+                        if item.server_id == server_id {
+                            matched = Some(index);
+                            break;
+                        }
+                    }
+                }
+                let Some(index) = matched else { break };
+                let Some(item) = next.items.item(index).cloned() else {
+                    break;
+                };
+                let take = remaining_units.min(u64::from(item.count));
+                remaining_units -= take;
+                next.items.take_item_units(index, take as u16);
+            }
+            next_containers.insert(next).map_err(HostError::Core)?;
+        }
+        containers = next_containers;
+    }
+    if remaining_units > 0 {
+        return Ok(Some("You do not carry enough of that item.".into()));
+    }
+    database
+        .replace_player_equipment(player_id, &equipment)
+        .map_err(HostError::Persistence)?;
+    database
+        .replace_player_containers(player_id, &containers)
+        .map_err(HostError::Persistence)?;
+    shared_world.replace_player_equipment(player_id, equipment)?;
+    shared_world.replace_player_containers(player_id, containers)?;
+    Ok(Some(format!("Removed {count} x item {server_id}.")))
+}
+
 /// Handles bounded NPC shop keywords ("buy <server-id> <count>" / "sell <server-id> <count>")
 /// near an active static NPC whose declared shop matches. Payments and proceeds flow through the
 /// durable bank balance; bought stacks chunk into free owned container slots, sold units leave

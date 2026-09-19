@@ -1366,6 +1366,7 @@ fn script_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                     subject_id,
                     value,
                     argument: String::new(),
+                    position: None,
                 },
             );
             println!(
@@ -1410,6 +1411,7 @@ fn script_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                     subject_id: 0,
                     value: 0,
                     argument: argument.to_owned(),
+                    position: None,
                 },
             );
             println!(
