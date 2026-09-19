@@ -616,10 +616,11 @@ impl SandboxedLuaCallbackDispatcher {
     /// Invokes one registered callback with TFS-shaped bound host functions (`doCreatureSay`,
     /// `doPlayerAddItem`, `doTeleportThing`, `doPlayerAddHealth`, `doPlayerAddMana`,
     /// `doPlayerRemoveItem`, `doSendMagicEffect`, `getThingPos`) installed. Scripts CALL these
-    /// returning an effect table; each call validates its arguments and records one bounded
-    /// typed intent that the host must validate and apply. The same fresh-VM, memory,
-    /// instruction, and primitive-only boundaries as `dispatch_effects` apply, and the callback
-    /// return value is ignored — api-mode scripts express exclusively through calls. No world
+    /// functions and may additionally return an effect table; call-recorded intents and the
+    /// returned table are unioned (capped) so return-table scripts keep working unchanged under
+    /// api routing. Each call validates its arguments; over-budget or invalid calls, malformed
+    /// return tables, and over-cap unions fail the whole dispatch. The same fresh-VM, memory,
+    /// instruction, and primitive-only boundaries as `dispatch_effects` apply. No world
     /// mutation, I/O, or host state is reachable from Lua; the functions are pure validated
     /// intent recorders against a per-dispatch budget.
     pub fn dispatch_api(
@@ -683,24 +684,46 @@ impl SandboxedLuaCallbackDispatcher {
                 mlua::Error::RuntimeError("callback subject ID out of signed integer range".into())
             })?;
             let position = sandboxed_lua_position_value(&lua, input.position)?;
-            callback
-                .call::<_, Value>((
-                    input.event_kind.as_str(),
-                    subject_id,
-                    input.value,
-                    input.argument.as_str(),
-                    position,
-                ))
-                .map(|_| ())
+            callback.call::<_, Value>((
+                input.event_kind.as_str(),
+                subject_id,
+                input.value,
+                input.argument.as_str(),
+                position,
+            ))
         });
         let instruction_checks = instruction_checks.load(Ordering::Relaxed);
         let instruction_limit_reached = instruction_checks > self.limits.max_instructions;
         match result {
-            Ok(()) => {
-                let effects = intents
+            Ok(value) => {
+                let mut effects = intents
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
                     .clone();
+                // Union call-recorded intents with a returned effect table so old
+                // return-table scripts keep working unchanged under api routing. A
+                // non-table return (nil, boolean, number, text) is ignored, letting
+                // call-style scripts end with an explicit return; a malformed table
+                // or an over-budget union rejects the whole dispatch.
+                if matches!(value, Value::Table(_)) {
+                    match sandboxed_lua_effects(value) {
+                        Some(returned) => effects.extend(returned),
+                        None => {
+                            return SandboxedLuaEffectDispatchOutcome {
+                                state: SandboxedLuaCallbackDispatchState::UnsupportedValue,
+                                effects: Vec::new(),
+                                instruction_checks,
+                            };
+                        }
+                    }
+                }
+                if effects.len() > MAX_SANDBOXED_LUA_EFFECTS {
+                    return SandboxedLuaEffectDispatchOutcome {
+                        state: SandboxedLuaCallbackDispatchState::UnsupportedValue,
+                        effects: Vec::new(),
+                        instruction_checks,
+                    };
+                }
                 SandboxedLuaEffectDispatchOutcome {
                     state: SandboxedLuaCallbackDispatchState::Completed,
                     effects,
@@ -1893,6 +1916,68 @@ mod tests {
         assert_eq!(
             dispatcher.dispatch_api("zero-kind", &input).state,
             SandboxedLuaCallbackDispatchState::RuntimeRejected
+        );
+    }
+
+    #[test]
+    fn callback_dispatcher_unions_calls_with_returned_effect_tables() {
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "mixed",
+                "return function() doCreatureSay('called') return { { teleport = { x = 1, y = 2, z = 7 } } } end",
+            )
+            .unwrap();
+        dispatcher
+            .register_callback(
+                "legacy-table",
+                "return function() return { { say = 'still works' } } end",
+            )
+            .unwrap();
+        dispatcher
+            .register_callback(
+                "explicit-return",
+                "return function() doCreatureSay('hi') return true end",
+            )
+            .unwrap();
+        let input = SandboxedLuaCallbackInput {
+            event_kind: "talkaction".into(),
+            subject_id: 9,
+            value: 0,
+            argument: String::new(),
+            position: None,
+        };
+        let mixed = dispatcher.dispatch_api("mixed", &input);
+        assert_eq!(mixed.state, SandboxedLuaCallbackDispatchState::Completed);
+        assert_eq!(
+            mixed.effects,
+            vec![
+                SandboxedLuaEffect::Say("called".into()),
+                SandboxedLuaEffect::Teleport { x: 1, y: 2, z: 7 },
+            ]
+        );
+        // A pure return-table script is unaffected by api routing.
+        let legacy = dispatcher.dispatch_api("legacy-table", &input);
+        assert_eq!(legacy.state, SandboxedLuaCallbackDispatchState::Completed);
+        assert_eq!(
+            legacy.effects,
+            vec![SandboxedLuaEffect::Say("still works".into())]
+        );
+        // A trailing non-table return after calls is ignored, not rejected.
+        let explicit = dispatcher.dispatch_api("explicit-return", &input);
+        assert_eq!(explicit.state, SandboxedLuaCallbackDispatchState::Completed);
+        assert_eq!(explicit.effects, vec![SandboxedLuaEffect::Say("hi".into())]);
+
+        // Malformed return tables still reject even when calls succeeded.
+        dispatcher
+            .register_callback(
+                "bad-table",
+                "return function() doCreatureSay('hi') return { { nope = 1 } } end",
+            )
+            .unwrap();
+        assert_eq!(
+            dispatcher.dispatch_api("bad-table", &input).state,
+            SandboxedLuaCallbackDispatchState::UnsupportedValue
         );
     }
 

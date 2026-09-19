@@ -30,7 +30,7 @@ pub(crate) fn dispatch_native_lua_talkaction(
         Some(index) => (&trimmed[..index], trimmed[index..].trim().to_owned()),
         None => (trimmed, String::new()),
     };
-    let outcome = dispatcher.dispatch_effects(
+    let outcome = dispatcher.dispatch_api(
         words,
         &SandboxedLuaCallbackInput {
             event_kind: "talkaction".into(),
