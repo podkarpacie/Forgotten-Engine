@@ -19,3 +19,6 @@ repository = "https://github.com/podkarpacie/Forgotten-Engine"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[profile.release]
+strip = true

@@ -15,6 +15,7 @@ rm -rf "$staging_dir"
 mkdir -p "$staging_dir"
 
 cp target/release/forgotten-engine "$staging_dir/forgotten-engine"
+strip "$staging_dir/forgotten-engine"
 cat > "$staging_dir/INSTALL.txt" <<'EOF'
 Forgotten Engine precompiled Linux archive
 
