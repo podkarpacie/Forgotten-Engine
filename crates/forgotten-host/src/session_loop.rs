@@ -2964,53 +2964,33 @@ pub(crate) fn handle_native_otclient_game(
                 target_client_thing_id,
                 target_stack_position,
             } => {
-                let Some(world_map) = config.world_map.as_deref() else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
+                // Map-item UseItemEx validation; see world_interaction.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
                         peer,
-                        "action=use-item-ex outcome=deferred-no-world-map",
-                    );
-                    continue;
-                };
-                let Some(intent) = native_map_item_use_ex_intent(
-                    config.item_presentation_catalog.as_deref(),
-                    character.id,
-                    (
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_use_item_ex_action(
+                        &mut ctx,
                         source_position,
                         source_client_thing_id,
                         source_stack_position,
-                    ),
-                    (
                         target_position,
                         target_client_thing_id,
                         target_stack_position,
-                    ),
-                ) else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=use-item-ex outcome=deferred-unmapped-or-ambiguous-client-thing-id",
-                    );
-                    continue;
-                };
-                match shared_world.validate_player_item_use_ex(world_map, intent) {
-                    Ok(outcome) => native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        &format!(
-                            "action=use-item-ex outcome=validated source-server-id={} source-count={} target-server-id={} target-count={}",
-                            outcome.source.server_id,
-                            outcome.source.count,
-                            outcome.target.server_id,
-                            outcome.target.count,
-                        ),
-                    ),
-                    Err(HostError::Core(_)) => native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=use-item-ex outcome=deferred-invalid-server-owned-map-item",
-                    ),
-                    Err(error) => return Err(error),
+                    )?;
                 }
             }
             NativeOtClientGameAction::UseItemOnCreature {
@@ -3019,257 +2999,35 @@ pub(crate) fn handle_native_otclient_game(
                 source_stack_position,
                 target_creature_id,
             } => {
-                let Some(world_map) = config.world_map.as_deref() else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
+                // Map-item use on a creature with declarative weapon combat; see
+                // world_interaction.rs. Container windows and the white-skull flag
+                // travel as specific arguments.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
                         peer,
-                        "action=use-item-on-creature outcome=deferred-no-world-map",
-                    );
-                    continue;
-                };
-                let Some(intent) = native_map_item_use_creature_intent(
-                    config.item_presentation_catalog.as_deref(),
-                    character.id,
-                    source_position,
-                    source_client_thing_id,
-                    source_stack_position,
-                    target_creature_id,
-                ) else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=use-item-on-creature outcome=deferred-unmapped-or-ambiguous-client-thing-id",
-                    );
-                    continue;
-                };
-                match shared_world.validate_player_item_use_creature(world_map, intent) {
-                    Ok(outcome) => {
-                        // Declarative weapon use against a creature: adjacent melee for sword/
-                        // club/axe declarations and runes; ranged distance shots with ammo
-                        // consumption plus a 0x85 missile record for declared distance weapons
-                        // (plan v49 slices 9-10).
-                        if let Some(catalog) = config.declarative_weapon_catalog.as_deref() {
-                            if let Some(definition) =
-                                catalog.get(outcome.source.server_id)
-                            {
-                                if let PlayerItemUseCreatureTargetOutcome::Player {
-                                    player_id: target_id,
-                                    ..
-                                } = outcome.target
-                                {
-                                    let is_distance = definition.distance_range.is_some();
-                                    // Target tile for slice-11 feedback records (missile,
-                                    // hit effect, animated damage number).
-                                    let target_position_feedback = shared_world
-                                        .lock()
-                                        .ok()
-                                        .and_then(|world| {
-                                            world
-                                                .player(target_id)
-                                                .map(|target| target.position)
-                                        });
-                                    let has_ammo = if is_distance {
-                                        let has = shared_world
-                                            .lock()
-                                            .ok()
-                                            .and_then(|world| {
-                                                world.player_equipment(character.id).ok().map(
-                                                    |equipment| {
-                                                        equipment
-                                                            .item(EquipmentSlot::Ammo)
-                                                            .is_some()
-                                                    },
-                                                )
-                                            })
-                                            .unwrap_or(false);
-                                        if !has {
-                                            native_diagnostic(
-                                                config.extended_diagnostics,
-                                                peer,
-                                                "action=distance-shot outcome=deferred-no-ammo",
-                                            );
-                                            continue;
-                                        }
-                                        true
-                                    } else {
-                                        true
-                                    };
-                                    if !has_ammo {
-                                        continue;
-                                    }
-                                    let event = if is_distance {
-                                        definition.distance_shot_event(character.id, target_id)
-                                    } else {
-                                        definition.adjacent_melee_event(character.id, target_id)
-                                    };
-                                    let event = match event {
-                                        Ok(event) => event,
-                                        Err(error) => {
-                                            native_diagnostic(
-                                                config.extended_diagnostics,
-                                                peer,
-                                                &format!("action=rune-hit outcome=invalid-event error={error}"),
-                                            );
-                                            continue;
-                                        }
-                                    };
-                                    match shared_world.apply_player_combat_event_with_death(
-                                        event,
-                                        world_map,
-                                    ) {
-                                        Ok((combat_outcome, _, _)) => {
-                                            if is_distance {
-                                                let ammo_consumed = shared_world
-                                                    .lock()
-                                                    .ok()
-                                                    .and_then(|mut world| {
-                                                        world
-                                                            .consume_player_equipment_item_unit(
-                                                                character.id,
-                                                                EquipmentSlot::Ammo,
-                                                            )
-                                                            .ok()
-                                                    })
-                                                    .unwrap_or(false);
-                                                if let Some(shot_effect) = definition.shot_effect
-                                                {
-                                                    let target_position = shared_world
-                                                        .lock()
-                                                        .ok()
-                                                        .and_then(|world| {
-                                                            world
-                                                                .player(target_id)
-                                                                .map(|target| target.position)
-                                                        });
-                                                    if let Some(target_position) = target_position
-                                                    {
-                                                        let missile =
-                                                            encode_native_otclient_distance_effect(
-                                                                &config.client_profile,
-                                                                native_position(player_position),
-                                                                native_position(target_position),
-                                                                shot_effect,
-                                                            )
-                                                            .map_err(HostError::Protocol)?;
-                                                        write_frame(stream, &missile)?;
-                                                    }                                                }
-                                                native_diagnostic(
-                                                    config.extended_diagnostics,
-                                                    peer,
-                                                    &format!(
-                                                        "action=distance-shot item={} target={} damage={} defeated={} ammo-consumed={}",
-                                                        outcome.source.server_id,
-                                                        target_id,
-                                                        combat_outcome.mitigated_damage,
-                                                        combat_outcome.damage.defeated,
-                                                        ammo_consumed
-                                                    ),
-                                                );
-                                            } else {
-                                                // Plan v49 slice 10: each fired rune consumes one
-                                                // charge from its owned container stack.
-                                                let charge_consumed = consume_declared_rune_charge(
-                                                    shared_world,
-                                                    &mut database,
-                                                    character.id,
-                                                    source_position,
-                                                    source_stack_position,
-                                                    &config.client_profile,
-                                                    config.item_presentation_catalog.as_deref(),
-                                                    &mut sent_container_windows,
-                                                );
-                                                native_diagnostic(
-                                                    config.extended_diagnostics,
-                                                    peer,
-                                                    &format!(
-                                                        "action=rune-hit item={} target={} damage={} defeated={} charge-consumed={}",
-                                                        outcome.source.server_id,
-                                                        target_id,
-                                                        combat_outcome.mitigated_damage,
-                                                        combat_outcome.damage.defeated,
-                                                        charge_consumed
-                                                    ),
-                                                );
-                                            }
-                                            // Plan v49 slice 11 combat feedback: declared hit
-                                            // effect, optional animated damage number, and the
-                                            // attacker's white-skull award record.
-                                            if let (Some(target_position), Some(hit_effect)) = (
-                                                target_position_feedback,
-                                                definition.hit_effect,
-                                            ) {
-                                                let effect_frame =
-                                                    encode_native_otclient_magic_effect(
-                                                        &config.client_profile,
-                                                        native_position(target_position),
-                                                        hit_effect,
-                                                    )
-                                                    .map_err(HostError::Protocol)?;
-                                                write_frame(stream, &effect_frame)?;
-                                            }
-                                            if config.animated_damage_text_enabled
-                                                && combat_outcome.damage.applied_damage > 0
-                                            {
-                                                if let Some(target_position) =
-                                                    target_position_feedback
-                                                {
-                                                    let animated =
-                                                        encode_native_otclient_animated_text(
-                                                            &config.client_profile,
-                                                            native_position(target_position),
-                                                            180,
-                                                            &combat_outcome
-                                                                .damage
-                                                                .applied_damage
-                                                                .to_string(),
-                                                        )
-                                                        .map_err(HostError::Protocol)?;
-                                                    write_frame(stream, &animated)?;
-                                                }
-                                            }
-                                            if shared_world
-                                                .lock()
-                                                .map(|world| {
-                                                    world.player_has_white_skull(character.id)
-                                                })
-                                                .unwrap_or(false)
-                                                && !observed_white_skull_sent
-                                            {
-                                                observed_white_skull_sent = true;
-                                                if let Ok(native_id) =
-                                                    native_player_id(character.id)
-                                                {
-                                                    let skull = encode_native_otclient_creature_skull(
-                                                        &config.client_profile,
-                                                        native_id,
-                                                        forgotten_protocol::NATIVE_OTCLIENT_SKULL_WHITE,
-                                                    )
-                                                    .map_err(HostError::Protocol)?;
-                                                    write_frame(stream, &skull)?;
-                                                }
-                                            }
-                                        }
-                                        Err(HostError::Core(_)) => {}
-                                        Err(error) => return Err(error),
-                                    }
-                                }
-                            }
-                        }
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            &format!(
-                                "action=use-item-on-creature outcome=validated source-server-id={} source-count={} target={:?}",
-                                outcome.source.server_id, outcome.source.count, outcome.target
-                            ),
-                        );
-                    }
-                    Err(HostError::Core(_)) => native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=use-item-on-creature outcome=deferred-invalid-server-owned-item-or-creature",
-                    ),
-                    Err(error) => return Err(error),
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_use_item_on_creature_action(
+                        &mut ctx,
+                        source_position,
+                        source_client_thing_id,
+                        source_stack_position,
+                        target_creature_id,
+                        &mut sent_container_windows,
+                        &mut observed_white_skull_sent,
+                    )?;
                 }
             }
             NativeOtClientGameAction::RotateItem {
@@ -3277,43 +3035,30 @@ pub(crate) fn handle_native_otclient_game(
                 client_thing_id,
                 stack_position,
             } => {
-                let Some(world_map) = config.world_map.as_deref() else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
+                // Map-item rotation validation; see world_interaction.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
                         peer,
-                        "action=rotate-item outcome=deferred-no-world-map",
-                    );
-                    continue;
-                };
-                let Some(intent) = native_map_item_use_intent(
-                    config.item_presentation_catalog.as_deref(),
-                    character.id,
-                    position,
-                    client_thing_id,
-                    stack_position,
-                ) else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=rotate-item outcome=deferred-unmapped-or-ambiguous-client-thing-id",
-                    );
-                    continue;
-                };
-                match shared_world.validate_player_item_use(world_map, intent) {
-                    Ok(outcome) => native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        &format!(
-                            "action=rotate-item outcome=validated server-id={} count={}",
-                            outcome.server_id, outcome.count
-                        ),
-                    ),
-                    Err(HostError::Core(_)) => native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=rotate-item outcome=deferred-invalid-server-owned-map-item",
-                    ),
-                    Err(error) => return Err(error),
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_rotate_item_action(
+                        &mut ctx,
+                        position,
+                        client_thing_id,
+                        stack_position,
+                    )?;
                 }
             }
             NativeOtClientGameAction::RequestOutfit => {

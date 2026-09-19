@@ -51,6 +51,10 @@ pub(crate) use world_chat::PrivateChatDelivery;
 mod world_combat;
 mod world_equipment;
 mod world_interaction;
+pub(crate) use world_interaction::{
+    apply_native_rotate_item_action, apply_native_use_item_ex_action,
+    apply_native_use_item_on_creature_action,
+};
 mod world_party;
 mod world_registration;
 mod world_state;
