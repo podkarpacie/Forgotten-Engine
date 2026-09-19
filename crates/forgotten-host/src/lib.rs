@@ -29,8 +29,9 @@ pub(crate) struct SharedPublicChatEvent {
     text: String,
 }
 pub(crate) use npc_shop::{
-    complete_native_player_quest, deliver_native_npc_shop_windows, give_items_to_player,
-    handle_native_shop_keyword, insert_units_into_containers, remove_items_from_player,
+    apply_native_shop_keyword_talk, complete_native_player_quest, deliver_native_npc_shop_windows,
+    give_items_to_player, handle_native_shop_keyword, insert_units_into_containers,
+    remove_items_from_player,
 };
 mod native_render;
 mod session_context;
@@ -55,7 +56,7 @@ mod world_state;
 mod world_static_creatures;
 
 pub(crate) use bank::{
-    handle_native_bank_keyword, native_carried_weight, NATIVE_BANK_NPC_RANGE_TILES,
+    apply_native_bank_keyword_talk, native_carried_weight, NATIVE_BANK_NPC_RANGE_TILES,
 };
 pub(crate) use consumables::apply_native_owned_consumable_use;
 pub(crate) use gm_commands::apply_native_gm_talkaction_talk;

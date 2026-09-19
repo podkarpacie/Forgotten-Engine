@@ -8,7 +8,13 @@ use forgotten_core::{
     EquipmentSlot, ItemInstance, PlayerContainers, PlayerEquipment, MAX_ITEM_STACK_COUNT,
 };
 
-use super::{EngineDatabase, HostError, SharedNativeWorld};
+use forgotten_protocol::NativeOtClientTalkRequest;
+
+use super::{
+    encode_native_otclient_status_message, native_diagnostic, write_frame, EngineDatabase,
+    HostError, SessionActionOutcome, SessionContext, SharedNativeWorld,
+    NATIVE_OTCLIENT_MESSAGE_SAY,
+};
 
 /// Computes the bounded flat carried weight in hundredths of an ounce across equipment slots,
 /// owned container shells, and their top-level items. Recursive nested trees stay outside this
@@ -220,4 +226,42 @@ pub(crate) fn handle_native_bank_keyword(
     shared_world.replace_player_equipment(player_id, equipment)?;
     shared_world.replace_player_containers(player_id, staged_containers)?;
     Ok(Some(format!("You withdrew {amount} gold.")))
+}
+
+/// Applies bounded NPC banking keywords ("balance", "deposit all", "withdraw <n>") for a Say
+/// record. Only living speakers are handled; unmatched messages fall through. Returns
+/// `SessionActionOutcome::Handled` on a handled keyword (the caller must `continue`),
+/// `Unhandled` otherwise.
+pub(crate) fn apply_native_bank_keyword_talk(
+    ctx: &mut SessionContext<'_>,
+    request: &NativeOtClientTalkRequest,
+) -> Result<SessionActionOutcome, HostError> {
+    if !(request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
+        && request.channel_id.is_none()
+        && request.recipient.is_none()
+        && !ctx.observed_dead)
+    {
+        return Ok(SessionActionOutcome::Unhandled);
+    }
+    let Some(reply) = handle_native_bank_keyword(
+        ctx.shared_world,
+        &mut *ctx.database,
+        ctx.character_id,
+        &request.message,
+    )?
+    else {
+        return Ok(SessionActionOutcome::Unhandled);
+    };
+    let reply_frame = encode_native_otclient_status_message(&ctx.config.client_profile, &reply)
+        .map_err(HostError::Protocol)?;
+    write_frame(&mut *ctx.stream, &reply_frame)?;
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!(
+            "action=talk outcome=bank-keyword reply-bytes={}",
+            reply.len()
+        ),
+    );
+    Ok(SessionActionOutcome::Handled)
 }

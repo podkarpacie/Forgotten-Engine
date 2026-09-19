@@ -4121,62 +4121,34 @@ pub(crate) fn handle_native_otclient_game(
                         continue;
                     }
                 }
-                // Bounded NPC banking keywords ("balance", "deposit all", "withdraw <n>") are
-                // only handled for authenticated living players; unmatched messages fall through
-                // to ordinary chat delivery.
-                if request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
-                    && request.channel_id.is_none()
-                    && request.recipient.is_none()
-                    && !observed_dead
+                // Bounded NPC banking and shop keywords; see bank.rs and npc_shop.rs.
+                // A handled keyword consumes the record; anything else falls through.
                 {
-                    if let Some(reply) = handle_native_bank_keyword(
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
                         shared_world,
-                        &mut database,
-                        character.id,
-                        &request.message,
-                    )? {
-                        let reply_frame =
-                            encode_native_otclient_status_message(&config.client_profile, &reply)
-                                .map_err(HostError::Protocol)?;
-                        write_frame(stream, &reply_frame)?;
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            &format!(
-                                "action=talk outcome=bank-keyword reply-bytes={}",
-                                reply.len()
-                            ),
-                        );
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    if apply_native_bank_keyword_talk(&mut ctx, &request)?
+                        == SessionActionOutcome::Handled
+                    {
                         continue;
                     }
-                    // Bounded NPC shop keywords ("buy <id> <count>" / "sell <id> <count>") are
-                    // only handled near an active NPC whose declared shop matches.
-                    if let Some(shop_catalog) = config.shop_catalog.as_deref() {
-                        if let Some(reply) = handle_native_shop_keyword(
-                            shared_world,
-                            &mut database,
-                            character.id,
-                            &request.message,
-                            shop_catalog,
-                        )? {
-                            let reply_frame = encode_native_otclient_status_message(
-                                &config.client_profile,
-                                &reply,
-                            )
-                            .map_err(HostError::Protocol)?;
-                            write_frame(stream, &reply_frame)?;
-                            shared_world.mark_visibility_changed();
-                            observed_visibility_epoch = shared_world.visibility_epoch();
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                &format!(
-                                    "action=talk outcome=shop-keyword reply-bytes={}",
-                                    reply.len()
-                                ),
-                            );
-                            continue;
-                        }
+                    if apply_native_shop_keyword_talk(&mut ctx, &request)?
+                        == SessionActionOutcome::Handled
+                    {
+                        continue;
                     }
                 }
                 let recipient_count = if request.mode == 5 {

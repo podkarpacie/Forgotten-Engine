@@ -4,6 +4,7 @@
 //! window opens the player's home-town depot as a read-only container.
 
 use super::*;
+use forgotten_protocol::NativeOtClientTalkRequest;
 
 /// Flips one persisted quest to completed and grants the catalog-declared rewards into the
 /// player's first owned container (plan v49 slice 15). Returns the granted rewards, or `None`
@@ -560,4 +561,48 @@ pub(crate) fn handle_native_shop_keyword(
     shared_world.replace_player_containers(player_id, containers)?;
     shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
     Ok(Some(format!("You sold {count} for {total} gold.")))
+}
+
+/// Applies bounded NPC shop keywords ("buy <id> <count>" / "sell <id> <count>") for a Say
+/// record. Only living speakers near a matching active NPC shop are handled. Returns
+/// `SessionActionOutcome::Handled` on a handled keyword (the caller must `continue`),
+/// `Unhandled` otherwise.
+pub(crate) fn apply_native_shop_keyword_talk(
+    ctx: &mut SessionContext<'_>,
+    request: &NativeOtClientTalkRequest,
+) -> Result<SessionActionOutcome, HostError> {
+    if !(request.mode == NATIVE_OTCLIENT_MESSAGE_SAY
+        && request.channel_id.is_none()
+        && request.recipient.is_none()
+        && !ctx.observed_dead)
+    {
+        return Ok(SessionActionOutcome::Unhandled);
+    }
+    let Some(shop_catalog) = ctx.config.shop_catalog.as_deref() else {
+        return Ok(SessionActionOutcome::Unhandled);
+    };
+    let Some(reply) = handle_native_shop_keyword(
+        ctx.shared_world,
+        &mut *ctx.database,
+        ctx.character_id,
+        &request.message,
+        shop_catalog,
+    )?
+    else {
+        return Ok(SessionActionOutcome::Unhandled);
+    };
+    let reply_frame = encode_native_otclient_status_message(&ctx.config.client_profile, &reply)
+        .map_err(HostError::Protocol)?;
+    write_frame(&mut *ctx.stream, &reply_frame)?;
+    ctx.shared_world.mark_visibility_changed();
+    *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!(
+            "action=talk outcome=shop-keyword reply-bytes={}",
+            reply.len()
+        ),
+    );
+    Ok(SessionActionOutcome::Handled)
 }
