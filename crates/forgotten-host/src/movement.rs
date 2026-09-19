@@ -448,3 +448,205 @@ pub(crate) fn native_classic_viewport_contains(observer: Position, target: Posit
     let vertical_offset = i32::from(target.y) - i32::from(observer.y);
     (-8..=9).contains(&horizontal_offset) && (-6..=7).contains(&vertical_offset)
 }
+
+/// Applies one manual turn: cancels any click-walk, persists the new facing, and emits the
+/// cancel-walk facing frame. Turns never move the player and never fail the session.
+pub(crate) fn apply_native_turn_action(
+    ctx: &mut SessionContext<'_>,
+    direction: NativeOtClientCardinalDirection,
+) -> Result<(), HostError> {
+    let cancelled_click_walk = ctx.active_click_walk.take().is_some();
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!(
+            "scheduler=click-walk-cancel reason=turn active={cancelled_click_walk} direction={direction:?}"
+        ),
+    );
+    *ctx.facing = direction;
+    ctx.shared_world
+        .update_player_facing(ctx.character_id, *ctx.facing)?;
+    *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
+    write_frame(
+        &mut *ctx.stream,
+        &encode_native_otclient_game_cancel_walk_facing(
+            &ctx.config.client_profile,
+            ctx.facing.protocol_direction(),
+        )
+        .map_err(HostError::Protocol)?,
+    )?;
+    Ok(())
+}
+
+/// Applies one click-walk path: replaces any active walk, or creates a speed-derived scheduled
+/// task when idle. A single-step path takes its step immediately through the cardinal mover.
+pub(crate) fn apply_native_autowalk_action(
+    ctx: &mut SessionContext<'_>,
+    path: Vec<NativeOtClientAutoWalkDirection>,
+) -> Result<(), HostError> {
+    if let Some(task) = ctx.active_click_walk.as_mut() {
+        let previous_steps = task.queued_steps.len();
+        let replacement_steps = native_click_walk_steps(path.clone()).len();
+        task.replace_path(path);
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            &format!(
+                "scheduler=click-walk-replace previous-steps={previous_steps} queued-steps={replacement_steps}"
+            ),
+        );
+    } else {
+        let equipment = ctx.shared_world.player_equipment(ctx.character_id)?;
+        let effective_speed = native_hasted_speed(
+            native_effective_player_speed(
+                ctx.snapshot.player_speed,
+                &equipment,
+                ctx.config.item_speed_bonus_by_server_id.as_deref(),
+            ),
+            ctx.shared_world
+                .player_speed_bonus_percent(ctx.character_id),
+        );
+        let step_delay = native_autowalk_step_delay(effective_speed, ctx.snapshot.server_beat);
+        let mut task = NativeActiveClickWalk::from_path(path, Instant::now() + step_delay);
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            &format!(
+                "scheduler=click-walk-create queued-steps={} step-delay-ms={}",
+                task.queued_steps.len(),
+                step_delay.as_millis()
+            ),
+        );
+        if task.queued_steps.is_empty() {
+            return Ok(());
+        }
+        if task.queued_steps.len() == 1 {
+            let Some(direction) = task.queued_steps.pop_front() else {
+                return Ok(());
+            };
+            if move_native_map_player(
+                &mut *ctx.stream,
+                &ctx.config.client_profile,
+                ctx.snapshot,
+                &*ctx.database,
+                ctx.shared_world,
+                ctx.character_id,
+                ctx.world_map.as_ref(),
+                &mut *ctx.player_position,
+                &mut *ctx.facing,
+                direction,
+            )? {
+                native_diagnostic(
+                    ctx.config.extended_diagnostics,
+                    ctx.peer,
+                    &format!(
+                        "scheduler=click-walk-step direction={direction:?} outcome=moved position={},{},{}",
+                        ctx.player_position.x, ctx.player_position.y, ctx.player_position.z
+                    ),
+                );
+                *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
+                *ctx.active_click_walk = Some(task);
+            } else {
+                native_diagnostic(
+                    ctx.config.extended_diagnostics,
+                    ctx.peer,
+                    &format!(
+                        "scheduler=click-walk-step direction={direction:?} outcome=blocked position={},{},{}",
+                        ctx.player_position.x, ctx.player_position.y, ctx.player_position.z
+                    ),
+                );
+            }
+        } else {
+            *ctx.active_click_walk = Some(task);
+        }
+    }
+    Ok(())
+}
+
+/// Applies one manual cardinal step through the shared map mover, cancelling any click-walk and
+/// refreshing visibility only on a real move. Manual steps never fail the session.
+pub(crate) fn apply_native_cardinal_move_action(
+    ctx: &mut SessionContext<'_>,
+    direction: NativeOtClientCardinalDirection,
+) -> Result<(), HostError> {
+    let cancelled_click_walk = ctx.active_click_walk.take().is_some();
+    let moved = move_native_map_player(
+        &mut *ctx.stream,
+        &ctx.config.client_profile,
+        ctx.snapshot,
+        &*ctx.database,
+        ctx.shared_world,
+        ctx.character_id,
+        ctx.world_map.as_ref(),
+        &mut *ctx.player_position,
+        &mut *ctx.facing,
+        direction,
+    )?;
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!(
+            "movement=cardinal direction={direction:?} outcome={} position={},{},{} map-update={}",
+            if moved { "moved" } else { "blocked" },
+            ctx.player_position.x,
+            ctx.player_position.y,
+            ctx.player_position.z,
+            if moved { "step" } else { "cancel-walk" }
+        ),
+    );
+    if cancelled_click_walk {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "scheduler=click-walk-cancel reason=manual-cardinal active=true",
+        );
+    }
+    if moved {
+        *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
+    }
+    Ok(())
+}
+
+/// Applies one manual diagonal step through the shared diagonal mover. Same cancel, diagnostic,
+/// and visibility contract as the cardinal step.
+pub(crate) fn apply_native_diagonal_move_action(
+    ctx: &mut SessionContext<'_>,
+    direction: NativeOtClientAutoWalkDirection,
+) -> Result<(), HostError> {
+    let cancelled_click_walk = ctx.active_click_walk.take().is_some();
+    let moved = move_native_map_player_diagonal(
+        &mut *ctx.stream,
+        &ctx.config.client_profile,
+        ctx.snapshot,
+        &*ctx.database,
+        ctx.shared_world,
+        ctx.character_id,
+        ctx.world_map.as_ref(),
+        &mut *ctx.player_position,
+        &mut *ctx.facing,
+        direction,
+    )?;
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!(
+            "movement=diagonal direction={direction:?} outcome={} position={},{},{} map-update={}",
+            if moved { "moved" } else { "blocked" },
+            ctx.player_position.x,
+            ctx.player_position.y,
+            ctx.player_position.z,
+            if moved { "double-step" } else { "cancel-walk" }
+        ),
+    );
+    if cancelled_click_walk {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "scheduler=click-walk-cancel reason=manual-diagonal active=true",
+        );
+    }
+    if moved {
+        *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
+    }
+    Ok(())
+}

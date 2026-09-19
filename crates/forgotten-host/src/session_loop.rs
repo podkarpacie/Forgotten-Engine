@@ -2670,8 +2670,9 @@ pub(crate) fn handle_native_otclient_game(
                         config,
                         world_map: &world_map,
                         snapshot: &snapshot,
-                        facing,
+                        facing: &mut facing,
                         player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
                         observed_dead,
                         observed_visibility_epoch: &mut observed_visibility_epoch,
                         observed_vitals_epoch: &mut observed_vitals_epoch,
@@ -4120,8 +4121,9 @@ pub(crate) fn handle_native_otclient_game(
                         config,
                         world_map: &world_map,
                         snapshot: &snapshot,
-                        facing,
+                        facing: &mut facing,
                         player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
                         observed_dead,
                         observed_visibility_epoch: &mut observed_visibility_epoch,
                         observed_vitals_epoch: &mut observed_vitals_epoch,
@@ -4145,8 +4147,9 @@ pub(crate) fn handle_native_otclient_game(
                         config,
                         world_map: &world_map,
                         snapshot: &snapshot,
-                        facing,
+                        facing: &mut facing,
                         player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
                         observed_dead,
                         observed_visibility_epoch: &mut observed_visibility_epoch,
                         observed_vitals_epoch: &mut observed_vitals_epoch,
@@ -4410,177 +4413,91 @@ pub(crate) fn handle_native_otclient_game(
                 )?;
             }
             NativeOtClientGameAction::Turn(direction) => {
-                let cancelled_click_walk = active_click_walk.take().is_some();
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "scheduler=click-walk-cancel reason=turn active={cancelled_click_walk} direction={direction:?}"
-                    ),
-                );
-                facing = direction;
-                shared_world.update_player_facing(character.id, facing)?;
-                observed_visibility_epoch = shared_world.visibility_epoch();
-                write_frame(
-                    stream,
-                    &encode_native_otclient_game_cancel_walk_facing(
-                        &config.client_profile,
-                        facing.protocol_direction(),
-                    )
-                    .map_err(HostError::Protocol)?,
-                )?;
+                // Manual turn; see movement.rs. Turns never fail the session.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_turn_action(&mut ctx, direction)?;
+                }
             }
             NativeOtClientGameAction::AutoWalk(path) => {
-                if let Some(task) = active_click_walk.as_mut() {
-                    let previous_steps = task.queued_steps.len();
-                    let replacement_steps = native_click_walk_steps(path.clone()).len();
-                    task.replace_path(path);
-                    native_diagnostic(
-                        config.extended_diagnostics,
+                // Click-walk path replace-or-create; see movement.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
                         peer,
-                        &format!(
-                            "scheduler=click-walk-replace previous-steps={previous_steps} queued-steps={replacement_steps}"
-                        ),
-                    );
-                } else {
-                    let equipment = shared_world.player_equipment(character.id)?;
-                    let effective_speed = native_hasted_speed(
-                        native_effective_player_speed(
-                            snapshot.player_speed,
-                            &equipment,
-                            config.item_speed_bonus_by_server_id.as_deref(),
-                        ),
-                        shared_world.player_speed_bonus_percent(character.id),
-                    );
-                    let step_delay =
-                        native_autowalk_step_delay(effective_speed, snapshot.server_beat);
-                    let mut task =
-                        NativeActiveClickWalk::from_path(path, Instant::now() + step_delay);
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        &format!(
-                            "scheduler=click-walk-create queued-steps={} step-delay-ms={}",
-                            task.queued_steps.len(),
-                            step_delay.as_millis()
-                        ),
-                    );
-                    if task.queued_steps.is_empty() {
-                        continue;
-                    }
-                    if task.queued_steps.len() == 1 {
-                        let Some(direction) = task.queued_steps.pop_front() else {
-                            continue;
-                        };
-                        if move_native_map_player(
-                            stream,
-                            &config.client_profile,
-                            &snapshot,
-                            &database,
-                            shared_world,
-                            character.id,
-                            world_map.as_ref(),
-                            &mut player_position,
-                            &mut facing,
-                            direction,
-                        )? {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                &format!(
-                                    "scheduler=click-walk-step direction={direction:?} outcome=moved position={},{},{}",
-                                    player_position.x, player_position.y, player_position.z
-                                ),
-                            );
-                            observed_visibility_epoch = shared_world.visibility_epoch();
-                            active_click_walk = Some(task);
-                        } else {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                &format!(
-                                    "scheduler=click-walk-step direction={direction:?} outcome=blocked position={},{},{}",
-                                    player_position.x, player_position.y, player_position.z
-                                ),
-                            );
-                        }
-                    } else {
-                        active_click_walk = Some(task);
-                    }
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_autowalk_action(&mut ctx, path)?;
                 }
             }
             NativeOtClientGameAction::CardinalMove(direction) => {
-                let cancelled_click_walk = active_click_walk.take().is_some();
-                let moved = move_native_map_player(
-                    stream,
-                    &config.client_profile,
-                    &snapshot,
-                    &database,
-                    shared_world,
-                    character.id,
-                    world_map.as_ref(),
-                    &mut player_position,
-                    &mut facing,
-                    direction,
-                )?;
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "movement=cardinal direction={direction:?} outcome={} position={},{},{} map-update={}",
-                        if moved { "moved" } else { "blocked" },
-                        player_position.x,
-                        player_position.y,
-                        player_position.z,
-                        if moved { "step" } else { "cancel-walk" }
-                    ),
-                );
-                if cancelled_click_walk {
-                    native_diagnostic(
-                        config.extended_diagnostics,
+                // Manual cardinal step; see movement.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
                         peer,
-                        "scheduler=click-walk-cancel reason=manual-cardinal active=true",
-                    );
-                }
-                if moved {
-                    observed_visibility_epoch = shared_world.visibility_epoch();
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_cardinal_move_action(&mut ctx, direction)?;
                 }
             }
             NativeOtClientGameAction::DiagonalMove(direction) => {
-                let cancelled_click_walk = active_click_walk.take().is_some();
-                let moved = move_native_map_player_diagonal(
-                    stream,
-                    &config.client_profile,
-                    &snapshot,
-                    &database,
-                    shared_world,
-                    character.id,
-                    world_map.as_ref(),
-                    &mut player_position,
-                    &mut facing,
-                    direction,
-                )?;
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "movement=diagonal direction={direction:?} outcome={} position={},{},{} map-update={}",
-                        if moved { "moved" } else { "blocked" },
-                        player_position.x,
-                        player_position.y,
-                        player_position.z,
-                        if moved { "double-step" } else { "cancel-walk" }
-                    ),
-                );
-                if cancelled_click_walk {
-                    native_diagnostic(
-                        config.extended_diagnostics,
+                // Manual diagonal step; see movement.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
                         peer,
-                        "scheduler=click-walk-cancel reason=manual-diagonal active=true",
-                    );
-                }
-                if moved {
-                    observed_visibility_epoch = shared_world.visibility_epoch();
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_diagonal_move_action(&mut ctx, direction)?;
                 }
             }
         }
