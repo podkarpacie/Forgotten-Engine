@@ -12,7 +12,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU32, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 pub const MAX_SANDBOXED_LUA_SOURCE_BYTES: usize = 4 * 1024;
@@ -612,6 +612,108 @@ impl SandboxedLuaCallbackDispatcher {
             Err(_) => rejected_effect_outcome(instruction_checks),
         }
     }
+
+    /// Invokes one registered callback with TFS-shaped bound host functions (`doCreatureSay`,
+    /// `doPlayerAddItem`, `getThingPos`) installed. Scripts CALL these functions instead of
+    /// returning an effect table; each call validates its arguments and records one bounded
+    /// typed intent that the host must validate and apply. The same fresh-VM, memory,
+    /// instruction, and primitive-only boundaries as `dispatch_effects` apply, and the callback
+    /// return value is ignored — api-mode scripts express exclusively through calls. No world
+    /// mutation, I/O, or host state is reachable from Lua; the functions are pure validated
+    /// intent recorders against a per-dispatch budget.
+    pub fn dispatch_api(
+        &self,
+        callback_name: &str,
+        input: &SandboxedLuaCallbackInput,
+    ) -> SandboxedLuaEffectDispatchOutcome {
+        if input.validate().is_err() {
+            return SandboxedLuaEffectDispatchOutcome {
+                state: SandboxedLuaCallbackDispatchState::InputRejected,
+                effects: Vec::new(),
+                instruction_checks: 0,
+            };
+        }
+        let Some(source) = self.callbacks.get(callback_name) else {
+            return SandboxedLuaEffectDispatchOutcome {
+                state: SandboxedLuaCallbackDispatchState::CallbackNotFound,
+                effects: Vec::new(),
+                instruction_checks: 0,
+            };
+        };
+        if source.len() > self.limits.max_source_bytes {
+            return SandboxedLuaEffectDispatchOutcome {
+                state: SandboxedLuaCallbackDispatchState::SourceRejected,
+                effects: Vec::new(),
+                instruction_checks: 0,
+            };
+        }
+        let lua = match Lua::new_with(StdLib::NONE, LuaOptions::default()) {
+            Ok(lua) => lua,
+            Err(_) => return rejected_effect_outcome(0),
+        };
+        if lua.set_memory_limit(self.limits.max_memory_bytes).is_err() {
+            return rejected_effect_outcome(0);
+        }
+        if install_sandboxed_tfs_compatibility_globals(&lua).is_err() {
+            return rejected_effect_outcome(0);
+        }
+        let intents = Arc::new(Mutex::new(Vec::new()));
+        if install_sandboxed_host_api(&lua, &intents, input.position).is_err() {
+            return rejected_effect_outcome(0);
+        }
+        let instruction_checks = Arc::new(AtomicU32::new(0));
+        let hook_checks = Arc::clone(&instruction_checks);
+        let instruction_limit = self.limits.max_instructions;
+        lua.set_hook(
+            HookTriggers {
+                every_nth_instruction: Some(1),
+                ..HookTriggers::default()
+            },
+            move |_, _| {
+                if hook_checks.fetch_add(1, Ordering::Relaxed) >= instruction_limit {
+                    Err(mlua::Error::RuntimeError(INSTRUCTION_LIMIT_MARKER.into()))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let result = lua.load(source).eval::<Function>().and_then(|callback| {
+            let subject_id = i64::try_from(input.subject_id).map_err(|_| {
+                mlua::Error::RuntimeError("callback subject ID out of signed integer range".into())
+            })?;
+            let position = sandboxed_lua_position_value(&lua, input.position)?;
+            callback
+                .call::<_, Value>((
+                    input.event_kind.as_str(),
+                    subject_id,
+                    input.value,
+                    input.argument.as_str(),
+                    position,
+                ))
+                .map(|_| ())
+        });
+        let instruction_checks = instruction_checks.load(Ordering::Relaxed);
+        let instruction_limit_reached = instruction_checks > self.limits.max_instructions;
+        match result {
+            Ok(()) => {
+                let effects = intents
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone();
+                SandboxedLuaEffectDispatchOutcome {
+                    state: SandboxedLuaCallbackDispatchState::Completed,
+                    effects,
+                    instruction_checks,
+                }
+            }
+            Err(_) if instruction_limit_reached => SandboxedLuaEffectDispatchOutcome {
+                state: SandboxedLuaCallbackDispatchState::InstructionLimitReached,
+                effects: Vec::new(),
+                instruction_checks,
+            },
+            Err(_) => rejected_effect_outcome(instruction_checks),
+        }
+    }
 }
 
 fn rejected_callback_outcome(instruction_checks: u32) -> SandboxedLuaCallbackDispatchOutcome {
@@ -800,6 +902,62 @@ fn sandboxed_lua_position_value(
     table.set("y", position.y)?;
     table.set("z", position.z)?;
     Ok(Value::Table(table))
+}
+
+/// Installs the bound TFS-shaped host API (`doCreatureSay`, `doPlayerAddItem`, `getThingPos`).
+/// Each function validates its arguments and records one bounded `SandboxedLuaEffect` into the
+/// per-dispatch queue; over-budget or invalid calls fail the whole dispatch rather than
+/// partially recording. Nothing here touches world state, files, or the network.
+fn install_sandboxed_host_api(
+    lua: &Lua,
+    intents: &Arc<Mutex<Vec<SandboxedLuaEffect>>>,
+    position: Option<SandboxedLuaPosition>,
+) -> Result<(), mlua::Error> {
+    let say_intents = Arc::clone(intents);
+    let do_creature_say = lua.create_function(move |_, text: String| {
+        if text.is_empty()
+            || text.len() > MAX_SANDBOXED_LUA_EFFECT_TEXT_BYTES
+            || text.chars().any(char::is_control)
+        {
+            return Err(mlua::Error::RuntimeError(
+                "invalid doCreatureSay text".into(),
+            ));
+        }
+        let mut intents = say_intents
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if intents.len() >= MAX_SANDBOXED_LUA_EFFECTS {
+            return Err(mlua::Error::RuntimeError(
+                "sandbox effect budget exhausted".into(),
+            ));
+        }
+        intents.push(SandboxedLuaEffect::Say(text));
+        Ok(true)
+    })?;
+    let add_item_intents = Arc::clone(intents);
+    let do_player_add_item = lua.create_function(move |_, (id, count): (u16, u16)| {
+        if id == 0 || count == 0 || count > MAX_SANDBOXED_LUA_EFFECT_ITEM_COUNT {
+            return Err(mlua::Error::RuntimeError(
+                "invalid doPlayerAddItem id or count".into(),
+            ));
+        }
+        let mut intents = add_item_intents
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if intents.len() >= MAX_SANDBOXED_LUA_EFFECTS {
+            return Err(mlua::Error::RuntimeError(
+                "sandbox effect budget exhausted".into(),
+            ));
+        }
+        intents.push(SandboxedLuaEffect::GiveItem { id, count });
+        Ok(true)
+    })?;
+    let get_thing_pos =
+        lua.create_function(move |lua, (): ()| sandboxed_lua_position_value(lua, position))?;
+    lua.globals().set("doCreatureSay", do_creature_say)?;
+    lua.globals().set("doPlayerAddItem", do_player_add_item)?;
+    lua.globals().set("getThingPos", get_thing_pos)?;
+    Ok(())
 }
 
 /// Extracts a bounded list of typed effects from an array-of-effect-table return:
@@ -1536,6 +1694,74 @@ mod tests {
         assert_eq!(
             dispatcher.dispatch("where", &unpositioned).value,
             Some(SandboxedLuaValue::Text("none".into()))
+        );
+    }
+
+    #[test]
+    fn callback_dispatcher_records_bound_host_calls_as_intents() {
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "greet",
+                "return function(_, _, _, _, position) doCreatureSay('Hello ' .. position.x) doPlayerAddItem(2160, 2) end",
+            )
+            .unwrap();
+        let input = SandboxedLuaCallbackInput {
+            event_kind: "talkaction".into(),
+            subject_id: 9,
+            value: 0,
+            argument: String::new(),
+            position: Some(SandboxedLuaPosition {
+                x: 100,
+                y: 200,
+                z: 7,
+            }),
+        };
+        let outcome = dispatcher.dispatch_api("greet", &input);
+        assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
+        assert_eq!(
+            outcome.effects,
+            vec![
+                SandboxedLuaEffect::Say("Hello 100".into()),
+                SandboxedLuaEffect::GiveItem { id: 2160, count: 2 },
+            ]
+        );
+
+        dispatcher
+            .register_callback(
+                "locate",
+                "return function() local pos = getThingPos() return pos == nil end",
+            )
+            .unwrap();
+        let unpositioned = SandboxedLuaCallbackInput {
+            position: None,
+            ..input.clone()
+        };
+        // getThingPos answers nil without a subject position; the boolean return is ignored.
+        assert_eq!(
+            dispatcher.dispatch_api("locate", &unpositioned).state,
+            SandboxedLuaCallbackDispatchState::Completed
+        );
+        assert!(dispatcher
+            .dispatch_api("locate", &unpositioned)
+            .effects
+            .is_empty());
+
+        dispatcher
+            .register_callback("bad-call", "return function() doPlayerAddItem(0, 1) end")
+            .unwrap();
+        assert_eq!(
+            dispatcher.dispatch_api("bad-call", &input).state,
+            SandboxedLuaCallbackDispatchState::RuntimeRejected
+        );
+        assert!(dispatcher
+            .dispatch_api("bad-call", &input)
+            .effects
+            .is_empty());
+
+        assert_eq!(
+            dispatcher.dispatch_api("missing", &input).state,
+            SandboxedLuaCallbackDispatchState::CallbackNotFound
         );
     }
 
