@@ -39,7 +39,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Validate capability matrix JSON
-        run: node -e "JSON.parse(require('fs').readFileSync('docs/capability-matrix.json', 'utf8')); console.log('capability-matrix.json: valid')"
+        run: node -e "JSON.parse(require('fs').readFileSync('docs/capability-matrix.json', 'utf8')); console.log('capability-matrix.json valid')"
 
       - name: Check whitespace errors
         run: git diff --check HEAD^
