@@ -970,6 +970,70 @@ pub(crate) fn native_cardinal_direction(
     }
 }
 
+/// Applies one target selection: records the intent, and emits a clear-target frame when the
+/// id is an explicit clear or the intent was rejected. Uses the shared context (stream, profile
+/// and world access) plus the selected id.
+pub(crate) fn apply_native_select_target_action(
+    ctx: &mut SessionContext<'_>,
+    native_selected_id: u32,
+) -> Result<(), HostError> {
+    let outcome = apply_native_player_interaction(
+        ctx.shared_world,
+        ctx.character_id,
+        native_selected_id,
+        NativePlayerInteractionKind::Target,
+        ctx.config.extended_diagnostics,
+    )?;
+    if native_selected_id == 0 || matches!(outcome, NativePlayerInteractionOutcome::Rejected) {
+        let clear_target = encode_native_otclient_clear_target(&ctx.config.client_profile)
+            .map_err(HostError::Protocol)?;
+        write_frame(&mut *ctx.stream, &clear_target)?;
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            if native_selected_id == 0 {
+                "outbound=clear-target opcode=0xa3 fields=none reason=explicit-target-clear"
+            } else {
+                "outbound=clear-target opcode=0xa3 fields=none reason=rejected-target"
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Applies one follow selection. Narrow enough for direct parameters.
+pub(crate) fn apply_native_select_follow_action(
+    shared_world: &SharedNativeWorld,
+    character_id: u64,
+    native_selected_id: u32,
+    extended_diagnostics: bool,
+) -> Result<(), HostError> {
+    apply_native_player_interaction(
+        shared_world,
+        character_id,
+        native_selected_id,
+        NativePlayerInteractionKind::Follow,
+        extended_diagnostics,
+    )?;
+    Ok(())
+}
+
+/// Clears one player's attack and follow intents. Narrow enough for direct parameters.
+pub(crate) fn apply_native_cancel_attack_and_follow_action(
+    shared_world: &SharedNativeWorld,
+    character_id: u64,
+    extended_diagnostics: bool,
+    peer: SocketAddr,
+) -> Result<(), HostError> {
+    cancel_native_player_attack_and_follow(shared_world, character_id)?;
+    native_diagnostic(
+        extended_diagnostics,
+        peer,
+        "action=cancel-attack-and-follow outcome=authoritative-intents-cleared",
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

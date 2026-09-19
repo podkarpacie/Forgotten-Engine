@@ -3717,163 +3717,151 @@ pub(crate) fn handle_native_otclient_game(
                 }
             }
             NativeOtClientGameAction::SelectTarget(native_selected_id) => {
-                let outcome = apply_native_player_interaction(
-                    shared_world,
-                    character.id,
-                    native_selected_id,
-                    NativePlayerInteractionKind::Target,
-                    config.extended_diagnostics,
-                )?;
-                if native_selected_id == 0
-                    || matches!(outcome, NativePlayerInteractionOutcome::Rejected)
+                // Target selection; see native_combat.rs.
                 {
-                    let clear_target = encode_native_otclient_clear_target(&config.client_profile)
-                        .map_err(HostError::Protocol)?;
-                    write_frame(stream, &clear_target)?;
-                    native_diagnostic(
-                        config.extended_diagnostics,
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
                         peer,
-                        if native_selected_id == 0 {
-                            "outbound=clear-target opcode=0xa3 fields=none reason=explicit-target-clear"
-                        } else {
-                            "outbound=clear-target opcode=0xa3 fields=none reason=rejected-target"
-                        },
-                    );
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_select_target_action(&mut ctx, native_selected_id)?;
                 }
             }
             NativeOtClientGameAction::SelectFollow(native_selected_id) => {
-                apply_native_player_interaction(
+                // Follow selection; see native_combat.rs.
+                apply_native_select_follow_action(
                     shared_world,
                     character.id,
                     native_selected_id,
-                    NativePlayerInteractionKind::Follow,
                     config.extended_diagnostics,
                 )?;
             }
             NativeOtClientGameAction::PartyInvite(native_target_id) => {
-                let Some(invitee_id) = native_player_id_to_character_id(native_target_id) else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
+                // Party invitation; see world_party.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
                         peer,
-                        "action=party-invite outcome=rejected-invalid-native-player-id",
-                    );
-                    continue;
-                };
-                let outcome = shared_world.invite_to_party(character.id, invitee_id);
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    if outcome.is_ok() {
-                        "action=party-invite outcome=authoritative-invitation-created"
-                    } else {
-                        "action=party-invite outcome=rejected-core-invariant"
-                    },
-                );
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_party_invite_action(&mut ctx, native_target_id)?;
+                }
             }
             NativeOtClientGameAction::PartyJoin(native_target_id) => {
-                let Some(leader_id) = native_player_id_to_character_id(native_target_id) else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
+                // Party join; see world_party.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
                         peer,
-                        "action=party-join outcome=rejected-invalid-native-player-id",
-                    );
-                    continue;
-                };
-                let outcome = shared_world.accept_party_invitation(character.id, leader_id);
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    if outcome.is_ok() {
-                        "action=party-join outcome=authoritative-membership-created"
-                    } else {
-                        "action=party-join outcome=rejected-core-invariant"
-                    },
-                );
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_party_join_action(&mut ctx, native_target_id)?;
+                }
             }
             NativeOtClientGameAction::PartyRevokeInvitation(native_target_id) => {
-                let Some(invitee_id) = native_player_id_to_character_id(native_target_id) else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
+                // Invitation revocation; see world_party.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
                         peer,
-                        "action=party-revoke-invitation outcome=rejected-invalid-native-player-id",
-                    );
-                    continue;
-                };
-                let outcome = shared_world.revoke_party_invitation(character.id, invitee_id);
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    if outcome.is_ok() {
-                        "action=party-revoke-invitation outcome=authoritative-invitation-removed"
-                    } else {
-                        "action=party-revoke-invitation outcome=rejected-core-invariant"
-                    },
-                );
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_party_revoke_invitation_action(&mut ctx, native_target_id)?;
+                }
             }
             NativeOtClientGameAction::PartyPassLeadership(native_target_id) => {
-                let Some(new_leader_id) = native_player_id_to_character_id(native_target_id) else {
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        "action=party-pass-leadership outcome=rejected-invalid-native-player-id",
-                    );
-                    continue;
-                };
-                let outcome = shared_world.transfer_party_leadership(character.id, new_leader_id);
-                native_diagnostic(
+                // Leadership transfer; see world_party.rs.
+                apply_native_party_pass_leadership_action(
+                    shared_world,
+                    character.id,
+                    native_target_id,
                     config.extended_diagnostics,
                     peer,
-                    if outcome.is_ok() {
-                        "action=party-pass-leadership outcome=authoritative-leadership-transferred"
-                    } else {
-                        "action=party-pass-leadership outcome=rejected-core-invariant"
-                    },
-                );
+                )?;
             }
             NativeOtClientGameAction::PartyLeave => {
-                let outcome = shared_world.leave_party(character.id);
-                native_diagnostic(
+                // Party leave; see world_party.rs.
+                apply_native_party_leave_action(
+                    shared_world,
+                    character.id,
                     config.extended_diagnostics,
                     peer,
-                    if outcome.is_ok() {
-                        "action=party-leave outcome=authoritative-membership-removed"
-                    } else {
-                        "action=party-leave outcome=rejected-core-invariant"
-                    },
-                );
+                )?;
             }
             NativeOtClientGameAction::PartySharedExperience(requested) => {
-                let outcome = config.party_shared_experience_rules.map_or_else(
-                    || {
-                        Err(HostError::InvalidConfiguration(
-                            "party shared experience is disabled by configuration".into(),
-                        ))
-                    },
-                    |rules| {
-                        shared_world.set_party_shared_experience_requested(
-                            character.id,
-                            requested,
-                            rules,
-                        )
-                    },
-                );
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    if outcome.is_ok() {
-                        "action=party-shared-experience outcome=authoritative-request-updated"
-                    } else {
-                        "action=party-shared-experience outcome=rejected-disabled-or-core-invariant"
-                    },
-                );
+                // Shared-experience request; see world_party.rs.
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
+                        shared_world,
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    apply_native_party_shared_experience_action(&mut ctx, requested)?;
+                }
             }
             NativeOtClientGameAction::CancelAttackAndFollow => {
-                cancel_native_player_attack_and_follow(shared_world, character.id)?;
-                native_diagnostic(
+                // Clear attack/follow intents; see native_combat.rs.
+                apply_native_cancel_attack_and_follow_action(
+                    shared_world,
+                    character.id,
                     config.extended_diagnostics,
                     peer,
-                    "action=cancel-attack-and-follow outcome=authoritative-intents-cleared",
-                );
+                )?;
             }
             NativeOtClientGameAction::Talk(request) => {
                 // Bounded fixed-window flood control over every routed talk record. Suppressed

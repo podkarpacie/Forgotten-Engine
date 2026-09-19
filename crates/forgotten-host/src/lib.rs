@@ -55,6 +55,11 @@ mod world_party;
 mod world_registration;
 mod world_state;
 mod world_static_creatures;
+pub(crate) use world_party::{
+    apply_native_party_invite_action, apply_native_party_join_action,
+    apply_native_party_leave_action, apply_native_party_pass_leadership_action,
+    apply_native_party_revoke_invitation_action, apply_native_party_shared_experience_action,
+};
 
 pub(crate) use bank::{
     apply_native_bank_keyword_talk, native_carried_weight, NATIVE_BANK_NPC_RANGE_TILES,

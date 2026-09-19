@@ -146,3 +146,169 @@ impl SharedNativeWorld {
         Ok(true)
     }
 }
+
+/// Applies one party invitation: resolves the native target id, then records the invitation.
+/// An unresolvable id emits a diagnostic without effect.
+pub(crate) fn apply_native_party_invite_action(
+    ctx: &mut SessionContext<'_>,
+    native_target_id: u32,
+) -> Result<(), HostError> {
+    let Some(invitee_id) = native_player_id_to_character_id(native_target_id) else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=party-invite outcome=rejected-invalid-native-player-id",
+        );
+        return Ok(());
+    };
+    let outcome = ctx
+        .shared_world
+        .invite_to_party(ctx.character_id, invitee_id);
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        if outcome.is_ok() {
+            "action=party-invite outcome=authoritative-invitation-created"
+        } else {
+            "action=party-invite outcome=rejected-core-invariant"
+        },
+    );
+    Ok(())
+}
+
+/// Applies one party join: resolves the leader id, then records membership.
+pub(crate) fn apply_native_party_join_action(
+    ctx: &mut SessionContext<'_>,
+    native_target_id: u32,
+) -> Result<(), HostError> {
+    let Some(leader_id) = native_player_id_to_character_id(native_target_id) else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=party-join outcome=rejected-invalid-native-player-id",
+        );
+        return Ok(());
+    };
+    let outcome = ctx
+        .shared_world
+        .accept_party_invitation(ctx.character_id, leader_id);
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        if outcome.is_ok() {
+            "action=party-join outcome=authoritative-membership-created"
+        } else {
+            "action=party-join outcome=rejected-core-invariant"
+        },
+    );
+    Ok(())
+}
+
+/// Applies one invitation revocation.
+pub(crate) fn apply_native_party_revoke_invitation_action(
+    ctx: &mut SessionContext<'_>,
+    native_target_id: u32,
+) -> Result<(), HostError> {
+    let Some(invitee_id) = native_player_id_to_character_id(native_target_id) else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=party-revoke-invitation outcome=rejected-invalid-native-player-id",
+        );
+        return Ok(());
+    };
+    let outcome = ctx
+        .shared_world
+        .revoke_party_invitation(ctx.character_id, invitee_id);
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        if outcome.is_ok() {
+            "action=party-revoke-invitation outcome=authoritative-invitation-removed"
+        } else {
+            "action=party-revoke-invitation outcome=rejected-core-invariant"
+        },
+    );
+    Ok(())
+}
+
+/// Applies one leadership transfer. Narrow enough for direct parameters.
+pub(crate) fn apply_native_party_pass_leadership_action(
+    shared_world: &SharedNativeWorld,
+    character_id: u64,
+    native_target_id: u32,
+    extended_diagnostics: bool,
+    peer: SocketAddr,
+) -> Result<(), HostError> {
+    let Some(new_leader_id) = native_player_id_to_character_id(native_target_id) else {
+        native_diagnostic(
+            extended_diagnostics,
+            peer,
+            "action=party-pass-leadership outcome=rejected-invalid-native-player-id",
+        );
+        return Ok(());
+    };
+    let outcome = shared_world.transfer_party_leadership(character_id, new_leader_id);
+    native_diagnostic(
+        extended_diagnostics,
+        peer,
+        if outcome.is_ok() {
+            "action=party-pass-leadership outcome=authoritative-leadership-transferred"
+        } else {
+            "action=party-pass-leadership outcome=rejected-core-invariant"
+        },
+    );
+    Ok(())
+}
+
+/// Applies one party leave. Narrow enough for direct parameters.
+pub(crate) fn apply_native_party_leave_action(
+    shared_world: &SharedNativeWorld,
+    character_id: u64,
+    extended_diagnostics: bool,
+    peer: SocketAddr,
+) -> Result<(), HostError> {
+    let outcome = shared_world.leave_party(character_id);
+    native_diagnostic(
+        extended_diagnostics,
+        peer,
+        if outcome.is_ok() {
+            "action=party-leave outcome=authoritative-membership-removed"
+        } else {
+            "action=party-leave outcome=rejected-core-invariant"
+        },
+    );
+    Ok(())
+}
+
+/// Applies one shared-experience request: honors the operator rules when configured, else
+/// records a disabled-configuration diagnostic without effect.
+pub(crate) fn apply_native_party_shared_experience_action(
+    ctx: &mut SessionContext<'_>,
+    requested: bool,
+) -> Result<(), HostError> {
+    let outcome = ctx.config.party_shared_experience_rules.map_or_else(
+        || {
+            Err(HostError::InvalidConfiguration(
+                "party shared experience is disabled by configuration".into(),
+            ))
+        },
+        |rules| {
+            ctx.shared_world.set_party_shared_experience_requested(
+                ctx.character_id,
+                requested,
+                rules,
+            )
+        },
+    );
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        if outcome.is_ok() {
+            "action=party-shared-experience outcome=authoritative-request-updated"
+        } else {
+            "action=party-shared-experience outcome=rejected-disabled-or-core-invariant"
+        },
+    );
+    Ok(())
+}
