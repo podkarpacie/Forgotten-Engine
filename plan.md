@@ -237,6 +237,11 @@ temple → relog retains everything. All under stock OTCv8 7.4.
 > fall-through after talkactions, exercises the shared context with different config), then
 > consumables, then reassess. Checkpoint after increment 3: stocktake what remains (one more
 > cohesive chunk vs. several unrelated ones) before picking increment 4 on momentum.
+>
+> Refinement (2026-09-19, trade increment): `SessionContext` is for handlers needing broad
+> session state (five or more items). Narrow handlers needing four or fewer (trade rejection,
+> NPC close) take direct parameters instead — an 18-line context literal where it fits nothing
+> is overhead, not consistency. No custom per-handler structs in either case.
 
 #### 2.2 Data Migration Tooling — ~55%
 - [x] `tfs-audit`: config/world/items/spawns/houses/registries/entities inventory + diagnostics
