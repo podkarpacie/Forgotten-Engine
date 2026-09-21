@@ -1306,208 +1306,48 @@ pub(crate) fn handle_native_otclient_game(
                             continue;
                         }
                     }
-                    let Some(intent) = native_map_item_use_intent(
-                        Some(catalog),
-                        character.id,
-                        source_position,
-                        source_client_thing_id,
-                        source_stack_position,
-                    ) else {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=throw-item outcome=deferred-unmapped-or-ambiguous-map-source-item",
-                        );
-                        continue;
-                    };
-                    let map_snapshot = map_owner.render_snapshot()?;
-                    let source = match shared_world.validate_player_item_use(&map_snapshot, intent)
+                    // Imported map source items move into owned containers or owned
+                    // equipment through validated transfers; anything else stays deferred.
                     {
-                        Ok(source) => source,
-                        Err(HostError::Core(_)) => {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=throw-item outcome=deferred-invalid-server-owned-map-source",
-                            );
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let source_position = Position {
-                        x: source_position.x,
-                        y: source_position.y,
-                        z: source_position.z,
-                    };
-                    if let Some(container_id) = target_container_id {
-                        if closed_container_ids.contains(&container_id) {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=throw-item outcome=deferred-closed-map-source-container-target",
-                            );
-                            continue;
-                        }
-                        let transfer = match map_owner
-                            .move_source_item_stack_to_top_level_container(
-                                shared_world,
-                                &mut database,
-                                character.id,
-                                source_position,
-                                usize::from(source_stack_position),
-                                u16::from(count),
-                                container_id,
-                            ) {
-                            Ok(transfer) => transfer,
-                            Err(HostError::Core(_) | HostError::InvalidConfiguration(_)) => {
-                                native_diagnostic(
-                                    config.extended_diagnostics,
-                                    peer,
-                                    "action=throw-item outcome=deferred-map-source-container-transfer-rejected",
-                                );
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        };
-                        let containers = shared_world.player_containers(character.id)?;
-                        let Some(container) = containers.container(container_id) else {
-                            return Err(HostError::InvalidConfiguration(
-                                "published map-source container transfer lost its container".into(),
-                            ));
-                        };
-                        let Some(container_frame) = native_classic_container_frame(
-                            &config.client_profile,
-                            Some(catalog),
-                            container,
-                        )
-                        .map_err(HostError::Protocol)?
-                        else {
-                            return Err(HostError::InvalidConfiguration(
-                                "published map-source container transfer is not client-mapped"
-                                    .into(),
-                            ));
-                        };
-                        write_frame(stream, &container_frame)?;
-                        sent_container_windows.insert(
-                            container_id,
-                            native_rendered_container_window(
-                                &config.client_profile,
-                                Some(catalog),
-                                container,
-                            ),
-                        );
-                        observed_containers_epoch = shared_world.containers_epoch();
-                        let mut refreshed_snapshot = snapshot.clone();
-                        refreshed_snapshot.player_position = native_position(player_position);
-                        refreshed_snapshot.player_direction = facing.protocol_direction();
-                        let map_snapshot = map_owner.render_snapshot()?;
-                        let refreshed_viewport = encode_shared_native_world_viewport(
-                            &config.client_profile,
-                            &refreshed_snapshot,
-                            map_snapshot.as_ref(),
+                        let mut ctx = SessionContext {
+                            stream: &mut *stream,
+                            peer,
+                            character_id: character.id,
+                            database: &mut database,
                             shared_world,
-                            character.id,
-                        )?;
-                        write_frame(stream, &refreshed_viewport)?;
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            &format!(
-                                "action=throw-item outcome=map-source-to-top-level-container source={:?} container-id={} client-thing-id={} count={} source-index={} map-revision={} container-refresh-bytes={} map-refresh-bytes={}",
-                                transfer.source_identity.position,
-                                container_id,
+                            config,
+                            world_map: &world_map,
+                            snapshot: &snapshot,
+                            facing: &mut facing,
+                            player_position: &mut player_position,
+                            active_click_walk: &mut active_click_walk,
+                            observed_dead,
+                            observed_visibility_epoch: &mut observed_visibility_epoch,
+                            observed_vitals_epoch: &mut observed_vitals_epoch,
+                        };
+                        if apply_native_throw_item_map_source(
+                            &mut ctx,
+                            map_owner,
+                            ThrowItemMapSourceRequest {
+                                source_position,
                                 source_client_thing_id,
+                                source_stack_position,
                                 count,
-                                transfer.source_identity.item_index,
-                                transfer.map_revision,
-                                container_frame.0.len(),
-                                refreshed_viewport.0.len(),
-                            ),
-                        );
-                        continue;
-                    }
-                    let Some(target_slot) = target_slot else {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=throw-item outcome=deferred-unsupported-map-source-target",
-                        );
-                        continue;
-                    };
-                    if !native_legacy_slot_types_allow_equipment_slot(
-                        config.item_slot_types_by_server_id.as_deref(),
-                        source.server_id,
-                        target_slot,
-                    ) {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=throw-item outcome=deferred-map-source-slot-type-mismatch",
-                        );
-                        continue;
-                    }
-                    let transfer = match map_owner.move_source_item_stack_to_equipment(
-                        shared_world,
-                        &mut database,
-                        character.id,
-                        source_position,
-                        usize::from(source_stack_position),
-                        u16::from(count),
-                        target_slot,
-                    ) {
-                        Ok(transfer) => transfer,
-                        Err(HostError::Core(_) | HostError::InvalidConfiguration(_)) => {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=throw-item outcome=deferred-map-source-transfer-rejected",
-                            );
+                                target_slot,
+                                target_container_id,
+                            },
+                            &closed_container_ids,
+                            &mut sent_container_windows,
+                            &mut ThrowItemMapSourceFollow {
+                                observed_mapped_equipment: &mut observed_mapped_equipment,
+                                observed_equipment_epoch: &mut observed_equipment_epoch,
+                                observed_containers_epoch: &mut observed_containers_epoch,
+                            },
+                        )? == SessionActionOutcome::Handled
+                        {
                             continue;
                         }
-                        Err(error) => return Err(error),
-                    };
-                    let equipment = shared_world.player_equipment(character.id)?;
-                    let current_mapped_equipment =
-                        native_classic_mapped_equipment(Some(catalog), &equipment);
-                    let equipment_updates = native_classic_equipment_delta_frames(
-                        &config.client_profile,
-                        &observed_mapped_equipment,
-                        &current_mapped_equipment,
-                    )
-                    .map_err(HostError::Protocol)?;
-                    for frame in &equipment_updates {
-                        write_frame(stream, frame)?;
                     }
-                    observed_mapped_equipment = current_mapped_equipment;
-                    observed_equipment_epoch = shared_world.equipment_epoch();
-                    let mut refreshed_snapshot = snapshot.clone();
-                    refreshed_snapshot.player_position = native_position(player_position);
-                    refreshed_snapshot.player_direction = facing.protocol_direction();
-                    let map_snapshot = map_owner.render_snapshot()?;
-                    let refreshed_viewport = encode_shared_native_world_viewport(
-                        &config.client_profile,
-                        &refreshed_snapshot,
-                        map_snapshot.as_ref(),
-                        shared_world,
-                        character.id,
-                    )?;
-                    write_frame(stream, &refreshed_viewport)?;
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        &format!(
-                            "action=throw-item outcome=map-source-to-equipment source={:?} target-slot={} client-thing-id={} count={} source-index={} map-revision={} equipment-records={} map-refresh-bytes={}",
-                            transfer.source_identity.position,
-                            target_slot.code(),
-                            source_client_thing_id,
-                            count,
-                            transfer.source_identity.item_index,
-                            transfer.map_revision,
-                            equipment_updates.len(),
-                            refreshed_viewport.0.len(),
-                        ),
-                    );
-                    continue;
                 }
                 if let Some((container_id, item_index)) = source_container {
                     // Open corpse windows are session-local views over durable runtime registry

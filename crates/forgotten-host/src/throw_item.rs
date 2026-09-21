@@ -508,6 +508,248 @@ pub(crate) fn apply_native_throw_item_runtime_pickup(
     Ok(SessionActionOutcome::Handled)
 }
 
+/// Owned-inventory ThrowItem request for an imported map source item: the map source
+/// address plus the client-asserted stack identity and the owned destination
+/// endpoints. Non-map sources fall through to the owned-source routers below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThrowItemMapSourceRequest {
+    pub source_position: NativeOtClientPosition,
+    pub source_client_thing_id: u16,
+    pub source_stack_position: u8,
+    pub count: u8,
+    pub target_slot: Option<EquipmentSlot>,
+    pub target_container_id: Option<u8>,
+}
+
+/// Mutable follow-state the map-source handler refreshes after an authoritative move:
+/// the observer's mapped-equipment mirror plus the equipment/container epochs.
+pub(crate) struct ThrowItemMapSourceFollow<'a> {
+    pub observed_mapped_equipment: &'a mut BTreeMap<EquipmentSlot, NativeOtClientClassicItemRecord>,
+    pub observed_equipment_epoch: &'a mut u64,
+    pub observed_containers_epoch: &'a mut u64,
+}
+
+/// Moves an imported map source item into an owned container or owned equipment.
+/// Returns `Unhandled` when the source is not a map tile; every map-source path
+/// consumes the record (`Handled`), including deferred diagnostics, preserving the
+/// loop's terminal `continue`s. The item-presentation catalog gate is re-derived with
+/// the same diagnostic so the handler is total; it is unreachable when called after
+/// the loop preamble.
+pub(crate) fn apply_native_throw_item_map_source(
+    ctx: &mut SessionContext<'_>,
+    map_owner: &SharedNativeMap,
+    request: ThrowItemMapSourceRequest,
+    closed_container_ids: &BTreeSet<u8>,
+    sent_container_windows: &mut BTreeMap<u8, NativeRenderedContainerWindow>,
+    follow: &mut ThrowItemMapSourceFollow<'_>,
+) -> Result<SessionActionOutcome, HostError> {
+    if request.source_position.x == 0xffff {
+        return Ok(SessionActionOutcome::Unhandled);
+    }
+    let Some(catalog) = ctx.config.item_presentation_catalog.as_deref() else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-no-item-presentation-catalog",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    let Some(intent) = native_map_item_use_intent(
+        Some(catalog),
+        ctx.character_id,
+        request.source_position,
+        request.source_client_thing_id,
+        request.source_stack_position,
+    ) else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-unmapped-or-ambiguous-map-source-item",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    let map_snapshot = map_owner.render_snapshot()?;
+    let source = match ctx
+        .shared_world
+        .validate_player_item_use(&map_snapshot, intent)
+    {
+        Ok(source) => source,
+        Err(HostError::Core(_)) => {
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                "action=throw-item outcome=deferred-invalid-server-owned-map-source",
+            );
+            return Ok(SessionActionOutcome::Handled);
+        }
+        Err(error) => return Err(error),
+    };
+    let source_position = Position {
+        x: request.source_position.x,
+        y: request.source_position.y,
+        z: request.source_position.z,
+    };
+    if let Some(container_id) = request.target_container_id {
+        if closed_container_ids.contains(&container_id) {
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                "action=throw-item outcome=deferred-closed-map-source-container-target",
+            );
+            return Ok(SessionActionOutcome::Handled);
+        }
+        let transfer = match map_owner.move_source_item_stack_to_top_level_container(
+            ctx.shared_world,
+            &mut *ctx.database,
+            ctx.character_id,
+            source_position,
+            usize::from(request.source_stack_position),
+            u16::from(request.count),
+            container_id,
+        ) {
+            Ok(transfer) => transfer,
+            Err(HostError::Core(_) | HostError::InvalidConfiguration(_)) => {
+                native_diagnostic(
+                    ctx.config.extended_diagnostics,
+                    ctx.peer,
+                    "action=throw-item outcome=deferred-map-source-container-transfer-rejected",
+                );
+                return Ok(SessionActionOutcome::Handled);
+            }
+            Err(error) => return Err(error),
+        };
+        let containers = ctx.shared_world.player_containers(ctx.character_id)?;
+        let Some(container) = containers.container(container_id) else {
+            return Err(HostError::InvalidConfiguration(
+                "published map-source container transfer lost its container".into(),
+            ));
+        };
+        let Some(container_frame) =
+            native_classic_container_frame(&ctx.config.client_profile, Some(catalog), container)
+                .map_err(HostError::Protocol)?
+        else {
+            return Err(HostError::InvalidConfiguration(
+                "published map-source container transfer is not client-mapped".into(),
+            ));
+        };
+        write_frame(&mut *ctx.stream, &container_frame)?;
+        sent_container_windows.insert(
+            container_id,
+            native_rendered_container_window(&ctx.config.client_profile, Some(catalog), container),
+        );
+        *follow.observed_containers_epoch = ctx.shared_world.containers_epoch();
+        let mut refreshed_snapshot = ctx.snapshot.clone();
+        refreshed_snapshot.player_position = native_position(*ctx.player_position);
+        refreshed_snapshot.player_direction = ctx.facing.protocol_direction();
+        let map_snapshot = map_owner.render_snapshot()?;
+        let refreshed_viewport = encode_shared_native_world_viewport(
+            &ctx.config.client_profile,
+            &refreshed_snapshot,
+            map_snapshot.as_ref(),
+            ctx.shared_world,
+            ctx.character_id,
+        )?;
+        write_frame(&mut *ctx.stream, &refreshed_viewport)?;
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            &format!(
+                "action=throw-item outcome=map-source-to-top-level-container source={:?} container-id={} client-thing-id={} count={} source-index={} map-revision={} container-refresh-bytes={} map-refresh-bytes={}",
+                transfer.source_identity.position,
+                container_id,
+                request.source_client_thing_id,
+                request.count,
+                transfer.source_identity.item_index,
+                transfer.map_revision,
+                container_frame.0.len(),
+                refreshed_viewport.0.len(),
+            ),
+        );
+        return Ok(SessionActionOutcome::Handled);
+    }
+    let Some(target_slot) = request.target_slot else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-unsupported-map-source-target",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    if !native_legacy_slot_types_allow_equipment_slot(
+        ctx.config.item_slot_types_by_server_id.as_deref(),
+        source.server_id,
+        target_slot,
+    ) {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-map-source-slot-type-mismatch",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    }
+    let transfer = match map_owner.move_source_item_stack_to_equipment(
+        ctx.shared_world,
+        &mut *ctx.database,
+        ctx.character_id,
+        source_position,
+        usize::from(request.source_stack_position),
+        u16::from(request.count),
+        target_slot,
+    ) {
+        Ok(transfer) => transfer,
+        Err(HostError::Core(_) | HostError::InvalidConfiguration(_)) => {
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                "action=throw-item outcome=deferred-map-source-transfer-rejected",
+            );
+            return Ok(SessionActionOutcome::Handled);
+        }
+        Err(error) => return Err(error),
+    };
+    let equipment = ctx.shared_world.player_equipment(ctx.character_id)?;
+    let current_mapped_equipment = native_classic_mapped_equipment(Some(catalog), &equipment);
+    let equipment_updates = native_classic_equipment_delta_frames(
+        &ctx.config.client_profile,
+        &*follow.observed_mapped_equipment,
+        &current_mapped_equipment,
+    )
+    .map_err(HostError::Protocol)?;
+    for frame in &equipment_updates {
+        write_frame(&mut *ctx.stream, frame)?;
+    }
+    *follow.observed_mapped_equipment = current_mapped_equipment;
+    *follow.observed_equipment_epoch = ctx.shared_world.equipment_epoch();
+    let mut refreshed_snapshot = ctx.snapshot.clone();
+    refreshed_snapshot.player_position = native_position(*ctx.player_position);
+    refreshed_snapshot.player_direction = ctx.facing.protocol_direction();
+    let map_snapshot = map_owner.render_snapshot()?;
+    let refreshed_viewport = encode_shared_native_world_viewport(
+        &ctx.config.client_profile,
+        &refreshed_snapshot,
+        map_snapshot.as_ref(),
+        ctx.shared_world,
+        ctx.character_id,
+    )?;
+    write_frame(&mut *ctx.stream, &refreshed_viewport)?;
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!(
+            "action=throw-item outcome=map-source-to-equipment source={:?} target-slot={} client-thing-id={} count={} source-index={} map-revision={} equipment-records={} map-refresh-bytes={}",
+            transfer.source_identity.position,
+            target_slot.code(),
+            request.source_client_thing_id,
+            request.count,
+            transfer.source_identity.item_index,
+            transfer.map_revision,
+            equipment_updates.len(),
+            refreshed_viewport.0.len(),
+        ),
+    );
+    Ok(SessionActionOutcome::Handled)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
