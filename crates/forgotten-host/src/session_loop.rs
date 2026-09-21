@@ -1433,239 +1433,40 @@ pub(crate) fn handle_native_otclient_game(
                             continue;
                         }
                     }
-                    let Some(target_slot) = target_slot else {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=throw-item outcome=deferred-unsupported-container-source-target",
-                        );
-                        continue;
-                    };
-                    // Nested content window source: translate the ephemeral window address and
-                    // move the whole content item into an empty equipment slot.
-                    if let Some(&(parent_container_id, parent_item_index)) =
-                        open_content_windows.get(&container_id)
+                    // Owned-container stacks move into owned equipment through the
+                    // atomic inventory boundary; the record always consumes here.
                     {
-                        shared_world.move_content_item_to_equipment(
-                            character.id,
-                            parent_container_id,
-                            parent_item_index,
-                            item_index,
-                            target_slot,
-                        )?;
-                        let next_equipment = shared_world.player_equipment(character.id)?;
-                        let next_containers = shared_world.player_containers(character.id)?;
-                        database.replace_player_inventory(
-                            character.id,
-                            &next_equipment,
-                            &next_containers,
-                        )?;
-                        native_diagnostic(
-                            config.extended_diagnostics,
+                        let mut ctx = SessionContext {
+                            stream: &mut *stream,
                             peer,
-                            &format!(
-                                "action=throw-item outcome=content-item-to-equipment parent-container-id={} parent-item-index={} content-index={item_index} target-slot={} client-thing-id={}",
-                                parent_container_id,
-                                parent_item_index,
-                                target_slot.code(),
-                                source_client_thing_id
-                            ),
-                        );
-                        native_refresh_open_content_windows(
-                            stream,
-                            &config.client_profile,
-                            config.item_presentation_catalog.as_deref(),
-                            &shared_world.player_containers(character.id)?,
-                            &mut open_content_windows,
-                        )?;
-                        continue;
-                    }
-                    let equipment = shared_world.player_equipment(character.id)?;
-                    let containers = shared_world.player_containers(character.id)?;
-                    let Some(container) = containers.container(container_id) else {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=throw-item outcome=deferred-unknown-container-source",
-                        );
-                        continue;
-                    };
-                    if container.has_parent {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=throw-item outcome=deferred-nested-container-source",
-                        );
-                        continue;
-                    }
-                    let Some(item) = container.items.item(item_index) else {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=throw-item outcome=deferred-unknown-container-source-item",
-                        );
-                        continue;
-                    };
-                    if item.count < u16::from(count)
-                        || catalog
-                            .presentation(item.server_id)
-                            .map(|entry| entry.client_thing_id)
-                            != Some(source_client_thing_id)
-                    {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=throw-item outcome=deferred-invalid-container-item-identity-or-source-count",
-                        );
-                        continue;
-                    }
-                    let requested_count = u16::from(count);
-                    if requested_count < item.count {
-                        if equipment
-                            .item(target_slot)
-                            .is_some_and(|destination| destination.server_id != item.server_id)
-                        {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=throw-item outcome=deferred-nonmatching-equipment-stack-merge-destination",
-                            );
-                            continue;
-                        }
-                        shared_world.move_container_stack_to_equipment(
-                            character.id,
-                            container_id,
-                            item_index,
-                            target_slot,
-                            requested_count,
-                        )?;
-                        let next_equipment = shared_world.player_equipment(character.id)?;
-                        let next_containers = shared_world.player_containers(character.id)?;
-                        database.replace_player_inventory(
-                            character.id,
-                            &next_equipment,
-                            &next_containers,
-                        )?;
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            &format!(
-                                "action=throw-item outcome=top-level-container-stack-to-equipment-merge container-id={} item-index={} target-slot={} client-thing-id={} count={}",
-                                container_id,
-                                item_index,
-                                target_slot.code(),
-                                source_client_thing_id,
-                                count
-                            ),
-                        );
-                        continue;
-                    }
-                    if equipment
-                        .item(target_slot)
-                        .is_some_and(|destination| destination.server_id == item.server_id)
-                    {
-                        shared_world.move_container_stack_to_equipment(
-                            character.id,
-                            container_id,
-                            item_index,
-                            target_slot,
-                            requested_count,
-                        )?;
-                        let next_equipment = shared_world.player_equipment(character.id)?;
-                        let next_containers = shared_world.player_containers(character.id)?;
-                        database.replace_player_inventory(
-                            character.id,
-                            &next_equipment,
-                            &next_containers,
-                        )?;
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            &format!(
-                                "action=throw-item outcome=top-level-container-stack-to-equipment-merge container-id={} item-index={} target-slot={} client-thing-id={} count={}",
-                                container_id,
-                                item_index,
-                                target_slot.code(),
-                                source_client_thing_id,
-                                count
-                            ),
-                        );
-                        continue;
-                    }
-                    if equipment.item(target_slot).is_some() {
-                        if requested_count == item.count {
-                            shared_world.swap_container_item_with_equipment(
-                                character.id,
+                            character_id: character.id,
+                            database: &mut database,
+                            shared_world,
+                            config,
+                            world_map: &world_map,
+                            snapshot: &snapshot,
+                            facing: &mut facing,
+                            player_position: &mut player_position,
+                            active_click_walk: &mut active_click_walk,
+                            observed_dead,
+                            observed_visibility_epoch: &mut observed_visibility_epoch,
+                            observed_vitals_epoch: &mut observed_vitals_epoch,
+                        };
+                        if apply_native_throw_item_container_to_equipment(
+                            &mut ctx,
+                            ThrowItemContainerToEquipmentRequest {
                                 container_id,
                                 item_index,
                                 target_slot,
-                            )?;
-                            let next_equipment = shared_world.player_equipment(character.id)?;
-                            let next_containers = shared_world.player_containers(character.id)?;
-                            database.replace_player_inventory(
-                                character.id,
-                                &next_equipment,
-                                &next_containers,
-                            )?;
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                &format!(
-                                    "action=throw-item outcome=top-level-container-to-occupied-equipment-swap container-id={} item-index={} target-slot={} client-thing-id={} count={}",
-                                    container_id,
-                                    item_index,
-                                    target_slot.code(),
-                                    source_client_thing_id,
-                                    count
-                                ),
-                            );
+                                source_client_thing_id,
+                                count,
+                            },
+                            &mut open_content_windows,
+                        )? == SessionActionOutcome::Handled
+                        {
                             continue;
                         }
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=throw-item outcome=deferred-partial-or-unverified-occupied-equipment-target",
-                        );
-                        continue;
                     }
-                    if !native_legacy_slot_types_allow_equipment_slot(
-                        config.item_slot_types_by_server_id.as_deref(),
-                        item.server_id,
-                        target_slot,
-                    ) {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=throw-item outcome=deferred-container-item-slot-type-mismatch",
-                        );
-                        continue;
-                    }
-                    shared_world.move_container_item_to_equipment(
-                        character.id,
-                        container_id,
-                        item_index,
-                        target_slot,
-                    )?;
-                    let next_equipment = shared_world.player_equipment(character.id)?;
-                    let next_containers = shared_world.player_containers(character.id)?;
-                    database.replace_player_inventory(
-                        character.id,
-                        &next_equipment,
-                        &next_containers,
-                    )?;
-                    native_diagnostic(
-                        config.extended_diagnostics,
-                        peer,
-                        &format!(
-                            "action=throw-item outcome=top-level-container-to-equipment container-id={} item-index={} target-slot={} client-thing-id={} count={}",
-                            container_id,
-                            item_index,
-                            target_slot.code(),
-                            source_client_thing_id,
-                            count
-                        ),
-                    );
-                    continue;
                 }
                 let Some(source_slot) = source_slot else {
                     native_diagnostic(
