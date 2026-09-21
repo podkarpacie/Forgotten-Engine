@@ -49,6 +49,7 @@ mod session_serve;
 mod shared_native_map;
 mod static_creature;
 mod talkactions;
+mod throw_item;
 mod trade;
 mod use_item;
 pub(crate) use actions::apply_native_action_use;
@@ -133,6 +134,7 @@ pub(crate) use static_creature::{
     persist_runtime_player_conditions, persist_static_target_attack_vitals,
 };
 pub(crate) use talkactions::apply_native_lua_talkaction;
+pub(crate) use throw_item::{decode_throw_item_addresses, ThrowItemAddresses};
 pub(crate) use trade::{
     apply_native_accept_trade_action, apply_native_npc_buy_action, apply_native_npc_sell_action,
     apply_native_npc_trade_close_action, apply_native_reject_trade_action,

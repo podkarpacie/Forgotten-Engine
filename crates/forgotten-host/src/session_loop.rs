@@ -1191,30 +1191,20 @@ pub(crate) fn handle_native_otclient_game(
                 target_position,
                 count,
             } => {
-                let source_slot = (source_position.x == 0xffff
-                    && source_position.y & 0x40 == 0
-                    && source_position.z == 0
-                    && source_stack_position == 0)
-                    .then(|| EquipmentSlot::from_code(source_position.y as u8))
-                    .flatten();
-                let source_container =
-                    (source_position.x == 0xffff && source_position.y & 0x40 != 0).then_some((
-                        (source_position.y & 0x0f) as u8,
-                        usize::from(source_position.z),
-                    ));
-                let target_slot = (target_position.x == 0xffff
-                    && target_position.y & 0x40 == 0
-                    && target_position.z == 0)
-                    .then(|| EquipmentSlot::from_code(target_position.y as u8))
-                    .flatten();
+                let addresses: ThrowItemAddresses = decode_throw_item_addresses(
+                    source_position,
+                    source_stack_position,
+                    target_position,
+                );
+                let source_slot = addresses.source_slot;
+                let source_container = addresses.source_container;
+                let target_slot = addresses.target_slot;
                 // Classic clients address open container windows with the high container flag
                 // in y and the window identifier in its lower four bits. For a whole item the
                 // destination index remains a client-side drop location and FE appends to the
                 // already-owned top-level container. A requested partial stack is narrower: it
                 // must name an existing matching top-level container item at that exact index.
-                let target_container_id = (target_position.x == 0xffff
-                    && target_position.y & 0x40 != 0)
-                    .then_some((target_position.y & 0x0f) as u8);
+                let target_container_id = addresses.target_container_id;
                 let Some(catalog) = config.item_presentation_catalog.as_deref() else {
                     native_diagnostic(
                         config.extended_diagnostics,
