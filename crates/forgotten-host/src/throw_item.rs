@@ -750,6 +750,214 @@ pub(crate) fn apply_native_throw_item_map_source(
     Ok(SessionActionOutcome::Handled)
 }
 
+/// Owned-inventory ThrowItem request for an open corpse window: the window id plus the
+/// client-asserted loot-child index and the owned destination endpoints. Sources
+/// without an open corpse window fall through to the owned-container routers below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThrowItemCorpseTakeRequest {
+    pub container_id: u8,
+    pub source_stack_position: u8,
+    pub count: u8,
+    pub target_slot: Option<EquipmentSlot>,
+    pub target_container_id: Option<u8>,
+}
+
+/// Session window maps the corpse-take handler reads and prunes: open corpse windows
+/// plus the nested-content windows that share their id space.
+pub(crate) struct ThrowItemCorpseWindows<'a> {
+    pub open_corpse_windows: &'a mut BTreeMap<u8, (Position, usize)>,
+    pub open_content_windows: &'a mut BTreeMap<u8, (u8, usize)>,
+}
+
+/// Mutable follow-state the corpse-take handler refreshes after an authoritative move:
+/// the observer's mapped-equipment mirror plus the equipment/container epochs.
+pub(crate) struct ThrowItemCorpseTakeFollow<'a> {
+    pub observed_mapped_equipment: &'a mut BTreeMap<EquipmentSlot, NativeOtClientClassicItemRecord>,
+    pub observed_equipment_epoch: &'a mut u64,
+    pub observed_containers_epoch: &'a mut u64,
+}
+
+/// Takes loot from an open corpse window into owned equipment or an owned container.
+/// Returns `Unhandled` when the source window has no open corpse (so the
+/// owned-container routers below still run); every corpse path consumes the record
+/// (`Handled`), including deferred diagnostics, preserving the loop's terminal
+/// `continue`. The item-presentation catalog gate is re-derived with the same
+/// diagnostic so the handler is total; it is unreachable when called after the loop
+/// preamble.
+pub(crate) fn apply_native_throw_item_corpse_take(
+    ctx: &mut SessionContext<'_>,
+    map_owner: &SharedNativeMap,
+    request: ThrowItemCorpseTakeRequest,
+    windows: &mut ThrowItemCorpseWindows<'_>,
+    closed_container_ids: &BTreeSet<u8>,
+    sent_container_windows: &mut BTreeMap<u8, NativeRenderedContainerWindow>,
+    follow: &mut ThrowItemCorpseTakeFollow<'_>,
+) -> Result<SessionActionOutcome, HostError> {
+    let Some(catalog) = ctx.config.item_presentation_catalog.as_deref() else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-no-item-presentation-catalog",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    // Open corpse windows are session-local views over durable runtime registry
+    // items; taking loot routes through the registry composite instead of
+    // player-owned container storage.
+    let Some((corpse_position, corpse_item_index)) = windows
+        .open_corpse_windows
+        .get(&request.container_id)
+        .copied()
+    else {
+        return Ok(SessionActionOutcome::Unhandled);
+    };
+    let destination = if let Some(slot) = request.target_slot {
+        Some(forgotten_core::PlayerGroundDropSource::EquipmentSlot(slot))
+    } else if let Some(target_container) = request.target_container_id {
+        if closed_container_ids.contains(&target_container)
+            || target_container == request.container_id
+        {
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                "action=throw-item outcome=deferred-closed-corpse-take-target",
+            );
+            return Ok(SessionActionOutcome::Handled);
+        }
+        Some(forgotten_core::PlayerGroundDropSource::ContainerItem {
+            container_id: target_container,
+            item_index: 0,
+        })
+    } else {
+        None
+    };
+    let Some(destination) = destination.filter(|_| !ctx.observed_dead) else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-unsupported-corpse-take-target",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    match map_owner.move_runtime_item_to_inventory(
+        ctx.shared_world,
+        &mut *ctx.database,
+        ctx.character_id,
+        corpse_position,
+        corpse_item_index,
+        Some(usize::from(request.source_stack_position)),
+        u16::from(request.count),
+        destination,
+        ctx.config.item_weight_by_server_id.as_deref(),
+    ) {
+        Ok(Some(outcome)) => {
+            // Re-send the refreshed corpse window so remaining loot stays accurate.
+            if let Some(runtime_corpse) =
+                map_owner.runtime_tile_item(corpse_position, corpse_item_index)?
+            {
+                if let Some(frame) = native_corpse_window_frame(
+                    &ctx.config.client_profile,
+                    Some(catalog),
+                    request.container_id,
+                    &runtime_corpse,
+                    ctx.config.item_name_by_server_id.as_deref(),
+                )
+                .map_err(HostError::Protocol)?
+                {
+                    write_frame(&mut *ctx.stream, &frame)?;
+                }
+            } else {
+                windows.open_corpse_windows.remove(&request.container_id);
+                windows.open_content_windows.remove(&request.container_id);
+            }
+            if let forgotten_core::PlayerGroundDropSource::EquipmentSlot(_) = outcome.source {
+                let equipment = ctx.shared_world.player_equipment(ctx.character_id)?;
+                let current_mapped_equipment =
+                    native_classic_mapped_equipment(Some(catalog), &equipment);
+                let equipment_updates = native_classic_equipment_delta_frames(
+                    &ctx.config.client_profile,
+                    &*follow.observed_mapped_equipment,
+                    &current_mapped_equipment,
+                )
+                .map_err(HostError::Protocol)?;
+                for frame in &equipment_updates {
+                    write_frame(&mut *ctx.stream, frame)?;
+                }
+                *follow.observed_mapped_equipment = current_mapped_equipment;
+                *follow.observed_equipment_epoch = ctx.shared_world.equipment_epoch();
+            }
+            if let forgotten_core::PlayerGroundDropSource::ContainerItem {
+                container_id: target_container,
+                ..
+            } = outcome.source
+            {
+                if !closed_container_ids.contains(&target_container) {
+                    let containers = ctx.shared_world.player_containers(ctx.character_id)?;
+                    if let Some(container) = containers.container(target_container) {
+                        if let Some(frame) = native_classic_container_frame(
+                            &ctx.config.client_profile,
+                            Some(catalog),
+                            container,
+                        )
+                        .map_err(HostError::Protocol)?
+                        {
+                            write_frame(&mut *ctx.stream, &frame)?;
+                        }
+                        sent_container_windows.insert(
+                            target_container,
+                            native_rendered_container_window(
+                                &ctx.config.client_profile,
+                                Some(catalog),
+                                container,
+                            ),
+                        );
+                    }
+                }
+                *follow.observed_containers_epoch = ctx.shared_world.containers_epoch();
+            }
+            let mut refreshed_snapshot = ctx.snapshot.clone();
+            refreshed_snapshot.player_position = native_position(*ctx.player_position);
+            refreshed_snapshot.player_direction = ctx.facing.protocol_direction();
+            let map_snapshot = map_owner.render_snapshot()?;
+            let refreshed_viewport = encode_shared_native_world_viewport(
+                &ctx.config.client_profile,
+                &refreshed_snapshot,
+                map_snapshot.as_ref(),
+                ctx.shared_world,
+                ctx.character_id,
+            )?;
+            write_frame(&mut *ctx.stream, &refreshed_viewport)?;
+            *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                &format!(
+                    "action=throw-item outcome=corpse-loot-taken window-id={} child-index={} server-id={} moved={} remaining={:?}",
+                    request.container_id,
+                    request.source_stack_position,
+                    outcome.moved_item.server_id,
+                    outcome.moved_item.count,
+                    outcome.source_remaining_count,
+                ),
+            );
+        }
+        Ok(None) => native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-corpse-take-rejected",
+        ),
+        Err(HostError::Core(_) | HostError::InvalidConfiguration(_)) => {
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                "action=throw-item outcome=deferred-corpse-take-failed",
+            );
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(SessionActionOutcome::Handled)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

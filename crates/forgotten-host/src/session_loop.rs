@@ -1353,161 +1353,49 @@ pub(crate) fn handle_native_otclient_game(
                     // Open corpse windows are session-local views over durable runtime registry
                     // items; taking loot routes through the registry composite instead of
                     // player-owned container storage.
-                    if let Some((corpse_position, corpse_item_index)) =
-                        open_corpse_windows.get(&container_id).copied()
                     {
-                        let destination = if let Some(slot) = target_slot {
-                            Some(forgotten_core::PlayerGroundDropSource::EquipmentSlot(slot))
-                        } else if let Some(target_container) = target_container_id {
-                            if closed_container_ids.contains(&target_container)
-                                || target_container == container_id
-                            {
-                                native_diagnostic(
-                                    config.extended_diagnostics,
-                                    peer,
-                                    "action=throw-item outcome=deferred-closed-corpse-take-target",
-                                );
-                                continue;
-                            }
-                            Some(forgotten_core::PlayerGroundDropSource::ContainerItem {
-                                container_id: target_container,
-                                item_index: 0,
-                            })
-                        } else {
-                            None
-                        };
-                        let Some(destination) = destination.filter(|_| !observed_dead) else {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=throw-item outcome=deferred-unsupported-corpse-take-target",
-                            );
-                            continue;
-                        };
-                        match map_owner.move_runtime_item_to_inventory(
+                        let mut ctx = SessionContext {
+                            stream: &mut *stream,
+                            peer,
+                            character_id: character.id,
+                            database: &mut database,
                             shared_world,
-                            &mut database,
-                            character.id,
-                            corpse_position,
-                            corpse_item_index,
-                            Some(usize::from(source_stack_position)),
-                            u16::from(count),
-                            destination,
-                            config.item_weight_by_server_id.as_deref(),
-                        ) {
-                            Ok(Some(outcome)) => {
-                                // Re-send the refreshed corpse window so remaining loot stays accurate.
-                                if let Some(runtime_corpse) = map_owner
-                                    .runtime_tile_item(corpse_position, corpse_item_index)?
-                                {
-                                    if let Some(frame) = native_corpse_window_frame(
-                                        &config.client_profile,
-                                        Some(catalog),
-                                        container_id,
-                                        &runtime_corpse,
-                                        config.item_name_by_server_id.as_deref(),
-                                    )
-                                    .map_err(HostError::Protocol)?
-                                    {
-                                        write_frame(stream, &frame)?;
-                                    }
-                                } else {
-                                    open_corpse_windows.remove(&container_id);
-                                    open_content_windows.remove(&container_id);
-                                }
-                                if let forgotten_core::PlayerGroundDropSource::EquipmentSlot(_) =
-                                    outcome.source
-                                {
-                                    let equipment = shared_world.player_equipment(character.id)?;
-                                    let current_mapped_equipment =
-                                        native_classic_mapped_equipment(Some(catalog), &equipment);
-                                    let equipment_updates = native_classic_equipment_delta_frames(
-                                        &config.client_profile,
-                                        &observed_mapped_equipment,
-                                        &current_mapped_equipment,
-                                    )
-                                    .map_err(HostError::Protocol)?;
-                                    for frame in &equipment_updates {
-                                        write_frame(stream, frame)?;
-                                    }
-                                    observed_mapped_equipment = current_mapped_equipment;
-                                    observed_equipment_epoch = shared_world.equipment_epoch();
-                                }
-                                if let forgotten_core::PlayerGroundDropSource::ContainerItem {
-                                    container_id: target_container,
-                                    ..
-                                } = outcome.source
-                                {
-                                    if !closed_container_ids.contains(&target_container) {
-                                        let containers =
-                                            shared_world.player_containers(character.id)?;
-                                        if let Some(container) =
-                                            containers.container(target_container)
-                                        {
-                                            if let Some(frame) = native_classic_container_frame(
-                                                &config.client_profile,
-                                                Some(catalog),
-                                                container,
-                                            )
-                                            .map_err(HostError::Protocol)?
-                                            {
-                                                write_frame(stream, &frame)?;
-                                            }
-                                            sent_container_windows.insert(
-                                                target_container,
-                                                native_rendered_container_window(
-                                                    &config.client_profile,
-                                                    Some(catalog),
-                                                    container,
-                                                ),
-                                            );
-                                        }
-                                    }
-                                    observed_containers_epoch = shared_world.containers_epoch();
-                                }
-                                let mut refreshed_snapshot = snapshot.clone();
-                                refreshed_snapshot.player_position =
-                                    native_position(player_position);
-                                refreshed_snapshot.player_direction = facing.protocol_direction();
-                                let map_snapshot = map_owner.render_snapshot()?;
-                                let refreshed_viewport = encode_shared_native_world_viewport(
-                                    &config.client_profile,
-                                    &refreshed_snapshot,
-                                    map_snapshot.as_ref(),
-                                    shared_world,
-                                    character.id,
-                                )?;
-                                write_frame(stream, &refreshed_viewport)?;
-                                observed_visibility_epoch = shared_world.visibility_epoch();
-                                native_diagnostic(
-                                    config.extended_diagnostics,
-                                    peer,
-                                    &format!(
-                                        "action=throw-item outcome=corpse-loot-taken window-id={} child-index={} server-id={} moved={} remaining={:?}",
-                                        container_id,
-                                        source_stack_position,
-                                        outcome.moved_item.server_id,
-                                        outcome.moved_item.count,
-                                        outcome.source_remaining_count,
-                                    ),
-                                );
-                            }
-                            Ok(None) => native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=throw-item outcome=deferred-corpse-take-rejected",
-                            ),
-                            Err(HostError::Core(_) | HostError::InvalidConfiguration(_)) => {
-                                native_diagnostic(
-                                    config.extended_diagnostics,
-                                    peer,
-                                    "action=throw-item outcome=deferred-corpse-take-failed",
-                                );
-                            }
-                            Err(error) => return Err(error),
+                            config,
+                            world_map: &world_map,
+                            snapshot: &snapshot,
+                            facing: &mut facing,
+                            player_position: &mut player_position,
+                            active_click_walk: &mut active_click_walk,
+                            observed_dead,
+                            observed_visibility_epoch: &mut observed_visibility_epoch,
+                            observed_vitals_epoch: &mut observed_vitals_epoch,
+                        };
+                        if apply_native_throw_item_corpse_take(
+                            &mut ctx,
+                            map_owner,
+                            ThrowItemCorpseTakeRequest {
+                                container_id,
+                                source_stack_position,
+                                count,
+                                target_slot,
+                                target_container_id,
+                            },
+                            &mut ThrowItemCorpseWindows {
+                                open_corpse_windows: &mut open_corpse_windows,
+                                open_content_windows: &mut open_content_windows,
+                            },
+                            &closed_container_ids,
+                            &mut sent_container_windows,
+                            &mut ThrowItemCorpseTakeFollow {
+                                observed_mapped_equipment: &mut observed_mapped_equipment,
+                                observed_equipment_epoch: &mut observed_equipment_epoch,
+                                observed_containers_epoch: &mut observed_containers_epoch,
+                            },
+                        )? == SessionActionOutcome::Handled
+                        {
+                            continue;
                         }
-                        continue;
-                    } // All containerâ†”equipment and containerâ†”container throw paths below
+                    } // All container↔equipment and container↔container throw paths below
                       // persist through the atomic replace_player_inventory boundary so a
                       // torn two-transaction inventory can never be observed or crash-duplicated.
                     if let Some(target_container_id) = target_container_id {
