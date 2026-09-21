@@ -958,6 +958,158 @@ pub(crate) fn apply_native_throw_item_corpse_take(
     Ok(SessionActionOutcome::Handled)
 }
 
+/// Owned-inventory ThrowItem request for a container source moving into an owned
+/// container: the source window address plus the client-asserted stack identity and
+/// the target window id. Non-container targets fall through to the equipment-target
+/// router below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThrowItemContainerToContainerRequest {
+    pub container_id: u8,
+    pub item_index: usize,
+    pub target_container_id: Option<u8>,
+    pub source_client_thing_id: u16,
+    pub count: u8,
+}
+
+/// Moves an owned-container stack into an owned container through the atomic
+/// inventory boundary. Returns `Unhandled` when the target is not a container;
+/// every container-target path consumes the record (`Handled`), including deferred
+/// diagnostics, preserving the loop's terminal `continue`s. The item-presentation
+/// catalog gate is re-derived with the same diagnostic so the handler is total; it
+/// is unreachable when called after the loop preamble.
+pub(crate) fn apply_native_throw_item_container_to_container(
+    ctx: &mut SessionContext<'_>,
+    request: ThrowItemContainerToContainerRequest,
+    closed_container_ids: &BTreeSet<u8>,
+    open_content_windows: &mut BTreeMap<u8, (u8, usize)>,
+) -> Result<SessionActionOutcome, HostError> {
+    let Some(target_container_id) = request.target_container_id else {
+        return Ok(SessionActionOutcome::Unhandled);
+    };
+    let Some(catalog) = ctx.config.item_presentation_catalog.as_deref() else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-no-item-presentation-catalog",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    // Nested content window source: translate the ephemeral window address
+    // and move the whole content item into the target owned container.
+    if let Some(&(parent_container_id, parent_item_index)) =
+        open_content_windows.get(&request.container_id)
+    {
+        ctx.shared_world.move_content_item_to_container(
+            ctx.character_id,
+            parent_container_id,
+            parent_item_index,
+            request.item_index,
+            target_container_id,
+        )?;
+        let next_equipment = ctx.shared_world.player_equipment(ctx.character_id)?;
+        let next_containers = ctx.shared_world.player_containers(ctx.character_id)?;
+        ctx.database.replace_player_inventory(
+            ctx.character_id,
+            &next_equipment,
+            &next_containers,
+        )?;
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            &format!(
+                "action=throw-item outcome=content-item-to-container parent-container-id={} parent-item-index={} content-index={} target-container-id={} client-thing-id={}",
+                parent_container_id,
+                parent_item_index,
+                request.item_index,
+                target_container_id,
+                request.source_client_thing_id
+            ),
+        );
+        native_refresh_open_content_windows(
+            &mut *ctx.stream,
+            &ctx.config.client_profile,
+            ctx.config.item_presentation_catalog.as_deref(),
+            &ctx.shared_world.player_containers(ctx.character_id)?,
+            &mut *open_content_windows,
+        )?;
+        return Ok(SessionActionOutcome::Handled);
+    }
+    let containers = ctx.shared_world.player_containers(ctx.character_id)?;
+    let Some(source_container) = containers.container(request.container_id) else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-unknown-container-source",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    let Some(target_container) = containers.container(target_container_id) else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-unknown-container-target",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    if closed_container_ids.contains(&request.container_id)
+        || closed_container_ids.contains(&target_container_id)
+        || request.container_id == target_container_id
+        || source_container.has_parent
+        || target_container.has_parent
+    {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-invalid-container-to-container-boundary",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    }
+    let Some(item) = source_container.items.item(request.item_index) else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-unknown-container-source-item",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    if item.count < u16::from(request.count)
+        || catalog
+            .presentation(item.server_id)
+            .map(|entry| entry.client_thing_id)
+            != Some(request.source_client_thing_id)
+    {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-invalid-container-item-identity-or-source-count",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    }
+    ctx.shared_world.move_container_stack_to_container(
+        ctx.character_id,
+        request.container_id,
+        request.item_index,
+        target_container_id,
+        u16::from(request.count),
+    )?;
+    let next_containers = ctx.shared_world.player_containers(ctx.character_id)?;
+    ctx.database
+        .replace_player_containers(ctx.character_id, &next_containers)?;
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        &format!(
+            "action=throw-item outcome=top-level-container-to-container-stack source-container-id={} item-index={} target-container-id={} client-thing-id={} count={}",
+            request.container_id,
+            request.item_index,
+            target_container_id,
+            request.source_client_thing_id,
+            request.count
+        ),
+    );
+    Ok(SessionActionOutcome::Handled)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

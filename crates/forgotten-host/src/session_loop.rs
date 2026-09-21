@@ -1398,120 +1398,40 @@ pub(crate) fn handle_native_otclient_game(
                     } // All container↔equipment and container↔container throw paths below
                       // persist through the atomic replace_player_inventory boundary so a
                       // torn two-transaction inventory can never be observed or crash-duplicated.
-                    if let Some(target_container_id) = target_container_id {
-                        // Nested content window source: translate the ephemeral window address
-                        // and move the whole content item into the target owned container.
-                        if let Some(&(parent_container_id, parent_item_index)) =
-                            open_content_windows.get(&container_id)
-                        {
-                            shared_world.move_content_item_to_container(
-                                character.id,
-                                parent_container_id,
-                                parent_item_index,
-                                item_index,
-                                target_container_id,
-                            )?;
-                            let next_equipment = shared_world.player_equipment(character.id)?;
-                            let next_containers = shared_world.player_containers(character.id)?;
-                            database.replace_player_inventory(
-                                character.id,
-                                &next_equipment,
-                                &next_containers,
-                            )?;
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                &format!(
-                                    "action=throw-item outcome=content-item-to-container parent-container-id={} parent-item-index={} content-index={item_index} target-container-id={} client-thing-id={}",
-                                    parent_container_id,
-                                    parent_item_index,
-                                    target_container_id,
-                                    source_client_thing_id
-                                ),
-                            );
-                            native_refresh_open_content_windows(
-                                stream,
-                                &config.client_profile,
-                                config.item_presentation_catalog.as_deref(),
-                                &shared_world.player_containers(character.id)?,
-                                &mut open_content_windows,
-                            )?;
-                            continue;
-                        }
-                        let containers = shared_world.player_containers(character.id)?;
-                        let Some(source_container) = containers.container(container_id) else {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=throw-item outcome=deferred-unknown-container-source",
-                            );
-                            continue;
-                        };
-                        let Some(target_container) = containers.container(target_container_id)
-                        else {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=throw-item outcome=deferred-unknown-container-target",
-                            );
-                            continue;
-                        };
-                        if closed_container_ids.contains(&container_id)
-                            || closed_container_ids.contains(&target_container_id)
-                            || container_id == target_container_id
-                            || source_container.has_parent
-                            || target_container.has_parent
-                        {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=throw-item outcome=deferred-invalid-container-to-container-boundary",
-                            );
-                            continue;
-                        }
-                        let Some(item) = source_container.items.item(item_index) else {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=throw-item outcome=deferred-unknown-container-source-item",
-                            );
-                            continue;
-                        };
-                        if item.count < u16::from(count)
-                            || catalog
-                                .presentation(item.server_id)
-                                .map(|entry| entry.client_thing_id)
-                                != Some(source_client_thing_id)
-                        {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=throw-item outcome=deferred-invalid-container-item-identity-or-source-count",
-                            );
-                            continue;
-                        }
-                        shared_world.move_container_stack_to_container(
-                            character.id,
-                            container_id,
-                            item_index,
-                            target_container_id,
-                            u16::from(count),
-                        )?;
-                        let next_containers = shared_world.player_containers(character.id)?;
-                        database.replace_player_containers(character.id, &next_containers)?;
-                        native_diagnostic(
-                            config.extended_diagnostics,
+                      // Owned-container stacks move into owned containers through the
+                      // atomic inventory boundary; equipment targets fall through below.
+                    {
+                        let mut ctx = SessionContext {
+                            stream: &mut *stream,
                             peer,
-                            &format!(
-                                "action=throw-item outcome=top-level-container-to-container-stack source-container-id={} item-index={} target-container-id={} client-thing-id={} count={}",
+                            character_id: character.id,
+                            database: &mut database,
+                            shared_world,
+                            config,
+                            world_map: &world_map,
+                            snapshot: &snapshot,
+                            facing: &mut facing,
+                            player_position: &mut player_position,
+                            active_click_walk: &mut active_click_walk,
+                            observed_dead,
+                            observed_visibility_epoch: &mut observed_visibility_epoch,
+                            observed_vitals_epoch: &mut observed_vitals_epoch,
+                        };
+                        if apply_native_throw_item_container_to_container(
+                            &mut ctx,
+                            ThrowItemContainerToContainerRequest {
                                 container_id,
                                 item_index,
                                 target_container_id,
                                 source_client_thing_id,
-                                count
-                            ),
-                        );
-                        continue;
+                                count,
+                            },
+                            &closed_container_ids,
+                            &mut open_content_windows,
+                        )? == SessionActionOutcome::Handled
+                        {
+                            continue;
+                        }
                     }
                     let Some(target_slot) = target_slot else {
                         native_diagnostic(
