@@ -28,7 +28,7 @@ pub enum TfsActionKey {
 
 impl TfsActionKey {
     /// Canonical sandbox callback name for singleton selectors. Ranges have no single name
-    /// and return `None`; range routing stays deferred.
+    /// and return `None`; they dispatch under [`range_callback_name`] instead.
     pub fn callback_name(self) -> Option<String> {
         match self {
             Self::ItemId(id) => Some(format!("action:item:{id}")),
@@ -37,28 +37,66 @@ impl TfsActionKey {
             Self::ItemIdRange { .. } | Self::ActionIdRange { .. } => None,
         }
     }
+
+    /// Whether one used item matches this selector: exact id for singletons, inclusive
+    /// containment for ranges. Absent optional ids never match.
+    pub fn matches(self, server_id: u16, action_id: Option<u16>, unique_id: Option<u16>) -> bool {
+        match self {
+            Self::ItemId(id) => id == server_id,
+            Self::ItemIdRange { from, to } => from <= server_id && server_id <= to,
+            Self::ActionId(id) => Some(id) == action_id,
+            Self::ActionIdRange { from, to } => action_id.is_some_and(|id| from <= id && id <= to),
+            Self::UniqueId(id) => Some(id) == unique_id,
+        }
+    }
 }
 
-/// Candidate callback names for one used item, most specific first (unique, action, item).
-/// The host tries each in order against the action dispatcher; the first hit wins.
-pub fn action_callback_candidates(
+/// Deterministic dispatcher name for a range entry: `action:range:{index}`, where the
+/// index is the entry position in registry document order. Positional (not id-derived)
+/// so overlapping or duplicate ranges never collide; both the CLI builder and the host
+/// router derive it from the same registry, so the names always agree.
+pub fn range_callback_name(index: usize) -> String {
+    format!("action:range:{index}")
+}
+
+/// Resolves one used item to its action entry in registry document order: the first
+/// entry whose selector matches wins, across singleton and range selectors alike.
+/// Returns the entry index with the entry; the index feeds [`range_callback_name`]
+/// for range entries. This single resolver backs both the CLI `dispatch-action` verb
+/// and live host routing so the two can never disagree on precedence.
+pub fn resolve_action_entry(
+    registry: &TfsActionRegistry,
     server_id: u16,
     action_id: Option<u16>,
     unique_id: Option<u16>,
-) -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Some(id) = unique_id {
-        candidates.push(format!("action:unique:{id}"));
-    }
-    if let Some(id) = action_id {
-        candidates.push(format!("action:action:{id}"));
-    }
-    candidates.push(format!("action:item:{server_id}"));
-    candidates
+) -> Option<(usize, &TfsActionEntry)> {
+    registry
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.key.matches(server_id, action_id, unique_id))
 }
 
-/// One declared action. `script` is a safe relative path into the operator content tree; matching
-/// precedence, ranges, use flags, and authorization are not represented here.
+/// Resolves one used item to its dispatcher callback name plus script path: the
+/// canonical [`TfsActionKey::callback_name`] for singletons, [`range_callback_name`]
+/// for ranges. `None` when the registry declares no match.
+pub fn resolve_action_callback(
+    registry: &TfsActionRegistry,
+    server_id: u16,
+    action_id: Option<u16>,
+    unique_id: Option<u16>,
+) -> Option<(String, PathBuf)> {
+    resolve_action_entry(registry, server_id, action_id, unique_id).map(|(index, entry)| {
+        let name = entry
+            .key
+            .callback_name()
+            .unwrap_or_else(|| range_callback_name(index));
+        (name, entry.script.clone())
+    })
+}
+
+/// One declared action. `script` is a safe relative path into the operator content tree;
+/// first-match precedence across singleton and range selectors is resolved by
+/// [`resolve_action_entry`]; use flags and authorization are not represented here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TfsActionEntry {
     pub key: TfsActionKey,
@@ -360,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn singleton_keys_name_callbacks_and_candidates_order_by_specificity() {
+    fn singleton_keys_name_callbacks() {
         assert_eq!(
             TfsActionKey::ItemId(2160).callback_name().as_deref(),
             Some("action:item:2160")
@@ -377,17 +415,80 @@ mod tests {
             TfsActionKey::ItemIdRange { from: 1, to: 2 }.callback_name(),
             None
         );
+        assert_eq!(range_callback_name(3), "action:range:3");
+    }
+
+    fn mixed_registry() -> TfsActionRegistry {
+        parse_tfs_actions_xml(
+            br#"<actions>
+                <action fromid="100" toid="200" script="range.lua"/>
+                <action itemid="150" script="single.lua"/>
+                <action fromactionid="10" toactionid="20" script="action-range.lua"/>
+                <action actionid="15" script="action-single.lua"/>
+            </actions>"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolution_matches_singletons_and_range_containment() {
+        let registry = mixed_registry();
+        // Item 150 sits inside [100, 200] but the range is first in file order.
         assert_eq!(
-            action_callback_candidates(2160, Some(1000), Some(7)),
-            vec![
-                "action:unique:7".to_owned(),
-                "action:action:1000".to_owned(),
-                "action:item:2160".to_owned(),
-            ]
+            resolve_action_callback(&registry, 150, None, None),
+            Some(("action:range:0".to_owned(), PathBuf::from("range.lua")))
+        );
+        // Item 199 hits only the range; 99 and 201 hit nothing.
+        assert_eq!(
+            resolve_action_callback(&registry, 199, None, None),
+            Some(("action:range:0".to_owned(), PathBuf::from("range.lua")))
+        );
+        assert_eq!(resolve_action_callback(&registry, 99, None, None), None);
+        assert_eq!(resolve_action_callback(&registry, 201, None, None), None);
+        // Action-id 15 sits inside [10, 20] but the range precedes the singleton.
+        assert_eq!(
+            resolve_action_callback(&registry, 999, Some(15), None),
+            Some((
+                "action:range:2".to_owned(),
+                PathBuf::from("action-range.lua")
+            ))
+        );
+        assert_eq!(resolve_action_callback(&registry, 999, Some(9), None), None);
+        assert_eq!(
+            resolve_action_callback(&registry, 999, Some(21), None),
+            None
+        );
+    }
+
+    #[test]
+    fn resolution_prefers_document_order_over_specificity() {
+        // The singleton comes first here, so it beats the covering range.
+        let registry = parse_tfs_actions_xml(
+            br#"<actions>
+                <action itemid="150" script="single.lua"/>
+                <action fromid="100" toid="200" script="range.lua"/>
+            </actions>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_action_callback(&registry, 150, None, None),
+            Some(("action:item:150".to_owned(), PathBuf::from("single.lua")))
+        );
+        // Overlapping ranges: first in file order wins.
+        let registry = parse_tfs_actions_xml(
+            br#"<actions>
+                <action fromid="100" toid="200" script="first.lua"/>
+                <action fromid="150" toid="250" script="second.lua"/>
+            </actions>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_action_callback(&registry, 175, None, None),
+            Some(("action:range:0".to_owned(), PathBuf::from("first.lua")))
         );
         assert_eq!(
-            action_callback_candidates(2160, None, None),
-            vec!["action:item:2160".to_owned()]
+            resolve_action_callback(&registry, 225, None, None),
+            Some(("action:range:1".to_owned(), PathBuf::from("second.lua")))
         );
     }
 }

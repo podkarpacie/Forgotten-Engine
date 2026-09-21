@@ -154,7 +154,7 @@ pub(crate) use trade::{
 use forgotten_config::{
     DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog, DeclarativeSpellCatalog,
     DeclarativeWeaponCatalog, LegacyItemSlotType, LegacyPublicChannelCatalog, QuestCatalog,
-    WorldType,
+    TfsActionRegistry, WorldType,
 };
 use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
@@ -503,10 +503,15 @@ pub struct NativeOtClientHostConfig {
     /// sockets, mutate world state, or exhaust memory/instructions without a bounded rejection.
     pub talkaction_dispatcher: Option<Arc<SandboxedLuaCallbackDispatcher>>,
     /// Optional pre-built sandboxed TFS action dispatcher keyed by canonical selector names
-    /// (`action:item|action|unique:{id}`). Validated map-item uses whose action or unique id
-    /// matches a registered selector route through this dispatcher before generic handling;
-    /// the same resource caps and intent-only boundaries as talkactions apply.
+    /// (`action:item|action|unique:{id}`) plus positional range names (`action:range:{index}`).
+    /// Validated map-item uses whose action or unique id matches a registered selector route
+    /// through this dispatcher before generic handling; the same resource caps and intent-only
+    /// boundaries as talkactions apply.
     pub action_dispatcher: Option<Arc<SandboxedLuaCallbackDispatcher>>,
+    /// The action registry the dispatcher was built from, shared so live routing resolves
+    /// the same first-match entry (singletons and ranges in document order) the CLI
+    /// `dispatch-action` verb proves. `None` exactly when `action_dispatcher` is `None`.
+    pub action_registry: Option<Arc<TfsActionRegistry>>,
     /// Configured corpse despawn delay in authoritative world-tick seconds. `0` (the default)
     /// disables decay; a positive value expires each placed runtime corpse after the delay on a
     /// later heartbeat, removing it from the map and the durable registry together.
@@ -1230,6 +1235,7 @@ mod tests {
             declarative_npc_dialogue_catalog: None,
             talkaction_dispatcher: None,
             action_dispatcher: None,
+            action_registry: None,
             corpse_despawn_seconds: 0,
         }
     }

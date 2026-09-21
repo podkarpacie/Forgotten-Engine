@@ -7,16 +7,18 @@
 //! dedup pass can unify the two once both paths have live coverage.
 
 use super::*;
-use forgotten_config::action_callback_candidates;
+use forgotten_config::resolve_action_callback;
 use forgotten_scripting::{
     SandboxedLuaCallbackDispatchState, SandboxedLuaCallbackDispatcher, SandboxedLuaCallbackInput,
     SandboxedLuaEffect, SandboxedLuaPosition,
 };
 
 /// Routes one validated map-item use through registered action scripts. Returns `true` when a
-/// selector matched (effects applied or script error consumed with a diagnostic, generic
+/// registry entry matched (effects applied or script error consumed with a diagnostic, generic
 /// handling skipped); returns `false` when nothing matched so generic handling proceeds.
-/// Candidate keys are tried most-specific first; only a missing callback falls through.
+/// Resolution is first-match in registry document order across singleton and range selectors
+/// via [`resolve_action_callback`] — the same resolver the CLI `dispatch-action` verb proves,
+/// so live routing and the CLI can never disagree on precedence.
 ///
 /// Takes explicit session pieces rather than the shared context because callers hold a live
 /// shared borrow (the derived world map) that conflicts with a whole-context mutable borrow;
@@ -52,42 +54,55 @@ pub(crate) fn apply_native_action_use(
             z: subject_position.z,
         }),
     };
-    for key in action_callback_candidates(server_id, action_id, unique_id) {
-        let outcome = dispatcher.dispatch_api(&key, &input);
-        match outcome.state {
-            SandboxedLuaCallbackDispatchState::CallbackNotFound => continue,
-            SandboxedLuaCallbackDispatchState::Completed => {
-                apply_native_action_effects(
-                    config,
-                    stream,
-                    database,
-                    shared_world,
-                    character_id,
-                    peer,
-                    snapshot,
-                    facing,
-                    player_position,
-                    observed_visibility_epoch,
-                    observed_vitals_epoch,
-                    world_map,
-                    outcome.effects,
-                )?;
-                return Ok(true);
-            }
-            _ => {
-                native_diagnostic(
-                    config.extended_diagnostics,
-                    peer,
-                    &format!(
-                        "action=use outcome=action-script-rejected key={key} state={:?}",
-                        outcome.state,
-                    ),
-                );
-                return Ok(true);
-            }
+    let Some(registry) = config.action_registry.as_deref() else {
+        return Ok(false);
+    };
+    let Some((key, _)) = resolve_action_callback(registry, server_id, action_id, unique_id) else {
+        return Ok(false);
+    };
+    let outcome = dispatcher.dispatch_api(&key, &input);
+    match outcome.state {
+        SandboxedLuaCallbackDispatchState::Completed => {
+            apply_native_action_effects(
+                config,
+                stream,
+                database,
+                shared_world,
+                character_id,
+                peer,
+                snapshot,
+                facing,
+                player_position,
+                observed_visibility_epoch,
+                observed_vitals_epoch,
+                world_map,
+                outcome.effects,
+            )?;
+            Ok(true)
+        }
+        // The builder registers every registry entry, so a resolved match always has a
+        // callback; a miss means registry/dispatcher skew, consumed loudly rather than
+        // silently falling through to generic handling.
+        SandboxedLuaCallbackDispatchState::CallbackNotFound => {
+            native_diagnostic(
+                config.extended_diagnostics,
+                peer,
+                &format!("action=use outcome=action-script-missing key={key}"),
+            );
+            Ok(true)
+        }
+        _ => {
+            native_diagnostic(
+                config.extended_diagnostics,
+                peer,
+                &format!(
+                    "action=use outcome=action-script-rejected key={key} state={:?}",
+                    outcome.state,
+                ),
+            );
+            Ok(true)
         }
     }
-    Ok(false)
 }
 
 /// Applies action-script intents against authoritative subject state. Subject-relative validated

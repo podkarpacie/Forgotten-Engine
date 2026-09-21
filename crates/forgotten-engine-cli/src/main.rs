@@ -5,12 +5,12 @@ use forgotten_config::{
     load_quest_catalog, load_tfs_action_registry, load_tfs_content_inventory,
     load_tfs_entity_catalog, load_tfs_public_channel_catalog, load_tfs_talkaction_registry,
     load_tfs_vocation_registry, load_world_companions, load_world_map,
-    materialize_tfs_spawn_templates, materialize_tfs_static_spawns,
-    resolve_tfs_registry_script_reference, resolve_tfs_spawn_references, validate_content,
-    world_map_path, write_template, ConsumableCatalog, DeclarativeNpcDialogueCatalog,
-    DeclarativeShopCatalog, DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig,
-    LegacyPublicChannelCatalog, LegacyWorldCompanionData, QuestCatalog, TfsActionKey,
-    TfsEntityCatalog, TfsRegistryCategory, TfsVocationRegistry,
+    materialize_tfs_spawn_templates, materialize_tfs_static_spawns, range_callback_name,
+    resolve_action_callback, resolve_tfs_registry_script_reference, resolve_tfs_spawn_references,
+    validate_content, world_map_path, write_template, ConsumableCatalog,
+    DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog, DeclarativeSpellCatalog,
+    DeclarativeWeaponCatalog, EngineConfig, LegacyPublicChannelCatalog, LegacyWorldCompanionData,
+    QuestCatalog, TfsActionRegistry, TfsEntityCatalog, TfsRegistryCategory, TfsVocationRegistry,
 };
 use forgotten_core::{
     DeathLossPolicy, EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
@@ -98,6 +98,7 @@ struct IndependentNativeStartupContent {
     declarative_npc_dialogue_catalog: Option<DeclarativeNpcDialogueCatalog>,
     talkaction_dispatcher: Option<SandboxedLuaCallbackDispatcher>,
     action_dispatcher: Option<SandboxedLuaCallbackDispatcher>,
+    action_registry: Option<Arc<TfsActionRegistry>>,
     consumable_catalog: Option<ConsumableCatalog>,
     shop_catalog: Option<DeclarativeShopCatalog>,
     quest_catalog: QuestCatalog,
@@ -155,6 +156,7 @@ fn load_independent_native_startup_content(
             let action_dispatcher = action_dispatcher
                 .join()
                 .map_err(|_| "action dispatcher worker panicked")??;
+            let (action_dispatcher, action_registry) = action_dispatcher;
             let consumable_catalog = consumable_catalog
                 .join()
                 .map_err(|_| "consumable catalog loader worker panicked")??;
@@ -174,6 +176,7 @@ fn load_independent_native_startup_content(
                 declarative_npc_dialogue_catalog,
                 talkaction_dispatcher,
                 action_dispatcher,
+                action_registry,
                 consumable_catalog,
                 shop_catalog,
                 quest_catalog,
@@ -209,17 +212,26 @@ fn build_talkaction_dispatcher(
 
 fn build_action_dispatcher(
     config: &EngineConfig,
-) -> Result<Option<SandboxedLuaCallbackDispatcher>, String> {
+) -> Result<
+    (
+        Option<SandboxedLuaCallbackDispatcher>,
+        Option<Arc<TfsActionRegistry>>,
+    ),
+    String,
+> {
     let registry = load_tfs_action_registry(config).map_err(|error| error.to_string())?;
     if registry.is_empty() {
-        return Ok(None);
+        return Ok((None, None));
     }
     let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
-    for entry in registry.iter() {
-        // Only singleton selectors get canonical callback names; ranges stay deferred.
-        let Some(callback_name) = entry.key.callback_name() else {
-            continue;
-        };
+    for (index, entry) in registry.iter().enumerate() {
+        // Singletons register under canonical names; ranges under positional
+        // `action:range:{index}` names so overlaps never collide. Both derive from
+        // the same registry the host router resolves against.
+        let callback_name = entry
+            .key
+            .callback_name()
+            .unwrap_or_else(|| range_callback_name(index));
         dispatcher
             .register_callback_file(
                 callback_name.as_str(),
@@ -231,9 +243,9 @@ fn build_action_dispatcher(
             })?;
     }
     if dispatcher.is_empty() {
-        return Ok(None);
+        return Ok((None, None));
     }
-    Ok(Some(dispatcher))
+    Ok((Some(dispatcher), Some(Arc::new(registry))))
 }
 
 fn required_path(
@@ -769,6 +781,7 @@ fn run_host(
         let quest_catalog = startup_content.quest_catalog;
         let talkaction_dispatcher = startup_content.talkaction_dispatcher;
         let action_dispatcher = startup_content.action_dispatcher;
+        let action_registry = startup_content.action_registry;
         let regeneration_rules = vocation_registry
             .as_ref()
             .map(|registry| {
@@ -968,6 +981,7 @@ fn run_host(
             declarative_npc_dialogue_catalog,
             talkaction_dispatcher: talkaction_dispatcher.map(Arc::new),
             action_dispatcher: action_dispatcher.map(Arc::new),
+            action_registry,
             consumable_effects,
             shop_catalog: shop_catalog.map(Arc::new),
             quest_catalog: Some(Arc::new(quest_catalog)),
@@ -1481,24 +1495,12 @@ fn script_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                 .unwrap_or(0);
             let config = load(&directory)?;
             let registry = load_tfs_action_registry(&config)?;
-            // First-match in registry order over singleton selectors; ranges stay deferred.
-            let mut matched: Option<(String, std::path::PathBuf)> = None;
-            for entry in registry.iter() {
-                let matches = match entry.key {
-                    TfsActionKey::ItemId(id) => id == item_id,
-                    TfsActionKey::ActionId(id) => Some(id) == action_id,
-                    TfsActionKey::UniqueId(id) => Some(id) == unique_id,
-                    TfsActionKey::ItemIdRange { .. } | TfsActionKey::ActionIdRange { .. } => false,
-                };
-                if matches {
-                    if let Some(name) = entry.key.callback_name() {
-                        matched = Some((name, entry.script.clone()));
-                        break;
-                    }
-                }
-            }
-            let (callback_name, script) = matched
-                .ok_or_else(|| format!("action registry declares no match for item {item_id}"))?;
+            // Shared first-match resolution over singleton and range selectors; the
+            // host routes the same registry the same way.
+            let (callback_name, script) = resolve_action_callback(
+                &registry, item_id, action_id, unique_id,
+            )
+            .ok_or_else(|| format!("action registry declares no match for item {item_id}"))?;
             // Action scripts resolve relative to the actions registry directory, matching
             // `resolve_tfs_registry_script_reference` used by the generic dispatch verb.
             let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
@@ -2823,6 +2825,45 @@ mod tests {
             "1000".into(),
         ];
         assert!(script_command(&matched).is_ok());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn dispatch_action_command_resolves_range_entries_to_api_dispatch() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("forgotten-engine-dispatch-range-{nonce}"));
+        fs::create_dir_all(directory.join("data/actions/scripts")).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        fs::write(
+            directory.join("data/actions/actions.xml"),
+            r#"<actions><action fromid="100" toid="200" script="scripts/door.lua"/></actions>"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.join("data/actions/scripts/door.lua"),
+            "return function() doCreatureSay('creak') end",
+        )
+        .unwrap();
+
+        // Item inside the range dispatches; item outside the range finds nothing.
+        let inside = vec![
+            "script".into(),
+            "dispatch-action".into(),
+            directory.display().to_string(),
+            "150".into(),
+        ];
+        assert!(script_command(&inside).is_ok());
+        let outside = vec![
+            "script".into(),
+            "dispatch-action".into(),
+            directory.display().to_string(),
+            "99".into(),
+        ];
+        assert!(script_command(&outside).is_err());
         let _ = fs::remove_dir_all(directory);
     }
 
