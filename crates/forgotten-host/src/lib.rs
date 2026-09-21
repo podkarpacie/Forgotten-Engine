@@ -135,8 +135,9 @@ pub(crate) use static_creature::{
 };
 pub(crate) use talkactions::apply_native_lua_talkaction;
 pub(crate) use throw_item::{
-    apply_native_throw_item_ground_drop, decode_throw_item_addresses, ThrowItemAddresses,
-    ThrowItemGroundDropFollow, ThrowItemGroundDropRequest,
+    apply_native_throw_item_ground_drop, apply_native_throw_item_runtime_pickup,
+    decode_throw_item_addresses, ThrowItemAddresses, ThrowItemGroundDropFollow,
+    ThrowItemGroundDropRequest, ThrowItemRuntimePickupFollow, ThrowItemRuntimePickupRequest,
 };
 pub(crate) use trade::{
     apply_native_accept_trade_action, apply_native_npc_buy_action, apply_native_npc_sell_action,

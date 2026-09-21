@@ -305,6 +305,209 @@ pub(crate) fn apply_native_throw_item_ground_drop(
     Ok(SessionActionOutcome::Handled)
 }
 
+/// Owned-inventory ThrowItem request for a durable-registry runtime ground stack: the
+/// map source address plus the client-asserted stack identity and the owned
+/// destination endpoints. Non-map sources and missing/foreign stacks fall through to
+/// the map-source transfer paths below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThrowItemRuntimePickupRequest {
+    pub source_position: NativeOtClientPosition,
+    pub source_client_thing_id: u16,
+    pub source_stack_position: u8,
+    pub count: u8,
+    pub target_slot: Option<EquipmentSlot>,
+    pub target_container_id: Option<u8>,
+}
+
+/// Mutable follow-state the runtime-pickup handler refreshes after an authoritative
+/// move: the observer's mapped-equipment mirror plus the equipment/container epochs.
+pub(crate) struct ThrowItemRuntimePickupFollow<'a> {
+    pub observed_mapped_equipment: &'a mut BTreeMap<EquipmentSlot, NativeOtClientClassicItemRecord>,
+    pub observed_equipment_epoch: &'a mut u64,
+    pub observed_containers_epoch: &'a mut u64,
+}
+
+/// Picks up a durable-registry runtime ground stack into owned equipment or an owned
+/// container. Returns `Unhandled` when the source is not a map tile or no live runtime
+/// stack sits at the addressed index (including while dead), so the map-source
+/// transfer paths still run; every live-stack path consumes the record (`Handled`),
+/// including deferred diagnostics, preserving the loop's terminal `continue`. The
+/// item-presentation catalog gate is re-derived with the same diagnostic so the
+/// handler is total; it is unreachable when called after the loop preamble.
+pub(crate) fn apply_native_throw_item_runtime_pickup(
+    ctx: &mut SessionContext<'_>,
+    map_owner: &SharedNativeMap,
+    request: ThrowItemRuntimePickupRequest,
+    closed_container_ids: &BTreeSet<u8>,
+    sent_container_windows: &mut BTreeMap<u8, NativeRenderedContainerWindow>,
+    follow: &mut ThrowItemRuntimePickupFollow<'_>,
+) -> Result<SessionActionOutcome, HostError> {
+    if request.source_position.x == 0xffff {
+        return Ok(SessionActionOutcome::Unhandled);
+    }
+    let Some(catalog) = ctx.config.item_presentation_catalog.as_deref() else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-no-item-presentation-catalog",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    let core_source_position = Position {
+        x: request.source_position.x,
+        y: request.source_position.y,
+        z: request.source_position.z,
+    };
+    // Runtime ground items (dropped stacks) are picked up from the durable
+    // registry; imported source items keep their own transfer paths below.
+    let runtime_pickup = map_owner.runtime_tile_item(
+        core_source_position,
+        usize::from(request.source_stack_position),
+    )?;
+    let Some(runtime_item) = runtime_pickup.filter(|_| !ctx.observed_dead) else {
+        return Ok(SessionActionOutcome::Unhandled);
+    };
+    let identity_ok = request.source_client_thing_id == runtime_item.server_id
+        || catalog
+            .presentation(runtime_item.server_id)
+            .is_some_and(|presentation| {
+                presentation.client_thing_id == request.source_client_thing_id
+            });
+    if !identity_ok {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-runtime-pickup-identity-mismatch",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    }
+    let destination = if let Some(slot) = request.target_slot {
+        Some(forgotten_core::PlayerGroundDropSource::EquipmentSlot(slot))
+    } else if let Some(container_id) = request.target_container_id {
+        if closed_container_ids.contains(&container_id) {
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                "action=throw-item outcome=deferred-closed-container-pickup-target",
+            );
+            return Ok(SessionActionOutcome::Handled);
+        }
+        Some(forgotten_core::PlayerGroundDropSource::ContainerItem {
+            container_id,
+            item_index: 0,
+        })
+    } else {
+        None
+    };
+    let Some(destination) = destination else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-unsupported-runtime-pickup-target",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    match map_owner.move_runtime_item_to_inventory(
+        ctx.shared_world,
+        &mut *ctx.database,
+        ctx.character_id,
+        core_source_position,
+        usize::from(request.source_stack_position),
+        None,
+        u16::from(request.count),
+        destination,
+        ctx.config.item_weight_by_server_id.as_deref(),
+    ) {
+        Ok(Some(outcome)) => {
+            if let forgotten_core::PlayerGroundDropSource::EquipmentSlot(_) = outcome.source {
+                let equipment = ctx.shared_world.player_equipment(ctx.character_id)?;
+                let current_mapped_equipment =
+                    native_classic_mapped_equipment(Some(catalog), &equipment);
+                let equipment_updates = native_classic_equipment_delta_frames(
+                    &ctx.config.client_profile,
+                    &*follow.observed_mapped_equipment,
+                    &current_mapped_equipment,
+                )
+                .map_err(HostError::Protocol)?;
+                for frame in &equipment_updates {
+                    write_frame(&mut *ctx.stream, frame)?;
+                }
+                *follow.observed_mapped_equipment = current_mapped_equipment;
+                *follow.observed_equipment_epoch = ctx.shared_world.equipment_epoch();
+            }
+            if let forgotten_core::PlayerGroundDropSource::ContainerItem { container_id, .. } =
+                outcome.source
+            {
+                if !closed_container_ids.contains(&container_id) {
+                    let containers = ctx.shared_world.player_containers(ctx.character_id)?;
+                    if let Some(container) = containers.container(container_id) {
+                        if let Some(frame) = native_classic_container_frame(
+                            &ctx.config.client_profile,
+                            Some(catalog),
+                            container,
+                        )
+                        .map_err(HostError::Protocol)?
+                        {
+                            write_frame(&mut *ctx.stream, &frame)?;
+                        }
+                        sent_container_windows.insert(
+                            container_id,
+                            native_rendered_container_window(
+                                &ctx.config.client_profile,
+                                Some(catalog),
+                                container,
+                            ),
+                        );
+                    }
+                }
+                *follow.observed_containers_epoch = ctx.shared_world.containers_epoch();
+            }
+            let mut refreshed_snapshot = ctx.snapshot.clone();
+            refreshed_snapshot.player_position = native_position(*ctx.player_position);
+            refreshed_snapshot.player_direction = ctx.facing.protocol_direction();
+            let map_snapshot = map_owner.render_snapshot()?;
+            let refreshed_viewport = encode_shared_native_world_viewport(
+                &ctx.config.client_profile,
+                &refreshed_snapshot,
+                map_snapshot.as_ref(),
+                ctx.shared_world,
+                ctx.character_id,
+            )?;
+            write_frame(&mut *ctx.stream, &refreshed_viewport)?;
+            *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                &format!(
+                    "action=throw-item outcome=runtime-ground-pickup source={},{},{} server-id={} count={} moved={} remaining={:?} index={}",
+                    core_source_position.x,
+                    core_source_position.y,
+                    core_source_position.z,
+                    runtime_item.server_id,
+                    request.source_client_thing_id,
+                    outcome.moved_item.count,
+                    outcome.source_remaining_count,
+                    request.source_stack_position,
+                ),
+            );
+        }
+        Ok(None) => native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-runtime-pickup-rejected",
+        ),
+        Err(HostError::Core(_) | HostError::InvalidConfiguration(_)) => {
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                "action=throw-item outcome=deferred-runtime-pickup-failed",
+            );
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(SessionActionOutcome::Handled)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
