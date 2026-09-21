@@ -57,6 +57,254 @@ pub(crate) fn decode_throw_item_addresses(
     }
 }
 
+/// Owned-inventory ThrowItem request for a real ground tile: the client-asserted stack
+/// identity plus the decoded source endpoints. The target position decides routing:
+/// ground tiles are handled here, everything else falls through to the next router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThrowItemGroundDropRequest {
+    pub target_position: NativeOtClientPosition,
+    pub source_client_thing_id: u16,
+    pub count: u8,
+    pub source_slot: Option<EquipmentSlot>,
+    pub source_container: Option<(u8, usize)>,
+}
+
+/// Mutable follow-state the ground-drop handler refreshes after an authoritative move:
+/// the observer's mapped-equipment mirror plus the equipment/container epochs.
+pub(crate) struct ThrowItemGroundDropFollow<'a> {
+    pub observed_mapped_equipment: &'a mut BTreeMap<EquipmentSlot, NativeOtClientClassicItemRecord>,
+    pub observed_equipment_epoch: &'a mut u64,
+    pub observed_containers_epoch: &'a mut u64,
+}
+
+/// Drops an owned-inventory stack onto a real ground tile through the durable runtime
+/// registry. Returns `Unhandled` when the target is not a ground tile; every
+/// ground-target path consumes the record (`Handled`), including deferred diagnostics,
+/// preserving the loop's terminal `continue`. The item-presentation catalog gate is
+/// re-derived with the same diagnostic so the handler is total; it is unreachable when
+/// called after the loop preamble, which gates first.
+pub(crate) fn apply_native_throw_item_ground_drop(
+    ctx: &mut SessionContext<'_>,
+    map_owner: &SharedNativeMap,
+    request: ThrowItemGroundDropRequest,
+    closed_container_ids: &BTreeSet<u8>,
+    open_content_windows: &mut BTreeMap<u8, (u8, usize)>,
+    sent_container_windows: &mut BTreeMap<u8, NativeRenderedContainerWindow>,
+    follow: &mut ThrowItemGroundDropFollow<'_>,
+) -> Result<SessionActionOutcome, HostError> {
+    if request.target_position.x == 0xffff {
+        return Ok(SessionActionOutcome::Unhandled);
+    }
+    let Some(catalog) = ctx.config.item_presentation_catalog.as_deref() else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-no-item-presentation-catalog",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    let target_tile = Position {
+        x: request.target_position.x,
+        y: request.target_position.y,
+        z: request.target_position.z,
+    };
+    let drop_source = if let Some(slot) = request.source_slot {
+        Some(forgotten_core::PlayerGroundDropSource::EquipmentSlot(slot))
+    } else if let Some((container_id, item_index)) = request.source_container {
+        if closed_container_ids.contains(&container_id) {
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                "action=throw-item outcome=deferred-closed-container-ground-drop",
+            );
+            return Ok(SessionActionOutcome::Handled);
+        }
+        // Nested content window: translate the ephemeral window address back
+        // to its parent container item and content index.
+        if let Some(&(parent_container_id, parent_item_index)) =
+            open_content_windows.get(&container_id)
+        {
+            Some(forgotten_core::PlayerGroundDropSource::ContainerContent {
+                container_id: parent_container_id,
+                item_index: parent_item_index,
+                content_index: item_index,
+            })
+        } else {
+            Some(forgotten_core::PlayerGroundDropSource::ContainerItem {
+                container_id,
+                item_index,
+            })
+        }
+    } else {
+        None
+    };
+    let Some(drop_source) = drop_source.filter(|_| !ctx.observed_dead) else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-unsupported-ground-drop-source",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    // Validate the requested stack identity before any authoritative mutation.
+    let identity_ok = match &drop_source {
+        forgotten_core::PlayerGroundDropSource::EquipmentSlot(slot) => ctx
+            .shared_world
+            .player_equipment(ctx.character_id)
+            .ok()
+            .and_then(|equipment| equipment.item(*slot).cloned())
+            .is_some_and(|item| {
+                native_classic_item_record(Some(catalog), &item)
+                    .is_some_and(|record| record.client_thing_id == request.source_client_thing_id)
+            }),
+        forgotten_core::PlayerGroundDropSource::ContainerItem {
+            container_id,
+            item_index,
+        } => ctx
+            .shared_world
+            .player_containers(ctx.character_id)
+            .ok()
+            .and_then(|containers| containers.container(*container_id).cloned())
+            .and_then(|container| container.items.item(*item_index).cloned())
+            .is_some_and(|item| {
+                native_classic_item_record(Some(catalog), &item)
+                    .is_some_and(|record| record.client_thing_id == request.source_client_thing_id)
+            }),
+        forgotten_core::PlayerGroundDropSource::ContainerContent {
+            container_id,
+            item_index,
+            content_index,
+        } => ctx
+            .shared_world
+            .player_containers(ctx.character_id)
+            .ok()
+            .and_then(|containers| containers.container(*container_id).cloned())
+            .and_then(|container| container.items.item(*item_index).cloned())
+            .and_then(|item| item.contents().get(*content_index).cloned())
+            .is_some_and(|item| {
+                native_classic_item_record(Some(catalog), &item)
+                    .is_some_and(|record| record.client_thing_id == request.source_client_thing_id)
+            }),
+    };
+    if !identity_ok {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-ground-drop-identity-mismatch",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    }
+    match map_owner.move_player_stack_to_ground(
+        ctx.shared_world,
+        &mut *ctx.database,
+        ctx.character_id,
+        drop_source,
+        target_tile,
+        u16::from(request.count),
+        ctx.config.item_weight_by_server_id.as_deref(),
+    ) {
+        Ok(Some(outcome)) => {
+            if matches!(
+                outcome.source,
+                forgotten_core::PlayerGroundDropSource::ContainerContent { .. }
+            ) {
+                native_refresh_open_content_windows(
+                    &mut *ctx.stream,
+                    &ctx.config.client_profile,
+                    ctx.config.item_presentation_catalog.as_deref(),
+                    &ctx.shared_world.player_containers(ctx.character_id)?,
+                    &mut *open_content_windows,
+                )?;
+            }
+            if let forgotten_core::PlayerGroundDropSource::EquipmentSlot(_) = outcome.source {
+                let equipment = ctx.shared_world.player_equipment(ctx.character_id)?;
+                let current_mapped_equipment =
+                    native_classic_mapped_equipment(Some(catalog), &equipment);
+                let equipment_updates = native_classic_equipment_delta_frames(
+                    &ctx.config.client_profile,
+                    &*follow.observed_mapped_equipment,
+                    &current_mapped_equipment,
+                )
+                .map_err(HostError::Protocol)?;
+                for frame in &equipment_updates {
+                    write_frame(&mut *ctx.stream, frame)?;
+                }
+                *follow.observed_mapped_equipment = current_mapped_equipment;
+                *follow.observed_equipment_epoch = ctx.shared_world.equipment_epoch();
+            }
+            if let forgotten_core::PlayerGroundDropSource::ContainerItem { container_id, .. } =
+                outcome.source
+            {
+                if !closed_container_ids.contains(&container_id) {
+                    let containers = ctx.shared_world.player_containers(ctx.character_id)?;
+                    if let Some(container) = containers.container(container_id) {
+                        if let Some(frame) = native_classic_container_frame(
+                            &ctx.config.client_profile,
+                            Some(catalog),
+                            container,
+                        )
+                        .map_err(HostError::Protocol)?
+                        {
+                            write_frame(&mut *ctx.stream, &frame)?;
+                        }
+                        sent_container_windows.insert(
+                            container_id,
+                            native_rendered_container_window(
+                                &ctx.config.client_profile,
+                                Some(catalog),
+                                container,
+                            ),
+                        );
+                    }
+                }
+                *follow.observed_containers_epoch = ctx.shared_world.containers_epoch();
+            }
+            let mut refreshed_snapshot = ctx.snapshot.clone();
+            refreshed_snapshot.player_position = native_position(*ctx.player_position);
+            refreshed_snapshot.player_direction = ctx.facing.protocol_direction();
+            let map_snapshot = map_owner.render_snapshot()?;
+            let refreshed_viewport = encode_shared_native_world_viewport(
+                &ctx.config.client_profile,
+                &refreshed_snapshot,
+                map_snapshot.as_ref(),
+                ctx.shared_world,
+                ctx.character_id,
+            )?;
+            write_frame(&mut *ctx.stream, &refreshed_viewport)?;
+            *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                &format!(
+                    "action=throw-item outcome=inventory-to-ground target={},{},{} server-id={} count={} moved={} remaining={:?} map-revision={}",
+                    target_tile.x,
+                    target_tile.y,
+                    target_tile.z,
+                    outcome.moved_item.server_id,
+                    request.source_client_thing_id,
+                    outcome.moved_item.count,
+                    outcome.source_remaining_count,
+                    map_owner.revision(),
+                ),
+            );
+        }
+        Ok(None) => native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-ground-drop-rejected",
+        ),
+        Err(HostError::Core(_) | HostError::InvalidConfiguration(_)) => {
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                "action=throw-item outcome=deferred-ground-drop-failed",
+            );
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(SessionActionOutcome::Handled)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

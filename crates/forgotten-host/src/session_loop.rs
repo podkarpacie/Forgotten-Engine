@@ -1223,212 +1223,45 @@ pub(crate) fn handle_native_otclient_game(
                 }
                 // Owned-inventory drops onto a real ground tile route through the durable
                 // runtime registry. Map-source and unknown sources stay deferred.
-                if target_position.x != 0xffff {
-                    let target_tile = Position {
-                        x: target_position.x,
-                        y: target_position.y,
-                        z: target_position.z,
-                    };
-                    let drop_source = if let Some(slot) = source_slot {
-                        Some(forgotten_core::PlayerGroundDropSource::EquipmentSlot(slot))
-                    } else if let Some((container_id, item_index)) = source_container {
-                        if closed_container_ids.contains(&container_id) {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=throw-item outcome=deferred-closed-container-ground-drop",
-                            );
-                            continue;
-                        }
-                        // Nested content window: translate the ephemeral window address back
-                        // to its parent container item and content index.
-                        if let Some(&(parent_container_id, parent_item_index)) =
-                            open_content_windows.get(&container_id)
-                        {
-                            Some(forgotten_core::PlayerGroundDropSource::ContainerContent {
-                                container_id: parent_container_id,
-                                item_index: parent_item_index,
-                                content_index: item_index,
-                            })
-                        } else {
-                            Some(forgotten_core::PlayerGroundDropSource::ContainerItem {
-                                container_id,
-                                item_index,
-                            })
-                        }
-                    } else {
-                        None
-                    };
-                    let Some(drop_source) = drop_source.filter(|_| !observed_dead) else {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=throw-item outcome=deferred-unsupported-ground-drop-source",
-                        );
-                        continue;
-                    };
-                    // Validate the requested stack identity before any authoritative mutation.
-                    let identity_ok = match &drop_source {
-                        forgotten_core::PlayerGroundDropSource::EquipmentSlot(slot) => shared_world
-                            .player_equipment(character.id)
-                            .ok()
-                            .and_then(|equipment| equipment.item(*slot).cloned())
-                            .is_some_and(|item| {
-                                native_classic_item_record(Some(catalog), &item).is_some_and(
-                                    |record| record.client_thing_id == source_client_thing_id,
-                                )
-                            }),
-                        forgotten_core::PlayerGroundDropSource::ContainerItem {
-                            container_id,
-                            item_index,
-                        } => shared_world
-                            .player_containers(character.id)
-                            .ok()
-                            .and_then(|containers| containers.container(*container_id).cloned())
-                            .and_then(|container| container.items.item(*item_index).cloned())
-                            .is_some_and(|item| {
-                                native_classic_item_record(Some(catalog), &item).is_some_and(
-                                    |record| record.client_thing_id == source_client_thing_id,
-                                )
-                            }),
-                        forgotten_core::PlayerGroundDropSource::ContainerContent {
-                            container_id,
-                            item_index,
-                            content_index,
-                        } => shared_world
-                            .player_containers(character.id)
-                            .ok()
-                            .and_then(|containers| containers.container(*container_id).cloned())
-                            .and_then(|container| container.items.item(*item_index).cloned())
-                            .and_then(|item| item.contents().get(*content_index).cloned())
-                            .is_some_and(|item| {
-                                native_classic_item_record(Some(catalog), &item).is_some_and(
-                                    |record| record.client_thing_id == source_client_thing_id,
-                                )
-                            }),
-                    };
-                    if !identity_ok {
-                        native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=throw-item outcome=deferred-ground-drop-identity-mismatch",
-                        );
-                        continue;
-                    }
-                    match map_owner.move_player_stack_to_ground(
+                {
+                    let mut ctx = SessionContext {
+                        stream: &mut *stream,
+                        peer,
+                        character_id: character.id,
+                        database: &mut database,
                         shared_world,
-                        &mut database,
-                        character.id,
-                        drop_source,
-                        target_tile,
-                        u16::from(count),
-                        config.item_weight_by_server_id.as_deref(),
-                    ) {
-                        Ok(Some(outcome)) => {
-                            if matches!(
-                                outcome.source,
-                                forgotten_core::PlayerGroundDropSource::ContainerContent { .. }
-                            ) {
-                                native_refresh_open_content_windows(
-                                    stream,
-                                    &config.client_profile,
-                                    config.item_presentation_catalog.as_deref(),
-                                    &shared_world.player_containers(character.id)?,
-                                    &mut open_content_windows,
-                                )?;
-                            }
-                            if let forgotten_core::PlayerGroundDropSource::EquipmentSlot(_) =
-                                outcome.source
-                            {
-                                let equipment = shared_world.player_equipment(character.id)?;
-                                let current_mapped_equipment =
-                                    native_classic_mapped_equipment(Some(catalog), &equipment);
-                                let equipment_updates = native_classic_equipment_delta_frames(
-                                    &config.client_profile,
-                                    &observed_mapped_equipment,
-                                    &current_mapped_equipment,
-                                )
-                                .map_err(HostError::Protocol)?;
-                                for frame in &equipment_updates {
-                                    write_frame(stream, frame)?;
-                                }
-                                observed_mapped_equipment = current_mapped_equipment;
-                                observed_equipment_epoch = shared_world.equipment_epoch();
-                            }
-                            if let forgotten_core::PlayerGroundDropSource::ContainerItem {
-                                container_id,
-                                ..
-                            } = outcome.source
-                            {
-                                if !closed_container_ids.contains(&container_id) {
-                                    let containers =
-                                        shared_world.player_containers(character.id)?;
-                                    if let Some(container) = containers.container(container_id) {
-                                        if let Some(frame) = native_classic_container_frame(
-                                            &config.client_profile,
-                                            Some(catalog),
-                                            container,
-                                        )
-                                        .map_err(HostError::Protocol)?
-                                        {
-                                            write_frame(stream, &frame)?;
-                                        }
-                                        sent_container_windows.insert(
-                                            container_id,
-                                            native_rendered_container_window(
-                                                &config.client_profile,
-                                                Some(catalog),
-                                                container,
-                                            ),
-                                        );
-                                    }
-                                }
-                                observed_containers_epoch = shared_world.containers_epoch();
-                            }
-                            let mut refreshed_snapshot = snapshot.clone();
-                            refreshed_snapshot.player_position = native_position(player_position);
-                            refreshed_snapshot.player_direction = facing.protocol_direction();
-                            let map_snapshot = map_owner.render_snapshot()?;
-                            let refreshed_viewport = encode_shared_native_world_viewport(
-                                &config.client_profile,
-                                &refreshed_snapshot,
-                                map_snapshot.as_ref(),
-                                shared_world,
-                                character.id,
-                            )?;
-                            write_frame(stream, &refreshed_viewport)?;
-                            observed_visibility_epoch = shared_world.visibility_epoch();
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                &format!(
-                                    "action=throw-item outcome=inventory-to-ground target={},{},{} server-id={} count={} moved={} remaining={:?} map-revision={}",
-                                    target_tile.x,
-                                    target_tile.y,
-                                    target_tile.z,
-                                    outcome.moved_item.server_id,
-                                    source_client_thing_id,
-                                    outcome.moved_item.count,
-                                    outcome.source_remaining_count,
-                                    map_owner.revision(),
-                                ),
-                            );
-                        }
-                        Ok(None) => native_diagnostic(
-                            config.extended_diagnostics,
-                            peer,
-                            "action=throw-item outcome=deferred-ground-drop-rejected",
-                        ),
-                        Err(HostError::Core(_) | HostError::InvalidConfiguration(_)) => {
-                            native_diagnostic(
-                                config.extended_diagnostics,
-                                peer,
-                                "action=throw-item outcome=deferred-ground-drop-failed",
-                            );
-                        }
-                        Err(error) => return Err(error),
+                        config,
+                        world_map: &world_map,
+                        snapshot: &snapshot,
+                        facing: &mut facing,
+                        player_position: &mut player_position,
+                        active_click_walk: &mut active_click_walk,
+                        observed_dead,
+                        observed_visibility_epoch: &mut observed_visibility_epoch,
+                        observed_vitals_epoch: &mut observed_vitals_epoch,
+                    };
+                    if apply_native_throw_item_ground_drop(
+                        &mut ctx,
+                        map_owner,
+                        ThrowItemGroundDropRequest {
+                            target_position,
+                            source_client_thing_id,
+                            count,
+                            source_slot,
+                            source_container,
+                        },
+                        &closed_container_ids,
+                        &mut open_content_windows,
+                        &mut sent_container_windows,
+                        &mut ThrowItemGroundDropFollow {
+                            observed_mapped_equipment: &mut observed_mapped_equipment,
+                            observed_equipment_epoch: &mut observed_equipment_epoch,
+                            observed_containers_epoch: &mut observed_containers_epoch,
+                        },
+                    )? == SessionActionOutcome::Handled
+                    {
+                        continue;
                     }
-                    continue;
                 }
                 if source_position.x != 0xffff {
                     let core_source_position = Position {
