@@ -1377,6 +1377,234 @@ pub(crate) fn apply_native_throw_item_container_to_equipment(
     Ok(SessionActionOutcome::Handled)
 }
 
+/// Owned-inventory ThrowItem request for an equipment source: the source slot plus
+/// the client-asserted stack identity and the owned destination endpoints. This is
+/// the fallthrough tail: any record reaching it consumes here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThrowItemEquipmentSourceRequest {
+    pub source_slot: Option<EquipmentSlot>,
+    pub target_slot: Option<EquipmentSlot>,
+    pub target_container_id: Option<u8>,
+    pub target_position: NativeOtClientPosition,
+    pub source_client_thing_id: u16,
+    pub count: u8,
+}
+
+/// Moves an owned-equipment stack into owned equipment (same-slot guard, swaps,
+/// plain transfers) or into an owned container (stack merges, full moves). Every
+/// path consumes the record (`Handled`), including deferred diagnostics, preserving
+/// the loop's terminal `continue`s and the fallthrough arm ends. The
+/// item-presentation catalog gate is re-derived with the same diagnostic so the
+/// handler is total; it is unreachable when called after the loop preamble.
+pub(crate) fn apply_native_throw_item_equipment_source(
+    ctx: &mut SessionContext<'_>,
+    request: ThrowItemEquipmentSourceRequest,
+) -> Result<SessionActionOutcome, HostError> {
+    let Some(source_slot) = request.source_slot else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-non-equipment-source-position",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    let Some(catalog) = ctx.config.item_presentation_catalog.as_deref() else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-no-item-presentation-catalog",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    let equipment = ctx.shared_world.player_equipment(ctx.character_id)?;
+    let Some(item) = equipment.item(source_slot).cloned() else {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-empty-source-slot",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    };
+    if item.count < u16::from(request.count)
+        || catalog
+            .presentation(item.server_id)
+            .map(|entry| entry.client_thing_id)
+            != Some(request.source_client_thing_id)
+    {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            "action=throw-item outcome=deferred-invalid-item-identity-or-source-count",
+        );
+        return Ok(SessionActionOutcome::Handled);
+    }
+    match (request.target_slot, request.target_container_id) {
+        (Some(target_slot), None) => {
+            if source_slot == target_slot {
+                native_diagnostic(
+                    ctx.config.extended_diagnostics,
+                    ctx.peer,
+                    "action=throw-item outcome=deferred-same-equipment-slot-target",
+                );
+                return Ok(SessionActionOutcome::Handled);
+            }
+            if equipment.item(target_slot).is_some() {
+                if u16::from(request.count) != item.count {
+                    native_diagnostic(
+                        ctx.config.extended_diagnostics,
+                        ctx.peer,
+                        "action=throw-item outcome=deferred-partial-occupied-equipment-target",
+                    );
+                    return Ok(SessionActionOutcome::Handled);
+                }
+                ctx.shared_world.swap_equipment_items(
+                    ctx.character_id,
+                    source_slot,
+                    target_slot,
+                )?;
+                let next_equipment = ctx.shared_world.player_equipment(ctx.character_id)?;
+                ctx.database
+                    .replace_player_equipment(ctx.character_id, &next_equipment)?;
+                native_diagnostic(
+                    ctx.config.extended_diagnostics,
+                    ctx.peer,
+                    &format!(
+                        "action=throw-item outcome=occupied-equipment-slot-swap source-slot={} target-slot={} client-thing-id={} count={}",
+                        source_slot.code(),
+                        target_slot.code(),
+                        request.source_client_thing_id,
+                        request.count
+                    ),
+                );
+                return Ok(SessionActionOutcome::Handled);
+            }
+            let mut next_equipment = equipment;
+            next_equipment.unequip(source_slot);
+            next_equipment.equip(target_slot, item);
+            ctx.database
+                .replace_player_equipment(ctx.character_id, &next_equipment)?;
+            ctx.shared_world
+                .replace_player_equipment(ctx.character_id, next_equipment)?;
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                &format!(
+                    "action=throw-item outcome=equipment-slot-transfer source-slot={} target-slot={} client-thing-id={} count={}",
+                    source_slot.code(),
+                    target_slot.code(),
+                    request.source_client_thing_id,
+                    request.count
+                ),
+            );
+        }
+        (None, Some(container_id)) => {
+            let containers = ctx.shared_world.player_containers(ctx.character_id)?;
+            let Some(container) = containers.container(container_id) else {
+                native_diagnostic(
+                    ctx.config.extended_diagnostics,
+                    ctx.peer,
+                    "action=throw-item outcome=deferred-unknown-container-target",
+                );
+                return Ok(SessionActionOutcome::Handled);
+            };
+            if container.has_parent {
+                native_diagnostic(
+                    ctx.config.extended_diagnostics,
+                    ctx.peer,
+                    "action=throw-item outcome=deferred-nested-container-target",
+                );
+                return Ok(SessionActionOutcome::Handled);
+            }
+            let requested_count = u16::from(request.count);
+            let destination_index = usize::from(request.target_position.z);
+            if container
+                .items
+                .item(destination_index)
+                .is_some_and(|destination| destination.server_id == item.server_id)
+            {
+                ctx.shared_world.move_equipment_stack_to_container(
+                    ctx.character_id,
+                    source_slot,
+                    container_id,
+                    requested_count,
+                )?;
+                let next_equipment = ctx.shared_world.player_equipment(ctx.character_id)?;
+                let next_containers = ctx.shared_world.player_containers(ctx.character_id)?;
+                ctx.database.replace_player_inventory(
+                    ctx.character_id,
+                    &next_equipment,
+                    &next_containers,
+                )?;
+                native_diagnostic(
+                    ctx.config.extended_diagnostics,
+                    ctx.peer,
+                    &format!(
+                        "action=throw-item outcome=equipment-stack-to-top-level-container-merge source-slot={} container-id={} destination-index={} client-thing-id={} count={}",
+                        source_slot.code(),
+                        container_id,
+                        destination_index,
+                        request.source_client_thing_id,
+                        request.count
+                    ),
+                );
+                return Ok(SessionActionOutcome::Handled);
+            }
+            if requested_count < item.count {
+                let outcome = if container.items.item(destination_index).is_some() {
+                    "deferred-nonmatching-stack-merge-destination"
+                } else {
+                    "deferred-missing-stack-merge-destination"
+                };
+                native_diagnostic(
+                    ctx.config.extended_diagnostics,
+                    ctx.peer,
+                    &format!("action=throw-item outcome={outcome}"),
+                );
+                return Ok(SessionActionOutcome::Handled);
+            }
+            if container.items.item(destination_index).is_some() {
+                native_diagnostic(
+                    ctx.config.extended_diagnostics,
+                    ctx.peer,
+                    "action=throw-item outcome=deferred-nonmatching-full-stack-merge-destination",
+                );
+                return Ok(SessionActionOutcome::Handled);
+            }
+            ctx.shared_world.move_equipment_item_to_container(
+                ctx.character_id,
+                source_slot,
+                container_id,
+            )?;
+            let next_equipment = ctx.shared_world.player_equipment(ctx.character_id)?;
+            let next_containers = ctx.shared_world.player_containers(ctx.character_id)?;
+            ctx.database.replace_player_inventory(
+                ctx.character_id,
+                &next_equipment,
+                &next_containers,
+            )?;
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                &format!(
+                    "action=throw-item outcome=equipment-to-top-level-container source-slot={} container-id={} client-thing-id={} count={}",
+                    source_slot.code(),
+                    container_id,
+                    request.source_client_thing_id,
+                    request.count
+                ),
+            );
+        }
+        _ => {
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                "action=throw-item outcome=deferred-unsupported-target-position",
+            );
+        }
+    }
+    Ok(SessionActionOutcome::Handled)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

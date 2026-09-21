@@ -250,6 +250,13 @@ temple → relog retains everything. All under stock OTCv8 7.4.
 > session state (five or more items). Narrow handlers needing four or fewer (trade rejection,
 > NPC close) take direct parameters instead — an 18-line context literal where it fits nothing
 > is overhead, not consistency. No custom per-handler structs in either case.
+>
+> Landing zone (2026-09-21, operator direction: ThrowItem matrix complete at 8 increments):
+> stop chasing a line-count target. Judge each remaining piece by "independent branches
+> (split it) vs sequential steps (leave it)" — the bootstrap/drain/heartbeat block (~1,100
+> lines) is sequential infrastructure and stays as one block; small independent slices
+> (100–200 lines) are fine either way, not urgent. Realistic landing zone is ~1,500–2,000
+> lines: a normal dispatcher-hub size, not a monolith.
 
 #### 2.2 Data Migration Tooling — ~55%
 - [x] `tfs-audit`: config/world/items/spawns/houses/registries/entities inventory + diagnostics

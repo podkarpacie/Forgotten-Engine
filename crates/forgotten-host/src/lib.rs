@@ -136,11 +136,12 @@ pub(crate) use static_creature::{
 pub(crate) use talkactions::apply_native_lua_talkaction;
 pub(crate) use throw_item::{
     apply_native_throw_item_container_to_container, apply_native_throw_item_container_to_equipment,
-    apply_native_throw_item_corpse_take, apply_native_throw_item_ground_drop,
-    apply_native_throw_item_map_source, apply_native_throw_item_runtime_pickup,
-    decode_throw_item_addresses, ThrowItemAddresses, ThrowItemContainerToContainerRequest,
-    ThrowItemContainerToEquipmentRequest, ThrowItemCorpseTakeFollow, ThrowItemCorpseTakeRequest,
-    ThrowItemCorpseWindows, ThrowItemGroundDropFollow, ThrowItemGroundDropRequest,
+    apply_native_throw_item_corpse_take, apply_native_throw_item_equipment_source,
+    apply_native_throw_item_ground_drop, apply_native_throw_item_map_source,
+    apply_native_throw_item_runtime_pickup, decode_throw_item_addresses, ThrowItemAddresses,
+    ThrowItemContainerToContainerRequest, ThrowItemContainerToEquipmentRequest,
+    ThrowItemCorpseTakeFollow, ThrowItemCorpseTakeRequest, ThrowItemCorpseWindows,
+    ThrowItemEquipmentSourceRequest, ThrowItemGroundDropFollow, ThrowItemGroundDropRequest,
     ThrowItemMapSourceFollow, ThrowItemMapSourceRequest, ThrowItemRuntimePickupFollow,
     ThrowItemRuntimePickupRequest,
 };
