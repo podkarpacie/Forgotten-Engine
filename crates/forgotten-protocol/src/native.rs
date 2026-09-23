@@ -14,16 +14,24 @@ pub fn decode_native_otclient_login_request(
     if reader.byte()? != NATIVE_OTCLIENT_ENTER_ACCOUNT {
         return Err(ProtocolError::InvalidNativeLoginRequest);
     }
+    let operating_system = reader.u16()?;
+    let protocol_version = reader.u16()?;
+    let dat_signature = reader.u32()?;
+    let spr_signature = reader.u32()?;
+    let pic_signature = reader.u32()?;
+    let account_id = reader.u32()?;
+    let password = reader.string(MAX_LOGIN_STRING_BYTES)?;
+    let (client_tag, client_build) = decode_optional_client_tag_build(&mut reader)?;
     let request = NativeOtClientLoginRequest {
-        operating_system: reader.u16()?,
-        protocol_version: reader.u16()?,
-        dat_signature: reader.u32()?,
-        spr_signature: reader.u32()?,
-        pic_signature: reader.u32()?,
-        account_id: reader.u32()?,
-        password: reader.string(MAX_LOGIN_STRING_BYTES)?,
-        client_tag: reader.string(MAX_LOGIN_STRING_BYTES)?,
-        client_build: reader.u16()?,
+        operating_system,
+        protocol_version,
+        dat_signature,
+        spr_signature,
+        pic_signature,
+        account_id,
+        password,
+        client_tag,
+        client_build,
     };
     if !classic_protocol_version_is_accepted(request.protocol_version)
         || reader.remaining() > profile.max_padding_bytes
@@ -49,14 +57,18 @@ pub fn decode_native_otclient_game_request(
     if reader.byte()? != 0 {
         return Err(ProtocolError::InvalidNativeGameRequest);
     }
+    let account_id = reader.u32()?;
+    let character_name = reader.string(MAX_LOGIN_STRING_BYTES)?;
+    let password = reader.string(MAX_LOGIN_STRING_BYTES)?;
+    let (client_tag, client_build) = decode_optional_client_tag_build(&mut reader)?;
     let request = NativeOtClientGameRequest {
         operating_system,
         protocol_version,
-        account_id: reader.u32()?,
-        character_name: reader.string(MAX_LOGIN_STRING_BYTES)?,
-        password: reader.string(MAX_LOGIN_STRING_BYTES)?,
-        client_tag: reader.string(MAX_LOGIN_STRING_BYTES)?,
-        client_build: reader.u16()?,
+        account_id,
+        character_name,
+        password,
+        client_tag,
+        client_build,
     };
     if !classic_protocol_version_is_accepted(request.protocol_version)
         || reader.remaining() > profile.max_padding_bytes
@@ -72,6 +84,24 @@ pub fn decode_native_otclient_game_request(
 /// visible-text behavior keeps following the server's own profile.
 fn classic_protocol_version_is_accepted(version: u16) -> bool {
     version == 740 || version == 760
+}
+
+/// Reads the trailing FE client tag/build pair when present. Stock 7.4 logins end
+/// after the password, so fully-absent fields default to empty/zero; a present tag
+/// with a truncated build (or any truncated field) still rejects as malformed.
+fn decode_optional_client_tag_build(
+    reader: &mut Reader<'_>,
+) -> Result<(String, u16), ProtocolError> {
+    if reader.remaining() == 0 {
+        return Ok((String::new(), 0));
+    }
+    let client_tag = reader.string(MAX_LOGIN_STRING_BYTES)?;
+    let client_build = if reader.remaining() == 0 {
+        0
+    } else {
+        reader.u16()?
+    };
+    Ok((client_tag, client_build))
 }
 
 pub fn encode_native_otclient_character_list(
@@ -91,6 +121,18 @@ pub fn encode_native_otclient_character_list(
     }
     writer.u16(0);
     Ok(Frame(writer.finish()))
+}
+
+/// Encodes the classic 740 world-light (ambient) record the client renders as global
+/// map brightness. Verified against the client's `parseWorldLight` (intensity + color
+/// bytes under the ambient opcode). The engine currently sends permanent daylight;
+/// a day/night cycle is a deferred slice.
+pub fn encode_native_otclient_world_light(intensity: u8, color: u8) -> Frame {
+    let mut writer = Writer::default();
+    writer.byte(NATIVE_OTCLIENT_GAME_WORLD_LIGHT);
+    writer.byte(intensity);
+    writer.byte(color);
+    Frame(writer.finish())
 }
 
 pub fn encode_native_otclient_login_error(message: &str) -> Frame {

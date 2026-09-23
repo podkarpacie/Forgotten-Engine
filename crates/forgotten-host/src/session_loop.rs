@@ -3,6 +3,12 @@
 
 use super::*;
 
+/// Permanent daylight sent once per session bootstrap. The engine has no day/night
+/// cycle yet, so every session starts at full day; the client renders night when it
+/// never receives a world-light record.
+pub(crate) const NATIVE_DAYLIGHT_INTENSITY: u8 = 255;
+pub(crate) const NATIVE_DAYLIGHT_COLOR: u8 = 215;
+
 pub(crate) fn handle_native_otclient_game(
     stream: &mut TcpStream,
     peer: SocketAddr,
@@ -342,6 +348,16 @@ pub(crate) fn handle_native_otclient_game(
     for frame in &static_health_frames {
         write_frame(stream, frame)?;
     }
+    // Daylight arrives with the bootstrap so the map never renders night; without a
+    // world-light record the client keeps its dark default.
+    let daylight =
+        encode_native_otclient_world_light(NATIVE_DAYLIGHT_INTENSITY, NATIVE_DAYLIGHT_COLOR);
+    write_frame(stream, &daylight)?;
+    native_diagnostic(
+        config.extended_diagnostics,
+        peer,
+        "outbound=daylight opcode=0x82 intensity=255 color=215",
+    );
     // Slice 13: hydrated condition icons arrive after the bootstrap so the login-state record
     // stays first on the wire; zero bits match the bootstrap default and skip the write.
     if observed_state_bits != 0 {

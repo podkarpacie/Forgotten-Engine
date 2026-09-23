@@ -223,18 +223,19 @@ use forgotten_protocol::{
     encode_native_otclient_public_say, encode_native_otclient_quest_line,
     encode_native_otclient_quest_list, encode_native_otclient_read_only_text_window,
     encode_native_otclient_set_inventory, encode_native_otclient_status_message,
-    encode_native_otclient_whisper, encode_native_otclient_yell, encode_status_binary,
-    encode_status_metrics, encode_status_xml, generate_legacy_74_game_challenge,
-    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
-    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
-    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection, NativeOtClientClassicChannel,
-    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
-    NativeOtClientClassicOutfit, NativeOtClientClassicPartyShield,
-    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
-    NativeOtClientGameAction, NativeOtClientPlayerGood, NativeOtClientPlayerVitals,
-    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientShopItem, NativeOtClientTradeItem,
-    NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
-    StatusSnapshot, MAX_FRAME_SIZE, MAX_LOGIN_STRING_BYTES, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES,
+    encode_native_otclient_whisper, encode_native_otclient_world_light,
+    encode_native_otclient_yell, encode_status_binary, encode_status_metrics, encode_status_xml,
+    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
+    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
+    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
+    NativeOtClientCardinalDirection, NativeOtClientClassicChannel, NativeOtClientClassicItemRecord,
+    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
+    NativeOtClientClassicPartyShield, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
+    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerGood,
+    NativeOtClientPlayerVitals, NativeOtClientPosition, NativeOtClientProfile,
+    NativeOtClientShopItem, NativeOtClientTradeItem, NativeOtClientVisiblePlayer, OtClientEndpoint,
+    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
+    MAX_LOGIN_STRING_BYTES, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES,
     NATIVE_OTCLIENT_MESSAGE_GM_BROADCAST, NATIVE_OTCLIENT_MESSAGE_SAY,
     NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
@@ -3065,6 +3066,16 @@ mod tests {
         read_data_frame(&mut stream);
 
         // Open the corpse window (stack index 1 above the imported item).
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -3224,6 +3235,16 @@ mod tests {
         read_data_frame(&mut stream);
 
         // Pick the whole dropped stack up from its solo-tile tail index into the right hand.
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -3467,6 +3488,16 @@ mod tests {
         );
 
         // Drop four of the ten right-hand coins onto the adjacent south-east tile.
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -3725,6 +3756,16 @@ mod tests {
         );
 
         // Use the corpse at stack index 1 (above the imported source item).
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -8102,6 +8143,16 @@ mod tests {
         .unwrap();
         read_data_frame(&mut stream);
 
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         for _ in 0..(CHAT_FLOOD_MAX_MESSAGES_PER_WINDOW + 5) {
             write_frame(&mut stream, &Frame(vec![0x96, 1, 2, 0, b'h', b'i'])).unwrap();
         }
@@ -8232,6 +8283,16 @@ mod tests {
         );
 
         // Deposit all carried coins near the banker. Classic Talk framing: mode byte then text.
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -8335,6 +8396,16 @@ mod tests {
         read_data_frame(&mut stream);
 
         // Drink from the backpack potion stack: own-container addressing with child index 0.
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -8474,6 +8545,16 @@ mod tests {
 
         // Sell both swords at 150 gold each.
         // Sell both swords: sell <item-id> <count>, at 200 gold each from the catalog.
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -8548,6 +8629,16 @@ mod tests {
         .unwrap();
         read_data_frame(&mut stream);
 
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -8764,6 +8855,23 @@ mod tests {
         );
 
         // Open the owned backpack window (container id 2).
+        // Bootstrap emits the top-level backpack window itself before daylight; the old
+        // sequence only passed because both frames share the open-container opcode.
+        let bootstrap_container = read_data_frame(&mut stream);
+        assert_eq!(
+            bootstrap_container.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER
+        );
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -8780,13 +8888,10 @@ mod tests {
             ]),
         )
         .unwrap();
-        let parent_window = read_data_frame(&mut stream);
-        assert_eq!(
-            parent_window.0[0],
-            forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER
-        );
-        assert_eq!(parent_window.0[1], 2);
-
+        // The equipped-backpack USE above is silently consumed by the consumable
+        // router (no effect, no frame), so there is no USE1 response to read:
+        // waiting for one blocks forever. The bootstrap container frame consumed
+        // earlier is the only backpack window the bootstrap sends.
         // Use the nested bag at index 0 inside window 2: a has_parent child window opens.
         write_frame(
             &mut stream,
@@ -8872,6 +8977,16 @@ mod tests {
         read_data_frame(&mut stream);
 
         // Request the quest line for the started quest.
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -9893,6 +10008,27 @@ mod tests {
             &[128, 0, 0, 0, 0]
         );
 
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut druid);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
+
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut knight);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut knight,
             &Frame(vec![
@@ -10690,6 +10826,16 @@ mod tests {
         .unwrap();
         let _initialization = read_frame(&mut client).unwrap();
         let _equipment = read_frame(&mut client).unwrap();
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut client);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut client,
             &Frame(vec![
@@ -10790,6 +10936,16 @@ mod tests {
         .unwrap();
         let _initialization = read_frame(&mut client).unwrap();
         let _container = read_frame(&mut client).unwrap();
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut client);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut client,
             &Frame(vec![
@@ -10900,6 +11056,16 @@ mod tests {
         let initial_container = read_frame(&mut client).unwrap();
         assert_eq!(initial_container.0.first(), Some(&0x6e));
 
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut client);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut client,
             &Frame(vec![
@@ -11046,6 +11212,16 @@ mod tests {
         let initial_container = read_frame(&mut client).unwrap();
         assert_eq!(initial_container.0.first(), Some(&0x6e));
 
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut client);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut client,
             &Frame(vec![
@@ -11274,6 +11450,16 @@ mod tests {
             ]
         );
 
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut client);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut client,
             &Frame(vec![
@@ -11428,6 +11614,16 @@ mod tests {
         let initial_container = read_frame(&mut client).unwrap();
         assert_eq!(initial_container.0.first(), Some(&0x6e));
 
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut client);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut client,
             &Frame(vec![
@@ -11716,6 +11912,16 @@ mod tests {
             forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
         );
 
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -12714,6 +12920,16 @@ mod tests {
             forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
         );
 
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -12900,6 +13116,16 @@ mod tests {
             read_frame(&mut stream).unwrap().0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
         );
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -12963,6 +13189,16 @@ mod tests {
         assert_eq!(
             read_frame(&mut stream).unwrap().0[0],
             forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
         );
         write_frame(
             &mut stream,
@@ -14520,7 +14756,9 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         let mut death_records = 0;
-        for _ in 0..3 {
+        // The bootstrap burst now carries permanent daylight ahead of the death
+        // record, so four reads cover the same window the old three did.
+        for _ in 0..4 {
             let frame = read_frame(&mut stream).unwrap();
             if frame.0 == vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_DEATH] {
                 death_records += 1;
@@ -14977,6 +15215,16 @@ mod tests {
             ]
         );
 
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -15802,6 +16050,16 @@ mod tests {
         let first_initialization = read_frame(&mut first).unwrap();
         assert_eq!(&first_initialization.0[9..14], &[100, 0, 100, 0, 7]);
 
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut first);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
         write_frame(
             &mut first,
             &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_EAST]),
@@ -16018,6 +16276,16 @@ mod tests {
                 0,
                 64,
                 100,
+            ]
+        );
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
             ]
         );
         let heartbeat = read_frame(&mut stream).unwrap();

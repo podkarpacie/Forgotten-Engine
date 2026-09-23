@@ -39,6 +39,9 @@ pub const NATIVE_OTCLIENT_GAME_CHANGE_IN_CONTAINER: u8 = 0x71;
 /// Classic DeleteInContainer (0x72): one removed thing from an open container window.
 pub const NATIVE_OTCLIENT_GAME_DELETE_IN_CONTAINER: u8 = 0x72;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_HEALTH: u8 = 0x8c;
+/// Classic world-light record (0x82, server-to-client): ambient intensity + color.
+/// Shares the byte with the client-to-server UseItem opcode; direction disambiguates.
+pub const NATIVE_OTCLIENT_GAME_WORLD_LIGHT: u8 = 0x82;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_OUTFIT: u8 = 0x8e;
 pub const NATIVE_OTCLIENT_GAME_CREATURE_PARTY: u8 = 0x91;
 pub const NATIVE_OTCLIENT_GAME_EDIT_TEXT: u8 = 0x96;

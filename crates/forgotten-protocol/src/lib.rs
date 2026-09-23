@@ -715,6 +715,8 @@ mod tests {
         assert_eq!(list.0[0], NATIVE_OTCLIENT_LOGIN_CHARACTER_LIST);
         assert_eq!(list.0[1], 1);
         assert!(list.0.windows(4).any(|bytes| bytes == [127, 0, 0, 1]));
+        let daylight = encode_native_otclient_world_light(255, 215);
+        assert_eq!(daylight.0, vec![NATIVE_OTCLIENT_GAME_WORLD_LIGHT, 255, 215]);
         let game = NativeOtClientGameRequest {
             operating_system: 2,
             protocol_version: profile.protocol_version,
@@ -739,6 +741,60 @@ mod tests {
             encode_native_otclient_game_login_error("Map initialization is pending.").0[0],
             NATIVE_OTCLIENT_GAME_LOGIN_ERROR
         );
+    }
+
+    #[test]
+    fn native_otclient_requests_accept_stock_packets_without_client_tag_build() {
+        let profile = NativeOtClientProfile {
+            protocol_version: 740,
+            numeric_account_ids: true,
+            login_packet_encryption: false,
+            protocol_checksum: false,
+            challenge_on_login: false,
+            max_padding_bytes: 128,
+        };
+        // Byte-exact shape of a stock 7.4 login: the packet ends after the password.
+        let mut writer = Writer::default();
+        writer.byte(NATIVE_OTCLIENT_ENTER_ACCOUNT);
+        writer.u16(2);
+        writer.u16(740);
+        writer.u32(0x1122_3344);
+        writer.u32(0x5566_7788);
+        writer.u32(0x99aa_bbcc);
+        writer.u32(42);
+        writer.string("correct horse");
+        let login =
+            decode_native_otclient_login_request(&Frame(writer.finish()), &profile).unwrap();
+        assert_eq!(login.account_id, 42);
+        assert_eq!(login.password, "correct horse");
+        assert_eq!(login.client_tag, "");
+        assert_eq!(login.client_build, 0);
+        // Same for the game request.
+        let mut writer = Writer::default();
+        writer.byte(NATIVE_OTCLIENT_PENDING_GAME);
+        writer.u16(2);
+        writer.u16(740);
+        writer.byte(0);
+        writer.u32(42);
+        writer.string("Knight");
+        writer.string("correct horse");
+        let game = decode_native_otclient_game_request(&Frame(writer.finish()), &profile).unwrap();
+        assert_eq!(game.character_name, "Knight");
+        assert_eq!(game.client_tag, "");
+        assert_eq!(game.client_build, 0);
+        // A present tag with a truncated build still rejects.
+        let game = NativeOtClientGameRequest {
+            operating_system: 2,
+            protocol_version: profile.protocol_version,
+            account_id: 42,
+            character_name: "Knight".into(),
+            password: "correct horse".into(),
+            client_tag: "OTCv8".into(),
+            client_build: 412,
+        };
+        let mut full = encode_native_otclient_game_request_for_harness(&game).0;
+        full.truncate(full.len() - 9);
+        assert!(decode_native_otclient_game_request(&Frame(full), &profile).is_err());
     }
 
     #[test]
