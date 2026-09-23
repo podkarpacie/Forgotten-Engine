@@ -231,6 +231,9 @@ pub(crate) fn apply_native_throw_item_ground_drop(
                 }
                 *follow.observed_mapped_equipment = current_mapped_equipment;
                 *follow.observed_equipment_epoch = ctx.shared_world.equipment_epoch();
+                if outcome.source_remaining_count.is_none() {
+                    fire_native_deequip_event(ctx, outcome.moved_item.server_id)?;
+                }
             }
             if let forgotten_core::PlayerGroundDropSource::ContainerItem { container_id, .. } =
                 outcome.source
@@ -1363,6 +1366,12 @@ pub(crate) fn apply_native_throw_item_container_to_equipment(
             if let Some(server_id) = equipped_id {
                 fire_native_equip_event(ctx, server_id)?;
             }
+            if let Some(displaced_id) = equipment
+                .item(target_slot)
+                .map(|previous| previous.server_id)
+            {
+                fire_native_deequip_event(ctx, displaced_id)?;
+            }
             return Ok(SessionActionOutcome::Handled);
         }
         native_diagnostic(
@@ -1587,6 +1596,15 @@ pub(crate) fn apply_native_throw_item_equipment_source(
                         request.count
                     ),
                 );
+                let vacated = ctx
+                    .shared_world
+                    .player_equipment(ctx.character_id)?
+                    .item(source_slot)
+                    .map(|current| current.server_id)
+                    != Some(item.server_id);
+                if vacated {
+                    fire_native_deequip_event(ctx, item.server_id)?;
+                }
                 return Ok(SessionActionOutcome::Handled);
             }
             if requested_count < item.count {
@@ -1626,13 +1644,22 @@ pub(crate) fn apply_native_throw_item_equipment_source(
                 ctx.config.extended_diagnostics,
                 ctx.peer,
                 &format!(
-                    "action=throw-item outcome=equipment-to-top-level-container source-slot={} container-id={} client-thing-id={} count={}",
-                    source_slot.code(),
-                    container_id,
-                    request.source_client_thing_id,
-                    request.count
-                ),
-            );
+                        "action=throw-item outcome=equipment-to-top-level-container source-slot={} container-id={} client-thing-id={} count={}",
+                        source_slot.code(),
+                        container_id,
+                        request.source_client_thing_id,
+                        request.count
+                    ),
+                );
+            let vacated = ctx
+                .shared_world
+                .player_equipment(ctx.character_id)?
+                .item(source_slot)
+                .map(|current| current.server_id)
+                != Some(item.server_id);
+            if vacated {
+                fire_native_deequip_event(ctx, item.server_id)?;
+            }
         }
         _ => {
             native_diagnostic(
