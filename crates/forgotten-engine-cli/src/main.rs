@@ -3,14 +3,15 @@ use forgotten_config::{
     load_declarative_npc_dialogue_catalog, load_declarative_shop_catalog,
     load_declarative_spell_catalog, load_declarative_weapon_catalog, load_legacy_item_catalog,
     load_quest_catalog, load_tfs_action_registry, load_tfs_content_inventory,
-    load_tfs_entity_catalog, load_tfs_public_channel_catalog, load_tfs_talkaction_registry,
-    load_tfs_vocation_registry, load_world_companions, load_world_map,
-    materialize_tfs_spawn_templates, materialize_tfs_static_spawns, range_callback_name,
-    resolve_action_callback, resolve_tfs_registry_script_reference, resolve_tfs_spawn_references,
-    validate_content, world_map_path, write_template, ConsumableCatalog,
-    DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog, DeclarativeSpellCatalog,
-    DeclarativeWeaponCatalog, EngineConfig, LegacyPublicChannelCatalog, LegacyWorldCompanionData,
-    QuestCatalog, TfsActionRegistry, TfsEntityCatalog, TfsRegistryCategory, TfsVocationRegistry,
+    load_tfs_entity_catalog, load_tfs_movement_registry, load_tfs_public_channel_catalog,
+    load_tfs_talkaction_registry, load_tfs_vocation_registry, load_world_companions,
+    load_world_map, materialize_tfs_spawn_templates, materialize_tfs_static_spawns,
+    range_callback_name, resolve_action_callback, resolve_movement_callback,
+    resolve_tfs_registry_script_reference, resolve_tfs_spawn_references, validate_content,
+    world_map_path, write_template, ConsumableCatalog, DeclarativeNpcDialogueCatalog,
+    DeclarativeShopCatalog, DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig,
+    LegacyPublicChannelCatalog, LegacyWorldCompanionData, QuestCatalog, TfsActionRegistry,
+    TfsEntityCatalog, TfsMoveEventType, TfsRegistryCategory, TfsVocationRegistry,
 };
 use forgotten_core::{
     DeathLossPolicy, EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
@@ -1527,6 +1528,68 @@ fn script_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             );
             Ok(())
         }
+        "dispatch-movement" => {
+            if arguments.len() < 5 || arguments.len() > 6 {
+                return Err(
+                    "usage: script dispatch-movement <directory> <type> <item-id> [subject-id]"
+                        .into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let movement_type = arguments
+                .get(3)
+                .and_then(|value| TfsMoveEventType::parse(value))
+                .ok_or(
+                    "a movement type is required: StepIn, StepOut, Equip, DeEquip, AddItem, RemoveItem",
+                )?;
+            let item_id: u16 = arguments
+                .get(4)
+                .and_then(|value| value.parse().ok())
+                .ok_or("an item id is required")?;
+            let subject_id: u64 = arguments
+                .get(5)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let config = load(&directory)?;
+            let registry = load_tfs_movement_registry(&config)?;
+            // Shared first-match resolution over singleton and range selectors; the
+            // host will route the same registry the same way once wired live.
+            let (callback_name, script) =
+                resolve_movement_callback(&registry, movement_type, item_id).ok_or_else(|| {
+                    format!(
+                        "movement registry declares no {movement_type} match for item {item_id}"
+                    )
+                })?;
+            // Movement scripts resolve relative to the movements registry directory.
+            let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+            dispatcher
+                .register_callback_file(
+                    &callback_name,
+                    &config.content_directory.join("movements"),
+                    &script,
+                )
+                .map_err(|error| format!("movement callback registration rejected: {error:?}"))?;
+            let outcome = dispatcher.dispatch_api(
+                &callback_name,
+                &SandboxedLuaCallbackInput {
+                    event_kind: "movement".into(),
+                    subject_id,
+                    value: u64::from(item_id) as i64,
+                    argument: String::new(),
+                    position: None,
+                },
+            );
+            println!(
+                "movement type={} item={} callback={} state={:?} instruction-checks={} effects={:?}",
+                movement_type,
+                item_id,
+                callback_name,
+                outcome.state,
+                outcome.instruction_checks,
+                outcome.effects,
+            );
+            Ok(())
+        }
         unsupported => Err(format!("unsupported script action `{unsupported}`").into()),
     }
 }
@@ -2864,6 +2927,63 @@ mod tests {
             "99".into(),
         ];
         assert!(script_command(&outside).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn dispatch_movement_command_resolves_registry_entries_to_api_dispatch() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("forgotten-engine-dispatch-movement-{nonce}"));
+        fs::create_dir_all(directory.join("data/movements/scripts")).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        fs::write(
+            directory.join("data/movements/movements.xml"),
+            r#"<movements><moveevent type="StepIn" fromid="100" toid="200" script="scripts/hole.lua"/></movements>"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.join("data/movements/scripts/hole.lua"),
+            "return function() doCreatureSay('whoosh') end",
+        )
+        .unwrap();
+
+        // Item inside the range dispatches; other types and outside ids find nothing.
+        let inside = vec![
+            "script".into(),
+            "dispatch-movement".into(),
+            directory.display().to_string(),
+            "StepIn".into(),
+            "150".into(),
+        ];
+        assert!(script_command(&inside).is_ok());
+        let wrong_type = vec![
+            "script".into(),
+            "dispatch-movement".into(),
+            directory.display().to_string(),
+            "StepOut".into(),
+            "150".into(),
+        ];
+        assert!(script_command(&wrong_type).is_err());
+        let outside = vec![
+            "script".into(),
+            "dispatch-movement".into(),
+            directory.display().to_string(),
+            "StepIn".into(),
+            "99".into(),
+        ];
+        assert!(script_command(&outside).is_err());
+        let bad_type = vec![
+            "script".into(),
+            "dispatch-movement".into(),
+            directory.display().to_string(),
+            "Teleport".into(),
+            "150".into(),
+        ];
+        assert!(script_command(&bad_type).is_err());
         let _ = fs::remove_dir_all(directory);
     }
 

@@ -82,8 +82,63 @@ pub struct TfsMoveEventEntry {
     pub script: PathBuf,
 }
 
-/// A bounded movement catalog kept in document order so overlapping ranges can later resolve
-/// first-match precedence.
+/// Deterministic dispatcher name for one movement entry: `movement:{type}:{index}`
+/// with the lowercase type label and the entry position in registry document order.
+/// Positional for singleton and range selectors alike so overlapping ranges never
+/// collide; both the CLI verb and the host router derive it from the same registry,
+/// so the names always agree.
+pub fn movement_callback_name(movement_type: TfsMoveEventType, index: usize) -> String {
+    format!(
+        "movement:{}:{index}",
+        movement_type.label().to_ascii_lowercase()
+    )
+}
+
+/// Whether one used item matches this entry's selector: exact id for singletons,
+/// inclusive containment for ranges.
+fn movement_entry_matches(entry: &TfsMoveEventEntry, server_id: u16) -> bool {
+    if entry.item_id == Some(server_id) {
+        return true;
+    }
+    if let Some((from, to)) = entry.item_range {
+        return from <= server_id && server_id <= to;
+    }
+    false
+}
+
+/// Resolves one movement trigger to its registry entry in document order: the first
+/// entry of the requested type whose selector matches wins. Returns the entry index
+/// with the entry; the index feeds [`movement_callback_name`]. Equip-slot matching
+/// stays deferred to the live Equip hook, which knows the authoritative slot.
+pub fn resolve_movement_entry(
+    registry: &TfsMoveEventRegistry,
+    movement_type: TfsMoveEventType,
+    server_id: u16,
+) -> Option<(usize, &TfsMoveEventEntry)> {
+    registry
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.movement_type == movement_type)
+        .find(|(_, entry)| movement_entry_matches(entry, server_id))
+}
+
+/// Resolves one movement trigger to its dispatcher callback name plus script path.
+/// `None` when the registry declares no match for the type/id pair.
+pub fn resolve_movement_callback(
+    registry: &TfsMoveEventRegistry,
+    movement_type: TfsMoveEventType,
+    server_id: u16,
+) -> Option<(String, PathBuf)> {
+    resolve_movement_entry(registry, movement_type, server_id).map(|(index, entry)| {
+        (
+            movement_callback_name(entry.movement_type, index),
+            entry.script.clone(),
+        )
+    })
+}
+
+/// A bounded movement catalog kept in document order so overlapping ranges resolve
+/// first-match precedence via [`resolve_movement_entry`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TfsMoveEventRegistry {
     entries: Vec<TfsMoveEventEntry>,
@@ -375,5 +430,59 @@ mod tests {
             br#"<movements><moveevent type="StepIn" fromid="9" toid="2" script="a.lua"/></movements>"#,
         )
         .is_err());
+    }
+
+    #[test]
+    fn resolution_filters_by_type_and_matches_ranges() {
+        let registry = parse_tfs_movements_xml(
+            br#"<movements>
+                <moveevent type="StepIn" fromid="100" toid="200" script="hole.lua"/>
+                <moveevent type="StepOut" itemid="150" script="pit.lua"/>
+                <moveevent type="StepIn" itemid="150" script="door.lua"/>
+            </movements>"#,
+        )
+        .unwrap();
+        // Item 150 is inside the StepIn range: first-match in document order.
+        assert_eq!(
+            resolve_movement_callback(&registry, TfsMoveEventType::StepIn, 150),
+            Some(("movement:stepin:0".to_owned(), PathBuf::from("hole.lua")))
+        );
+        // Same id under StepOut resolves the singleton, not the StepIn range.
+        assert_eq!(
+            resolve_movement_callback(&registry, TfsMoveEventType::StepOut, 150),
+            Some(("movement:stepout:1".to_owned(), PathBuf::from("pit.lua")))
+        );
+        // Outside every selector matches nothing; unregistered types neither.
+        assert_eq!(
+            resolve_movement_callback(&registry, TfsMoveEventType::StepIn, 99),
+            None
+        );
+        assert_eq!(
+            resolve_movement_callback(&registry, TfsMoveEventType::Equip, 150),
+            None
+        );
+        assert_eq!(
+            movement_callback_name(TfsMoveEventType::AddItem, 7),
+            "movement:additem:7"
+        );
+    }
+
+    #[test]
+    fn resolution_prefers_document_order_for_overlapping_ranges() {
+        let registry = parse_tfs_movements_xml(
+            br#"<movements>
+                <moveevent type="StepIn" fromid="100" toid="200" script="first.lua"/>
+                <moveevent type="StepIn" fromid="150" toid="250" script="second.lua"/>
+            </movements>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_movement_callback(&registry, TfsMoveEventType::StepIn, 175),
+            Some(("movement:stepin:0".to_owned(), PathBuf::from("first.lua")))
+        );
+        assert_eq!(
+            resolve_movement_callback(&registry, TfsMoveEventType::StepIn, 225),
+            Some(("movement:stepin:1".to_owned(), PathBuf::from("second.lua")))
+        );
     }
 }

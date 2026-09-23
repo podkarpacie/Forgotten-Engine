@@ -80,7 +80,8 @@ pub use tfs_globalevents::{
     TfsGlobalEventRegistry,
 };
 pub use tfs_movements::{
-    load_tfs_movement_registry, parse_tfs_movements_xml, TfsMoveEventEntry, TfsMoveEventRegistry,
+    load_tfs_movement_registry, movement_callback_name, parse_tfs_movements_xml,
+    resolve_movement_callback, resolve_movement_entry, TfsMoveEventEntry, TfsMoveEventRegistry,
     TfsMoveEventType,
 };
 pub use tfs_registry::{
