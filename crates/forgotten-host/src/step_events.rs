@@ -1,12 +1,12 @@
-//! Live sandboxed TFS StepIn routing for successful player displacements. When a step
-//! lands on a tile carrying an item id matching a registered StepIn selector (singleton
-//! or range, first-match in document order), the match dispatches through the
-//! resource-capped movement dispatcher and the returned intents apply against
-//! authoritative subject state through the shared effect arms. Effect application is
-//! intentionally NOT duplicated here: it reuses `apply_native_action_effects` with a
-//! movement outcome tag. StepOut, Equip, and the remaining movement families stay
-//! deferred; chained teleports (a StepIn effect landing on another scripted tile)
-//! deliberately do not re-trigger — one level only.
+//! Live sandboxed TFS step-event routing for successful player displacements. When a
+//! step lands on (StepIn) or leaves (StepOut) a tile carrying an item id matching a
+//! registered selector (singleton or range, first-match in document order), the match
+//! dispatches through the resource-capped movement dispatcher and the returned intents
+//! apply against authoritative subject state through the shared effect arms. Effect
+//! application is intentionally NOT duplicated here: it reuses
+//! `apply_native_action_effects` with a movement outcome tag. Equip and the remaining
+//! movement families stay deferred; chained teleports (a step effect landing on
+//! another scripted tile) deliberately do not re-trigger — one level only.
 
 use super::*;
 use forgotten_scripting::{
@@ -22,17 +22,38 @@ pub(crate) fn apply_native_step_in(
     ctx: &mut SessionContext<'_>,
     arrival: Position,
 ) -> Result<(), HostError> {
+    dispatch_native_step_event(ctx, TfsMoveEventType::StepIn, arrival, "step")
+}
+
+/// Routes one departed tile through registered StepOut scripts. Runs alongside
+/// StepIn after any successful displacement, before the arrival routing; same
+/// no-op contract. The move itself always stands.
+pub(crate) fn apply_native_step_out(
+    ctx: &mut SessionContext<'_>,
+    departed: Position,
+) -> Result<(), HostError> {
+    dispatch_native_step_event(ctx, TfsMoveEventType::StepOut, departed, "step-out")
+}
+
+/// Shared StepIn/StepOut resolve-dispatch-apply core. `kind_tag` feeds the outcome
+/// diagnostics (`step` vs `step-out`); the effect arms keep their shared tag.
+fn dispatch_native_step_event(
+    ctx: &mut SessionContext<'_>,
+    movement_type: TfsMoveEventType,
+    tile: Position,
+    kind_tag: &'static str,
+) -> Result<(), HostError> {
     let (Some(registry), Some(dispatcher)) = (
         ctx.config.movement_registry.as_deref(),
         ctx.config.movement_dispatcher.as_deref(),
     ) else {
         return Ok(());
     };
-    let Some(tile_items) = ctx.world_map.tile_items(arrival) else {
+    let Some(tile_items) = ctx.world_map.tile_items(tile) else {
         return Ok(());
     };
     let Some((matched_id, callback_name)) = tile_items.iter().find_map(|item| {
-        resolve_movement_callback(registry, TfsMoveEventType::StepIn, item.server_id)
+        resolve_movement_callback(registry, movement_type, item.server_id)
             .map(|(callback_name, _)| (item.server_id, callback_name))
     }) else {
         return Ok(());
@@ -45,9 +66,9 @@ pub(crate) fn apply_native_step_in(
             value: i64::from(matched_id),
             argument: String::new(),
             position: Some(SandboxedLuaPosition {
-                x: arrival.x,
-                y: arrival.y,
-                z: arrival.z,
+                x: tile.x,
+                y: tile.y,
+                z: tile.z,
             }),
         },
     );
@@ -76,7 +97,7 @@ pub(crate) fn apply_native_step_in(
             native_diagnostic(
                 ctx.config.extended_diagnostics,
                 ctx.peer,
-                &format!("movement=step outcome=step-script-missing key={callback_name}"),
+                &format!("movement={kind_tag} outcome=step-script-missing key={callback_name}"),
             );
         }
         _ => {
@@ -84,7 +105,7 @@ pub(crate) fn apply_native_step_in(
                 ctx.config.extended_diagnostics,
                 ctx.peer,
                 &format!(
-                    "movement=step outcome=step-script-rejected key={callback_name} state={:?}",
+                    "movement={kind_tag} outcome=step-script-rejected key={callback_name} state={:?}",
                     outcome.state,
                 ),
             );

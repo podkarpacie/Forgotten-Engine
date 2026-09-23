@@ -134,7 +134,7 @@ pub(crate) use static_creature::{
 pub(crate) use static_creature::{
     persist_runtime_player_conditions, persist_static_target_attack_vitals,
 };
-pub(crate) use step_events::apply_native_step_in;
+pub(crate) use step_events::{apply_native_step_in, apply_native_step_out};
 pub(crate) use talkactions::apply_native_lua_talkaction;
 pub(crate) use throw_item::{
     apply_native_throw_item_container_to_container, apply_native_throw_item_container_to_equipment,
@@ -8578,6 +8578,129 @@ mod tests {
             }
         }
         assert!(whooshed, "live StepIn Say effect never arrived");
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_live_step_out_routes_through_a_wired_dispatcher() {
+        let database_path = database_path("native-live-step-out");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        drop(database);
+        let registry = parse_tfs_movements_xml(
+            br#"<movements><moveevent type="StepOut" itemid="2151" script="door.lua"/></movements>"#,
+        )
+        .unwrap();
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "movement:stepout:0",
+                "return function() doCreatureSay('leaving') end",
+            )
+            .unwrap();
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.movement_dispatcher = Some(Arc::new(dispatcher));
+        native_config.movement_registry = Some(Arc::new(registry));
+        {
+            Arc::get_mut(native_config.world_map.as_mut().unwrap())
+                .unwrap()
+                .set_tile_items(
+                    Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    vec![WorldMapItem {
+                        server_id: 2151,
+                        client_thing_id: Some(2151),
+                        count: 1,
+                        action_id: None,
+                        unique_id: None,
+                        text: None,
+                        description: None,
+                        teleport_destination: None,
+                        duration: None,
+                        charges: None,
+                        children: Vec::new(),
+                    }],
+                )
+                .unwrap();
+        }
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
+        // Step east off the scripted tile: the StepOut script answers Say for the
+        // departed tile while the plain arrival tile stays silent.
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_EAST]),
+        )
+        .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut leaving = false;
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue;
+                }
+                Ok(frame) => {
+                    if String::from_utf8_lossy(&frame.0).contains("leaving") {
+                        leaving = true;
+                        break;
+                    }
+                }
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("native session ended during step probe: {error}"),
+            }
+        }
+        assert!(leaving, "live StepOut Say effect never arrived");
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }

@@ -1097,7 +1097,8 @@ pub(crate) fn handle_native_otclient_game(
                             active_click_walk = None;
                         }
                         // Arrival routing for moved steps and stepped-on teleports
-                        // alike; blocked steps leave the position untouched.
+                        // alike; blocked steps leave the position untouched. StepOut
+                        // fires for the departed tile before StepIn for the arrival.
                         if player_position != pre_step_position {
                             let mut ctx = SessionContext {
                                 stream: &mut *stream,
@@ -1115,7 +1116,9 @@ pub(crate) fn handle_native_otclient_game(
                                 observed_visibility_epoch: &mut observed_visibility_epoch,
                                 observed_vitals_epoch: &mut observed_vitals_epoch,
                             };
+                            let departed = pre_step_position;
                             let arrival = *ctx.player_position;
+                            apply_native_step_out(&mut ctx, departed)?;
                             apply_native_step_in(&mut ctx, arrival)?;
                         }
                         continue;
@@ -2549,7 +2552,9 @@ pub(crate) fn handle_native_otclient_game(
                     };
                     apply_native_autowalk_action(&mut ctx, path)?;
                     if *ctx.player_position != pre_step_position {
+                        let departed = pre_step_position;
                         let arrival = *ctx.player_position;
+                        apply_native_step_out(&mut ctx, departed)?;
                         apply_native_step_in(&mut ctx, arrival)?;
                     }
                 }
@@ -2576,7 +2581,9 @@ pub(crate) fn handle_native_otclient_game(
                     };
                     apply_native_cardinal_move_action(&mut ctx, direction)?;
                     if *ctx.player_position != pre_step_position {
+                        let departed = pre_step_position;
                         let arrival = *ctx.player_position;
+                        apply_native_step_out(&mut ctx, departed)?;
                         apply_native_step_in(&mut ctx, arrival)?;
                     }
                 }
@@ -2603,7 +2610,9 @@ pub(crate) fn handle_native_otclient_game(
                     };
                     apply_native_diagonal_move_action(&mut ctx, direction)?;
                     if *ctx.player_position != pre_step_position {
+                        let departed = pre_step_position;
                         let arrival = *ctx.player_position;
+                        apply_native_step_out(&mut ctx, departed)?;
                         apply_native_step_in(&mut ctx, arrival)?;
                     }
                 }
