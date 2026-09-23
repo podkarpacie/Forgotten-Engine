@@ -9131,10 +9131,15 @@ mod tests {
             ]),
         )
         .unwrap();
-        // The equipped-backpack USE above is silently consumed by the consumable
-        // router (no effect, no frame), so there is no USE1 response to read:
-        // waiting for one blocks forever. The bootstrap container frame consumed
-        // earlier is the only backpack window the bootstrap sends.
+        // The equipped-backpack USE opens the lowest owned top-level container now
+        // that non-consumables fall through to backpack routing: a real window
+        // response follows.
+        let parent_window = read_data_frame(&mut stream);
+        assert_eq!(
+            parent_window.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER
+        );
+        assert_eq!(parent_window.0[1], 2);
         // Use the nested bag at index 0 inside window 2: a has_parent child window opens.
         write_frame(
             &mut stream,

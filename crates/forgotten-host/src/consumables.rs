@@ -14,10 +14,12 @@ struct ConsumableSource {
     container_ref: Option<(u8, usize)>,
 }
 
-/// Applies one owned-inventory consumable use. Returns `SessionActionOutcome::Handled` whenever
-/// the position addresses the caller's own inventory (every path consumes the record, with or
-/// without effect); returns `Unhandled` for map-addressed positions so the caller falls through
-/// to map-item routing.
+/// Applies one owned-inventory consumable use. Returns `SessionActionOutcome::Handled`
+/// when the addressed item is a declared consumable (consumed, refused while dead,
+/// or refused while fed); returns `Unhandled` for map-addressed positions AND for
+/// owned items with no declared effect, so backpack/corpse/map-item routing below
+/// still runs. Swallowing non-consumables here would make every owned USE
+/// unreachable to the routers below (notably backpack opening).
 pub(crate) fn apply_native_owned_consumable_use(
     ctx: &mut SessionContext<'_>,
     position: NativeOtClientPosition,
@@ -66,7 +68,7 @@ pub(crate) fn apply_native_owned_consumable_use(
         container_ref,
     }) = consumable_target
     else {
-        return Ok(SessionActionOutcome::Handled);
+        return Ok(SessionActionOutcome::Unhandled);
     };
     let Some(&effect) = ctx
         .config
@@ -74,7 +76,7 @@ pub(crate) fn apply_native_owned_consumable_use(
         .as_deref()
         .and_then(|effects| effects.get(&consumable_server_id))
     else {
-        return Ok(SessionActionOutcome::Handled);
+        return Ok(SessionActionOutcome::Unhandled);
     };
     let (heal, mana_restore) = (effect.health, effect.mana);
     // Classic fed state (plan v49 slice 16): eating while a food window is
