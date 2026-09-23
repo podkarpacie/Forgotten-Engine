@@ -61,6 +61,45 @@ impl TfsCreatureScriptRegistry {
         }
         Ok(())
     }
+
+    /// Position of one entry in name-sorted iteration order, or `None` when absent.
+    /// Feeds [`creature_callback_name`]; deterministic for a given registry.
+    pub fn index_of(&self, name: &str) -> Option<usize> {
+        self.entries.keys().position(|key| key == name)
+    }
+}
+
+/// Deterministic dispatcher name for one creature entry: `creature:{index}` with the
+/// entry position in name-sorted registry order. Positional (never the raw operator
+/// name) so arbitrary names can never collide or breach callback bounds; both the
+/// CLI verb and the host router derive it from the same registry, so the names
+/// always agree.
+pub fn creature_callback_name(index: usize) -> String {
+    format!("creature:{index}")
+}
+
+/// All entries of one event type in registry (name-sorted) order with indices.
+/// Login-style events run every match; the live router unions their effects.
+pub fn resolve_creature_entries<'a>(
+    registry: &'a TfsCreatureScriptRegistry,
+    event_type: &str,
+) -> Vec<(usize, &'a TfsCreatureScriptEntry)> {
+    registry
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.event_type == event_type)
+        .collect()
+}
+
+/// One entry by registration name with its dispatcher callback plus script path,
+/// for the CLI verb and single-name host lookups. `None` for unknown names.
+pub fn resolve_creature_callback(
+    registry: &TfsCreatureScriptRegistry,
+    name: &str,
+) -> Option<(String, PathBuf)> {
+    let index = registry.index_of(name)?;
+    let entry = registry.get(name)?;
+    Some((creature_callback_name(index), entry.script.clone()))
 }
 
 /// Loads the optional TFS creaturescript registry. A missing file intentionally yields an empty
@@ -276,8 +315,34 @@ mod tests {
         )
         .is_err());
         assert!(parse_tfs_creaturescripts_xml(
-            br#"<creaturescripts><event type="login" name="A" script="../a.lua"/></creaturescripts>"#,
+            br#"<creaturescripts><event type="StepIn" fromid="9" toid="2" script="a.lua"/></movements>"#,
         )
         .is_err());
+    }
+
+    #[test]
+    fn resolution_filters_by_type_and_names_callbacks_positionally() {
+        let registry = parse_tfs_creaturescripts_xml(
+            br#"<creaturescripts>
+                <event type="login" name="SecondLogin" script="second.lua"/>
+                <event type="death" name="PlayerDeath" script="death.lua"/>
+                <event type="login" name="FirstLogin" script="first.lua"/>
+            </creaturescripts>"#,
+        )
+        .unwrap();
+        // Name-sorted order: FirstLogin (0), PlayerDeath (1), SecondLogin (2).
+        assert_eq!(registry.index_of("FirstLogin"), Some(0));
+        assert_eq!(registry.index_of("Nope"), None);
+        let logins = resolve_creature_entries(&registry, "login");
+        assert_eq!(logins.len(), 2);
+        assert_eq!(logins[0].1.name, "FirstLogin");
+        assert_eq!(logins[1].1.name, "SecondLogin");
+        assert_eq!(
+            resolve_creature_callback(&registry, "SecondLogin"),
+            Some(("creature:2".to_owned(), PathBuf::from("second.lua")))
+        );
+        assert_eq!(resolve_creature_callback(&registry, "Nope"), None);
+        assert_eq!(resolve_creature_entries(&registry, "advance").len(), 0);
+        assert_eq!(creature_callback_name(5), "creature:5");
     }
 }

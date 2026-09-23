@@ -3,16 +3,17 @@ use forgotten_config::{
     load_declarative_npc_dialogue_catalog, load_declarative_shop_catalog,
     load_declarative_spell_catalog, load_declarative_weapon_catalog, load_legacy_item_catalog,
     load_quest_catalog, load_tfs_action_registry, load_tfs_content_inventory,
-    load_tfs_entity_catalog, load_tfs_movement_registry, load_tfs_public_channel_catalog,
-    load_tfs_talkaction_registry, load_tfs_vocation_registry, load_world_companions,
-    load_world_map, materialize_tfs_spawn_templates, materialize_tfs_static_spawns,
-    movement_callback_name, range_callback_name, resolve_action_callback,
-    resolve_movement_callback, resolve_tfs_registry_script_reference, resolve_tfs_spawn_references,
-    validate_content, world_map_path, write_template, ConsumableCatalog,
-    DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog, DeclarativeSpellCatalog,
-    DeclarativeWeaponCatalog, EngineConfig, LegacyPublicChannelCatalog, LegacyWorldCompanionData,
-    QuestCatalog, TfsActionRegistry, TfsEntityCatalog, TfsMoveEventRegistry, TfsMoveEventType,
-    TfsRegistryCategory, TfsVocationRegistry,
+    load_tfs_creaturescript_registry, load_tfs_entity_catalog, load_tfs_movement_registry,
+    load_tfs_public_channel_catalog, load_tfs_talkaction_registry, load_tfs_vocation_registry,
+    load_world_companions, load_world_map, materialize_tfs_spawn_templates,
+    materialize_tfs_static_spawns, movement_callback_name, range_callback_name,
+    resolve_action_callback, resolve_creature_callback, resolve_movement_callback,
+    resolve_tfs_registry_script_reference, resolve_tfs_spawn_references, validate_content,
+    world_map_path, write_template, ConsumableCatalog, DeclarativeNpcDialogueCatalog,
+    DeclarativeShopCatalog, DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig,
+    LegacyPublicChannelCatalog, LegacyWorldCompanionData, QuestCatalog, TfsActionRegistry,
+    TfsEntityCatalog, TfsMoveEventRegistry, TfsMoveEventType, TfsRegistryCategory,
+    TfsVocationRegistry,
 };
 use forgotten_core::{
     DeathLossPolicy, EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
@@ -1638,6 +1639,48 @@ fn script_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
             );
             Ok(())
         }
+        "dispatch-creaturescript" => {
+            if arguments.len() < 4 || arguments.len() > 5 {
+                return Err(
+                    "usage: script dispatch-creaturescript <directory> <name> [subject-id]".into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let name = arguments.get(3).cloned().unwrap_or_default();
+            let subject_id: u64 = arguments
+                .get(4)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let config = load(&directory)?;
+            let registry = load_tfs_creaturescript_registry(&config)?;
+            // Name-keyed resolution shared with the host router.
+            let (callback_name, script) = resolve_creature_callback(&registry, &name)
+                .ok_or_else(|| format!("creature registry declares no script named `{name}`"))?;
+            // Creature scripts resolve relative to the creaturescripts registry directory.
+            let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+            dispatcher
+                .register_callback_file(
+                    &callback_name,
+                    &config.content_directory.join("creaturescripts"),
+                    &script,
+                )
+                .map_err(|error| format!("creature callback registration rejected: {error:?}"))?;
+            let outcome = dispatcher.dispatch_api(
+                &callback_name,
+                &SandboxedLuaCallbackInput {
+                    event_kind: "creaturescript".into(),
+                    subject_id,
+                    value: 0,
+                    argument: String::new(),
+                    position: None,
+                },
+            );
+            println!(
+                "creature name={} callback={} state={:?} instruction-checks={} effects={:?}",
+                name, callback_name, outcome.state, outcome.instruction_checks, outcome.effects,
+            );
+            Ok(())
+        }
         unsupported => Err(format!("unsupported script action `{unsupported}`").into()),
     }
 }
@@ -3032,6 +3075,45 @@ mod tests {
             "150".into(),
         ];
         assert!(script_command(&bad_type).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn dispatch_creaturescript_command_resolves_named_entries_to_api_dispatch() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("forgotten-engine-dispatch-creature-{nonce}"));
+        fs::create_dir_all(directory.join("data/creaturescripts/scripts")).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        fs::write(
+            directory.join("data/creaturescripts/creaturescripts.xml"),
+            r#"<creaturescripts><event type="login" name="FirstItems" script="scripts/first.lua"/></creaturescripts>"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.join("data/creaturescripts/scripts/first.lua"),
+            "return function() doCreatureSay('welcome') end",
+        )
+        .unwrap();
+
+        // Registered name dispatches; unknown names find nothing.
+        let known = vec![
+            "script".into(),
+            "dispatch-creaturescript".into(),
+            directory.display().to_string(),
+            "FirstItems".into(),
+        ];
+        assert!(script_command(&known).is_ok());
+        let unknown = vec![
+            "script".into(),
+            "dispatch-creaturescript".into(),
+            directory.display().to_string(),
+            "Nope".into(),
+        ];
+        assert!(script_command(&unknown).is_err());
         let _ = fs::remove_dir_all(directory);
     }
 

@@ -68,7 +68,8 @@ pub use tfs_actions::{
     resolve_action_entry, TfsActionEntry, TfsActionKey, TfsActionRegistry,
 };
 pub use tfs_creaturescripts::{
-    load_tfs_creaturescript_registry, parse_tfs_creaturescripts_xml, TfsCreatureScriptEntry,
+    creature_callback_name, load_tfs_creaturescript_registry, parse_tfs_creaturescripts_xml,
+    resolve_creature_callback, resolve_creature_entries, TfsCreatureScriptEntry,
     TfsCreatureScriptRegistry,
 };
 pub use tfs_entities::{
