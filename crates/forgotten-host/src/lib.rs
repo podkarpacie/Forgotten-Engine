@@ -48,11 +48,12 @@ mod session_loop;
 mod session_serve;
 mod shared_native_map;
 mod static_creature;
+mod step_events;
 mod talkactions;
 mod throw_item;
 mod trade;
 mod use_item;
-pub(crate) use actions::apply_native_action_use;
+pub(crate) use actions::{apply_native_action_effects, apply_native_action_use};
 pub(crate) use frames::*;
 pub use heartbeat::*;
 pub(crate) use use_item::{
@@ -133,6 +134,7 @@ pub(crate) use static_creature::{
 pub(crate) use static_creature::{
     persist_runtime_player_conditions, persist_static_target_attack_vitals,
 };
+pub(crate) use step_events::apply_native_step_in;
 pub(crate) use talkactions::apply_native_lua_talkaction;
 pub(crate) use throw_item::{
     apply_native_throw_item_container_to_container, apply_native_throw_item_container_to_equipment,
@@ -152,11 +154,12 @@ pub(crate) use trade::{
 };
 
 #[cfg(test)]
-use forgotten_config::parse_tfs_actions_xml;
+use forgotten_config::{parse_tfs_actions_xml, parse_tfs_movements_xml};
 use forgotten_config::{
-    DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog, DeclarativeSpellCatalog,
-    DeclarativeWeaponCatalog, LegacyItemSlotType, LegacyPublicChannelCatalog, QuestCatalog,
-    TfsActionRegistry, WorldType,
+    resolve_movement_callback, DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog,
+    DeclarativeSpellCatalog, DeclarativeWeaponCatalog, LegacyItemSlotType,
+    LegacyPublicChannelCatalog, QuestCatalog, TfsActionRegistry, TfsMoveEventRegistry,
+    TfsMoveEventType, WorldType,
 };
 use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
@@ -515,6 +518,15 @@ pub struct NativeOtClientHostConfig {
     /// the same first-match entry (singletons and ranges in document order) the CLI
     /// `dispatch-action` verb proves. `None` exactly when `action_dispatcher` is `None`.
     pub action_registry: Option<Arc<TfsActionRegistry>>,
+    /// Optional pre-built sandboxed TFS movement dispatcher keyed by positional names
+    /// (`movement:{type}:{index}`). Successful player displacements whose arrival tile
+    /// carries a matching StepIn selector route through this dispatcher; the same
+    /// resource caps and intent-only boundaries as actions apply.
+    pub movement_dispatcher: Option<Arc<SandboxedLuaCallbackDispatcher>>,
+    /// The movement registry the dispatcher was built from, shared so live routing
+    /// resolves the same first-match entry the CLI `dispatch-movement` verb proves.
+    /// `None` exactly when `movement_dispatcher` is `None`.
+    pub movement_registry: Option<Arc<TfsMoveEventRegistry>>,
     /// Configured corpse despawn delay in authoritative world-tick seconds. `0` (the default)
     /// disables decay; a positive value expires each placed runtime corpse after the delay on a
     /// later heartbeat, removing it from the map and the durable registry together.
@@ -1239,6 +1251,8 @@ mod tests {
             talkaction_dispatcher: None,
             action_dispatcher: None,
             action_registry: None,
+            movement_dispatcher: None,
+            movement_registry: None,
             corpse_despawn_seconds: 0,
         }
     }
@@ -8430,6 +8444,140 @@ mod tests {
             }
         }
         assert!(rung, "live action Say effect never arrived");
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_live_step_in_routes_through_a_wired_dispatcher() {
+        let database_path = database_path("native-live-step-in");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        drop(database);
+        let registry = parse_tfs_movements_xml(
+            br#"<movements><moveevent type="StepIn" itemid="2150" script="hole.lua"/></movements>"#,
+        )
+        .unwrap();
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "movement:stepin:0",
+                "return function() doCreatureSay('whoosh') end",
+            )
+            .unwrap();
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.movement_dispatcher = Some(Arc::new(dispatcher));
+        native_config.movement_registry = Some(Arc::new(registry));
+        {
+            Arc::get_mut(native_config.world_map.as_mut().unwrap())
+                .unwrap()
+                .set_tile_items(
+                    Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    vec![WorldMapItem {
+                        server_id: 2150,
+                        client_thing_id: Some(2150),
+                        count: 1,
+                        action_id: None,
+                        unique_id: None,
+                        text: None,
+                        description: None,
+                        teleport_destination: None,
+                        duration: None,
+                        charges: None,
+                        children: Vec::new(),
+                    }],
+                )
+                .unwrap();
+        }
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                2150,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 2150,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        native_config.item_presentation_catalog = Some(Arc::new(catalog));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
+        // Step east onto the scripted tile: the StepIn script answers Say through
+        // the live movement hook.
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_EAST]),
+        )
+        .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut whooshed = false;
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue;
+                }
+                Ok(frame) => {
+                    if String::from_utf8_lossy(&frame.0).contains("whoosh") {
+                        whooshed = true;
+                        break;
+                    }
+                }
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("native session ended during step probe: {error}"),
+            }
+        }
+        assert!(whooshed, "live StepIn Say effect never arrived");
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }

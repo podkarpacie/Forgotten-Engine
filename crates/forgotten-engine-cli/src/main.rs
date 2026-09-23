@@ -6,12 +6,13 @@ use forgotten_config::{
     load_tfs_entity_catalog, load_tfs_movement_registry, load_tfs_public_channel_catalog,
     load_tfs_talkaction_registry, load_tfs_vocation_registry, load_world_companions,
     load_world_map, materialize_tfs_spawn_templates, materialize_tfs_static_spawns,
-    range_callback_name, resolve_action_callback, resolve_movement_callback,
-    resolve_tfs_registry_script_reference, resolve_tfs_spawn_references, validate_content,
-    world_map_path, write_template, ConsumableCatalog, DeclarativeNpcDialogueCatalog,
-    DeclarativeShopCatalog, DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig,
-    LegacyPublicChannelCatalog, LegacyWorldCompanionData, QuestCatalog, TfsActionRegistry,
-    TfsEntityCatalog, TfsMoveEventType, TfsRegistryCategory, TfsVocationRegistry,
+    movement_callback_name, range_callback_name, resolve_action_callback,
+    resolve_movement_callback, resolve_tfs_registry_script_reference, resolve_tfs_spawn_references,
+    validate_content, world_map_path, write_template, ConsumableCatalog,
+    DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog, DeclarativeSpellCatalog,
+    DeclarativeWeaponCatalog, EngineConfig, LegacyPublicChannelCatalog, LegacyWorldCompanionData,
+    QuestCatalog, TfsActionRegistry, TfsEntityCatalog, TfsMoveEventRegistry, TfsMoveEventType,
+    TfsRegistryCategory, TfsVocationRegistry,
 };
 use forgotten_core::{
     DeathLossPolicy, EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
@@ -100,6 +101,8 @@ struct IndependentNativeStartupContent {
     talkaction_dispatcher: Option<SandboxedLuaCallbackDispatcher>,
     action_dispatcher: Option<SandboxedLuaCallbackDispatcher>,
     action_registry: Option<Arc<TfsActionRegistry>>,
+    movement_dispatcher: Option<SandboxedLuaCallbackDispatcher>,
+    movement_registry: Option<Arc<TfsMoveEventRegistry>>,
     consumable_catalog: Option<ConsumableCatalog>,
     shop_catalog: Option<DeclarativeShopCatalog>,
     quest_catalog: QuestCatalog,
@@ -126,6 +129,7 @@ fn load_independent_native_startup_content(
                 scope.spawn(|| load_declarative_npc_dialogue_catalog(config));
             let talkaction_dispatcher = scope.spawn(|| build_talkaction_dispatcher(config));
             let action_dispatcher = scope.spawn(|| build_action_dispatcher(config));
+            let movement_dispatcher = scope.spawn(|| build_movement_dispatcher(config));
             let consumable_catalog = scope.spawn(|| load_consumable_catalog(config));
             let shop_catalog = scope.spawn(|| load_declarative_shop_catalog(config));
             let quest_catalog = scope.spawn(|| load_quest_catalog(config));
@@ -158,6 +162,10 @@ fn load_independent_native_startup_content(
                 .join()
                 .map_err(|_| "action dispatcher worker panicked")??;
             let (action_dispatcher, action_registry) = action_dispatcher;
+            let movement_dispatcher = movement_dispatcher
+                .join()
+                .map_err(|_| "movement dispatcher worker panicked")??;
+            let (movement_dispatcher, movement_registry) = movement_dispatcher;
             let consumable_catalog = consumable_catalog
                 .join()
                 .map_err(|_| "consumable catalog loader worker panicked")??;
@@ -178,6 +186,8 @@ fn load_independent_native_startup_content(
                 talkaction_dispatcher,
                 action_dispatcher,
                 action_registry,
+                movement_dispatcher,
+                movement_registry,
                 consumable_catalog,
                 shop_catalog,
                 quest_catalog,
@@ -241,6 +251,40 @@ fn build_action_dispatcher(
             )
             .map_err(|error| {
                 format!("action `{callback_name}` registration rejected: {error:?}")
+            })?;
+    }
+    if dispatcher.is_empty() {
+        return Ok((None, None));
+    }
+    Ok((Some(dispatcher), Some(Arc::new(registry))))
+}
+
+fn build_movement_dispatcher(
+    config: &EngineConfig,
+) -> Result<
+    (
+        Option<SandboxedLuaCallbackDispatcher>,
+        Option<Arc<TfsMoveEventRegistry>>,
+    ),
+    String,
+> {
+    let registry = load_tfs_movement_registry(config).map_err(|error| error.to_string())?;
+    if registry.is_empty() {
+        return Ok((None, None));
+    }
+    let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+    for (index, entry) in registry.iter().enumerate() {
+        // Positional `movement:{type}:{index}` names for singletons and ranges alike,
+        // derived from the same registry the host router resolves against.
+        let callback_name = movement_callback_name(entry.movement_type, index);
+        dispatcher
+            .register_callback_file(
+                callback_name.as_str(),
+                &config.content_directory.join("movements"),
+                &entry.script,
+            )
+            .map_err(|error| {
+                format!("movement `{callback_name}` registration rejected: {error:?}")
             })?;
     }
     if dispatcher.is_empty() {
@@ -783,6 +827,8 @@ fn run_host(
         let talkaction_dispatcher = startup_content.talkaction_dispatcher;
         let action_dispatcher = startup_content.action_dispatcher;
         let action_registry = startup_content.action_registry;
+        let movement_dispatcher = startup_content.movement_dispatcher;
+        let movement_registry = startup_content.movement_registry;
         let regeneration_rules = vocation_registry
             .as_ref()
             .map(|registry| {
@@ -983,6 +1029,8 @@ fn run_host(
             talkaction_dispatcher: talkaction_dispatcher.map(Arc::new),
             action_dispatcher: action_dispatcher.map(Arc::new),
             action_registry,
+            movement_dispatcher: movement_dispatcher.map(Arc::new),
+            movement_registry,
             consumable_effects,
             shop_catalog: shop_catalog.map(Arc::new),
             quest_catalog: Some(Arc::new(quest_catalog)),

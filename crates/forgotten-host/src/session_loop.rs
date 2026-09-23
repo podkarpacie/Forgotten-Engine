@@ -1047,6 +1047,7 @@ pub(crate) fn handle_native_otclient_game(
                             active_click_walk = None;
                             continue;
                         };
+                        let pre_step_position = player_position;
                         if move_native_map_player(
                             stream,
                             &config.client_profile,
@@ -1094,6 +1095,28 @@ pub(crate) fn handle_native_otclient_game(
                                 ),
                             );
                             active_click_walk = None;
+                        }
+                        // Arrival routing for moved steps and stepped-on teleports
+                        // alike; blocked steps leave the position untouched.
+                        if player_position != pre_step_position {
+                            let mut ctx = SessionContext {
+                                stream: &mut *stream,
+                                peer,
+                                character_id: character.id,
+                                database: &mut database,
+                                shared_world,
+                                config,
+                                world_map: &world_map,
+                                snapshot: &snapshot,
+                                facing: &mut facing,
+                                player_position: &mut player_position,
+                                active_click_walk: &mut active_click_walk,
+                                observed_dead,
+                                observed_visibility_epoch: &mut observed_visibility_epoch,
+                                observed_vitals_epoch: &mut observed_vitals_epoch,
+                            };
+                            let arrival = *ctx.player_position;
+                            apply_native_step_in(&mut ctx, arrival)?;
                         }
                         continue;
                     }
@@ -2504,7 +2527,9 @@ pub(crate) fn handle_native_otclient_game(
                 }
             }
             NativeOtClientGameAction::AutoWalk(path) => {
-                // Click-walk path replace-or-create; see movement.rs.
+                // Click-walk path replace-or-create; see movement.rs. A displacement
+                // (immediate single step, or a stepped-on teleport) routes StepIn.
+                let pre_step_position = player_position;
                 {
                     let mut ctx = SessionContext {
                         stream: &mut *stream,
@@ -2523,10 +2548,15 @@ pub(crate) fn handle_native_otclient_game(
                         observed_vitals_epoch: &mut observed_vitals_epoch,
                     };
                     apply_native_autowalk_action(&mut ctx, path)?;
+                    if *ctx.player_position != pre_step_position {
+                        let arrival = *ctx.player_position;
+                        apply_native_step_in(&mut ctx, arrival)?;
+                    }
                 }
             }
             NativeOtClientGameAction::CardinalMove(direction) => {
                 // Manual cardinal step; see movement.rs.
+                let pre_step_position = player_position;
                 {
                     let mut ctx = SessionContext {
                         stream: &mut *stream,
@@ -2545,10 +2575,15 @@ pub(crate) fn handle_native_otclient_game(
                         observed_vitals_epoch: &mut observed_vitals_epoch,
                     };
                     apply_native_cardinal_move_action(&mut ctx, direction)?;
+                    if *ctx.player_position != pre_step_position {
+                        let arrival = *ctx.player_position;
+                        apply_native_step_in(&mut ctx, arrival)?;
+                    }
                 }
             }
             NativeOtClientGameAction::DiagonalMove(direction) => {
                 // Manual diagonal step; see movement.rs.
+                let pre_step_position = player_position;
                 {
                     let mut ctx = SessionContext {
                         stream: &mut *stream,
@@ -2567,6 +2602,10 @@ pub(crate) fn handle_native_otclient_game(
                         observed_vitals_epoch: &mut observed_vitals_epoch,
                     };
                     apply_native_diagonal_move_action(&mut ctx, direction)?;
+                    if *ctx.player_position != pre_step_position {
+                        let arrival = *ctx.player_position;
+                        apply_native_step_in(&mut ctx, arrival)?;
+                    }
                 }
             }
         }

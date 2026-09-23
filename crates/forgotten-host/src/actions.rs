@@ -77,6 +77,7 @@ pub(crate) fn apply_native_action_use(
                 observed_vitals_epoch,
                 world_map,
                 outcome.effects,
+                "action=use outcome=action-applied",
             )?;
             Ok(true)
         }
@@ -105,10 +106,12 @@ pub(crate) fn apply_native_action_use(
     }
 }
 
-/// Applies action-script intents against authoritative subject state. Subject-relative validated
+/// Applies script intents against authoritative subject state. Subject-relative validated
 /// intents only; teleport resends the viewport, every mutation persists before frames.
+/// Shared by action routing and movement step routing; the trailing `outcome_tag`
+/// keeps each caller's diagnostics honest (`action=use ...` vs `movement=step ...`).
 #[allow(clippy::too_many_arguments)]
-fn apply_native_action_effects(
+pub(crate) fn apply_native_action_effects(
     config: &NativeOtClientHostConfig,
     stream: &mut TcpStream,
     database: &mut EngineDatabase,
@@ -122,6 +125,7 @@ fn apply_native_action_effects(
     observed_vitals_epoch: &mut u64,
     world_map: &WorldMap,
     effects: Vec<SandboxedLuaEffect>,
+    outcome_tag: &'static str,
 ) -> Result<(), HostError> {
     let mut teleported = false;
     for effect in effects {
@@ -244,10 +248,6 @@ fn apply_native_action_effects(
         }
         *observed_visibility_epoch = shared_world.visibility_epoch();
     }
-    native_diagnostic(
-        config.extended_diagnostics,
-        peer,
-        "action=use outcome=action-applied",
-    );
+    native_diagnostic(config.extended_diagnostics, peer, outcome_tag);
     Ok(())
 }
