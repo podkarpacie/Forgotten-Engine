@@ -134,7 +134,9 @@ pub(crate) use static_creature::{
 pub(crate) use static_creature::{
     persist_runtime_player_conditions, persist_static_target_attack_vitals,
 };
-pub(crate) use step_events::{apply_native_step_in, apply_native_step_out};
+pub(crate) use step_events::{
+    apply_native_step_in, apply_native_step_out, fire_native_equip_event,
+};
 pub(crate) use talkactions::apply_native_lua_talkaction;
 pub(crate) use throw_item::{
     apply_native_throw_item_container_to_container, apply_native_throw_item_container_to_equipment,
@@ -8701,6 +8703,154 @@ mod tests {
             }
         }
         assert!(leaving, "live StepOut Say effect never arrived");
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_live_equip_routes_through_a_wired_dispatcher() {
+        let database_path = database_path("native-live-equip");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let mut container = forgotten_core::PlayerContainer::new(
+            2,
+            ItemInstance::new(1988, 1).unwrap(),
+            "Backpack",
+            false,
+            20,
+        )
+        .unwrap();
+        container
+            .items
+            .insert(ItemInstance::new(4526, 1).unwrap())
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers.insert(container).unwrap();
+        database.replace_player_containers(1, &containers).unwrap();
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for (server_id, client_thing_id, requires_classic_740_subtype) in
+            [(1988, 1988, false), (4526, 102, true)]
+        {
+            catalog
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id,
+                        requires_classic_740_subtype,
+                    },
+                )
+                .unwrap();
+        }
+        let registry = parse_tfs_movements_xml(
+            br#"<movements><moveevent type="Equip" itemid="4526" slot="right-hand" script="gear.lua"/></movements>"#,
+        )
+        .unwrap();
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "movement:equip:0",
+                "return function() doCreatureSay('geared') end",
+            )
+            .unwrap();
+        let mut config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        config.item_presentation_catalog = Some(Arc::new(catalog));
+        config.movement_dispatcher = Some(Arc::new(dispatcher));
+        config.movement_registry = Some(Arc::new(registry));
+        let game = start_native_otclient_game(config, &database_path).unwrap();
+        let mut client = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut client,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut client).unwrap();
+        let initial_container = read_frame(&mut client).unwrap();
+        assert_eq!(
+            initial_container.0.first(),
+            Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER)
+        );
+
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut client);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
+        // Throw the mapped sword into the empty right hand: the Equip script answers
+        // Say through the live container-to-equipment hook.
+        write_frame(
+            &mut client,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                255,
+                255,
+                0x40 | 2,
+                0,
+                0,
+                102,
+                0,
+                0,
+                255,
+                255,
+                EquipmentSlot::RightHand.code(),
+                0,
+                0,
+                1,
+            ]),
+        )
+        .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut geared = false;
+        loop {
+            match read_frame(&mut client) {
+                Ok(frame) if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue;
+                }
+                Ok(frame) => {
+                    if String::from_utf8_lossy(&frame.0).contains("geared") {
+                        geared = true;
+                        break;
+                    }
+                }
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("native session ended during equip probe: {error}"),
+            }
+        }
+        assert!(geared, "live Equip Say effect never arrived");
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }

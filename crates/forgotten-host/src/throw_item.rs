@@ -1190,6 +1190,14 @@ pub(crate) fn apply_native_throw_item_container_to_equipment(
             &ctx.shared_world.player_containers(ctx.character_id)?,
             &mut *open_content_windows,
         )?;
+        let equipped_id = ctx
+            .shared_world
+            .player_equipment(ctx.character_id)?
+            .item(target_slot)
+            .map(|item| item.server_id);
+        if let Some(server_id) = equipped_id {
+            fire_native_equip_event(ctx, server_id)?;
+        }
         return Ok(SessionActionOutcome::Handled);
     }
     let equipment = ctx.shared_world.player_equipment(ctx.character_id)?;
@@ -1270,6 +1278,14 @@ pub(crate) fn apply_native_throw_item_container_to_equipment(
                 request.count
             ),
         );
+        let equipped_id = ctx
+            .shared_world
+            .player_equipment(ctx.character_id)?
+            .item(target_slot)
+            .map(|item| item.server_id);
+        if let Some(server_id) = equipped_id {
+            fire_native_equip_event(ctx, server_id)?;
+        }
         return Ok(SessionActionOutcome::Handled);
     }
     if equipment
@@ -1302,6 +1318,14 @@ pub(crate) fn apply_native_throw_item_container_to_equipment(
                 request.count
             ),
         );
+        let equipped_id = ctx
+            .shared_world
+            .player_equipment(ctx.character_id)?
+            .item(target_slot)
+            .map(|item| item.server_id);
+        if let Some(server_id) = equipped_id {
+            fire_native_equip_event(ctx, server_id)?;
+        }
         return Ok(SessionActionOutcome::Handled);
     }
     if equipment.item(target_slot).is_some() {
@@ -1331,6 +1355,14 @@ pub(crate) fn apply_native_throw_item_container_to_equipment(
                     request.count
                 ),
             );
+            let equipped_id = ctx
+                .shared_world
+                .player_equipment(ctx.character_id)?
+                .item(target_slot)
+                .map(|item| item.server_id);
+            if let Some(server_id) = equipped_id {
+                fire_native_equip_event(ctx, server_id)?;
+            }
             return Ok(SessionActionOutcome::Handled);
         }
         native_diagnostic(
@@ -1366,14 +1398,22 @@ pub(crate) fn apply_native_throw_item_container_to_equipment(
         ctx.config.extended_diagnostics,
         ctx.peer,
         &format!(
-            "action=throw-item outcome=top-level-container-to-equipment container-id={} item-index={} target-slot={} client-thing-id={} count={}",
-            request.container_id,
-            request.item_index,
-            target_slot.code(),
-            request.source_client_thing_id,
-            request.count
-        ),
-    );
+                "action=throw-item outcome=top-level-container-to-equipment container-id={} item-index={} target-slot={} client-thing-id={} count={}",
+                request.container_id,
+                request.item_index,
+                target_slot.code(),
+                request.source_client_thing_id,
+                request.count
+            ),
+        );
+    let equipped_id = ctx
+        .shared_world
+        .player_equipment(ctx.character_id)?
+        .item(target_slot)
+        .map(|item| item.server_id);
+    if let Some(server_id) = equipped_id {
+        fire_native_equip_event(ctx, server_id)?;
+    }
     Ok(SessionActionOutcome::Handled)
 }
 

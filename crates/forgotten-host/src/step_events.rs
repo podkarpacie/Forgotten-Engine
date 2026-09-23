@@ -35,6 +35,83 @@ pub(crate) fn apply_native_step_out(
     dispatch_native_step_event(ctx, TfsMoveEventType::StepOut, departed, "step-out")
 }
 
+/// Routes one equipped item through registered Equip scripts. Callers invoke this
+/// after a successful move into an equipment slot with the slot's post-move item id;
+/// Equip-slot string matching stays deferred (entries match on item id for now).
+/// Deliberately mirrors the step-event routing shell instead of sharing it: the match
+/// source (slot read vs tile scan) and position differ, and the codebase prefers an
+/// explicit small duplicate over a clever parameter here (same call as the
+/// talkaction/action effect-arms split). Effect arms are still shared.
+pub(crate) fn fire_native_equip_event(
+    ctx: &mut SessionContext<'_>,
+    server_id: u16,
+) -> Result<(), HostError> {
+    let (Some(registry), Some(dispatcher)) = (
+        ctx.config.movement_registry.as_deref(),
+        ctx.config.movement_dispatcher.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    let Some((callback_name, _)) =
+        resolve_movement_callback(registry, TfsMoveEventType::Equip, server_id)
+    else {
+        return Ok(());
+    };
+    let subject_position = ctx.shared_world.player_position(ctx.character_id)?;
+    let outcome = dispatcher.dispatch_api(
+        &callback_name,
+        &SandboxedLuaCallbackInput {
+            event_kind: "movement".into(),
+            subject_id: ctx.character_id,
+            value: i64::from(server_id),
+            argument: String::new(),
+            position: Some(SandboxedLuaPosition {
+                x: subject_position.x,
+                y: subject_position.y,
+                z: subject_position.z,
+            }),
+        },
+    );
+    match outcome.state {
+        SandboxedLuaCallbackDispatchState::Completed => {
+            apply_native_action_effects(
+                ctx.config,
+                &mut *ctx.stream,
+                &mut *ctx.database,
+                ctx.shared_world,
+                ctx.character_id,
+                ctx.peer,
+                ctx.snapshot,
+                *ctx.facing,
+                &mut *ctx.player_position,
+                &mut *ctx.observed_visibility_epoch,
+                &mut *ctx.observed_vitals_epoch,
+                ctx.world_map,
+                outcome.effects,
+                "movement=equip outcome=equip-applied",
+            )?;
+        }
+        SandboxedLuaCallbackDispatchState::CallbackNotFound => {
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                &format!("movement=equip outcome=equip-script-missing key={callback_name}"),
+            );
+        }
+        _ => {
+            native_diagnostic(
+                ctx.config.extended_diagnostics,
+                ctx.peer,
+                &format!(
+                    "movement=equip outcome=equip-script-rejected key={callback_name} state={:?}",
+                    outcome.state,
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Shared StepIn/StepOut resolve-dispatch-apply core. `kind_tag` feeds the outcome
 /// diagnostics (`step` vs `step-out`); the effect arms keep their shared tag.
 fn dispatch_native_step_event(
