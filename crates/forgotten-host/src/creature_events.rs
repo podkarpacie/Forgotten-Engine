@@ -47,13 +47,13 @@ pub(crate) fn apply_native_login_scripts(ctx: &mut SessionContext<'_>) -> Result
     Ok(())
 }
 
-/// Routes one static-creature kill through registered `kill` scripts. The killer is
+/// Routes one creature kill through registered `kill` scripts. The killer is
 /// the dispatch subject; the victim id and name cross as value and argument, the
 /// killer position as the subject-relative read. Same union, cap, and fail-open
-/// contract as login. PvP kills stay deferred.
+/// contract as login. Covers static-creature and player victims alike.
 pub(crate) fn fire_native_kill_event(
     ctx: &mut SessionContext<'_>,
-    victim_id: u32,
+    victim_id: u64,
     victim_name: &str,
 ) -> Result<(), HostError> {
     let position = *ctx.player_position;
@@ -61,7 +61,7 @@ pub(crate) fn fire_native_kill_event(
         ctx,
         "kill",
         ctx.character_id,
-        i64::from(victim_id),
+        i64::try_from(victim_id).unwrap_or(i64::MAX),
         victim_name.to_owned(),
         position,
     )?;

@@ -9374,6 +9374,168 @@ mod tests {
     }
 
     #[test]
+    fn native_live_pvp_kill_routes_through_a_wired_dispatcher() {
+        let database_path = database_path("native-live-pvp-kill");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        for (id, name, position) in [
+            (
+                1,
+                "Knight",
+                Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+            (
+                2,
+                "Druid",
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 7,
+                },
+            ),
+        ] {
+            database
+                .save_player(&Player {
+                    id,
+                    account_id: account_id as u64,
+                    name: name.into(),
+                    position,
+                    level: 8,
+                    experience: 4_900,
+                    skill_points: 3,
+                })
+                .unwrap();
+        }
+        // One hit point on the victim so the first damaging heartbeat tick ends it.
+        // Both sides need hometowns or melee refuses with town-unassigned.
+        database.update_player_town(1, 1).unwrap();
+        database.update_player_town(2, 1).unwrap();
+        database
+            .update_player_vitals(
+                2,
+                PersistedPlayerVitals {
+                    health: 1,
+                    max_health: 150,
+                    mana: 50,
+                    max_mana: 50,
+                    capacity: 220,
+                    magic_level: 0,
+                },
+            )
+            .unwrap();
+        drop(database);
+        let registry = parse_tfs_creaturescripts_xml(
+            br#"<creaturescripts><event type="kill" name="PlayerSlain" script="slain.lua"/></creaturescripts>"#,
+        )
+        .unwrap();
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback("creature:0", "return function() doCreatureSay('slain') end")
+            .unwrap();
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.creature_dispatcher = Some(Arc::new(dispatcher));
+        native_config.creature_registry = Some(Arc::new(registry));
+        native_config.extended_diagnostics = true;
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut knight = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut knight,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut knight);
+
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut knight);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
+        let mut druid = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut druid,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Druid",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let druid_init = read_frame(&mut druid).unwrap();
+        assert_eq!(&druid_init.0[9..14], &[101, 0, 100, 0, 7]);
+        // Target the victim by native player id, then idle through heartbeat melee
+        // ticks until the one-hit-point victim falls.
+        let victim_native_id = forgotten_protocol::NATIVE_OTCLIENT_PLAYER_ID_START + 2;
+        let mut select = vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_SELECT_TARGET];
+        select.extend_from_slice(&victim_native_id.to_le_bytes());
+        write_frame(&mut knight, &Frame(select)).unwrap();
+        knight
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let started = Instant::now();
+        let mut slain = false;
+        let mut saw_clear_target = false;
+        let mut health_frames = 0usize;
+        while started.elapsed() < Duration::from_secs(15) {
+            match read_frame(&mut knight) {
+                Ok(frame)
+                    if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] =>
+                {
+                    continue;
+                }
+                Ok(frame) => {
+                    if frame.0.first()
+                        == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_CLEAR_TARGET)
+                    {
+                        saw_clear_target = true;
+                    }
+                    if frame.0.first()
+                        == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH)
+                    {
+                        health_frames += 1;
+                    }
+                    if String::from_utf8_lossy(&frame.0).contains("slain") {
+                        slain = true;
+                        break;
+                    }
+                }
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => panic!("native session ended during pvp probe: {error}"),
+            }
+        }
+        assert!(
+            slain,
+            "live PvP kill Say effect never arrived (clear-target seen: {saw_clear_target}, victim health frames: {health_frames})"
+        );
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn native_live_logout_scripts_route_through_a_wired_dispatcher() {
         let database_path = database_path("native-live-logout");
         let database = EngineDatabase::open(&database_path).unwrap();

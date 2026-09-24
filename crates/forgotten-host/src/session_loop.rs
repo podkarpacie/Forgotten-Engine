@@ -823,6 +823,36 @@ pub(crate) fn handle_native_otclient_game(
                                 peer,
                                 "lifecycle=death-notification profile=740 fields=none",
                             );
+                            // Registered kill scripts run after the death frames, with
+                            // the victim character id and name as value and argument.
+                            {
+                                let victim_name = shared_world
+                                    .lock()
+                                    .ok()
+                                    .and_then(|world| {
+                                        world
+                                            .player(outcome.target_id)
+                                            .map(|player| player.name.clone())
+                                    })
+                                    .unwrap_or_default();
+                                let mut ctx = SessionContext {
+                                    stream: &mut *stream,
+                                    peer,
+                                    character_id: character.id,
+                                    database: &mut database,
+                                    shared_world,
+                                    config,
+                                    world_map: &world_map,
+                                    snapshot: &snapshot,
+                                    facing: &mut facing,
+                                    player_position: &mut player_position,
+                                    active_click_walk: &mut active_click_walk,
+                                    observed_dead,
+                                    observed_visibility_epoch: &mut observed_visibility_epoch,
+                                    observed_vitals_epoch: &mut observed_vitals_epoch,
+                                };
+                                fire_native_kill_event(&mut ctx, outcome.target_id, &victim_name)?;
+                            }
                         }
                         native_diagnostic(
                             config.extended_diagnostics,
@@ -947,7 +977,11 @@ pub(crate) fn handle_native_otclient_game(
                                     observed_visibility_epoch: &mut observed_visibility_epoch,
                                     observed_vitals_epoch: &mut observed_vitals_epoch,
                                 };
-                                fire_native_kill_event(&mut ctx, outcome.target_id, &victim_name)?;
+                                fire_native_kill_event(
+                                    &mut ctx,
+                                    u64::from(outcome.target_id),
+                                    &victim_name,
+                                )?;
                             }
                         }
                         let health_update = encode_native_otclient_creature_health(
