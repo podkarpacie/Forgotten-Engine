@@ -1515,6 +1515,7 @@ fn script_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                     value,
                     argument: String::new(),
                     position: None,
+                    storage: std::collections::BTreeMap::new(),
                 },
             );
             println!(
@@ -1560,6 +1561,7 @@ fn script_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                     value: 0,
                     argument: argument.to_owned(),
                     position: None,
+                    storage: std::collections::BTreeMap::new(),
                 },
             );
             println!(
@@ -1616,6 +1618,7 @@ fn script_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                     value: u64::from(item_id) as i64,
                     argument: String::new(),
                     position: None,
+                    storage: std::collections::BTreeMap::new(),
                 },
             );
             println!(
@@ -1673,6 +1676,7 @@ fn script_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                     value: u64::from(item_id) as i64,
                     argument: String::new(),
                     position: None,
+                    storage: std::collections::BTreeMap::new(),
                 },
             );
             println!(
@@ -1720,6 +1724,7 @@ fn script_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                     value: 0,
                     argument: String::new(),
                     position: None,
+                    storage: std::collections::BTreeMap::new(),
                 },
             );
             println!(

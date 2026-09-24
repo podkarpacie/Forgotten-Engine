@@ -70,6 +70,7 @@ pub(crate) fn fire_native_equip_event(
                 y: subject_position.y,
                 z: subject_position.z,
             }),
+            storage: ctx.database.player_storage_snapshot(ctx.character_id)?,
         },
     );
     match outcome.state {
@@ -146,6 +147,7 @@ pub(crate) fn fire_native_deequip_event(
                 y: subject_position.y,
                 z: subject_position.z,
             }),
+            storage: ctx.database.player_storage_snapshot(ctx.character_id)?,
         },
     );
     match outcome.state {
@@ -223,6 +225,7 @@ fn dispatch_native_step_event(
                 y: tile.y,
                 z: tile.z,
             }),
+            storage: ctx.database.player_storage_snapshot(ctx.character_id)?,
         },
     );
     match outcome.state {

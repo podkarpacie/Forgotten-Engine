@@ -72,6 +72,28 @@ impl EngineDatabase {
         )?;
         Ok(count as usize)
     }
+
+    /// Snapshots every durable script storage pair for one dispatch subject. The map
+    /// is bounded by the per-player entry cap, so a single dispatch carries at most
+    /// that many pairs; readers answer misses as `-1` without touching the database.
+    pub fn player_storage_snapshot(
+        &self,
+        player_id: u64,
+    ) -> Result<std::collections::BTreeMap<i64, i64>, PersistenceError> {
+        self.ensure_player_exists(player_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT storage_key, storage_value FROM player_storage_values WHERE player_id = ?1",
+        )?;
+        let pairs = statement.query_map(params![player_id as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut snapshot = std::collections::BTreeMap::new();
+        for pair in pairs {
+            let (key, value) = pair?;
+            snapshot.insert(key, value);
+        }
+        Ok(snapshot)
+    }
 }
 
 #[cfg(test)]

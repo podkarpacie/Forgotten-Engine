@@ -142,6 +142,7 @@ fn dispatch_creature_event_effects(
     ) else {
         return Ok(Vec::new());
     };
+    let storage = ctx.database.player_storage_snapshot(subject_id)?;
     let mut effects = Vec::new();
     for (index, entry) in resolve_creature_entries(registry, event_type) {
         let callback_name = creature_callback_name(index);
@@ -157,6 +158,7 @@ fn dispatch_creature_event_effects(
                     y: position.y,
                     z: position.z,
                 }),
+                storage: storage.clone(),
             },
         );
         match outcome.state {

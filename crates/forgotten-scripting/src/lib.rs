@@ -213,6 +213,11 @@ pub struct SandboxedLuaCallbackInput {
     pub argument: String,
     /// Optional authoritative subject position, received as a fifth `{ x, y, z }` argument.
     pub position: Option<SandboxedLuaPosition>,
+    /// Durable script storage snapshot for the dispatch subject, hydrated by the host
+    /// before dispatch. `getPlayerStorageValue` reads this map (absent keys answer
+    /// `-1`); it never touches the live database, and writes cross back as intents.
+    /// Bounded by the persistence-layer per-player entry cap.
+    pub storage: BTreeMap<i64, i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +324,12 @@ pub enum SandboxedLuaEffect {
         y: u16,
         z: u8,
         kind: u8,
+    },
+    /// Durable script storage write for the dispatch subject. The host persists it;
+    /// absent-key reads answer `-1` through `getPlayerStorageValue`, matching TFS.
+    SetStorage {
+        key: i64,
+        value: i64,
     },
 }
 
@@ -615,7 +626,8 @@ impl SandboxedLuaCallbackDispatcher {
 
     /// Invokes one registered callback with TFS-shaped bound host functions (`doCreatureSay`,
     /// `doPlayerAddItem`, `doTeleportThing`, `doPlayerAddHealth`, `doPlayerAddMana`,
-    /// `doPlayerRemoveItem`, `doSendMagicEffect`, `getThingPos`) installed. Scripts CALL these
+    /// `doPlayerRemoveItem`, `doSendMagicEffect`, `getThingPos`,
+    /// `getPlayerStorageValue`, `setPlayerStorageValue`) installed. Scripts CALL these
     /// functions and may additionally return an effect table; call-recorded intents and the
     /// returned table are unioned (capped) so return-table scripts keep working unchanged under
     /// api routing. Each call validates its arguments; over-budget or invalid calls, malformed
@@ -660,7 +672,15 @@ impl SandboxedLuaCallbackDispatcher {
             return rejected_effect_outcome(0);
         }
         let intents = Arc::new(Mutex::new(Vec::new()));
-        if install_sandboxed_host_api(&lua, &intents, input.position).is_err() {
+        if install_sandboxed_host_api(
+            &lua,
+            &intents,
+            input.position,
+            input.subject_id,
+            input.storage.clone(),
+        )
+        .is_err()
+        {
             return rejected_effect_outcome(0);
         }
         let instruction_checks = Arc::new(AtomicU32::new(0));
@@ -930,14 +950,19 @@ fn sandboxed_lua_position_value(
 
 /// Installs the bound TFS-shaped host API (`doCreatureSay`, `doPlayerAddItem`,
 /// `doTeleportThing`, `doPlayerAddHealth`, `doPlayerAddMana`, `doPlayerRemoveItem`,
-/// `doSendMagicEffect`, `getThingPos`). Each function validates its arguments and records one
-/// bounded `SandboxedLuaEffect` into the per-dispatch queue; over-budget or invalid calls fail
-/// the whole dispatch rather than partially recording. Nothing here touches world state,
-/// files, or the network.
+/// `doSendMagicEffect`, `getThingPos`, `getPlayerStorageValue`,
+/// `setPlayerStorageValue`). Each function validates its arguments and records one
+/// bounded `SandboxedLuaEffect` into the per-dispatch queue, except the readers
+/// (`getThingPos`, `getPlayerStorageValue`), which answer from dispatch input;
+/// over-budget or invalid calls fail the whole dispatch rather than partially
+/// recording. Nothing here touches world state, files, or the network. Storage
+/// functions are subject-locked: a mismatched player id fails closed.
 fn install_sandboxed_host_api(
     lua: &Lua,
     intents: &Arc<Mutex<Vec<SandboxedLuaEffect>>>,
     position: Option<SandboxedLuaPosition>,
+    subject_id: u64,
+    storage: BTreeMap<i64, i64>,
 ) -> Result<(), mlua::Error> {
     let say_intents = Arc::clone(intents);
     let do_creature_say = lua.create_function(move |_, text: String| {
@@ -1024,6 +1049,23 @@ fn install_sandboxed_host_api(
         })?;
     let get_thing_pos =
         lua.create_function(move |lua, (): ()| sandboxed_lua_position_value(lua, position))?;
+    let do_get_storage_value = lua.create_function(move |_, (cid, key): (u64, i64)| {
+        if cid != subject_id {
+            return Err(mlua::Error::RuntimeError("foreign storage subject".into()));
+        }
+        Ok(storage.get(&key).copied().unwrap_or(-1))
+    })?;
+    let set_storage_intents = Arc::clone(intents);
+    let do_set_storage_value =
+        lua.create_function(move |_, (cid, key, value): (u64, i64, i64)| {
+            if cid != subject_id {
+                return Err(mlua::Error::RuntimeError("foreign storage subject".into()));
+            }
+            record_sandboxed_intent(
+                &set_storage_intents,
+                SandboxedLuaEffect::SetStorage { key, value },
+            )
+        })?;
     lua.globals().set("doCreatureSay", do_creature_say)?;
     lua.globals().set("doPlayerAddItem", do_player_add_item)?;
     lua.globals().set("doTeleportThing", do_teleport_thing)?;
@@ -1035,6 +1077,10 @@ fn install_sandboxed_host_api(
     lua.globals()
         .set("doSendMagicEffect", do_send_magic_effect)?;
     lua.globals().set("getThingPos", get_thing_pos)?;
+    lua.globals()
+        .set("getPlayerStorageValue", do_get_storage_value)?;
+    lua.globals()
+        .set("setPlayerStorageValue", do_set_storage_value)?;
     Ok(())
 }
 
@@ -1057,7 +1103,8 @@ fn record_sandboxed_intent(
 /// Extracts a bounded list of typed effects from an array-of-effect-table return:
 /// `{ { say = "text" }, { teleport = { x = 1, y = 2, z = 7 } }, { heal = { health = 10, mana = 0 } },
 /// { give_item = { id = 2160, count = 1 } }, { remove_item = { id = 2160, count = 1 } },
-/// { magic_effect = { x = 1, y = 2, z = 7, kind = 10 } } }`. Any non-table value, a non-sequence
+/// { magic_effect = { x = 1, y = 2, z = 7, kind = 10 } },
+/// { set_storage = { key = 1000, value = 3 } } }`. Any non-table value, a non-sequence
 /// element, an effect entry with no recognized field, an oversize/control text, an out-of-range
 /// coordinate, a zero heal/give-item/remove-item, a zero magic-effect kind, or more than the
 /// bounded effect count rejects the whole return.
@@ -1129,6 +1176,14 @@ fn sandboxed_lua_effects(value: Value) -> Option<Vec<SandboxedLuaEffect>> {
             effects.push(parse_magic_effect(effect_table)?);
             produced = true;
         }
+        let set_storage: Option<Table> = match effect.get("set_storage") {
+            Ok(value) => value,
+            Err(_) => return None,
+        };
+        if let Some(storage) = set_storage {
+            effects.push(parse_set_storage_effect(storage)?);
+            produced = true;
+        }
         if !produced {
             return None;
         }
@@ -1179,6 +1234,12 @@ fn parse_magic_effect(effect_table: Table) -> Option<SandboxedLuaEffect> {
         return None;
     }
     Some(SandboxedLuaEffect::MagicEffect { x, y, z, kind })
+}
+
+fn parse_set_storage_effect(storage_table: Table) -> Option<SandboxedLuaEffect> {
+    let key: i64 = storage_table.get("key").ok()?;
+    let value: i64 = storage_table.get("value").ok()?;
+    Some(SandboxedLuaEffect::SetStorage { key, value })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1400,6 +1461,7 @@ mod tests {
             value: 41,
             argument: String::new(),
             position: None,
+            storage: BTreeMap::new(),
         };
         let outcome = dispatcher.dispatch("award", &input);
         assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
@@ -1447,6 +1509,7 @@ mod tests {
             value: 0,
             argument: "100 100".into(),
             position: None,
+            storage: BTreeMap::new(),
         };
         assert_eq!(
             dispatcher.dispatch("echo-arg", &input).value,
@@ -1463,6 +1526,7 @@ mod tests {
             value: 7,
             argument: "ignored".into(),
             position: None,
+            storage: BTreeMap::new(),
         };
         assert_eq!(
             dispatcher.dispatch("legacy", &legacy).value,
@@ -1479,6 +1543,7 @@ mod tests {
                         value: 0,
                         argument: "x".repeat(MAX_SANDBOXED_LUA_CALLBACK_ARGUMENT_BYTES + 1),
                         position: None,
+                        storage: BTreeMap::new(),
                     },
                 )
                 .state,
@@ -1516,6 +1581,7 @@ mod tests {
             value: 0,
             argument: String::new(),
             position: None,
+            storage: BTreeMap::new(),
         };
         assert_eq!(
             dispatcher.dispatch("typed", &input).state,
@@ -1535,6 +1601,7 @@ mod tests {
                         value: 0,
                         argument: String::new(),
                         position: None,
+                        storage: BTreeMap::new(),
                     }
                 )
                 .state,
@@ -1550,6 +1617,7 @@ mod tests {
                         value: 0,
                         argument: String::new(),
                         position: None,
+                        storage: BTreeMap::new(),
                     }
                 )
                 .state,
@@ -1565,6 +1633,7 @@ mod tests {
                         value: 0,
                         argument: String::new(),
                         position: None,
+                        storage: BTreeMap::new(),
                     }
                 )
                 .state,
@@ -1587,6 +1656,7 @@ mod tests {
             value: 0,
             argument: String::new(),
             position: None,
+            storage: BTreeMap::new(),
         };
         let outcome = dispatcher.dispatch_effects("go", &input);
         assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
@@ -1637,6 +1707,7 @@ mod tests {
             value: 0,
             argument: String::new(),
             position: None,
+            storage: BTreeMap::new(),
         };
         let outcome = dispatcher.dispatch_effects("recover", &input);
         assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
@@ -1703,6 +1774,7 @@ mod tests {
             value: 0,
             argument: String::new(),
             position: None,
+            storage: BTreeMap::new(),
         };
         let outcome = dispatcher.dispatch_effects("consume", &input);
         assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
@@ -1761,6 +1833,7 @@ mod tests {
                 y: 200,
                 z: 7,
             }),
+            storage: BTreeMap::new(),
         };
         assert_eq!(
             dispatcher.dispatch("where", &positioned).value,
@@ -1768,6 +1841,7 @@ mod tests {
         );
         let unpositioned = SandboxedLuaCallbackInput {
             position: None,
+            storage: BTreeMap::new(),
             ..positioned.clone()
         };
         // A callback written for fewer arguments ignores the trailing position.
@@ -1780,6 +1854,7 @@ mod tests {
             value: 7,
             argument: "ignored".into(),
             position: Some(SandboxedLuaPosition { x: 1, y: 2, z: 3 }),
+            storage: BTreeMap::new(),
         };
         assert_eq!(
             dispatcher.dispatch("legacy", &legacy).value,
@@ -1810,6 +1885,7 @@ mod tests {
                 y: 200,
                 z: 7,
             }),
+            storage: BTreeMap::new(),
         };
         let outcome = dispatcher.dispatch_api("greet", &input);
         assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
@@ -1829,6 +1905,7 @@ mod tests {
             .unwrap();
         let unpositioned = SandboxedLuaCallbackInput {
             position: None,
+            storage: BTreeMap::new(),
             ..input.clone()
         };
         // getThingPos answers nil without a subject position; the boolean return is ignored.
@@ -1874,6 +1951,7 @@ mod tests {
             value: 0,
             argument: String::new(),
             position: None,
+            storage: BTreeMap::new(),
         };
         let outcome = dispatcher.dispatch_api("buff", &input);
         assert_eq!(outcome.state, SandboxedLuaCallbackDispatchState::Completed);
@@ -1920,6 +1998,93 @@ mod tests {
     }
 
     #[test]
+    fn callback_dispatcher_answers_storage_reads_and_records_writes() {
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "read",
+                "return function(_, cid) return getPlayerStorageValue(cid, 1000) end",
+            )
+            .unwrap();
+        dispatcher
+            .register_callback(
+                "write",
+                "return function(_, cid) setPlayerStorageValue(cid, 1000, 3) end",
+            )
+            .unwrap();
+        dispatcher
+            .register_callback(
+                "foreign",
+                "return function() return getPlayerStorageValue(77, 1000) end",
+            )
+            .unwrap();
+        let input = SandboxedLuaCallbackInput {
+            event_kind: "talkaction".into(),
+            subject_id: 7,
+            value: 0,
+            argument: String::new(),
+            position: None,
+            storage: BTreeMap::from([(1000, 3)]),
+        };
+        // A hit returns the stored value; the callback return itself is ignored.
+        let hit = dispatcher.dispatch_api("read", &input);
+        assert_eq!(hit.state, SandboxedLuaCallbackDispatchState::Completed);
+        assert!(hit.effects.is_empty());
+        // A write records a single SetStorage intent against the budget.
+        let written = dispatcher.dispatch_api("write", &input);
+        assert_eq!(written.state, SandboxedLuaCallbackDispatchState::Completed);
+        assert_eq!(
+            written.effects,
+            vec![SandboxedLuaEffect::SetStorage {
+                key: 1000,
+                value: 3
+            }]
+        );
+        // A foreign subject id fails the dispatch closed.
+        assert_eq!(
+            dispatcher.dispatch_api("foreign", &input).state,
+            SandboxedLuaCallbackDispatchState::RuntimeRejected
+        );
+    }
+
+    #[test]
+    fn callback_dispatcher_misses_storage_as_minus_one_and_parses_set_tables() {
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "miss",
+                "return function(_, cid) if getPlayerStorageValue(cid, 999) == -1 then doCreatureSay('unset') end end",
+            )
+            .unwrap();
+        dispatcher
+            .register_callback(
+                "table",
+                "return function() return { { set_storage = { key = 1000, value = 3 } } } end",
+            )
+            .unwrap();
+        let input = SandboxedLuaCallbackInput {
+            event_kind: "talkaction".into(),
+            subject_id: 7,
+            value: 0,
+            argument: String::new(),
+            position: None,
+            storage: BTreeMap::new(),
+        };
+        let miss = dispatcher.dispatch_api("miss", &input);
+        assert_eq!(miss.state, SandboxedLuaCallbackDispatchState::Completed);
+        assert_eq!(miss.effects, vec![SandboxedLuaEffect::Say("unset".into())]);
+        let table = dispatcher.dispatch_api("table", &input);
+        assert_eq!(table.state, SandboxedLuaCallbackDispatchState::Completed);
+        assert_eq!(
+            table.effects,
+            vec![SandboxedLuaEffect::SetStorage {
+                key: 1000,
+                value: 3
+            }]
+        );
+    }
+
+    #[test]
     fn callback_dispatcher_unions_calls_with_returned_effect_tables() {
         let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
         dispatcher
@@ -1946,6 +2111,7 @@ mod tests {
             value: 0,
             argument: String::new(),
             position: None,
+            storage: BTreeMap::new(),
         };
         let mixed = dispatcher.dispatch_api("mixed", &input);
         assert_eq!(mixed.state, SandboxedLuaCallbackDispatchState::Completed);
@@ -2008,6 +2174,7 @@ mod tests {
                         value: 41,
                         argument: String::new(),
                         position: None,
+                        storage: BTreeMap::new(),
                     },
                 )
                 .value,

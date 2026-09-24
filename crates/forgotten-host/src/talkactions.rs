@@ -21,6 +21,7 @@ pub(crate) fn dispatch_native_lua_talkaction(
     message: &str,
     player_id: u64,
     position: Option<SandboxedLuaPosition>,
+    storage: std::collections::BTreeMap<i64, i64>,
 ) -> Option<Vec<SandboxedLuaEffect>> {
     let trimmed = message.trim();
     if trimmed.is_empty() {
@@ -38,6 +39,7 @@ pub(crate) fn dispatch_native_lua_talkaction(
             value: 0,
             argument,
             position,
+            storage,
         },
     );
     match outcome.state {
@@ -75,6 +77,7 @@ pub(crate) fn apply_native_lua_talkaction(
         &request.message,
         ctx.character_id,
         subject_position,
+        ctx.database.player_storage_snapshot(ctx.character_id)?,
     ) else {
         return Ok(SessionActionOutcome::Unhandled);
     };
@@ -177,6 +180,10 @@ pub(crate) fn apply_native_lua_talkaction(
                 .map_err(HostError::Protocol)?;
                 write_frame(&mut *ctx.stream, &effect_frame)?;
             }
+            SandboxedLuaEffect::SetStorage { key, value } => {
+                ctx.database
+                    .set_player_storage_value(ctx.character_id, key, value)?;
+            }
         }
     }
     if teleported {
@@ -235,25 +242,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            dispatch_native_lua_talkaction(&dispatcher, "/echo 100 100", 7, None),
+            dispatch_native_lua_talkaction(
+                &dispatcher,
+                "/echo 100 100",
+                7,
+                None,
+                Default::default()
+            ),
             Some(vec![SandboxedLuaEffect::Say("100 100".into())])
         );
         assert_eq!(
-            dispatch_native_lua_talkaction(&dispatcher, "/goto", 7, None),
+            dispatch_native_lua_talkaction(&dispatcher, "/goto", 7, None, Default::default()),
             Some(vec![SandboxedLuaEffect::Teleport { x: 1, y: 2, z: 7 }])
         );
         assert_eq!(
-            dispatch_native_lua_talkaction(&dispatcher, "/silent", 7, None),
+            dispatch_native_lua_talkaction(&dispatcher, "/silent", 7, None, Default::default()),
             Some(vec![])
         );
         assert_eq!(
-            dispatch_native_lua_talkaction(&dispatcher, "/missing", 7, None),
+            dispatch_native_lua_talkaction(&dispatcher, "/missing", 7, None, Default::default()),
             None
         );
         // A registered word whose argument is over the bound is still handled, with no effects.
         let long = "x".repeat(256);
         assert_eq!(
-            dispatch_native_lua_talkaction(&dispatcher, &format!("/silent {long}"), 7, None),
+            dispatch_native_lua_talkaction(
+                &dispatcher,
+                &format!("/silent {long}"),
+                7,
+                None,
+                Default::default()
+            ),
             Some(vec![])
         );
     }

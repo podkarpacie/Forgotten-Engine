@@ -53,6 +53,7 @@ pub(crate) fn apply_native_action_use(
             y: subject_position.y,
             z: subject_position.z,
         }),
+        storage: database.player_storage_snapshot(character_id)?,
     };
     let Some(registry) = config.action_registry.as_deref() else {
         return Ok(false);
@@ -224,6 +225,9 @@ pub(crate) fn apply_native_action_effects(
                 )
                 .map_err(HostError::Protocol)?;
                 write_frame(stream, &effect_frame)?;
+            }
+            SandboxedLuaEffect::SetStorage { key, value } => {
+                database.set_player_storage_value(character_id, key, value)?;
             }
         }
     }

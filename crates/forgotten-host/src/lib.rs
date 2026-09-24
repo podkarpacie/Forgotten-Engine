@@ -8324,6 +8324,99 @@ mod tests {
     }
 
     #[test]
+    fn native_live_talkaction_set_storage_persists_to_the_database() {
+        let database_path = database_path("native-live-storage");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        drop(database);
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "/flag",
+                "return function(_, cid) setPlayerStorageValue(cid, 1000, 3) end",
+            )
+            .unwrap();
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.talkaction_dispatcher = Some(Arc::new(dispatcher));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
+        // Say "/flag": the bound write records a SetStorage intent, applied
+        // silently — no client frame answers, the row lands in the database.
+        let message = b"/flag";
+        let mut talk = vec![
+            0x96,
+            forgotten_protocol::NATIVE_OTCLIENT_MESSAGE_SAY,
+            message.len() as u8,
+            0,
+        ];
+        talk.extend_from_slice(message);
+        write_frame(&mut stream, &Frame(talk)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue;
+                }
+                Ok(_) => {
+                    continue;
+                }
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("native session ended during storage probe: {error}"),
+            }
+        }
+        game.shutdown().unwrap();
+        let database = EngineDatabase::open(&database_path).unwrap();
+        assert_eq!(database.player_storage_value(1, 1000).unwrap(), Some(3));
+        drop(database);
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn native_live_action_use_routes_through_a_wired_dispatcher() {
         let database_path = database_path("native-live-action");
         let database = EngineDatabase::open(&database_path).unwrap();
