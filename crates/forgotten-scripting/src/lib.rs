@@ -9,10 +9,10 @@
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, Value, Variadic};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, RwLock,
 };
 
 pub const MAX_SANDBOXED_LUA_SOURCE_BYTES: usize = 4 * 1024;
@@ -340,14 +340,108 @@ pub struct SandboxedLuaEffectDispatchOutcome {
     pub instruction_checks: u32,
 }
 
+/// Reads one explicit callback-function chunk from a canonical operator-owned script root,
+/// returning the canonical root plus the file body. Shared by registration and hot-reload so a
+/// reload can never accept a file registration would reject.
+fn read_callback_file_source(
+    script_root: &Path,
+    relative_path: &Path,
+) -> Result<(PathBuf, String), SandboxedLuaCallbackFileRegistrationError> {
+    if !relative_path.is_relative()
+        || !relative_path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(SandboxedLuaCallbackFileRegistrationError::InvalidRelativePath);
+    }
+    let canonical_root = fs::canonicalize(script_root)
+        .map_err(|_| SandboxedLuaCallbackFileRegistrationError::SourceReadFailed)?;
+    let canonical_source = fs::canonicalize(script_root.join(relative_path))
+        .map_err(|_| SandboxedLuaCallbackFileRegistrationError::SourceReadFailed)?;
+    if !canonical_source.starts_with(&canonical_root) {
+        return Err(SandboxedLuaCallbackFileRegistrationError::SourceOutsideRoot);
+    }
+    let metadata = fs::metadata(&canonical_source)
+        .map_err(|_| SandboxedLuaCallbackFileRegistrationError::SourceReadFailed)?;
+    if !metadata.is_file() {
+        return Err(SandboxedLuaCallbackFileRegistrationError::SourceNotRegularFile);
+    }
+    let source = fs::read_to_string(canonical_source)
+        .map_err(|_| SandboxedLuaCallbackFileRegistrationError::SourceReadFailed)?;
+    Ok((canonical_root, source))
+}
+
+/// The per-name outcome of [`SandboxedLuaCallbackDispatcher::reload_file_callbacks`]: every
+/// reloaded name serves its fresh source, every failed name keeps its previous source.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScriptFileReloadReport {
+    pub reloaded: Vec<String>,
+    pub failed: Vec<ScriptFileReloadFailure>,
+}
+
+/// One file-backed callback whose reload failed validation; the previous source keeps serving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptFileReloadFailure {
+    pub name: String,
+    pub error: String,
+}
+
+impl ScriptFileReloadReport {
+    /// Bounded one-line operator summary: names are length-capped at registration and the
+    /// callback count is capped, so this line cannot grow without bound.
+    pub fn summary(&self) -> String {
+        let mut summary = format!(
+            "reloaded={} failed={}",
+            self.reloaded.len(),
+            self.failed.len()
+        );
+        if !self.reloaded.is_empty() {
+            summary.push_str(&format!(" reloaded_names=[{}]", self.reloaded.join(",")));
+        }
+        for failure in &self.failed {
+            summary.push_str(&format!(
+                " failed_names=[{}:{}]",
+                failure.name, failure.error
+            ));
+        }
+        summary
+    }
+}
+
 /// A bounded trusted-source callback registry. Registration is explicit and in-memory: it does
 /// not discover files, load TFS registries, preserve global Lua state, or resolve modules. Every
 /// dispatch creates a new VM and expects the source to evaluate to a function accepting exactly
 /// `(event_kind, subject_id, value)` primitive arguments.
-#[derive(Debug, Clone)]
+///
+/// The callback and file-source maps live behind reader-writer locks so a running host can
+/// hot-reload file-backed callbacks in place: every session shares the same dispatcher object
+/// through `Arc` clones, so a reload is visible to live sessions without reconnects. Dispatch
+/// clones the source under a read lock and evaluates outside it, so a reload write waits only
+/// for in-flight lookups, never for script execution. Cloning a dispatcher still snapshots
+/// independent maps, exactly like the previous plain-`BTreeMap` behavior.
+#[derive(Debug)]
 pub struct SandboxedLuaCallbackDispatcher {
     limits: SandboxedLuaLimits,
-    callbacks: BTreeMap<String, String>,
+    callbacks: Arc<RwLock<BTreeMap<String, String>>>,
+    file_sources: Arc<RwLock<BTreeMap<String, ScriptFileSource>>>,
+}
+
+/// A remembered file-backed callback registration: the canonical script root plus the declared
+/// relative path, re-read verbatim on every hot-reload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScriptFileSource {
+    root: PathBuf,
+    relative: PathBuf,
+}
+
+impl Clone for SandboxedLuaCallbackDispatcher {
+    fn clone(&self) -> Self {
+        Self {
+            limits: self.limits,
+            callbacks: Arc::new(RwLock::new(self.read_callbacks().clone())),
+            file_sources: Arc::new(RwLock::new(self.read_file_sources().clone())),
+        }
+    }
 }
 
 impl Default for SandboxedLuaCallbackDispatcher {
@@ -360,8 +454,29 @@ impl SandboxedLuaCallbackDispatcher {
     pub fn new(limits: SandboxedLuaLimits) -> Self {
         Self {
             limits,
-            callbacks: BTreeMap::new(),
+            callbacks: Arc::new(RwLock::new(BTreeMap::new())),
+            file_sources: Arc::new(RwLock::new(BTreeMap::new())),
         }
+    }
+
+    fn read_callbacks(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, String>> {
+        self.callbacks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn read_file_sources(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, ScriptFileSource>> {
+        self.file_sources
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_callbacks(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<String, String>> {
+        self.callbacks
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub const fn limits(&self) -> SandboxedLuaLimits {
@@ -369,16 +484,18 @@ impl SandboxedLuaCallbackDispatcher {
     }
 
     pub fn len(&self) -> usize {
-        self.callbacks.len()
+        self.read_callbacks().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.callbacks.is_empty()
+        self.read_callbacks().is_empty()
     }
 
     /// Registers one operator-provided callback source. The source must be a Lua chunk that
     /// evaluates to a function, for example: `return function(kind, id, value) return value end`.
     /// Source execution is deferred until dispatch and takes place in a fresh restricted VM.
+    /// Takes `&mut self` deliberately: registration is build-time only; live updates go
+    /// through [`Self::reload_file_callbacks`] on the shared dispatcher instead.
     pub fn register_callback(
         &mut self,
         name: impl Into<String>,
@@ -392,51 +509,87 @@ impl SandboxedLuaCallbackDispatcher {
         if source.len() > self.limits.max_source_bytes {
             return Err(SandboxedLuaCallbackRegistrationError::SourceRejected);
         }
-        if self.callbacks.contains_key(&name) {
+        let mut callbacks = self.write_callbacks();
+        if callbacks.contains_key(&name) {
             return Err(SandboxedLuaCallbackRegistrationError::DuplicateName(name));
         }
-        if self.callbacks.len() >= MAX_SANDBOXED_LUA_CALLBACKS {
+        if callbacks.len() >= MAX_SANDBOXED_LUA_CALLBACKS {
             return Err(SandboxedLuaCallbackRegistrationError::CallbackLimit(
                 MAX_SANDBOXED_LUA_CALLBACKS,
             ));
         }
-        self.callbacks.insert(name, source);
+        callbacks.insert(name, source);
         Ok(())
     }
 
     /// Loads one explicit callback-function chunk from a canonical operator-owned script root.
     /// The path must contain only normal relative components and resolve to a regular UTF-8 file
     /// inside that root. Ordinary TFS script registries, module imports, filesystem access from
-    /// Lua, and legacy callback APIs are intentionally not enabled by this loader.
+    /// Lua, and legacy callback APIs are intentionally not enabled by this loader. The file
+    /// source is remembered so [`Self::reload_file_callbacks`] can re-read it later.
     pub fn register_callback_file(
         &mut self,
         name: impl Into<String>,
         script_root: &Path,
         relative_path: &Path,
     ) -> Result<(), SandboxedLuaCallbackFileRegistrationError> {
-        if !relative_path.is_relative()
-            || !relative_path
-                .components()
-                .all(|component| matches!(component, std::path::Component::Normal(_)))
-        {
-            return Err(SandboxedLuaCallbackFileRegistrationError::InvalidRelativePath);
+        let (canonical_root, source) = read_callback_file_source(script_root, relative_path)?;
+        let name = name.into();
+        self.register_callback(name.clone(), source)
+            .map_err(SandboxedLuaCallbackFileRegistrationError::Registration)?;
+        self.file_sources
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                name,
+                ScriptFileSource {
+                    root: canonical_root,
+                    relative: relative_path.to_path_buf(),
+                },
+            );
+        Ok(())
+    }
+
+    /// Re-reads every file-backed callback from disk and swaps the loaded sources in place. A
+    /// file that fails validation keeps serving its previous source; the failure is reported,
+    /// never thrown — one broken script must not unload the working set. Inline-registered
+    /// callbacks have no file source and are never touched.
+    pub fn reload_file_callbacks(&self) -> ScriptFileReloadReport {
+        let sources: Vec<(String, ScriptFileSource)> = self
+            .read_file_sources()
+            .iter()
+            .map(|(name, source)| (name.clone(), source.clone()))
+            .collect();
+        let mut report = ScriptFileReloadReport::default();
+        for (name, source) in sources {
+            match read_callback_file_source(&source.root, &source.relative) {
+                Ok((_, body)) => {
+                    if body.len() > self.limits.max_source_bytes {
+                        report.failed.push(ScriptFileReloadFailure {
+                            name,
+                            error: format!(
+                                "{:?}",
+                                SandboxedLuaCallbackFileRegistrationError::Registration(
+                                    SandboxedLuaCallbackRegistrationError::SourceRejected
+                                )
+                            ),
+                        });
+                        continue;
+                    }
+                    self.write_callbacks().insert(name.clone(), body);
+                    report.reloaded.push(name);
+                }
+                Err(error) => report.failed.push(ScriptFileReloadFailure {
+                    name,
+                    error: format!("{error:?}"),
+                }),
+            }
         }
-        let canonical_root = fs::canonicalize(script_root)
-            .map_err(|_| SandboxedLuaCallbackFileRegistrationError::SourceReadFailed)?;
-        let canonical_source = fs::canonicalize(script_root.join(relative_path))
-            .map_err(|_| SandboxedLuaCallbackFileRegistrationError::SourceReadFailed)?;
-        if !canonical_source.starts_with(&canonical_root) {
-            return Err(SandboxedLuaCallbackFileRegistrationError::SourceOutsideRoot);
-        }
-        let metadata = fs::metadata(&canonical_source)
-            .map_err(|_| SandboxedLuaCallbackFileRegistrationError::SourceReadFailed)?;
-        if !metadata.is_file() {
-            return Err(SandboxedLuaCallbackFileRegistrationError::SourceNotRegularFile);
-        }
-        let source = fs::read_to_string(canonical_source)
-            .map_err(|_| SandboxedLuaCallbackFileRegistrationError::SourceReadFailed)?;
-        self.register_callback(name, source)
-            .map_err(SandboxedLuaCallbackFileRegistrationError::Registration)
+        report.reloaded.sort();
+        report
+            .failed
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        report
     }
 
     /// Invokes one registered callback in a new no-standard-library VM. Callback state cannot
@@ -454,7 +607,7 @@ impl SandboxedLuaCallbackDispatcher {
                 instruction_checks: 0,
             };
         }
-        let Some(source) = self.callbacks.get(callback_name) else {
+        let Some(source) = self.read_callbacks().get(callback_name).cloned() else {
             return SandboxedLuaCallbackDispatchOutcome {
                 state: SandboxedLuaCallbackDispatchState::CallbackNotFound,
                 value: None,
@@ -547,7 +700,7 @@ impl SandboxedLuaCallbackDispatcher {
                 instruction_checks: 0,
             };
         }
-        let Some(source) = self.callbacks.get(callback_name) else {
+        let Some(source) = self.read_callbacks().get(callback_name).cloned() else {
             return SandboxedLuaEffectDispatchOutcome {
                 state: SandboxedLuaCallbackDispatchState::CallbackNotFound,
                 effects: Vec::new(),
@@ -647,7 +800,7 @@ impl SandboxedLuaCallbackDispatcher {
                 instruction_checks: 0,
             };
         }
-        let Some(source) = self.callbacks.get(callback_name) else {
+        let Some(source) = self.read_callbacks().get(callback_name).cloned() else {
             return SandboxedLuaEffectDispatchOutcome {
                 state: SandboxedLuaCallbackDispatchState::CallbackNotFound,
                 effects: Vec::new(),
@@ -2211,6 +2364,75 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_file(escaped_source).unwrap();
+    }
+
+    #[test]
+    fn callback_dispatcher_reloads_edited_files_and_keeps_unreadable_ones() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("forgotten-engine-script-reload-{nonce}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("live.lua"), "return function() return 1 end").unwrap();
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback_file("live", &root, Path::new("live.lua"))
+            .unwrap();
+        dispatcher
+            .register_callback("inline", "return function() return 0 end")
+            .unwrap();
+        let input = SandboxedLuaCallbackInput {
+            event_kind: "reload".into(),
+            subject_id: 7,
+            value: 0,
+            argument: String::new(),
+            position: None,
+            storage: BTreeMap::new(),
+        };
+        assert_eq!(
+            dispatcher.dispatch("live", &input).value,
+            Some(SandboxedLuaValue::Integer(1))
+        );
+        // An edited file is picked up; the inline callback is never touched.
+        fs::write(root.join("live.lua"), "return function() return 2 end").unwrap();
+        let report = dispatcher.reload_file_callbacks();
+        assert_eq!(report.reloaded, vec!["live".to_string()]);
+        assert!(report.failed.is_empty());
+        assert!(report.summary().contains("reloaded=1"));
+        assert_eq!(
+            dispatcher.dispatch("live", &input).value,
+            Some(SandboxedLuaValue::Integer(2))
+        );
+        assert_eq!(
+            dispatcher.dispatch("inline", &input).value,
+            Some(SandboxedLuaValue::Integer(0))
+        );
+        // An unreadable file keeps serving its previous source and is reported.
+        fs::remove_file(root.join("live.lua")).unwrap();
+        let report = dispatcher.reload_file_callbacks();
+        assert!(report.reloaded.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].name, "live");
+        assert!(report.summary().contains("failed=1"));
+        assert_eq!(
+            dispatcher.dispatch("live", &input).value,
+            Some(SandboxedLuaValue::Integer(2))
+        );
+        // Clones snapshot independent maps: a twin reloads the same files alone.
+        fs::write(root.join("live.lua"), "return function() return 3 end").unwrap();
+        let twin = dispatcher.clone();
+        let twin_report = twin.reload_file_callbacks();
+        assert_eq!(twin_report.reloaded, vec!["live".to_string()]);
+        assert_eq!(
+            twin.dispatch("live", &input).value,
+            Some(SandboxedLuaValue::Integer(3))
+        );
+        assert_eq!(
+            dispatcher.dispatch("live", &input).value,
+            Some(SandboxedLuaValue::Integer(2))
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

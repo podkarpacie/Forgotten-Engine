@@ -21,6 +21,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use forgotten_persistence::EngineDatabase;
+use forgotten_scripting::SandboxedLuaCallbackDispatcher;
 
 use crate::{HostError, SharedNativeWorld};
 
@@ -111,6 +112,10 @@ pub enum OperatorRequest {
     },
     /// Report live world counters for console display.
     Status,
+    /// Re-read every file-backed script callback from disk and swap the loaded sources in
+    /// place. Live sessions share the dispatcher objects, so reloaded scripts serve
+    /// immediately with no reconnects; unreadable files keep their previous source.
+    ReloadScripts,
 }
 
 fn default_count() -> u16 {
@@ -158,6 +163,17 @@ impl OperatorResponse {
 pub struct OperatorBridgeConfig {
     pub shared_world: SharedNativeWorld,
     pub database_path: PathBuf,
+    /// Live script dispatchers shared with every session (same `Arc` objects the session
+    /// configs hold), so a reload swaps sources under running sessions. Empty when the
+    /// host runs without scripted families.
+    pub script_routers: Vec<ScriptRouterHandle>,
+}
+
+/// One live script dispatcher reachable by the reload command, tagged with its script
+/// family (`talkaction`, `action`, `movement`, `creature`) for per-family reporting.
+pub struct ScriptRouterHandle {
+    pub family: &'static str,
+    pub dispatcher: Arc<SandboxedLuaCallbackDispatcher>,
 }
 
 pub(crate) struct BridgeRuntime {
@@ -217,7 +233,7 @@ fn handle_operator_connection(
     let response = match serde_json::from_str::<OperatorRequest>(trimmed) {
         Ok(request) => apply_operator_request(runtime, request),
         Err(error) => OperatorResponse::failure(format!(
-            "invalid request: {error}; expected {{\"op\": \"broadcast\"|\"gm\"|\"give\"|\"tp\"|\"spawn\"|\"kick\"|\"status\", ...}}"
+            "invalid request: {error}; expected {{\"op\": \"broadcast\"|\"gm\"|\"give\"|\"tp\"|\"spawn\"|\"kick\"|\"status\"|\"reload-scripts\", ...}}"
         )),
     };
     write_response(stream, response)
@@ -284,7 +300,23 @@ pub(crate) fn apply_operator_request(
         }
         OperatorRequest::Goto { player } => apply_goto(runtime, &player),
         OperatorRequest::Tome { player, scope } => apply_tome(runtime, &player, &scope),
+        OperatorRequest::ReloadScripts => apply_reload_scripts(runtime),
     }
+}
+
+fn apply_reload_scripts(runtime: &BridgeRuntime) -> OperatorResponse {
+    if runtime.config.script_routers.is_empty() {
+        return OperatorResponse::success(
+            "reload-scripts",
+            Some("routers=0 reloaded=0 failed=0".into()),
+        );
+    }
+    let mut parts = Vec::new();
+    for router in &runtime.config.script_routers {
+        let report = router.dispatcher.reload_file_callbacks();
+        parts.push(format!("{}:{}", router.family, report.summary()));
+    }
+    OperatorResponse::success("reload-scripts", Some(parts.join(" ")))
 }
 
 fn open_database(path: &Path) -> Result<EngineDatabase, String> {

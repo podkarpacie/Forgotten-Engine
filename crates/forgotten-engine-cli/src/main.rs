@@ -1184,7 +1184,7 @@ fn run_host(
         );
         if let Some(bridge_port) = native_game.operator_bridge_port() {
             println!(
-                "> Live operator bridge listening on 127.0.0.1:{bridge_port} (JSON-line: broadcast/gm/give/tp/spawn/kick/status)"
+                "> Live operator bridge listening on 127.0.0.1:{bridge_port} (JSON-line: broadcast/gm/give/tp/spawn/kick/status/reload-scripts)"
             );
         }
     }
@@ -1413,6 +1413,22 @@ fn command_line(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
                 return Ok(());
             }
             Err(format!("player `{player}` is not online on this machine's running world").into())
+        }
+        "reload-scripts" => {
+            if arguments.len() != 3 {
+                return Err("usage: command <directory> reload-scripts".into());
+            }
+            if let Some(response) = try_live_operator_command(
+                &directory,
+                &serde_json::json!({ "op": "reload-scripts" }),
+            )? {
+                println!("{response}");
+                return Ok(());
+            }
+            Err(format!(
+                "live script reload requires a running server (start `forgotten-engine run {directory:?}`)"
+            )
+            .into())
         }
         unsupported => Err(format!("unsupported command action `{unsupported}`").into()),
     }

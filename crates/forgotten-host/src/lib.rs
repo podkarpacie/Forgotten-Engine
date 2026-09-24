@@ -1065,10 +1065,27 @@ pub fn start_native_otclient_game_with_bridge(
     let thread_shutdown = Arc::clone(&shutdown);
     let thread_online_players = shared_world.online_players_counter();
     let bridge_port = if enable_operator_bridge {
+        // The bridge shares the live dispatcher objects (same `Arc`s the session configs
+        // hold), so `reload-scripts` swaps file sources under running sessions.
+        let mut script_routers = Vec::new();
+        for (family, dispatcher) in [
+            ("talkaction", &config.talkaction_dispatcher),
+            ("action", &config.action_dispatcher),
+            ("movement", &config.movement_dispatcher),
+            ("creature", &config.creature_dispatcher),
+        ] {
+            if let Some(dispatcher) = dispatcher {
+                script_routers.push(operator::ScriptRouterHandle {
+                    family,
+                    dispatcher: Arc::clone(dispatcher),
+                });
+            }
+        }
         let (port, _bridge_shutdown) =
             operator::start_operator_bridge(operator::OperatorBridgeConfig {
                 shared_world: shared_world.clone(),
                 database_path: database_path.clone(),
+                script_routers,
             })?;
         Some(port)
     } else {
@@ -19574,6 +19591,7 @@ mod gm_talkaction_tests {
         let (port, shutdown) = operator::start_operator_bridge(operator::OperatorBridgeConfig {
             shared_world: shared,
             database_path: path.clone(),
+            script_routers: Vec::new(),
         })
         .unwrap();
         let mut stream =
@@ -19589,6 +19607,63 @@ mod gm_talkaction_tests {
         assert!(line.contains("players-online=0"));
         shutdown.store(true, Ordering::SeqCst);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn operator_bridge_reloads_file_scripts_over_tcp() {
+        use forgotten_scripting::{SandboxedLuaCallbackInput, SandboxedLuaValue};
+        let path = database_path("bridge-reload");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("forgotten-engine-bridge-reload-{nonce}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("flag.lua"), "return function() return 1 end").unwrap();
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback_file("flag", &root, Path::new("flag.lua"))
+            .unwrap();
+        let dispatcher = Arc::new(dispatcher);
+        let shared = SharedNativeWorld::from_static_spawns(None).unwrap();
+        let (port, shutdown) = operator::start_operator_bridge(operator::OperatorBridgeConfig {
+            shared_world: shared,
+            database_path: path.clone(),
+            script_routers: vec![operator::ScriptRouterHandle {
+                family: "talkaction",
+                dispatcher: Arc::clone(&dispatcher),
+            }],
+        })
+        .unwrap();
+        // An edited file is picked up through the bridge, and the shared Arc serves the
+        // fresh source at once — no reconnect, no restart.
+        fs::write(root.join("flag.lua"), "return function() return 2 end").unwrap();
+        let mut stream =
+            std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        writeln!(stream, r#"{{"op":"reload-scripts"}}"#).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"ok\":true"));
+        assert!(line.contains("talkaction:reloaded=1"));
+        let input = SandboxedLuaCallbackInput {
+            event_kind: "talkaction".into(),
+            subject_id: 7,
+            value: 0,
+            argument: String::new(),
+            position: None,
+            storage: BTreeMap::new(),
+        };
+        assert_eq!(
+            dispatcher.dispatch("flag", &input).value,
+            Some(SandboxedLuaValue::Integer(2))
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&root);
     }
 }
 
