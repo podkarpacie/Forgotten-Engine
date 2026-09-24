@@ -8601,6 +8601,123 @@ mod tests {
     }
 
     #[test]
+    fn native_live_spawn_step_in_routes_through_a_wired_dispatcher() {
+        let database_path = database_path("native-live-spawn-step-in");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        drop(database);
+        let registry = parse_tfs_movements_xml(
+            br#"<movements><moveevent type="StepIn" itemid="2150" script="hole.lua"/></movements>"#,
+        )
+        .unwrap();
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "movement:stepin:0",
+                "return function() doCreatureSay('spawned') end",
+            )
+            .unwrap();
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.movement_dispatcher = Some(Arc::new(dispatcher));
+        native_config.movement_registry = Some(Arc::new(registry));
+        {
+            Arc::get_mut(native_config.world_map.as_mut().unwrap())
+                .unwrap()
+                .set_tile_items(
+                    Position {
+                        x: 100,
+                        y: 100,
+                        z: 7,
+                    },
+                    vec![WorldMapItem {
+                        server_id: 2150,
+                        client_thing_id: Some(2150),
+                        count: 1,
+                        action_id: None,
+                        unique_id: None,
+                        text: None,
+                        description: None,
+                        teleport_destination: None,
+                        duration: None,
+                        charges: None,
+                        children: Vec::new(),
+                    }],
+                )
+                .unwrap();
+        }
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
+        // Spawning onto the scripted tile fires StepIn with no movement at all.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut spawned = false;
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue;
+                }
+                Ok(frame) => {
+                    if String::from_utf8_lossy(&frame.0).contains("spawned") {
+                        spawned = true;
+                        break;
+                    }
+                }
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("native session ended during spawn probe: {error}"),
+            }
+        }
+        assert!(spawned, "spawn StepIn Say effect never arrived");
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn native_live_step_out_routes_through_a_wired_dispatcher() {
         let database_path = database_path("native-live-step-out");
         let database = EngineDatabase::open(&database_path).unwrap();

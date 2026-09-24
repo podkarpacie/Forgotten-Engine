@@ -459,6 +459,8 @@ pub(crate) fn handle_native_otclient_game(
     let mut talk_windows: VecDeque<Instant> = VecDeque::new();
     // Registered login scripts run once here, after bootstrap frames are out and
     // before the first loop pass, through the same intents as live actions.
+    // A spawn-tile StepIn follows on the final position (login scripts may have
+    // teleported), so relogging onto a scripted tile behaves like stepping on it.
     {
         let mut ctx = SessionContext {
             stream: &mut *stream,
@@ -477,6 +479,8 @@ pub(crate) fn handle_native_otclient_game(
             observed_vitals_epoch: &mut observed_vitals_epoch,
         };
         apply_native_login_scripts(&mut ctx)?;
+        let arrival = *ctx.player_position;
+        apply_native_step_in(&mut ctx, arrival)?;
     }
     loop {
         drain_shared_vip_presence(
