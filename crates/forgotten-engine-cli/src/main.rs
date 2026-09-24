@@ -1,6 +1,6 @@
 use forgotten_config::{
-    apply_legacy_item_metadata, ensure_content_skeleton, load, load_consumable_catalog,
-    load_declarative_npc_dialogue_catalog, load_declarative_shop_catalog,
+    apply_legacy_item_metadata, creature_callback_name, ensure_content_skeleton, load,
+    load_consumable_catalog, load_declarative_npc_dialogue_catalog, load_declarative_shop_catalog,
     load_declarative_spell_catalog, load_declarative_weapon_catalog, load_legacy_item_catalog,
     load_quest_catalog, load_tfs_action_registry, load_tfs_content_inventory,
     load_tfs_creaturescript_registry, load_tfs_entity_catalog, load_tfs_movement_registry,
@@ -12,8 +12,8 @@ use forgotten_config::{
     world_map_path, write_template, ConsumableCatalog, DeclarativeNpcDialogueCatalog,
     DeclarativeShopCatalog, DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig,
     LegacyPublicChannelCatalog, LegacyWorldCompanionData, QuestCatalog, TfsActionRegistry,
-    TfsEntityCatalog, TfsMoveEventRegistry, TfsMoveEventType, TfsRegistryCategory,
-    TfsVocationRegistry,
+    TfsCreatureScriptRegistry, TfsEntityCatalog, TfsMoveEventRegistry, TfsMoveEventType,
+    TfsRegistryCategory, TfsVocationRegistry,
 };
 use forgotten_core::{
     DeathLossPolicy, EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
@@ -104,6 +104,8 @@ struct IndependentNativeStartupContent {
     action_registry: Option<Arc<TfsActionRegistry>>,
     movement_dispatcher: Option<SandboxedLuaCallbackDispatcher>,
     movement_registry: Option<Arc<TfsMoveEventRegistry>>,
+    creature_dispatcher: Option<SandboxedLuaCallbackDispatcher>,
+    creature_registry: Option<Arc<TfsCreatureScriptRegistry>>,
     consumable_catalog: Option<ConsumableCatalog>,
     shop_catalog: Option<DeclarativeShopCatalog>,
     quest_catalog: QuestCatalog,
@@ -131,6 +133,7 @@ fn load_independent_native_startup_content(
             let talkaction_dispatcher = scope.spawn(|| build_talkaction_dispatcher(config));
             let action_dispatcher = scope.spawn(|| build_action_dispatcher(config));
             let movement_dispatcher = scope.spawn(|| build_movement_dispatcher(config));
+            let creature_dispatcher = scope.spawn(|| build_creature_dispatcher(config));
             let consumable_catalog = scope.spawn(|| load_consumable_catalog(config));
             let shop_catalog = scope.spawn(|| load_declarative_shop_catalog(config));
             let quest_catalog = scope.spawn(|| load_quest_catalog(config));
@@ -167,6 +170,10 @@ fn load_independent_native_startup_content(
                 .join()
                 .map_err(|_| "movement dispatcher worker panicked")??;
             let (movement_dispatcher, movement_registry) = movement_dispatcher;
+            let creature_dispatcher = creature_dispatcher
+                .join()
+                .map_err(|_| "creature dispatcher worker panicked")??;
+            let (creature_dispatcher, creature_registry) = creature_dispatcher;
             let consumable_catalog = consumable_catalog
                 .join()
                 .map_err(|_| "consumable catalog loader worker panicked")??;
@@ -189,6 +196,8 @@ fn load_independent_native_startup_content(
                 action_registry,
                 movement_dispatcher,
                 movement_registry,
+                creature_dispatcher,
+                creature_registry,
                 consumable_catalog,
                 shop_catalog,
                 quest_catalog,
@@ -286,6 +295,40 @@ fn build_movement_dispatcher(
             )
             .map_err(|error| {
                 format!("movement `{callback_name}` registration rejected: {error:?}")
+            })?;
+    }
+    if dispatcher.is_empty() {
+        return Ok((None, None));
+    }
+    Ok((Some(dispatcher), Some(Arc::new(registry))))
+}
+
+fn build_creature_dispatcher(
+    config: &EngineConfig,
+) -> Result<
+    (
+        Option<SandboxedLuaCallbackDispatcher>,
+        Option<Arc<TfsCreatureScriptRegistry>>,
+    ),
+    String,
+> {
+    let registry = load_tfs_creaturescript_registry(config).map_err(|error| error.to_string())?;
+    if registry.is_empty() {
+        return Ok((None, None));
+    }
+    let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+    for (index, entry) in registry.iter().enumerate() {
+        // Positional `creature:{index}` names in name-sorted registry order, derived
+        // from the same registry the host router resolves against.
+        let callback_name = creature_callback_name(index);
+        dispatcher
+            .register_callback_file(
+                callback_name.as_str(),
+                &config.content_directory.join("creaturescripts"),
+                &entry.script,
+            )
+            .map_err(|error| {
+                format!("creature `{callback_name}` registration rejected: {error:?}")
             })?;
     }
     if dispatcher.is_empty() {
@@ -830,6 +873,8 @@ fn run_host(
         let action_registry = startup_content.action_registry;
         let movement_dispatcher = startup_content.movement_dispatcher;
         let movement_registry = startup_content.movement_registry;
+        let creature_dispatcher = startup_content.creature_dispatcher;
+        let creature_registry = startup_content.creature_registry;
         let regeneration_rules = vocation_registry
             .as_ref()
             .map(|registry| {
@@ -1032,6 +1077,8 @@ fn run_host(
             action_registry,
             movement_dispatcher: movement_dispatcher.map(Arc::new),
             movement_registry,
+            creature_dispatcher: creature_dispatcher.map(Arc::new),
+            creature_registry,
             consumable_effects,
             shop_catalog: shop_catalog.map(Arc::new),
             quest_catalog: Some(Arc::new(quest_catalog)),

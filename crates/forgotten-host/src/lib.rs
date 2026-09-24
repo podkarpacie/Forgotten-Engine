@@ -10,6 +10,7 @@ mod actions;
 mod bank;
 mod consumables;
 mod container_views;
+mod creature_events;
 mod frames;
 mod gm_commands;
 mod heartbeat;
@@ -93,6 +94,7 @@ pub(crate) use container_views::{
     apply_native_close_container_action, apply_native_up_arrow_container_action,
     apply_native_update_container_action,
 };
+pub(crate) use creature_events::apply_native_login_scripts;
 pub(crate) use gm_commands::apply_native_gm_talkaction_talk;
 #[cfg(test)]
 pub(crate) use gm_commands::handle_native_gm_talkaction;
@@ -155,13 +157,16 @@ pub(crate) use trade::{
     apply_native_request_trade_action,
 };
 
-#[cfg(test)]
-use forgotten_config::{parse_tfs_actions_xml, parse_tfs_movements_xml};
 use forgotten_config::{
-    resolve_movement_callback, DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog,
-    DeclarativeSpellCatalog, DeclarativeWeaponCatalog, LegacyItemSlotType,
-    LegacyPublicChannelCatalog, QuestCatalog, TfsActionRegistry, TfsMoveEventRegistry,
-    TfsMoveEventType, WorldType,
+    creature_callback_name, resolve_creature_entries, resolve_movement_callback,
+    DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog, DeclarativeSpellCatalog,
+    DeclarativeWeaponCatalog, LegacyItemSlotType, LegacyPublicChannelCatalog, QuestCatalog,
+    TfsActionRegistry, TfsCreatureScriptRegistry, TfsMoveEventRegistry, TfsMoveEventType,
+    WorldType,
+};
+#[cfg(test)]
+use forgotten_config::{
+    parse_tfs_actions_xml, parse_tfs_creaturescripts_xml, parse_tfs_movements_xml,
 };
 use forgotten_core::{
     CardinalDirection, CombatAttackTiming, CombatDamageType, DeathLossPolicy, EmptyWorldManifest,
@@ -529,6 +534,15 @@ pub struct NativeOtClientHostConfig {
     /// resolves the same first-match entry the CLI `dispatch-movement` verb proves.
     /// `None` exactly when `movement_dispatcher` is `None`.
     pub movement_registry: Option<Arc<TfsMoveEventRegistry>>,
+    /// Optional pre-built sandboxed TFS creature dispatcher keyed by positional names
+    /// (`creature:{index}`). Session-lifecycle events (currently login) route every
+    /// matching entry through this dispatcher; same resource caps and intent-only
+    /// boundaries as the other families.
+    pub creature_dispatcher: Option<Arc<SandboxedLuaCallbackDispatcher>>,
+    /// The creature registry the dispatcher was built from, shared so live routing
+    /// resolves the same entries the CLI `dispatch-creaturescript` verb proves.
+    /// `None` exactly when `creature_dispatcher` is `None`.
+    pub creature_registry: Option<Arc<TfsCreatureScriptRegistry>>,
     /// Configured corpse despawn delay in authoritative world-tick seconds. `0` (the default)
     /// disables decay; a positive value expires each placed runtime corpse after the delay on a
     /// later heartbeat, removing it from the map and the durable registry together.
@@ -1255,6 +1269,8 @@ mod tests {
             action_registry: None,
             movement_dispatcher: None,
             movement_registry: None,
+            creature_dispatcher: None,
+            creature_registry: None,
             corpse_despawn_seconds: 0,
         }
     }
@@ -9005,6 +9021,105 @@ mod tests {
             }
         }
         assert!(shed, "live DeEquip Say effect never arrived");
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_live_login_scripts_route_through_a_wired_dispatcher() {
+        let database_path = database_path("native-live-login");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        drop(database);
+        let registry = parse_tfs_creaturescripts_xml(
+            br#"<creaturescripts><event type="login" name="FirstItems" script="login.lua"/><event type="login" name="Greeting" script="greet.lua"/></creaturescripts>"#,
+        )
+        .unwrap();
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "creature:0",
+                "return function() doCreatureSay('welcome') end",
+            )
+            .unwrap();
+        dispatcher
+            .register_callback("creature:1", "return function() doCreatureSay('again') end")
+            .unwrap();
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.creature_dispatcher = Some(Arc::new(dispatcher));
+        native_config.creature_registry = Some(Arc::new(registry));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
+        // Both login scripts run in registry order with no further client input.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut welcomed = false;
+        let mut greeted = false;
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue;
+                }
+                Ok(frame) => {
+                    let text = String::from_utf8_lossy(&frame.0);
+                    welcomed = welcomed || text.contains("welcome");
+                    greeted = greeted || text.contains("again");
+                    if welcomed && greeted {
+                        break;
+                    }
+                }
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("native session ended during login probe: {error}"),
+            }
+        }
+        assert!(welcomed, "live login Say effect never arrived");
+        assert!(greeted, "second live login Say effect never arrived");
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }

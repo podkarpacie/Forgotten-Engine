@@ -457,6 +457,27 @@ pub(crate) fn handle_native_otclient_game(
     let mut open_content_windows: BTreeMap<u8, (u8, usize)> = BTreeMap::new();
     let mut open_public_channel_ids = BTreeSet::new();
     let mut talk_windows: VecDeque<Instant> = VecDeque::new();
+    // Registered login scripts run once here, after bootstrap frames are out and
+    // before the first loop pass, through the same intents as live actions.
+    {
+        let mut ctx = SessionContext {
+            stream: &mut *stream,
+            peer,
+            character_id: character.id,
+            database: &mut database,
+            shared_world,
+            config,
+            world_map: &world_map,
+            snapshot: &snapshot,
+            facing: &mut facing,
+            player_position: &mut player_position,
+            active_click_walk: &mut active_click_walk,
+            observed_dead,
+            observed_visibility_epoch: &mut observed_visibility_epoch,
+            observed_vitals_epoch: &mut observed_vitals_epoch,
+        };
+        apply_native_login_scripts(&mut ctx)?;
+    }
     loop {
         drain_shared_vip_presence(
             stream,
