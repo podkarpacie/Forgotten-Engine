@@ -87,6 +87,43 @@ pub(crate) fn fire_native_kill_event(
     Ok(())
 }
 
+/// Routes all registered logout scripts for an orderly session end (client
+/// LeaveGame or operator kick, while the stream is still open). Same union, cap,
+/// and fail-open contract as login; effects still apply and persist, frames flush
+/// before the close. Abrupt disconnects skip logout routing: with no live stream
+/// there is nothing to answer and no orderly teardown to attach to.
+pub(crate) fn apply_native_logout_scripts(ctx: &mut SessionContext<'_>) -> Result<(), HostError> {
+    let position = *ctx.player_position;
+    let effects = dispatch_creature_event_effects(
+        ctx,
+        "logout",
+        ctx.character_id,
+        0,
+        String::new(),
+        position,
+    )?;
+    if effects.is_empty() {
+        return Ok(());
+    }
+    apply_native_action_effects(
+        ctx.config,
+        &mut *ctx.stream,
+        &mut *ctx.database,
+        ctx.shared_world,
+        ctx.character_id,
+        ctx.peer,
+        ctx.snapshot,
+        *ctx.facing,
+        &mut *ctx.player_position,
+        &mut *ctx.observed_visibility_epoch,
+        &mut *ctx.observed_vitals_epoch,
+        ctx.world_map,
+        effects,
+        "creature=logout outcome=logout-applied",
+    )?;
+    Ok(())
+}
+
 /// Shared creature-event resolve-dispatch-union core: runs every entry of one event
 /// type in registry order, concatenating Completed intents up to the shared
 /// per-dispatch effect bound. Failed scripts log and yield nothing; the union never

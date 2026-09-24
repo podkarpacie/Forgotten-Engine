@@ -94,7 +94,9 @@ pub(crate) use container_views::{
     apply_native_close_container_action, apply_native_up_arrow_container_action,
     apply_native_update_container_action,
 };
-pub(crate) use creature_events::{apply_native_login_scripts, fire_native_kill_event};
+pub(crate) use creature_events::{
+    apply_native_login_scripts, apply_native_logout_scripts, fire_native_kill_event,
+};
 pub(crate) use gm_commands::apply_native_gm_talkaction_talk;
 #[cfg(test)]
 pub(crate) use gm_commands::handle_native_gm_talkaction;
@@ -9367,6 +9369,107 @@ mod tests {
             }
         }
         assert!(slain, "live kill Say effect never arrived");
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_live_logout_scripts_route_through_a_wired_dispatcher() {
+        let database_path = database_path("native-live-logout");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        drop(database);
+        let registry = parse_tfs_creaturescripts_xml(
+            br#"<creaturescripts><event type="logout" name="Farewell" script="bye.lua"/></creaturescripts>"#,
+        )
+        .unwrap();
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback(
+                "creature:0",
+                "return function() doCreatureSay('farewell') end",
+            )
+            .unwrap();
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.creature_dispatcher = Some(Arc::new(dispatcher));
+        native_config.creature_registry = Some(Arc::new(registry));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
+        // LeaveGame closes the session; the logout Say must arrive first. The
+        // closed socket ends the read loop, which is expected, not a failure.
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_LEAVE_GAME]),
+        )
+        .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut farewell = false;
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue;
+                }
+                Ok(frame) => {
+                    if String::from_utf8_lossy(&frame.0).contains("farewell") {
+                        farewell = true;
+                        break;
+                    }
+                }
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("native session failed during logout probe: {error}"),
+            }
+        }
+        assert!(farewell, "live logout Say effect never arrived");
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }

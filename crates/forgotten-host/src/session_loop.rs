@@ -533,6 +533,26 @@ pub(crate) fn handle_native_otclient_game(
                 peer,
                 "lifecycle=kicked-by-operator",
             );
+            // Kicked sessions get logout routing too: the stream is still open.
+            {
+                let mut ctx = SessionContext {
+                    stream: &mut *stream,
+                    peer,
+                    character_id: character.id,
+                    database: &mut database,
+                    shared_world,
+                    config,
+                    world_map: &world_map,
+                    snapshot: &snapshot,
+                    facing: &mut facing,
+                    player_position: &mut player_position,
+                    active_click_walk: &mut active_click_walk,
+                    observed_dead,
+                    observed_visibility_epoch: &mut observed_visibility_epoch,
+                    observed_vitals_epoch: &mut observed_vitals_epoch,
+                };
+                apply_native_logout_scripts(&mut ctx)?;
+            }
             break;
         }
         // Trade window lifecycle: close this side's windows when a swap completed, the
@@ -2543,7 +2563,28 @@ pub(crate) fn handle_native_otclient_game(
                     )?;
                 }
             }
-            NativeOtClientGameAction::LeaveGame => break,
+            NativeOtClientGameAction::LeaveGame => {
+                // Registered logout scripts run while the stream is still open;
+                // their frames flush before the close below ends the session.
+                let mut ctx = SessionContext {
+                    stream: &mut *stream,
+                    peer,
+                    character_id: character.id,
+                    database: &mut database,
+                    shared_world,
+                    config,
+                    world_map: &world_map,
+                    snapshot: &snapshot,
+                    facing: &mut facing,
+                    player_position: &mut player_position,
+                    active_click_walk: &mut active_click_walk,
+                    observed_dead,
+                    observed_visibility_epoch: &mut observed_visibility_epoch,
+                    observed_vitals_epoch: &mut observed_vitals_epoch,
+                };
+                apply_native_logout_scripts(&mut ctx)?;
+                break;
+            }
             NativeOtClientGameAction::Stop => {
                 let cancelled_click_walk = active_click_walk.take().is_some();
                 native_diagnostic(
