@@ -2,6 +2,8 @@
 
 use std::net::SocketAddr;
 
+use forgotten_scripting::SandboxedLuaCallbackDispatchState;
+
 use super::NativeOtClientGameAction;
 pub(crate) fn native_diagnostic_record(
     enabled: bool,
@@ -15,6 +17,27 @@ pub(crate) fn native_diagnostic(enabled: bool, peer: SocketAddr, event: &str) {
     if let Some(record) = native_diagnostic_record(enabled, peer, event) {
         eprintln!("{record}");
     }
+}
+
+/// Builds the extended-diagnostics event for a script dispatch that strained its instruction
+/// budget (four-fifths of the cap or more, the same threshold as
+/// `SandboxedLuaCallbackDispatcher::strains_instruction_budget`), whether it completed or
+/// tripped the cap. Returns `None` for comfortable dispatches so quiet scripts stay quiet.
+/// Metadata only: family, callback name, state, and counters cross into the trace — never
+/// chat text, arguments, or source.
+pub(crate) fn script_budget_event(
+    family: &str,
+    callback_name: &str,
+    state: &SandboxedLuaCallbackDispatchState,
+    instruction_checks: u32,
+    max_instructions: u32,
+) -> Option<String> {
+    let strained = u64::from(instruction_checks) * 5 >= u64::from(max_instructions) * 4;
+    strained.then(|| {
+        format!(
+            "script=budget-strained family={family} callback={callback_name} state={state:?} instruction-checks={instruction_checks} max-instructions={max_instructions}"
+        )
+    })
 }
 
 /// Guild chat channel id on classic profiles: FE reserves 0x00F1 so it never collides with

@@ -483,6 +483,14 @@ impl SandboxedLuaCallbackDispatcher {
         self.limits
     }
 
+    /// Reports whether one dispatch burned four-fifths or more of this dispatcher's
+    /// instruction cap. Strained-but-completed scripts are the invisible case: they pass
+    /// today and trip tomorrow after an edit, so the host logs them under extended
+    /// diagnostics while quiet scripts stay quiet.
+    pub fn strains_instruction_budget(&self, instruction_checks: u32) -> bool {
+        u64::from(instruction_checks) * 5 >= u64::from(self.limits.max_instructions) * 4
+    }
+
     pub fn len(&self) -> usize {
         self.read_callbacks().len()
     }
@@ -2433,6 +2441,49 @@ mod tests {
             Some(SandboxedLuaValue::Integer(2))
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dispatcher_strain_predicate_flags_four_fifths_of_the_cap_and_above() {
+        let dispatcher = SandboxedLuaCallbackDispatcher::default();
+        let cap = dispatcher.limits().max_instructions;
+        assert!(!dispatcher.strains_instruction_budget(0));
+        assert!(!dispatcher.strains_instruction_budget(cap * 4 / 5 - 1));
+        assert!(dispatcher.strains_instruction_budget(cap * 4 / 5));
+        assert!(dispatcher.strains_instruction_budget(cap));
+        assert!(dispatcher.strains_instruction_budget(cap.saturating_mul(2)));
+    }
+
+    #[test]
+    fn callback_dispatcher_terminates_a_full_burst_of_runaway_scripts() {
+        // The whole registry spins forever; every dispatch must still terminate at the
+        // instruction cap instead of stalling the caller. States (not timings) are the
+        // assertion so this stays deterministic under load.
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        for index in 0..MAX_SANDBOXED_LUA_CALLBACKS {
+            dispatcher
+                .register_callback(
+                    format!("spin{index}"),
+                    "return function() while true do end end",
+                )
+                .unwrap();
+        }
+        let input = SandboxedLuaCallbackInput {
+            event_kind: "burst".into(),
+            subject_id: 7,
+            value: 0,
+            argument: String::new(),
+            position: None,
+            storage: BTreeMap::new(),
+        };
+        for index in 0..MAX_SANDBOXED_LUA_CALLBACKS {
+            let outcome = dispatcher.dispatch_api(&format!("spin{index}"), &input);
+            assert_eq!(
+                outcome.state,
+                SandboxedLuaCallbackDispatchState::InstructionLimitReached
+            );
+            assert!(dispatcher.strains_instruction_budget(outcome.instruction_checks));
+        }
     }
 
     #[test]

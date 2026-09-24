@@ -161,6 +161,15 @@ fn dispatch_creature_event_effects(
                 storage: storage.clone(),
             },
         );
+        if let Some(event) = script_budget_event(
+            "creature",
+            &callback_name,
+            &outcome.state,
+            outcome.instruction_checks,
+            dispatcher.limits().max_instructions,
+        ) {
+            native_diagnostic(ctx.config.extended_diagnostics, ctx.peer, &event);
+        }
         match outcome.state {
             SandboxedLuaCallbackDispatchState::Completed => {
                 effects.extend(outcome.effects);

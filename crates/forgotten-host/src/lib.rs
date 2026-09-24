@@ -115,7 +115,8 @@ pub(crate) use native_combat::*;
 #[cfg(test)]
 pub(crate) use native_diagnostics::native_diagnostic_record;
 pub(crate) use native_diagnostics::{
-    native_action_diagnostic_summary, native_diagnostic, NATIVE_GUILD_CHAT_CHANNEL_ID,
+    native_action_diagnostic_summary, native_diagnostic, script_budget_event,
+    NATIVE_GUILD_CHAT_CHANNEL_ID,
 };
 #[cfg(test)]
 pub(crate) use native_render::{
@@ -19215,11 +19216,46 @@ mod native_timing_tests {
 mod native_diagnostics_tests {
     use super::{
         native_action_diagnostic_summary, native_classic_viewport_contains,
-        native_diagnostic_record, NativeOtClientGameAction,
+        native_diagnostic_record, script_budget_event, NativeOtClientGameAction,
     };
     use forgotten_core::Position;
     use forgotten_protocol::NativeOtClientCardinalDirection;
+    use forgotten_scripting::SandboxedLuaCallbackDispatchState;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn budget_events_fire_only_for_strained_dispatches() {
+        assert!(script_budget_event(
+            "talkaction",
+            "/echo",
+            &SandboxedLuaCallbackDispatchState::Completed,
+            7999,
+            10_000,
+        )
+        .is_none());
+        assert_eq!(
+            script_budget_event(
+                "action",
+                "action:item:2148",
+                &SandboxedLuaCallbackDispatchState::Completed,
+                8000,
+                10_000,
+            )
+            .as_deref(),
+            Some("script=budget-strained family=action callback=action:item:2148 state=Completed instruction-checks=8000 max-instructions=10000")
+        );
+        assert_eq!(
+            script_budget_event(
+                "movement",
+                "movement:step-in:0",
+                &SandboxedLuaCallbackDispatchState::InstructionLimitReached,
+                10_001,
+                10_000,
+            )
+            .as_deref(),
+            Some("script=budget-strained family=movement callback=movement:step-in:0 state=InstructionLimitReached instruction-checks=10001 max-instructions=10000")
+        );
+    }
 
     #[test]
     fn diagnostic_records_are_strictly_opt_in() {

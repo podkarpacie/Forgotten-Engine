@@ -62,6 +62,15 @@ pub(crate) fn apply_native_action_use(
         return Ok(false);
     };
     let outcome = dispatcher.dispatch_api(&key, &input);
+    if let Some(event) = script_budget_event(
+        "action",
+        &key,
+        &outcome.state,
+        outcome.instruction_checks,
+        dispatcher.limits().max_instructions,
+    ) {
+        native_diagnostic(config.extended_diagnostics, peer, &event);
+    }
     match outcome.state {
         SandboxedLuaCallbackDispatchState::Completed => {
             apply_native_action_effects(

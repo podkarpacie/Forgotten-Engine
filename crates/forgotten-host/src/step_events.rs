@@ -73,6 +73,15 @@ pub(crate) fn fire_native_equip_event(
             storage: ctx.database.player_storage_snapshot(ctx.character_id)?,
         },
     );
+    if let Some(event) = script_budget_event(
+        "movement",
+        &callback_name,
+        &outcome.state,
+        outcome.instruction_checks,
+        dispatcher.limits().max_instructions,
+    ) {
+        native_diagnostic(ctx.config.extended_diagnostics, ctx.peer, &event);
+    }
     match outcome.state {
         SandboxedLuaCallbackDispatchState::Completed => {
             apply_native_action_effects(
@@ -150,6 +159,15 @@ pub(crate) fn fire_native_deequip_event(
             storage: ctx.database.player_storage_snapshot(ctx.character_id)?,
         },
     );
+    if let Some(event) = script_budget_event(
+        "movement",
+        &callback_name,
+        &outcome.state,
+        outcome.instruction_checks,
+        dispatcher.limits().max_instructions,
+    ) {
+        native_diagnostic(ctx.config.extended_diagnostics, ctx.peer, &event);
+    }
     match outcome.state {
         SandboxedLuaCallbackDispatchState::Completed => {
             apply_native_action_effects(
@@ -228,6 +246,15 @@ fn dispatch_native_step_event(
             storage: ctx.database.player_storage_snapshot(ctx.character_id)?,
         },
     );
+    if let Some(event) = script_budget_event(
+        "movement",
+        &callback_name,
+        &outcome.state,
+        outcome.instruction_checks,
+        dispatcher.limits().max_instructions,
+    ) {
+        native_diagnostic(ctx.config.extended_diagnostics, ctx.peer, &event);
+    }
     match outcome.state {
         SandboxedLuaCallbackDispatchState::Completed => {
             apply_native_action_effects(

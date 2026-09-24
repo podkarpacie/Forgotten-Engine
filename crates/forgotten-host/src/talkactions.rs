@@ -11,9 +11,11 @@ use forgotten_scripting::{
     SandboxedLuaEffect, SandboxedLuaPosition,
 };
 
-/// Dispatches one operator-registered talkaction word. Returns `Some(effects)` when the word is a
-/// registered callback (the effect list may be empty if the script requested none or failed a
-/// bound); returns `None` only for an unknown word so the caller can fall through to normal chat.
+/// Dispatches one operator-registered talkaction word. Returns `Some((effects, budget_event))`
+/// when the word is a registered callback (the effect list may be empty if the script requested
+/// none or failed a bound); returns `None` only for an unknown word so the caller can fall
+/// through to normal chat. The budget event is `Some` only for dispatches that strained the
+/// dispatcher's instruction budget; the caller emits it under extended diagnostics.
 /// The optional authoritative subject position is forwarded so scripts can read a
 /// `getThingPos`-style coordinate without any world access.
 pub(crate) fn dispatch_native_lua_talkaction(
@@ -22,7 +24,7 @@ pub(crate) fn dispatch_native_lua_talkaction(
     player_id: u64,
     position: Option<SandboxedLuaPosition>,
     storage: std::collections::BTreeMap<i64, i64>,
-) -> Option<Vec<SandboxedLuaEffect>> {
+) -> Option<(Vec<SandboxedLuaEffect>, Option<String>)> {
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return None;
@@ -44,7 +46,16 @@ pub(crate) fn dispatch_native_lua_talkaction(
     );
     match outcome.state {
         SandboxedLuaCallbackDispatchState::CallbackNotFound => None,
-        _ => Some(outcome.effects),
+        _ => {
+            let budget_event = script_budget_event(
+                "talkaction",
+                words,
+                &outcome.state,
+                outcome.instruction_checks,
+                dispatcher.limits().max_instructions,
+            );
+            Some((outcome.effects, budget_event))
+        }
     }
 }
 
@@ -72,7 +83,7 @@ pub(crate) fn apply_native_lua_talkaction(
         y: subject_position.y,
         z: subject_position.z,
     });
-    let Some(effects) = dispatch_native_lua_talkaction(
+    let Some((effects, budget_event)) = dispatch_native_lua_talkaction(
         dispatcher,
         &request.message,
         ctx.character_id,
@@ -81,6 +92,9 @@ pub(crate) fn apply_native_lua_talkaction(
     ) else {
         return Ok(SessionActionOutcome::Unhandled);
     };
+    if let Some(event) = budget_event {
+        native_diagnostic(ctx.config.extended_diagnostics, ctx.peer, &event);
+    }
     let mut teleported = false;
     for effect in effects {
         match effect {
@@ -240,6 +254,9 @@ mod tests {
         dispatcher
             .register_callback("/silent", "return function() return {} end")
             .unwrap();
+        dispatcher
+            .register_callback("/spin", "return function() while true do end end")
+            .unwrap();
 
         assert_eq!(
             dispatch_native_lua_talkaction(
@@ -249,15 +266,18 @@ mod tests {
                 None,
                 Default::default()
             ),
-            Some(vec![SandboxedLuaEffect::Say("100 100".into())])
+            Some((vec![SandboxedLuaEffect::Say("100 100".into())], None))
         );
         assert_eq!(
             dispatch_native_lua_talkaction(&dispatcher, "/goto", 7, None, Default::default()),
-            Some(vec![SandboxedLuaEffect::Teleport { x: 1, y: 2, z: 7 }])
+            Some((
+                vec![SandboxedLuaEffect::Teleport { x: 1, y: 2, z: 7 }],
+                None
+            ))
         );
         assert_eq!(
             dispatch_native_lua_talkaction(&dispatcher, "/silent", 7, None, Default::default()),
-            Some(vec![])
+            Some((vec![], None))
         );
         assert_eq!(
             dispatch_native_lua_talkaction(&dispatcher, "/missing", 7, None, Default::default()),
@@ -273,7 +293,15 @@ mod tests {
                 None,
                 Default::default()
             ),
-            Some(vec![])
+            Some((vec![], None))
         );
+        // A runaway script trips the cap and reports a budget event alongside its empty effects.
+        let spin =
+            dispatch_native_lua_talkaction(&dispatcher, "/spin", 7, None, Default::default())
+                .expect("registered word stays handled");
+        assert!(spin.0.is_empty());
+        let event = spin.1.expect("runaway dispatch strains the budget");
+        assert!(event.contains("script=budget-strained"));
+        assert!(event.contains("callback=/spin"));
     }
 }
