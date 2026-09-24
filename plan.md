@@ -196,13 +196,17 @@ temple → relog retains everything. All under stock OTCv8 7.4.
 
 *Goal: existing TFS servers migrate with minimal script rewrites.*
 
-#### 2.1 Sandboxed Lua Host — ~15%
+#### 2.1 Sandboxed Lua Host — ~65% (was ~15%)
 - [x] Vendored Lua VM, no stdlib, instruction/memory budgets, callback file registration with
       traversal rejection, primitive-only results
-- [ ] **Event dispatch surface (5%)** — creature events, talkactions, actions, movements,
-      globalevents registered from TFS XML registries *(est. 15 days)*
-- [ ] **TFS-compatible API subset (0%)** — `doCreatureSay`, `doPlayerAddItem`, `getThingPos`,
-      teleport, storage functions mapped onto typed core calls *(est. 20 days)*
+- [x] **Event dispatch surface, Option B bound-function model** — talkactions, actions
+      (+ranges), StepIn/StepOut/spawn-arrivals, Equip, DeEquip, login, static kill, PvP kill,
+      logout, all live with socket-level regressions (11 live scripting tests, 480 green)
+- [x] **TFS-compatible API subset, reads + writes** — `doCreatureSay`, `doPlayerAddItem`,
+      `getThingPos`-style position read, `doTeleportThing`, `doPlayerAddHealth/Mana`,
+      `doPlayerRemoveItem`, `doSendMagicEffect` (subject-session delivery)
+- [ ] **Storage functions** (`get/setPlayerStorageValue`) — needs a new storage subsystem +
+      migration *(est. 3 days)*
 - [ ] **Script hot-reload (0%)** — reload command with safe swap *(est. 4 days)*
 - [ ] **Perf guardrails (0%)** — budget enforcement under load, script timeouts don't stall world
       tick *(est. 4 days)*
@@ -218,6 +222,29 @@ temple → relog retains everything. All under stock OTCv8 7.4.
 > read remain as the proven safe core. Reason: drop-in TFS compatibility is core to the product
 > thesis, and every variant added before the rework is work the rework discards. Phase 2 time
 > estimates below are suspended pending the rework landing; they will be re-baselined after.
+>
+> **Re-baseline (2026-09-23, rework landed):** the dispatcher rework is done and
+> amortising as designed — twelve scripting increments since, each a registration
+> and/or router rather than an enum variant plus session-loop branch. Live families:
+> talkactions, actions (+ranges), StepIn/StepOut/spawn, Equip, DeEquip, login, static
+> kill, PvP kill, logout (11 live socket tests). Remaining surface, with settled
+> designs so future increments need no re-litigation:
+> - *Advance/death scripts* — deferred, needs design: no single level-up signal exists
+>   (XP lands via melee/party/admin paths) and death effects need victim-subject
+>   semantics (effects to a corpse-screen session, plus offline victims with no
+>   stream at all).
+> - *AddItem/RemoveItem events* — deferred, needs a recursion guard: script-granted
+>   items flow through the same grant/take functions, so naive hooks recurse
+>   (script gives item → AddItem fires → script gives item …). Firing must be
+>   limited to non-script sources with a silent flag through the shared functions.
+> - *Equip-slot strings* — deferred, needs evidence: parser accepts any bounded slot
+>   label, but the TFS slot-name ↔ equipment-slot table was never verified against a
+>   real distribution; matching stays item-only until it is.
+> - *Globalevents* — deferred, needs a timer home: startup/shutdown could run in
+>   `run_host`, but interval events need global (not per-session) tick infrastructure
+>   that does not exist yet.
+> - *Talkaction separators/case* — deferred, minor: custom separators and
+>   case-insensitive word matching.
 >
 > **Structural finding (2026-09-19, session_loop.rs):** the 4,988-line remainder is a SINGLE
 > function (`handle_native_otclient_game`), not a large file of small items. That is a different,

@@ -9492,9 +9492,7 @@ mod tests {
         let mut health_frames = 0usize;
         while started.elapsed() < Duration::from_secs(15) {
             match read_frame(&mut knight) {
-                Ok(frame)
-                    if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] =>
-                {
+                Ok(frame) if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
                     continue;
                 }
                 Ok(frame) => {
