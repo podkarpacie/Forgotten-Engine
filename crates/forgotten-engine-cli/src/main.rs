@@ -2083,6 +2083,83 @@ fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>
                 }
             }
         }
+        "storage" => {
+            if !(5..=7).contains(&arguments.len()) {
+                return Err(
+                    "usage: player storage <directory> <player-id> <get|set|count|list> [key] [value]"
+                        .into(),
+                );
+            }
+            let directory = required_path(arguments, 2)?;
+            let player_id = parse_player_id(arguments.get(3))?;
+            let storage_action = arguments
+                .get(4)
+                .map(String::as_str)
+                .ok_or("a player storage action is required")?;
+            let config = load(&directory)?;
+            let database = EngineDatabase::open(&config.database_path)?;
+            match storage_action {
+                "get" if arguments.len() == 6 => {
+                    let key = arguments
+                        .get(5)
+                        .ok_or("a storage key is required")?
+                        .parse::<i64>()
+                        .map_err(|_| "storage key must be a signed 64-bit integer")?;
+                    match database.player_storage_value(player_id, key)? {
+                        Some(value) => {
+                            println!("player storage player-id={player_id} key={key} value={value}")
+                        }
+                        None => {
+                            println!("player storage player-id={player_id} key={key} absent")
+                        }
+                    }
+                    Ok(())
+                }
+                "set" if arguments.len() == 7 => {
+                    let key = arguments
+                        .get(5)
+                        .ok_or("a storage key is required")?
+                        .parse::<i64>()
+                        .map_err(|_| "storage key must be a signed 64-bit integer")?;
+                    let value = arguments
+                        .get(6)
+                        .ok_or("a storage value is required")?
+                        .parse::<i64>()
+                        .map_err(|_| "storage value must be a signed 64-bit integer")?;
+                    database.set_player_storage_value(player_id, key, value)?;
+                    println!(
+                        "updated player storage player-id={player_id} key={key} value={value}"
+                    );
+                    Ok(())
+                }
+                "count" if arguments.len() == 5 => {
+                    let count = database.player_storage_value_count(player_id)?;
+                    println!("player storage player-id={player_id} count={count}");
+                    Ok(())
+                }
+                "list" if arguments.len() == 5 => {
+                    let snapshot = database.player_storage_snapshot(player_id)?;
+                    for (key, value) in &snapshot {
+                        println!("player storage player-id={player_id} key={key} value={value}");
+                    }
+                    println!(
+                        "player storage player-id={player_id} count={}",
+                        snapshot.len()
+                    );
+                    Ok(())
+                }
+                "get" => Err("usage: player storage <directory> <player-id> get <key>".into()),
+                "set" => {
+                    Err("usage: player storage <directory> <player-id> set <key> <value>".into())
+                }
+                "count" | "list" => {
+                    Err("usage: player storage <directory> <player-id> <count|list>".into())
+                }
+                unsupported => {
+                    Err(format!("unsupported player storage action `{unsupported}`").into())
+                }
+            }
+        }
         "respawn" => {
             if arguments.len() != 4 {
                 return Err("usage: player respawn <directory> <player-id>".into());
@@ -3678,6 +3755,107 @@ experienceStages = {
         ])
         .is_err());
         assert_eq!(database.player_bank_balance(1).unwrap(), 50);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn stable_cli_player_storage_commands_persist_bounded_values() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("forgotten-engine-player-storage-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        account_command(&[
+            "account".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "storage-account".into(),
+            "storage-password".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "create".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "Storer".into(),
+        ])
+        .unwrap();
+        for (key, value) in [("1000", "3"), ("1001", "-5")] {
+            player_command(&[
+                "player".into(),
+                "storage".into(),
+                directory.display().to_string(),
+                "1".into(),
+                "set".into(),
+                key.into(),
+                value.into(),
+            ])
+            .unwrap();
+        }
+        player_command(&[
+            "player".into(),
+            "storage".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "get".into(),
+            "1000".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "storage".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "count".into(),
+        ])
+        .unwrap();
+        player_command(&[
+            "player".into(),
+            "storage".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "list".into(),
+        ])
+        .unwrap();
+
+        let config = load(&directory).unwrap();
+        let database = EngineDatabase::open(&config.database_path).unwrap();
+        assert_eq!(database.player_storage_value(1, 1000).unwrap(), Some(3));
+        assert_eq!(database.player_storage_value(1, 1001).unwrap(), Some(-5));
+        assert_eq!(database.player_storage_value(1, 999).unwrap(), None);
+        assert_eq!(database.player_storage_value_count(1).unwrap(), 2);
+        assert!(player_command(&[
+            "player".into(),
+            "storage".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "set".into(),
+            "invalid".into(),
+            "3".into(),
+        ])
+        .is_err());
+        assert!(player_command(&[
+            "player".into(),
+            "storage".into(),
+            directory.display().to_string(),
+            "1".into(),
+            "get".into(),
+        ])
+        .is_err());
+        assert!(player_command(&[
+            "player".into(),
+            "storage".into(),
+            directory.display().to_string(),
+            "999".into(),
+            "get".into(),
+            "1000".into(),
+        ])
+        .is_err());
+        assert_eq!(database.player_storage_value_count(1).unwrap(), 2);
         let _ = fs::remove_dir_all(directory);
     }
 
