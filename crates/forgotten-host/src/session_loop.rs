@@ -899,6 +899,36 @@ pub(crate) fn handle_native_otclient_game(
                                 peer,
                                 "outbound=clear-target opcode=0xa3 fields=none reason=static-target-deactivated",
                             );
+                            // Registered kill scripts run after rewards settle, with the
+                            // victim id and name crossing as value and argument.
+                            {
+                                let victim_name = shared_world
+                                    .lock()
+                                    .ok()
+                                    .and_then(|world| {
+                                        world
+                                            .static_creature(outcome.target_id)
+                                            .map(|creature| creature.name.clone())
+                                    })
+                                    .unwrap_or_default();
+                                let mut ctx = SessionContext {
+                                    stream: &mut *stream,
+                                    peer,
+                                    character_id: character.id,
+                                    database: &mut database,
+                                    shared_world,
+                                    config,
+                                    world_map: &world_map,
+                                    snapshot: &snapshot,
+                                    facing: &mut facing,
+                                    player_position: &mut player_position,
+                                    active_click_walk: &mut active_click_walk,
+                                    observed_dead,
+                                    observed_visibility_epoch: &mut observed_visibility_epoch,
+                                    observed_vitals_epoch: &mut observed_vitals_epoch,
+                                };
+                                fire_native_kill_event(&mut ctx, outcome.target_id, &victim_name)?;
+                            }
                         }
                         let health_update = encode_native_otclient_creature_health(
                             &config.client_profile,

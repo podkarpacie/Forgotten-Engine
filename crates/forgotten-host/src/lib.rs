@@ -94,7 +94,7 @@ pub(crate) use container_views::{
     apply_native_close_container_action, apply_native_up_arrow_container_action,
     apply_native_update_container_action,
 };
-pub(crate) use creature_events::apply_native_login_scripts;
+pub(crate) use creature_events::{apply_native_login_scripts, fire_native_kill_event};
 pub(crate) use gm_commands::apply_native_gm_talkaction_talk;
 #[cfg(test)]
 pub(crate) use gm_commands::handle_native_gm_talkaction;
@@ -9237,6 +9237,136 @@ mod tests {
         }
         assert!(welcomed, "live login Say effect never arrived");
         assert!(greeted, "second live login Say effect never arrived");
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_live_kill_routes_through_a_wired_dispatcher() {
+        let database_path = database_path("native-live-kill");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        drop(database);
+        let creature_id = forgotten_protocol::NATIVE_OTCLIENT_PLAYER_ID_END + 1;
+        let registry = parse_tfs_creaturescripts_xml(
+            br#"<creaturescripts><event type="kill" name="RatSlain" script="slain.lua"/></creaturescripts>"#,
+        )
+        .unwrap();
+        let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+        dispatcher
+            .register_callback("creature:0", "return function() doCreatureSay('slain') end")
+            .unwrap();
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.creature_dispatcher = Some(Arc::new(dispatcher));
+        native_config.creature_registry = Some(Arc::new(registry));
+        native_config.static_creature_wander_policy =
+            forgotten_core::StaticCreatureDecisionPolicy::Disabled;
+        native_config.static_creature_wander_every_ticks = 0;
+        native_config.static_spawns = Some(Arc::new(
+            FeTfsStaticSpawnCollection::with_combat_metadata_and_npc_ids(
+                vec![forgotten_core::FeTfsStaticEntity {
+                    id: creature_id,
+                    name: "Rat".into(),
+                    name_description: String::new(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    look_type: 21,
+                    head: 0,
+                    body: 0,
+                    legs: 0,
+                    feet: 0,
+                    addons: 0,
+                    speed: 134,
+                    health_percent: 10,
+                    direction: 2,
+                }],
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+            )
+            .unwrap(),
+        ));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+        let bootstrap_health = read_data_frame(&mut stream);
+        assert_eq!(
+            bootstrap_health.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH
+        );
+
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
+        // Target the rat, then idle through heartbeat melee ticks until it dies.
+        let mut select = vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_SELECT_TARGET];
+        select.extend_from_slice(&creature_id.to_le_bytes());
+        write_frame(&mut stream, &Frame(select)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(8)))
+            .unwrap();
+        let mut slain = false;
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue;
+                }
+                Ok(frame) => {
+                    if String::from_utf8_lossy(&frame.0).contains("slain") {
+                        slain = true;
+                        break;
+                    }
+                }
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("native session ended during kill probe: {error}"),
+            }
+        }
+        assert!(slain, "live kill Say effect never arrived");
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
     }
