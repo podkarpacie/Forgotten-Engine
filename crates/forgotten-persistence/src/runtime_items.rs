@@ -840,6 +840,17 @@ impl EngineDatabase {
                 params![SCHEMA_VERSION_CONDITION_SPEED, unix_seconds()],
             )?;
         }
+        if self.schema_version()? < SCHEMA_VERSION_SCRIPT_STORAGE {
+            // Script storage values (plan Phase 2): per-player signed key/value jail for
+            // sandboxed Lua scripts; absent keys simply have no row.
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS player_storage_values (player_id INTEGER NOT NULL REFERENCES players(id), storage_key INTEGER NOT NULL, storage_value INTEGER NOT NULL, PRIMARY KEY (player_id, storage_key));",
+            )?;
+            self.connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_SCRIPT_STORAGE, unix_seconds()],
+            )?;
+        }
         Ok(())
     }
 

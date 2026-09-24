@@ -55,6 +55,9 @@ const SCHEMA_VERSION_ACCOUNT_BANS: i64 = 34;
 const SCHEMA_VERSION_PLAYER_FROZEN: i64 = 35;
 /// Timed speed condition (haste, plan v49 slice 12): per-kind payload column on conditions.
 const SCHEMA_VERSION_CONDITION_SPEED: i64 = 36;
+/// Script storage values (plan Phase 2, TFS set/getPlayerStorageValue): per-player
+/// signed key/value jail for sandboxed Lua scripts.
+const SCHEMA_VERSION_SCRIPT_STORAGE: i64 = 37;
 // Guild module extracted
 mod bank;
 mod guilds;
@@ -63,8 +66,9 @@ mod moderation;
 mod player_storage;
 mod progression_state;
 mod runtime_items;
+mod script_storage;
 mod vips;
-pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_CONDITION_SPEED;
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION_SCRIPT_STORAGE;
 /// Classic blessing count ceiling; the audited default death-loss reduction consumes this.
 pub const MAX_PLAYER_BLESSINGS: u8 = 5;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -88,6 +92,9 @@ pub const MAX_PLAYER_DEPOT_TOP_LEVEL_ITEMS: usize = 1_000;
 pub const MAX_PLAYER_INBOX_TOP_LEVEL_ITEMS: usize = 30;
 pub const MAX_HOUSE_ACCESS_LISTS_PER_HOUSE: usize = 64;
 pub const MAX_HOUSE_ACCESS_LIST_TEXT_BYTES: usize = 8_192;
+/// Per-player script storage entries before the count gate rejects writes. Quest
+/// scripts use dozens of keys; the bound only bites runaway per-tick writers.
+pub const MAX_PLAYER_STORAGE_VALUES: usize = 1_024;
 
 /// Validates one complete runtime tile-item registry before any durable write. Bounds, nonzero
 /// identities, unique ordered positions, and signed-integer-safe despawn ticks are enforced here
@@ -2511,6 +2518,7 @@ pub enum PersistenceError {
     InvalidInboxRecord(String),
     InvalidHouseOwnershipRecord(String),
     InvalidHouseAccessListRecord(String),
+    InvalidStorageRecord(String),
     UnknownAccount(u32),
     UnknownPlayer(u64),
     UnknownGuild(u64),
