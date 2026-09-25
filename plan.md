@@ -205,11 +205,9 @@ temple → relog retains everything. All under stock OTCv8 7.4.
 - [x] **TFS-compatible API subset, reads + writes** — `doCreatureSay`, `doPlayerAddItem`,
       `getThingPos`-style position read, `doTeleportThing`, `doPlayerAddHealth/Mana`,
       `doPlayerRemoveItem`, `doSendMagicEffect` (subject-session delivery)
-- [ ] **Storage functions** (`get/setPlayerStorageValue`) — needs a new storage subsystem +
-      migration *(est. 3 days)*
-- [ ] **Script hot-reload (0%)** — reload command with safe swap *(est. 4 days)*
-- [ ] **Perf guardrails (0%)** — budget enforcement under load, script timeouts don't stall world
-      tick *(est. 4 days)*
+- [x] **Storage functions** (`get/setPlayerStorageValue`) — landed 2026-09: schema v37 `player_storage_values` subsystem with per-dispatch snapshot hydration, subject-locked bound functions, silent `SetStorage` persistence, and `player storage` CLI verbs.
+- [x] **Script hot-reload** — landed 2026-09: file-backed callbacks re-read in place through a `reload-scripts` operator-bridge op; unreadable files keep serving with per-name reporting.
+- [x] **Perf guardrails** — landed 2026-09: enforcement was already complete (fresh VM, memory cap, instruction hook); added budget visibility (`strains_instruction_budget` + `script=budget-strained` diagnostics at all six dispatch sites) and a burst-termination proof.
 
 > **Architectural decision (2026-09-19, Option B — bound-function API, decided by operator):**
 > the closed typed-intent enum (`SandboxedLuaEffect`) does not amortise — every TFS function
