@@ -336,7 +336,7 @@ pub(crate) struct ThrowItemRuntimePickupFollow<'a> {
 /// or when no weight catalog is configured (ungated behavior preserved); unmapped
 /// items weigh zero per `carried_inventory_weight`, so only provably overweight
 /// intakes refuse, never unknown ones.
-fn check_native_carry_capacity(
+pub(crate) fn check_native_carry_capacity(
     shared_world: &SharedNativeWorld,
     character_id: u64,
     incoming: &[(u16, u16)],

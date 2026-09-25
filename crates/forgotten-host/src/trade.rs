@@ -444,6 +444,7 @@ pub(crate) fn apply_native_npc_buy_action(
             .shop_catalog
             .as_deref()
             .unwrap_or(&DeclarativeShopCatalog::default()),
+        ctx.config.item_weight_by_server_id.as_deref(),
     )?;
     let (reply, traded_npc_name) = match message {
         Some(outcome) => (outcome.reply, outcome.traded_npc_name),
@@ -490,6 +491,7 @@ pub(crate) fn apply_native_npc_sell_action(
             .shop_catalog
             .as_deref()
             .unwrap_or(&DeclarativeShopCatalog::default()),
+        ctx.config.item_weight_by_server_id.as_deref(),
     )?;
     let (reply, traded_npc_name) = match message {
         Some(outcome) => (outcome.reply, outcome.traded_npc_name),

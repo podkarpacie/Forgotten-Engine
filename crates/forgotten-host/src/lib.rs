@@ -149,12 +149,12 @@ pub(crate) use throw_item::{
     apply_native_throw_item_container_to_container, apply_native_throw_item_container_to_equipment,
     apply_native_throw_item_corpse_take, apply_native_throw_item_equipment_source,
     apply_native_throw_item_ground_drop, apply_native_throw_item_map_source,
-    apply_native_throw_item_runtime_pickup, decode_throw_item_addresses, ThrowItemAddresses,
-    ThrowItemContainerToContainerRequest, ThrowItemContainerToEquipmentRequest,
-    ThrowItemCorpseTakeFollow, ThrowItemCorpseTakeRequest, ThrowItemCorpseWindows,
-    ThrowItemEquipmentSourceRequest, ThrowItemGroundDropFollow, ThrowItemGroundDropRequest,
-    ThrowItemMapSourceFollow, ThrowItemMapSourceRequest, ThrowItemRuntimePickupFollow,
-    ThrowItemRuntimePickupRequest,
+    apply_native_throw_item_runtime_pickup, check_native_carry_capacity,
+    decode_throw_item_addresses, ThrowItemAddresses, ThrowItemContainerToContainerRequest,
+    ThrowItemContainerToEquipmentRequest, ThrowItemCorpseTakeFollow, ThrowItemCorpseTakeRequest,
+    ThrowItemCorpseWindows, ThrowItemEquipmentSourceRequest, ThrowItemGroundDropFollow,
+    ThrowItemGroundDropRequest, ThrowItemMapSourceFollow, ThrowItemMapSourceRequest,
+    ThrowItemRuntimePickupFollow, ThrowItemRuntimePickupRequest,
 };
 pub(crate) use trade::{
     apply_native_accept_trade_action, apply_native_npc_buy_action, apply_native_npc_sell_action,
@@ -10239,6 +10239,159 @@ mod tests {
             .items
             .iter()
             .any(|item| item.server_id == 2666 && item.count == 1));
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_shop_buy_refuses_overweight_intake_without_mutation() {
+        let database_path = database_path("native-shop-overweight-buy");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        database.set_player_bank_balance(1, 500).unwrap();
+        let mut containers = PlayerContainers::default();
+        containers
+            .insert(
+                forgotten_core::PlayerContainer::new(
+                    2,
+                    ItemInstance::new(1988, 1).unwrap(),
+                    "Bag",
+                    false,
+                    20,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        database.replace_player_containers(1, &containers).unwrap();
+
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        native_config.static_creature_wander_policy =
+            forgotten_core::StaticCreatureDecisionPolicy::Disabled;
+        native_config.static_creature_wander_every_ticks = 0;
+        native_config.static_spawns = Some(Arc::new(
+            FeTfsStaticSpawnCollection::with_combat_metadata_and_npc_ids(
+                vec![forgotten_core::FeTfsStaticEntity {
+                    id: NATIVE_OTCLIENT_PLAYER_ID_END + 3,
+                    name: "Trader".into(),
+                    name_description: String::new(),
+                    position: Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    look_type: 128,
+                    head: 0,
+                    body: 0,
+                    legs: 0,
+                    feet: 0,
+                    addons: 0,
+                    speed: 134,
+                    health_percent: 100,
+                    direction: 2,
+                }],
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::from([NATIVE_OTCLIENT_PLAYER_ID_END + 3]),
+            )
+            .unwrap(),
+        ));
+        let shop_catalog = parse_declarative_shops_xml(
+            br#"<fe-shops><fe-shop npc="Trader"><fe-item id="2666" buy="75"/></fe-shop></fe-shops>"#,
+        )
+        .unwrap();
+        native_config.shop_catalog = Some(Arc::new(shop_catalog));
+        // One unit outweighs any vitals capacity; the affordable buy must refuse.
+        native_config.item_weight_by_server_id =
+            Some(Arc::new(BTreeMap::from([(2666, 1_000_000)])));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+        read_data_frame(&mut stream);
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                0x96, 1, 10, 0, b'b', b'u', b'y', b' ', b'2', b'6', b'6', b'6', b' ', b'1',
+            ]),
+        )
+        .unwrap();
+        let reply = read_data_frame(&mut stream);
+        assert!(String::from_utf8_lossy(&reply.0).contains("cannot carry"));
+        // No goods refresh follows a refused trade; heartbeat pings are skipped.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue;
+                }
+                Ok(frame) => {
+                    if frame.0.first()
+                        == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_GOODS)
+                    {
+                        panic!("player goods refreshed after a refused buy");
+                    }
+                }
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("native session ended during shop probe: {error}"),
+            }
+        }
+
+        drop(stream);
+        game.shutdown().unwrap();
+        let database = EngineDatabase::open(&database_path).unwrap();
+        assert_eq!(database.player_bank_balance(1).unwrap(), 500);
+        assert!(database
+            .player_containers(1)
+            .unwrap()
+            .container(2)
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| item.server_id != 2666));
         let _ = fs::remove_file(database_path);
     }
 

@@ -441,6 +441,7 @@ pub(crate) fn handle_native_shop_keyword(
     player_id: u64,
     message: &str,
     shop_catalog: &DeclarativeShopCatalog,
+    weights: Option<&BTreeMap<u16, u32>>,
 ) -> Result<Option<ShopKeywordOutcome>, HostError> {
     let normalized = message.trim().to_ascii_lowercase();
     let mut parts = normalized.split_whitespace();
@@ -528,6 +529,16 @@ pub(crate) fn handle_native_shop_keyword(
                     "You need a container with free space to buy.",
                 )));
             }
+        }
+        // Carry-capacity gate: the staged intake must fit the vitals capacity.
+        // Sells only lighten the load, so the sell path below needs no gate.
+        if let Some(refusal) = check_native_carry_capacity(
+            shared_world,
+            player_id,
+            &[(server_id, count.min(u64::from(u16::MAX)) as u16)],
+            weights,
+        )? {
+            return Ok(Some(ShopKeywordOutcome::reply(refusal)));
         }
         database.replace_player_inventory_and_bank_balance(
             player_id,
@@ -654,6 +665,7 @@ pub(crate) fn apply_native_shop_keyword_talk(
         ctx.character_id,
         &request.message,
         shop_catalog,
+        ctx.config.item_weight_by_server_id.as_deref(),
     )?
     else {
         return Ok(SessionActionOutcome::Unhandled);
