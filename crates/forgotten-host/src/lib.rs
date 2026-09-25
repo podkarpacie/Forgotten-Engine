@@ -3885,6 +3885,142 @@ mod tests {
     }
 
     #[test]
+    fn native_use_item_opens_a_depot_window_for_a_depot_named_map_item() {
+        let database_path = database_path("native-depot-window");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        drop(database);
+
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        // A depot locker beside the spawn tile; identification is name-based against
+        // the operator's own imported item names, so no item-id convention is needed.
+        let depot_position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        {
+            Arc::get_mut(native_config.world_map.as_mut().unwrap())
+                .unwrap()
+                .set_tile_items(
+                    depot_position,
+                    vec![WorldMapItem {
+                        server_id: 2594,
+                        client_thing_id: Some(2594),
+                        count: 1,
+                        action_id: None,
+                        unique_id: None,
+                        text: None,
+                        description: None,
+                        teleport_destination: None,
+                        duration: None,
+                        charges: None,
+                        children: Vec::new(),
+                    }],
+                )
+                .unwrap();
+        }
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                2594,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 2594,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        native_config.item_presentation_catalog = Some(Arc::new(catalog));
+        native_config.item_name_by_server_id = Some(Arc::new(BTreeMap::from([(
+            2594_u16,
+            "depot locker".to_string(),
+        )])));
+
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let initialization = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            initialization.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+
+        // Use the depot locker at stack index 0 on the adjacent tile.
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_USE_ITEM,
+                101,
+                0,
+                100,
+                0,
+                7,
+                0x22,
+                0x0a,
+                0,
+                0,
+            ]),
+        )
+        .unwrap();
+        // Empty home-town depot: dedicated window id, "Depot" name, full capacity,
+        // no parent, zero items.
+        let expected_window = vec![
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER,
+            0xdf,
+            1,
+            0,
+            5,
+            0,
+            b'D',
+            b'e',
+            b'p',
+            b'o',
+            b't',
+            255,
+            0,
+            0,
+        ];
+        assert_eq!(read_data_frame(&mut stream).0, expected_window);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn native_game_startup_rematerializes_persisted_corpses_into_the_initial_viewport() {
         let database_path = database_path("native-corpse-restart");
         let mut database = EngineDatabase::open(&database_path).unwrap();

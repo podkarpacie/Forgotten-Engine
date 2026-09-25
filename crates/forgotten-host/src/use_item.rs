@@ -3,6 +3,7 @@
 //! text, validated generic use). Each handler consumes its record on match and falls through
 //! otherwise, preserving the session loop's sequential routing order.
 
+use super::npc_shop::handle_native_depot_open;
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -324,6 +325,34 @@ pub(crate) fn apply_native_map_item_use_action(
                     outcome.unique_id,
                 )? {
                     return Ok(());
+                }
+            }
+            // Depot boxes open the player's home-town depot window. Identification is
+            // name-based against the operator's own imported item names (any map item
+            // whose display name contains "depot"), so no new item-id convention or
+            // config surface is needed; without a names map this step is skipped.
+            // Action scripts above keep precedence: a scripted depot box runs its
+            // script instead of opening the window.
+            if let Some(names) = ctx.config.item_name_by_server_id.as_deref() {
+                if let Some(name) = names.get(&outcome.server_id) {
+                    if name.to_ascii_lowercase().contains("depot") {
+                        handle_native_depot_open(
+                            &mut *ctx.stream,
+                            &ctx.config.client_profile,
+                            &*ctx.database,
+                            ctx.character_id,
+                            ctx.config.item_presentation_catalog.as_deref(),
+                        )?;
+                        native_diagnostic(
+                            ctx.config.extended_diagnostics,
+                            ctx.peer,
+                            &format!(
+                                "action=use-item outcome=depot-window-opened server-id={} index={index}",
+                                outcome.server_id,
+                            ),
+                        );
+                        return Ok(());
+                    }
                 }
             }
             if let Some(destination) = outcome.teleport_destination {

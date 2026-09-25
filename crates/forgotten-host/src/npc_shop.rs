@@ -73,7 +73,6 @@ pub(crate) fn complete_native_player_quest(
 /// hydrated from SQLite. Window ids for depots live in a dedicated high range so they never
 /// collide with owned-container or corpse windows. Item movement out of depots remains a
 /// deferred slice; this opens the window and shows contents.
-#[allow(dead_code)] // staged depot-window slice (plan 1.2); not yet routed from UseItem
 pub fn handle_native_depot_open(
     stream: &mut TcpStream,
     profile: &NativeOtClientProfile,
