@@ -16422,15 +16422,41 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         let mut death_records = 0;
-        // The bootstrap burst now carries permanent daylight ahead of the death
-        // record, so four reads cover the same window the old three did.
-        for _ in 0..4 {
+        // The bootstrap burst length varies under parallel load (daylight, vitals, and
+        // heartbeat frames can all precede the death record), so read until the first
+        // death record instead of a fixed window.
+        for _ in 0..32 {
             let frame = read_frame(&mut stream).unwrap();
             if frame.0 == vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_DEATH] {
                 death_records += 1;
+                break;
             }
         }
         assert_eq!(death_records, 1);
+        // No second death record follows on a short drain: the transition emits once.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) => {
+                    assert_ne!(
+                        frame.0,
+                        vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_DEATH],
+                        "duplicate death record"
+                    );
+                }
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("native session ended during death probe: {error}"),
+            }
+        }
 
         game.shutdown().unwrap();
         let reloaded = EngineDatabase::open(&database_path).unwrap();
