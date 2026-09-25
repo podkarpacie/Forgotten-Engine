@@ -2427,15 +2427,9 @@ pub(crate) fn handle_native_otclient_game(
             }
             NativeOtClientGameAction::Talk(request) => {
                 // Bounded fixed-window flood control over every routed talk record. Suppressed
-                // messages emit no client feedback and never reach the shared chat queue.
-                let now = Instant::now();
-                while talk_windows
-                    .front()
-                    .is_some_and(|sent| now.saturating_duration_since(*sent) >= CHAT_FLOOD_WINDOW)
-                {
-                    talk_windows.pop_front();
-                }
-                if talk_windows.len() >= CHAT_FLOOD_MAX_MESSAGES_PER_WINDOW {
+                // messages emit no client feedback and never reach the shared chat queue; the
+                // window check lives in talk_gates.rs.
+                if check_native_talk_flood(&mut talk_windows, Instant::now()) {
                     native_diagnostic(
                         config.extended_diagnostics,
                         peer,
@@ -2443,25 +2437,19 @@ pub(crate) fn handle_native_otclient_game(
                     );
                     continue;
                 }
-                talk_windows.push_back(now);
                 // Plan v49 slice 17: muted accounts cannot route talk records. GMs are exempt
-                // through their persisted tier so moderation stays possible while muted.
-                let speaker_gm_level = database
-                    .player_gm_level(character.id)
-                    .map_err(HostError::Persistence)?;
-                if speaker_gm_level == 0 {
-                    if let Some(remaining) = database
-                        .account_mute_remaining_seconds(account_id)
-                        .map_err(HostError::Persistence)?
-                    {
-                        let muted_notice = encode_native_otclient_status_message(
-                            &config.client_profile,
-                            &format!("You are muted for {remaining} more seconds."),
-                        )
-                        .map_err(HostError::Protocol)?;
-                        write_frame(stream, &muted_notice)?;
-                        continue;
-                    }
+                // through their persisted tier so moderation stays possible while muted; the
+                // mute read lives in talk_gates.rs.
+                if let Some(remaining) =
+                    check_native_account_mute(&database, character.id, account_id)?
+                {
+                    let muted_notice = encode_native_otclient_status_message(
+                        &config.client_profile,
+                        &format!("You are muted for {remaining} more seconds."),
+                    )
+                    .map_err(HostError::Protocol)?;
+                    write_frame(stream, &muted_notice)?;
+                    continue;
                 }
                 // Gamemaster talkactions run before every other keyword router; see
                 // gm_commands.rs. A handled verb consumes the record.

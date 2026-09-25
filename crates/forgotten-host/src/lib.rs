@@ -50,6 +50,7 @@ mod session_serve;
 mod shared_native_map;
 mod static_creature;
 mod step_events;
+mod talk_gates;
 mod talkactions;
 mod throw_item;
 mod trade;
@@ -142,6 +143,7 @@ pub(crate) use static_creature::{
 pub(crate) use step_events::{
     apply_native_step_in, apply_native_step_out, fire_native_deequip_event, fire_native_equip_event,
 };
+pub(crate) use talk_gates::{check_native_account_mute, check_native_talk_flood};
 pub(crate) use talkactions::apply_native_lua_talkaction;
 pub(crate) use throw_item::{
     apply_native_throw_item_container_to_container, apply_native_throw_item_container_to_equipment,
