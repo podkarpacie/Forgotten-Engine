@@ -162,10 +162,10 @@ pub(crate) use trade::{
 
 use forgotten_config::{
     creature_callback_name, resolve_creature_entries, resolve_movement_callback,
-    DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog, DeclarativeSpellCatalog,
-    DeclarativeWeaponCatalog, LegacyItemSlotType, LegacyPublicChannelCatalog, QuestCatalog,
-    TfsActionRegistry, TfsCreatureScriptRegistry, TfsMoveEventRegistry, TfsMoveEventType,
-    WorldType,
+    DeclarativeNpcDialogueCatalog, DeclarativeNpcShop, DeclarativeShopCatalog,
+    DeclarativeSpellCatalog, DeclarativeWeaponCatalog, LegacyItemSlotType,
+    LegacyPublicChannelCatalog, QuestCatalog, TfsActionRegistry, TfsCreatureScriptRegistry,
+    TfsMoveEventRegistry, TfsMoveEventType, WorldType,
 };
 #[cfg(test)]
 use forgotten_config::{
@@ -10082,6 +10082,19 @@ mod tests {
         )
         .unwrap();
         native_config.shop_catalog = Some(Arc::new(shop_catalog));
+        let mut presentation = NativeItemPresentationCatalog::default();
+        for server_id in [3294, 2666] {
+            presentation
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id: server_id,
+                        requires_classic_740_subtype: false,
+                    },
+                )
+                .unwrap();
+        }
+        native_config.item_presentation_catalog = Some(Arc::new(presentation));
         let game = start_native_otclient_game(native_config, &database_path).unwrap();
         let mut stream = TcpStream::connect(game.local_addr()).unwrap();
         write_frame(
@@ -10118,18 +10131,110 @@ mod tests {
         .unwrap();
         let reply = read_data_frame(&mut stream);
         assert!(String::from_utf8_lossy(&reply.0).contains("You sold"));
+        // The completed sale refreshes player goods behind the open window: 900 gold
+        // (500 + 2 x 200) with no sellable stock left (heartbeat pings skipped).
+        let goods = loop {
+            let frame = read_data_frame(&mut stream);
+            if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] {
+                continue;
+            }
+            break frame;
+        };
+        assert_eq!(
+            goods.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_GOODS,
+                132,
+                3,
+                0,
+                0,
+                0,
+            ]
+        );
+
+        // Buy one 2666 for 75 gold: the goods window follows the new balance too.
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                0x96, 1, 10, 0, b'b', b'u', b'y', b' ', b'2', b'6', b'6', b'6', b' ', b'1',
+            ]),
+        )
+        .unwrap();
+        let reply = read_data_frame(&mut stream);
+        assert!(String::from_utf8_lossy(&reply.0).contains("You bought"));
+        let goods = loop {
+            let frame = read_data_frame(&mut stream);
+            if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] {
+                continue;
+            }
+            break frame;
+        };
+        assert_eq!(
+            goods.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_GOODS,
+                57,
+                3,
+                0,
+                0,
+                0,
+            ]
+        );
+
+        // A failed trade answers with a usage reply and refreshes nothing.
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                0x96, 1, 10, 0, b'b', b'u', b'y', b' ', b'9', b'9', b'9', b'9', b' ', b'1',
+            ]),
+        )
+        .unwrap();
+        let reply = read_data_frame(&mut stream);
+        assert!(String::from_utf8_lossy(&reply.0).contains("I do not trade"));
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue;
+                }
+                Ok(frame) => {
+                    if frame.0.first()
+                        == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_GOODS)
+                    {
+                        panic!("player goods refreshed after a failed trade");
+                    }
+                }
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("native session ended during shop probe: {error}"),
+            }
+        }
 
         drop(stream);
         game.shutdown().unwrap();
         let database = EngineDatabase::open(&database_path).unwrap();
-        assert_eq!(database.player_bank_balance(1).unwrap(), 500 + 400);
-        let drained = database.player_containers(1).unwrap();
-        assert!(drained
+        assert_eq!(database.player_bank_balance(1).unwrap(), 900 - 75);
+        let restocked = database.player_containers(1).unwrap();
+        assert!(restocked
             .container(2)
             .unwrap()
             .items
             .iter()
             .all(|item| item.server_id != 3294));
+        assert!(restocked
+            .container(2)
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.server_id == 2666 && item.count == 1));
         let _ = fs::remove_file(database_path);
     }
 

@@ -7,7 +7,7 @@ use std::net::{SocketAddr, TcpStream};
 
 use forgotten_core::ItemInstance;
 
-use super::npc_shop::handle_native_shop_keyword;
+use super::npc_shop::{deliver_native_player_goods, handle_native_shop_keyword};
 use super::{
     encode_native_otclient_counter_trade, encode_native_otclient_failure_message,
     encode_native_otclient_own_trade, encode_native_otclient_status_message, native_diagnostic,
@@ -382,6 +382,36 @@ pub(crate) fn apply_native_npc_trade_close_action(
     Ok(())
 }
 
+/// Re-sends the player-goods record (0x7B) after a completed shop trade so the open
+/// trade window stops showing stale gold and stock. `None` (fallthrough or usage
+/// error) sends nothing; a missing shop or presentation mapping skips silently.
+fn refresh_player_goods_after_trade(
+    ctx: &mut SessionContext<'_>,
+    traded_npc_name: Option<String>,
+) -> Result<(), HostError> {
+    let Some(npc_name) = traded_npc_name else {
+        return Ok(());
+    };
+    let Some(shop) = ctx
+        .config
+        .shop_catalog
+        .as_deref()
+        .and_then(|catalog| catalog.by_npc_name(&npc_name))
+    else {
+        return Ok(());
+    };
+    let _ = deliver_native_player_goods(
+        &mut *ctx.stream,
+        &ctx.config.client_profile,
+        ctx.shared_world,
+        &*ctx.database,
+        ctx.character_id,
+        shop,
+        ctx.config.item_presentation_catalog.as_deref(),
+    )?;
+    Ok(())
+}
+
 /// Applies one NPC buy: maps the client thing id back to a server item, then routes through
 /// the declarative shop keyword path. An unmapped id answers with a failure frame.
 pub(crate) fn apply_native_npc_buy_action(
@@ -415,12 +445,14 @@ pub(crate) fn apply_native_npc_buy_action(
             .as_deref()
             .unwrap_or(&DeclarativeShopCatalog::default()),
     )?;
-    let reply_frame = encode_native_otclient_status_message(
-        &ctx.config.client_profile,
-        &message.unwrap_or_else(|| "Nothing to buy here.".into()),
-    )
-    .map_err(HostError::Protocol)?;
+    let (reply, traded_npc_name) = match message {
+        Some(outcome) => (outcome.reply, outcome.traded_npc_name),
+        None => ("Nothing to buy here.".into(), None),
+    };
+    let reply_frame = encode_native_otclient_status_message(&ctx.config.client_profile, &reply)
+        .map_err(HostError::Protocol)?;
     write_frame(&mut *ctx.stream, &reply_frame)?;
+    refresh_player_goods_after_trade(ctx, traded_npc_name)?;
     native_diagnostic(
         ctx.config.extended_diagnostics,
         ctx.peer,
@@ -459,12 +491,14 @@ pub(crate) fn apply_native_npc_sell_action(
             .as_deref()
             .unwrap_or(&DeclarativeShopCatalog::default()),
     )?;
-    let reply_frame = encode_native_otclient_status_message(
-        &ctx.config.client_profile,
-        &message.unwrap_or_else(|| "Nothing to sell here.".into()),
-    )
-    .map_err(HostError::Protocol)?;
+    let (reply, traded_npc_name) = match message {
+        Some(outcome) => (outcome.reply, outcome.traded_npc_name),
+        None => ("Nothing to sell here.".into(), None),
+    };
+    let reply_frame = encode_native_otclient_status_message(&ctx.config.client_profile, &reply)
+        .map_err(HostError::Protocol)?;
     write_frame(&mut *ctx.stream, &reply_frame)?;
+    refresh_player_goods_after_trade(ctx, traded_npc_name)?;
     native_diagnostic(
         ctx.config.extended_diagnostics,
         ctx.peer,

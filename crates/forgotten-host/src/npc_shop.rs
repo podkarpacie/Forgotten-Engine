@@ -175,6 +175,35 @@ pub(crate) fn deliver_native_npc_shop_windows(
     write_frame(stream, &open_record)?;
 
     // Player goods: gold balance plus sellable items found in owned containers.
+    let _ = deliver_native_player_goods(
+        stream,
+        profile,
+        shared_world,
+        database,
+        player_id,
+        shop,
+        item_presentation_catalog,
+    )?;
+    Ok(true)
+}
+
+/// Delivers one standalone player-goods record (0x7B: bank gold plus sellable owned
+/// amounts) for an NPC shop. Trade-window open sends it after the catalog; completed
+/// keyword/window trades re-send it so the open window stops showing stale gold and
+/// stock. Returns false when the presentation mapping is unavailable and the record
+/// cannot be rendered; the completed trade itself always stands either way.
+pub(crate) fn deliver_native_player_goods(
+    stream: &mut TcpStream,
+    profile: &NativeOtClientProfile,
+    shared_world: &SharedNativeWorld,
+    database: &EngineDatabase,
+    player_id: u64,
+    shop: &DeclarativeNpcShop,
+    item_presentation_catalog: Option<&NativeItemPresentationCatalog>,
+) -> Result<bool, HostError> {
+    let Some(presentation) = item_presentation_catalog else {
+        return Ok(false);
+    };
     let gold = database
         .player_bank_balance(player_id)
         .map_err(HostError::Persistence)?;
@@ -378,6 +407,30 @@ pub(crate) fn remove_items_from_player(
     Ok(Some(format!("Removed {count} x item {server_id}.")))
 }
 
+/// The outcome of one shop keyword: the chat reply plus, when a buy/sell actually
+/// completed, the NPC shop name so callers can refresh the client's player-goods
+/// window (0x7B). Usage errors carry no shop name and refresh nothing.
+pub(crate) struct ShopKeywordOutcome {
+    pub reply: String,
+    pub traded_npc_name: Option<String>,
+}
+
+impl ShopKeywordOutcome {
+    fn reply(reply: impl Into<String>) -> Self {
+        Self {
+            reply: reply.into(),
+            traded_npc_name: None,
+        }
+    }
+
+    fn traded(reply: impl Into<String>, npc_name: &str) -> Self {
+        Self {
+            reply: reply.into(),
+            traded_npc_name: Some(npc_name.to_owned()),
+        }
+    }
+}
+
 /// Handles bounded NPC shop keywords ("buy <server-id> <count>" / "sell <server-id> <count>")
 /// near an active static NPC whose declared shop matches. Payments and proceeds flow through the
 /// durable bank balance; bought stacks chunk into free owned container slots, sold units leave
@@ -388,7 +441,7 @@ pub(crate) fn handle_native_shop_keyword(
     player_id: u64,
     message: &str,
     shop_catalog: &DeclarativeShopCatalog,
-) -> Result<Option<String>, HostError> {
+) -> Result<Option<ShopKeywordOutcome>, HostError> {
     let normalized = message.trim().to_ascii_lowercase();
     let mut parts = normalized.split_whitespace();
     let verb = parts.next().unwrap_or("");
@@ -421,29 +474,33 @@ pub(crate) fn handle_native_shop_keyword(
         .filter(|id| *id != 0);
     let count = parts.next().and_then(|count| count.parse::<u64>().ok());
     let (Some(server_id), Some(count)) = (server_id, count) else {
-        return Ok(Some(
-            "Usage: buy <item-id> <count> or sell <item-id> <count>.".into(),
-        ));
+        return Ok(Some(ShopKeywordOutcome::reply(
+            "Usage: buy <item-id> <count> or sell <item-id> <count>.",
+        )));
     };
     if count == 0 || count > 100 {
-        return Ok(Some("You must trade between 1 and 100 at once.".into()));
+        return Ok(Some(ShopKeywordOutcome::reply(
+            "You must trade between 1 and 100 at once.",
+        )));
     }
     let Some(entry) = shop.entry(server_id) else {
-        return Ok(Some("I do not trade that item.".into()));
+        return Ok(Some(ShopKeywordOutcome::reply("I do not trade that item.")));
     };
     let mut equipment = shared_world.player_equipment(player_id)?;
     let mut containers = shared_world.player_containers(player_id)?;
 
     if verb == "buy" {
         let Some(price) = entry.buy_price_gold else {
-            return Ok(Some("I do not sell that item.".into()));
+            return Ok(Some(ShopKeywordOutcome::reply("I do not sell that item.")));
         };
         let total = price.saturating_mul(count);
         let balance = database
             .player_bank_balance(player_id)
             .map_err(HostError::Persistence)?;
         if balance < total {
-            return Ok(Some("You do not have enough gold on your account.".into()));
+            return Ok(Some(ShopKeywordOutcome::reply(
+                "You do not have enough gold on your account.",
+            )));
         }
         let mut staged_containers = containers.clone();
         for _ in 0..count {
@@ -467,7 +524,9 @@ pub(crate) fn handle_native_shop_keyword(
                 }
             }
             if !placed {
-                return Ok(Some("You need a container with free space to buy.".into()));
+                return Ok(Some(ShopKeywordOutcome::reply(
+                    "You need a container with free space to buy.",
+                )));
             }
         }
         database.replace_player_inventory_and_bank_balance(
@@ -479,12 +538,15 @@ pub(crate) fn handle_native_shop_keyword(
         shared_world.replace_player_equipment(player_id, equipment)?;
         shared_world.replace_player_containers(player_id, staged_containers)?;
         shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
-        return Ok(Some(format!("You bought {count} for {total} gold.")));
+        return Ok(Some(ShopKeywordOutcome::traded(
+            format!("You bought {count} for {total} gold."),
+            &npc_name,
+        )));
     }
 
     // Sell path: gather the requested unit count from carried equipment and container items.
     let Some(unit_price) = entry.sell_price_gold else {
-        return Ok(Some("I do not buy that item.".into()));
+        return Ok(Some(ShopKeywordOutcome::reply("I do not buy that item.")));
     };
     let mut remaining_units = count;
     for slot in [
@@ -544,7 +606,9 @@ pub(crate) fn handle_native_shop_keyword(
         containers = next_containers;
     }
     if remaining_units > 0 {
-        return Ok(Some("You do not carry enough of that item.".into()));
+        return Ok(Some(ShopKeywordOutcome::reply(
+            "You do not carry enough of that item.",
+        )));
     }
     let total = unit_price.saturating_mul(count);
     let new_balance = database
@@ -560,7 +624,10 @@ pub(crate) fn handle_native_shop_keyword(
     shared_world.replace_player_equipment(player_id, equipment)?;
     shared_world.replace_player_containers(player_id, containers)?;
     shared_world.vitals_epoch.fetch_add(1, Ordering::SeqCst);
-    Ok(Some(format!("You sold {count} for {total} gold.")))
+    Ok(Some(ShopKeywordOutcome::traded(
+        format!("You sold {count} for {total} gold."),
+        &npc_name,
+    )))
 }
 
 /// Applies bounded NPC shop keywords ("buy <id> <count>" / "sell <id> <count>") for a Say
@@ -581,7 +648,7 @@ pub(crate) fn apply_native_shop_keyword_talk(
     let Some(shop_catalog) = ctx.config.shop_catalog.as_deref() else {
         return Ok(SessionActionOutcome::Unhandled);
     };
-    let Some(reply) = handle_native_shop_keyword(
+    let Some(outcome) = handle_native_shop_keyword(
         ctx.shared_world,
         &mut *ctx.database,
         ctx.character_id,
@@ -591,9 +658,25 @@ pub(crate) fn apply_native_shop_keyword_talk(
     else {
         return Ok(SessionActionOutcome::Unhandled);
     };
-    let reply_frame = encode_native_otclient_status_message(&ctx.config.client_profile, &reply)
-        .map_err(HostError::Protocol)?;
+    let reply_frame =
+        encode_native_otclient_status_message(&ctx.config.client_profile, &outcome.reply)
+            .map_err(HostError::Protocol)?;
     write_frame(&mut *ctx.stream, &reply_frame)?;
+    // A completed trade refreshes the open trade window's player goods (0x7B); usage
+    // errors leave the window untouched.
+    if let Some(npc_name) = outcome.traded_npc_name {
+        if let Some(shop) = shop_catalog.by_npc_name(&npc_name) {
+            let _ = deliver_native_player_goods(
+                &mut *ctx.stream,
+                &ctx.config.client_profile,
+                ctx.shared_world,
+                &*ctx.database,
+                ctx.character_id,
+                shop,
+                ctx.config.item_presentation_catalog.as_deref(),
+            )?;
+        }
+    }
     ctx.shared_world.mark_visibility_changed();
     *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
     native_diagnostic(
@@ -601,7 +684,7 @@ pub(crate) fn apply_native_shop_keyword_talk(
         ctx.peer,
         &format!(
             "action=talk outcome=shop-keyword reply-bytes={}",
-            reply.len()
+            outcome.reply.len()
         ),
     );
     Ok(SessionActionOutcome::Handled)
