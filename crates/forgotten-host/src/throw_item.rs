@@ -1,10 +1,10 @@
-//! ThrowItem address decoding for the native 740 session loop.
+//! ThrowItem address decoding and per-source routing for the native 740 session loop.
 //!
-//! The `ThrowItem` matrix is the hardest remaining `session_loop.rs` block (hardest-first
+//! The `ThrowItem` matrix was the hardest remaining `session_loop.rs` block (hardest-first
 //! order): source-by-target branches interleaved across ~1,300 lines that cannot split
-//! verbatim. This module is step 1 of that restructure — the straight-line endpoint-address
-//! preamble moved verbatim behind a pure, unit-tested classifier, with no behavior change.
-//! Per-source handlers dispatching on `ThrowItemAddresses` follow in later increments.
+//! verbatim. The restructure landed per-source handlers dispatching on `ThrowItemAddresses`
+//! behind a pure, unit-tested classifier, plus a carry-capacity gate on the three
+//! owned-inventory intakes; the session loop keeps only the thin dispatch hub.
 
 use super::*;
 
