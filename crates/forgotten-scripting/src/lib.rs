@@ -1444,6 +1444,16 @@ const MATRIX: &[ApiEntry] = &[
         note: "Backed by forgotten-core Position.",
     },
     ApiEntry {
+        api: "Player:getStorageValue()",
+        capability: Capability::Implemented,
+        note: "Available as the getPlayerStorageValue bound function; reads answer from the per-dispatch snapshot, misses as -1.",
+    },
+    ApiEntry {
+        api: "Player:setStorageValue()",
+        capability: Capability::Implemented,
+        note: "Available as the setPlayerStorageValue bound function; writes persist silently as SetStorage intents.",
+    },
+    ApiEntry {
         api: "Game.createItem()",
         capability: Capability::Planned,
         note: "Item-domain implementation required.",
@@ -1567,6 +1577,14 @@ mod tests {
         assert_eq!(find_api("doCreatureSay()"), None);
         assert_eq!(
             find_api("Player:getLevel()").unwrap().capability,
+            Capability::Implemented
+        );
+        assert_eq!(
+            find_api("Player:getStorageValue()").unwrap().capability,
+            Capability::Implemented
+        );
+        assert_eq!(
+            find_api("Player:setStorageValue()").unwrap().capability,
             Capability::Implemented
         );
     }
