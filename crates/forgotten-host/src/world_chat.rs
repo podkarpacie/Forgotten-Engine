@@ -364,6 +364,53 @@ impl SharedNativeWorld {
     }
 }
 
+/// Routes one Talk record through the keyword chain (gamemaster verbs, operator Lua
+/// words, declarative spell invocations, bank keywords, shop keywords) into chat
+/// delivery, which always terminates the chain. Each router reports
+/// `Handled`/`Unhandled`; the first handler wins. Exactly four parameters per the
+/// handler rule: the session context, the record, and the two chat-drain handles.
+/// Flood/mute gating stays in the session loop ahead of this call.
+pub(crate) fn apply_native_talk_action(
+    ctx: &mut SessionContext<'_>,
+    request: &NativeOtClientTalkRequest,
+    chat_events: &mpsc::Receiver<SharedPublicChatEvent>,
+    open_public_channel_ids: &BTreeSet<u16>,
+) -> Result<(), HostError> {
+    // Gamemaster talkactions run before every other keyword router; see
+    // gm_commands.rs. A handled verb consumes the record.
+    if apply_native_gm_talkaction_talk(ctx, request)? == SessionActionOutcome::Handled {
+        return Ok(());
+    }
+    // Operator-registered Lua talkactions dispatch through the resource-capped
+    // sandbox; dispatch and effect application live in talkactions.rs. A handled word
+    // consumes the record; anything else falls through to ordinary routing.
+    // The config reference is copied out first so the dispatcher borrow never
+    // overlaps the mutable context borrow below.
+    let config = ctx.config;
+    if let Some(dispatcher) = config.talkaction_dispatcher.as_ref() {
+        if apply_native_lua_talkaction(ctx, request, dispatcher)? == SessionActionOutcome::Handled {
+            return Ok(());
+        }
+    }
+    // Spell invocation resolves through the operator command or an exact
+    // declared Say keyword; see native_combat.rs. A handled invocation consumes
+    // the record; anything else falls through to ordinary routing.
+    if apply_native_declarative_spell_talk(ctx, request)? == SessionActionOutcome::Handled {
+        return Ok(());
+    }
+    // Bounded NPC banking and shop keywords; see bank.rs and npc_shop.rs.
+    // A handled keyword consumes the record; anything else falls through.
+    if apply_native_bank_keyword_talk(ctx, request)? == SessionActionOutcome::Handled {
+        return Ok(());
+    }
+    if apply_native_shop_keyword_talk(ctx, request)? == SessionActionOutcome::Handled {
+        return Ok(());
+    }
+    // Chat delivery (private/channel/whisper/yell/guild/public), inbound
+    // drain, and NPC dialogue; see below. Always ends Talk handling.
+    apply_native_chat_routing(ctx, request, chat_events, open_public_channel_ids)
+}
+
 /// Routes one Talk record to private, channel, whisper, yell, guild, or public chat, drains
 /// pending inbound chat, and answers Say records with NPC dialogue plus shop windows. Deferred
 /// modes/channels emit a diagnostic and consume the record without effect; every path ends Talk

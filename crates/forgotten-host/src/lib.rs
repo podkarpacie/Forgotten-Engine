@@ -66,9 +66,9 @@ mod world_chat;
 #[cfg(test)]
 pub(crate) use world_chat::PrivateChatDelivery;
 pub(crate) use world_chat::{
-    apply_native_add_vip_action, apply_native_chat_routing, apply_native_edit_vip_action,
-    apply_native_join_channel_action, apply_native_leave_channel_action,
-    apply_native_remove_vip_action, apply_native_request_channels_action,
+    apply_native_add_vip_action, apply_native_edit_vip_action, apply_native_join_channel_action,
+    apply_native_leave_channel_action, apply_native_remove_vip_action,
+    apply_native_request_channels_action, apply_native_talk_action,
 };
 mod world_combat;
 mod world_equipment;

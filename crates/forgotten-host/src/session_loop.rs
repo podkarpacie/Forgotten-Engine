@@ -2451,8 +2451,9 @@ pub(crate) fn handle_native_otclient_game(
                     write_frame(stream, &muted_notice)?;
                     continue;
                 }
-                // Gamemaster talkactions run before every other keyword router; see
-                // gm_commands.rs. A handled verb consumes the record.
+                // Gamemaster verbs, Lua words, spell invocations, bank/shop keywords,
+                // then chat delivery run as one router chain sharing a single context;
+                // see world_chat.rs. The first handler wins; chat always terminates.
                 {
                     let mut ctx = SessionContext {
                         stream: &mut *stream,
@@ -2470,114 +2471,7 @@ pub(crate) fn handle_native_otclient_game(
                         observed_visibility_epoch: &mut observed_visibility_epoch,
                         observed_vitals_epoch: &mut observed_vitals_epoch,
                     };
-                    if apply_native_gm_talkaction_talk(&mut ctx, &request)?
-                        == SessionActionOutcome::Handled
-                    {
-                        continue;
-                    }
-                }
-                // Operator-registered Lua talkactions dispatch through the resource-capped
-                // sandbox; dispatch and effect application live in talkactions.rs. A handled word
-                // consumes the record; anything else falls through to ordinary routing.
-                if let Some(dispatcher) = config.talkaction_dispatcher.as_ref() {
-                    let mut ctx = SessionContext {
-                        stream: &mut *stream,
-                        peer,
-                        character_id: character.id,
-                        database: &mut database,
-                        shared_world,
-                        config,
-                        world_map: &world_map,
-                        snapshot: &snapshot,
-                        facing: &mut facing,
-                        player_position: &mut player_position,
-                        active_click_walk: &mut active_click_walk,
-                        observed_dead,
-                        observed_visibility_epoch: &mut observed_visibility_epoch,
-                        observed_vitals_epoch: &mut observed_vitals_epoch,
-                    };
-                    if apply_native_lua_talkaction(&mut ctx, &request, dispatcher)?
-                        == SessionActionOutcome::Handled
-                    {
-                        continue;
-                    }
-                }
-                // Spell invocation resolves through the operator command or an exact
-                // declared Say keyword; see native_combat.rs. A handled invocation consumes
-                // the record; anything else falls through to ordinary routing.
-                {
-                    let mut ctx = SessionContext {
-                        stream: &mut *stream,
-                        peer,
-                        character_id: character.id,
-                        database: &mut database,
-                        shared_world,
-                        config,
-                        world_map: &world_map,
-                        snapshot: &snapshot,
-                        facing: &mut facing,
-                        player_position: &mut player_position,
-                        active_click_walk: &mut active_click_walk,
-                        observed_dead,
-                        observed_visibility_epoch: &mut observed_visibility_epoch,
-                        observed_vitals_epoch: &mut observed_vitals_epoch,
-                    };
-                    if apply_native_declarative_spell_talk(&mut ctx, &request)?
-                        == SessionActionOutcome::Handled
-                    {
-                        continue;
-                    }
-                }
-                // Bounded NPC banking and shop keywords; see bank.rs and npc_shop.rs.
-                // A handled keyword consumes the record; anything else falls through.
-                {
-                    let mut ctx = SessionContext {
-                        stream: &mut *stream,
-                        peer,
-                        character_id: character.id,
-                        database: &mut database,
-                        shared_world,
-                        config,
-                        world_map: &world_map,
-                        snapshot: &snapshot,
-                        facing: &mut facing,
-                        player_position: &mut player_position,
-                        active_click_walk: &mut active_click_walk,
-                        observed_dead,
-                        observed_visibility_epoch: &mut observed_visibility_epoch,
-                        observed_vitals_epoch: &mut observed_vitals_epoch,
-                    };
-                    if apply_native_bank_keyword_talk(&mut ctx, &request)?
-                        == SessionActionOutcome::Handled
-                    {
-                        continue;
-                    }
-                    if apply_native_shop_keyword_talk(&mut ctx, &request)?
-                        == SessionActionOutcome::Handled
-                    {
-                        continue;
-                    }
-                }
-                // Chat delivery (private/channel/whisper/yell/guild/public), inbound
-                // drain, and NPC dialogue; see world_chat.rs. Always ends Talk handling.
-                {
-                    let mut ctx = SessionContext {
-                        stream: &mut *stream,
-                        peer,
-                        character_id: character.id,
-                        database: &mut database,
-                        shared_world,
-                        config,
-                        world_map: &world_map,
-                        snapshot: &snapshot,
-                        facing: &mut facing,
-                        player_position: &mut player_position,
-                        active_click_walk: &mut active_click_walk,
-                        observed_dead,
-                        observed_visibility_epoch: &mut observed_visibility_epoch,
-                        observed_vitals_epoch: &mut observed_vitals_epoch,
-                    };
-                    apply_native_chat_routing(
+                    apply_native_talk_action(
                         &mut ctx,
                         &request,
                         &chat_events,
