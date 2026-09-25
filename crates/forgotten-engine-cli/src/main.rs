@@ -3176,7 +3176,6 @@ Commands:
   command <directory> broadcast <message>
   command <directory> reload-scripts
   debug-map <directory> [map-name]
-  debug-map <directory> [map-name]
   script dispatch <directory> <actions|creaturescripts|events|globalevents|movements|spells|talkactions|weapons> <declared-relative-script> <callback-name> <event-kind> <subject-id> <value>
   compatibility [--json]
   version"#
