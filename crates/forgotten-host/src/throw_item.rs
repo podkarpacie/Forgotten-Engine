@@ -330,6 +330,64 @@ pub(crate) struct ThrowItemRuntimePickupFollow<'a> {
     pub observed_containers_epoch: &'a mut u64,
 }
 
+/// Capacity gate for one incoming stack into owned equipment or containers: sums
+/// carried equipment/container/shell weight plus the intake and refuses past the
+/// vitals capacity with a player-facing message. Returns `None` when the intake fits
+/// or when no weight catalog is configured (ungated behavior preserved); unmapped
+/// items weigh zero per `carried_inventory_weight`, so only provably overweight
+/// intakes refuse, never unknown ones.
+fn check_native_carry_capacity(
+    shared_world: &SharedNativeWorld,
+    character_id: u64,
+    incoming: &[(u16, u16)],
+    weights: Option<&BTreeMap<u16, u32>>,
+) -> Result<Option<String>, HostError> {
+    let Some(weights) = weights else {
+        return Ok(None);
+    };
+    let vitals = shared_world.player_vitals(character_id)?;
+    let mut carried = forgotten_core::carried_inventory_weight(
+        &shared_world.player_equipment(character_id)?,
+        &shared_world.player_containers(character_id)?,
+        weights,
+    );
+    for (server_id, count) in incoming {
+        let unit = u64::from(weights.get(server_id).copied().unwrap_or(0));
+        carried = carried.saturating_add(unit.saturating_mul(u64::from(*count)));
+    }
+    if carried > u64::from(vitals.capacity) {
+        return Ok(Some("You cannot carry that item.".into()));
+    }
+    Ok(None)
+}
+
+/// Refuses one overweight intake with a player-visible status message plus the
+/// extended-diagnostics trace. Callers return `Handled`: the record is consumed.
+/// Emits nothing and returns false when the gate passes.
+fn refuse_overweight_intake(
+    ctx: &mut SessionContext<'_>,
+    incoming: &[(u16, u16)],
+) -> Result<bool, HostError> {
+    let Some(refusal) = check_native_carry_capacity(
+        ctx.shared_world,
+        ctx.character_id,
+        incoming,
+        ctx.config.item_weight_by_server_id.as_deref(),
+    )?
+    else {
+        return Ok(false);
+    };
+    let refusal_frame = encode_native_otclient_status_message(&ctx.config.client_profile, &refusal)
+        .map_err(HostError::Protocol)?;
+    write_frame(&mut *ctx.stream, &refusal_frame)?;
+    native_diagnostic(
+        ctx.config.extended_diagnostics,
+        ctx.peer,
+        "action=throw-item outcome=carry-capacity-refused",
+    );
+    Ok(true)
+}
+
 /// Picks up a durable-registry runtime ground stack into owned equipment or an owned
 /// container. Returns `Unhandled` when the source is not a map tile or no live runtime
 /// stack sits at the addressed index (including while dead), so the map-source
@@ -382,6 +440,9 @@ pub(crate) fn apply_native_throw_item_runtime_pickup(
             ctx.peer,
             "action=throw-item outcome=deferred-runtime-pickup-identity-mismatch",
         );
+        return Ok(SessionActionOutcome::Handled);
+    }
+    if refuse_overweight_intake(ctx, &[(runtime_item.server_id, u16::from(request.count))])? {
         return Ok(SessionActionOutcome::Handled);
     }
     let destination = if let Some(slot) = request.target_slot {
@@ -587,6 +648,9 @@ pub(crate) fn apply_native_throw_item_map_source(
         }
         Err(error) => return Err(error),
     };
+    if refuse_overweight_intake(ctx, &[(source.server_id, u16::from(request.count))])? {
+        return Ok(SessionActionOutcome::Handled);
+    }
     let source_position = Position {
         x: request.source_position.x,
         y: request.source_position.y,
@@ -842,6 +906,11 @@ pub(crate) fn apply_native_throw_item_corpse_take(
         );
         return Ok(SessionActionOutcome::Handled);
     };
+    if let Some(corpse_item) = map_owner.runtime_tile_item(corpse_position, corpse_item_index)? {
+        if refuse_overweight_intake(ctx, &[(corpse_item.server_id, u16::from(request.count))])? {
+            return Ok(SessionActionOutcome::Handled);
+        }
+    }
     match map_owner.move_runtime_item_to_inventory(
         ctx.shared_world,
         &mut *ctx.database,

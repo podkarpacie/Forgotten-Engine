@@ -2533,6 +2533,93 @@ impl PlayerContainers {
     }
 }
 
+/// Sums the carried weight of one player's equipment plus owned containers (shells,
+/// top-level items, and their nested contents), in operator weight units. Items without a declared
+/// weight contribute zero (fail-open on unmapped content): the capacity gate refuses
+/// only provably overweight intakes, never unknown ones. Saturates instead of
+/// overflowing on adversarial counts.
+pub fn carried_inventory_weight(
+    equipment: &PlayerEquipment,
+    containers: &PlayerContainers,
+    weights: &BTreeMap<u16, u32>,
+) -> u64 {
+    fn stack_weight(item: &ItemInstance, weights: &BTreeMap<u16, u32>) -> u64 {
+        let unit = u64::from(weights.get(&item.server_id).copied().unwrap_or(0));
+        let own = unit.saturating_mul(u64::from(item.count));
+        item.contents().iter().fold(own, |total, nested| {
+            total.saturating_add(stack_weight(nested, weights))
+        })
+    }
+    let equipment_weight = equipment
+        .iter()
+        .map(|(_, item)| stack_weight(item, weights))
+        .fold(0_u64, u64::saturating_add);
+    containers
+        .iter()
+        .fold(equipment_weight, |total, (_, container)| {
+            let shell = stack_weight(&container.container_item, weights);
+            container
+                .items
+                .iter()
+                .fold(total.saturating_add(shell), |total, item| {
+                    total.saturating_add(stack_weight(item, weights))
+                })
+        })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod inventory_weight_tests {
+    use super::*;
+
+    fn weighted_containers() -> (PlayerEquipment, PlayerContainers) {
+        let mut equipment = PlayerEquipment::default();
+        equipment.equip(EquipmentSlot::Armor, ItemInstance::new(2464, 1).unwrap());
+        let mut containers = PlayerContainers::default();
+        let mut bag =
+            PlayerContainer::new(2, ItemInstance::new(1988, 1).unwrap(), "Bag", false, 20).unwrap();
+        bag.items
+            .merge_or_insert_stack(ItemInstance::new(2148, 100).unwrap())
+            .unwrap();
+        let mut nested_bag = ItemInstance::new(1988, 1).unwrap();
+        nested_bag
+            .insert_content(ItemInstance::new(2148, 50).unwrap())
+            .unwrap();
+        bag.items.merge_or_insert_stack(nested_bag).unwrap();
+        containers.insert(bag).unwrap();
+        (equipment, containers)
+    }
+
+    #[test]
+    fn carried_weight_sums_equipment_containers_and_nested_contents() {
+        let (equipment, containers) = weighted_containers();
+        let weights = BTreeMap::from([(2464, 1_200), (1988, 1_800), (2148, 1)]);
+        // Armor 1200 + bag 1800 + 100 coins + nested bag 1800 + 50 nested coins.
+        assert_eq!(
+            carried_inventory_weight(&equipment, &containers, &weights),
+            1_200 + 1_800 + 100 + 1_800 + 50
+        );
+    }
+
+    #[test]
+    fn carried_weight_treats_unmapped_items_as_zero() {
+        let (equipment, containers) = weighted_containers();
+        assert_eq!(
+            carried_inventory_weight(&equipment, &containers, &BTreeMap::new()),
+            0
+        );
+        // Empty load weighs nothing even with a full catalog.
+        assert_eq!(
+            carried_inventory_weight(
+                &PlayerEquipment::default(),
+                &PlayerContainers::default(),
+                &BTreeMap::from([(2464, 1_200)]),
+            ),
+            0
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayerDamageOutcome {
     pub attacker_id: u64,

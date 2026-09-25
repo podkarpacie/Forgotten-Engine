@@ -430,9 +430,11 @@ pub struct NativeOtClientHostConfig {
     /// native map-source-to-empty-equipment route; generic inventories, stacks, swaps, and
     /// two-handed placement remain outside this policy.
     pub item_slot_types_by_server_id: Option<Arc<BTreeMap<u16, BTreeSet<LegacyItemSlotType>>>>,
-    /// Immutable validated legacy `items.xml` source weights used only to append one bounded
-    /// classic weight sentence to an exact native map LookMap response. They do not enforce
-    /// capacity or change item-transfer behavior.
+    /// Immutable validated legacy `items.xml` source weights: one bounded classic weight
+    /// sentence on exact native map LookMap responses, plus the carry-capacity gate on
+    /// owned-inventory intakes (ground, map-source, and corpse-take pickups refuse past
+    /// the vitals capacity). Unmapped items weigh zero; without this map the gate stays
+    /// open and prior ungated behavior is preserved.
     pub item_weight_by_server_id: Option<Arc<BTreeMap<u16, u32>>>,
     /// Immutable validated legacy `items.xml` names used only to append one bounded inspected
     /// item-name detail after exact native map LookMap validation. They do not generate articles,
@@ -12434,6 +12436,143 @@ mod tests {
             read_frame(&mut client).unwrap().0.first().copied(),
             Some(forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP)
         );
+        drop(client);
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_throw_refuses_overweight_map_pickup_with_a_status_message() {
+        let database_path = database_path("native-map-source-overweight");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        let source_position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: source_position,
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let mut containers = PlayerContainers::default();
+        containers
+            .insert(
+                forgotten_core::PlayerContainer::new(
+                    2,
+                    ItemInstance::new(1988, 1).unwrap(),
+                    "Bag",
+                    false,
+                    20,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        database.replace_player_containers(1, &containers).unwrap();
+        let mut source_map = (*native_world_map()).clone();
+        source_map
+            .set_tile_items(
+                source_position,
+                vec![WorldMapItem {
+                    server_id: 4526,
+                    client_thing_id: Some(102),
+                    count: 1,
+                    action_id: None,
+                    unique_id: None,
+                    text: None,
+                    description: None,
+                    teleport_destination: None,
+                    duration: None,
+                    charges: None,
+                    children: Vec::new(),
+                }],
+            )
+            .unwrap();
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for (server_id, client_thing_id) in [(4526, 102), (1988, 1988)] {
+            catalog
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id,
+                        requires_classic_740_subtype: false,
+                    },
+                )
+                .unwrap();
+        }
+        let mut config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        config.world_map = Some(Arc::new(source_map));
+        config.item_presentation_catalog = Some(Arc::new(catalog));
+        // One unit outweighs any vitals capacity, so the pickup must refuse.
+        config.item_weight_by_server_id = Some(Arc::new(BTreeMap::from([(4526, 1_000_000)])));
+        let game = start_native_otclient_game(config, &database_path).unwrap();
+        let mut client = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut client,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut client).unwrap();
+        let _equipment = read_frame(&mut client).unwrap();
+        let _container = read_frame(&mut client).unwrap();
+        write_frame(
+            &mut client,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                100,
+                0,
+                100,
+                0,
+                7,
+                102,
+                0,
+                0,
+                255,
+                255,
+                0x40 | 2,
+                0,
+                0,
+                1,
+            ]),
+        )
+        .unwrap();
+        // The refusal arrives as a player-visible status message; heartbeat pings
+        // interleaved ahead of it are skipped.
+        let refusal = loop {
+            let frame = read_frame(&mut client).unwrap();
+            if frame.0 == [forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] {
+                continue;
+            }
+            break frame;
+        };
+        assert!(
+            String::from_utf8_lossy(&refusal.0).contains("cannot carry"),
+            "overweight pickup refused visibly"
+        );
+        // Nothing moved: the bag is untouched and the map journal stayed empty.
+        let database = EngineDatabase::open(&database_path).unwrap();
+        assert!(database
+            .player_containers(1)
+            .unwrap()
+            .container(2)
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| item.server_id != 4526));
+        assert_eq!(database.map_item_removal_journal().unwrap(), None);
         drop(client);
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
