@@ -330,12 +330,12 @@ pub(crate) struct ThrowItemRuntimePickupFollow<'a> {
     pub observed_containers_epoch: &'a mut u64,
 }
 
-/// Capacity gate for one incoming stack into owned equipment or containers: sums
-/// carried equipment/container/shell weight plus the intake and refuses past the
-/// vitals capacity with a player-facing message. Returns `None` when the intake fits
-/// or when no weight catalog is configured (ungated behavior preserved); unmapped
-/// items weigh zero per `carried_inventory_weight`, so only provably overweight
-/// intakes refuse, never unknown ones.
+/// Capacity gate for one incoming stack into owned equipment or containers, mirroring
+/// the transfer layer's own gate exactly (same `native_carried_weight` helper, same
+/// hundredths-of-an-ounce comparison against `capacity * 100`) so the player-visible
+/// refusal below agrees with what the transfer would decide. Returns the refusal
+/// message on rejection. A missing weight catalog skips the gate, preserving ungated
+/// behavior; unmapped items weigh zero, so only provably overweight intakes refuse.
 pub(crate) fn check_native_carry_capacity(
     shared_world: &SharedNativeWorld,
     character_id: u64,
@@ -346,16 +346,16 @@ pub(crate) fn check_native_carry_capacity(
         return Ok(None);
     };
     let vitals = shared_world.player_vitals(character_id)?;
-    let mut carried = forgotten_core::carried_inventory_weight(
+    let mut carried = native_carried_weight(
+        weights,
         &shared_world.player_equipment(character_id)?,
         &shared_world.player_containers(character_id)?,
-        weights,
     );
     for (server_id, count) in incoming {
         let unit = u64::from(weights.get(server_id).copied().unwrap_or(0));
         carried = carried.saturating_add(unit.saturating_mul(u64::from(*count)));
     }
-    if carried > u64::from(vitals.capacity) {
+    if carried > u64::from(vitals.capacity).saturating_mul(100) {
         return Ok(Some("You cannot carry that item.".into()));
     }
     Ok(None)
@@ -907,8 +907,15 @@ pub(crate) fn apply_native_throw_item_corpse_take(
         return Ok(SessionActionOutcome::Handled);
     };
     if let Some(corpse_item) = map_owner.runtime_tile_item(corpse_position, corpse_item_index)? {
-        if refuse_overweight_intake(ctx, &[(corpse_item.server_id, u16::from(request.count))])? {
-            return Ok(SessionActionOutcome::Handled);
+        // The gate weighs the loot leaving the corpse, not the corpse shell itself:
+        // the shell never enters the inventory.
+        if let Some(loot) = corpse_item
+            .children
+            .get(usize::from(request.source_stack_position))
+        {
+            if refuse_overweight_intake(ctx, &[(loot.server_id, u16::from(request.count))])? {
+                return Ok(SessionActionOutcome::Handled);
+            }
         }
     }
     match map_owner.move_runtime_item_to_inventory(

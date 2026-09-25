@@ -3222,6 +3222,181 @@ mod tests {
     }
 
     #[test]
+    fn native_throw_refuses_overweight_corpse_take_with_a_status_message() {
+        let database_path = database_path("native-corpse-take-overweight");
+        let mut database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        let corpse_position = Position {
+            x: 101,
+            y: 100,
+            z: 7,
+        };
+        {
+            Arc::get_mut(native_config.world_map.as_mut().unwrap())
+                .unwrap()
+                .set_tile_items(
+                    corpse_position,
+                    vec![WorldMapItem {
+                        server_id: 1988,
+                        client_thing_id: Some(1988),
+                        count: 1,
+                        action_id: None,
+                        unique_id: None,
+                        text: None,
+                        description: None,
+                        teleport_destination: None,
+                        duration: None,
+                        charges: None,
+                        children: Vec::new(),
+                    }],
+                )
+                .unwrap();
+        }
+        let source_revision = native_config.world_map.as_ref().unwrap().source_revision();
+        database
+            .replace_runtime_map_items(
+                source_revision,
+                &[RuntimeMapItemRecord {
+                    position: corpse_position,
+                    ordinal: 0,
+                    server_id: NATIVE_OTCLIENT_DEFAULT_CORPSE_SERVER_ID,
+                    count: 1,
+                    children: vec![RuntimeMapItemChildRecord {
+                        server_id: 2148,
+                        count: 12,
+                    }],
+                    despawn_tick: None,
+                }],
+            )
+            .unwrap();
+        drop(database);
+
+        let mut catalog = NativeItemPresentationCatalog::default();
+        for server_id in [2148, 1988] {
+            catalog
+                .insert(
+                    server_id,
+                    forgotten_core::NativeItemPresentation {
+                        client_thing_id: server_id,
+                        requires_classic_740_subtype: false,
+                    },
+                )
+                .unwrap();
+        }
+        native_config.item_presentation_catalog = Some(Arc::new(catalog));
+        // Twelve coins outweigh any vitals capacity, so the take must refuse.
+        native_config.item_weight_by_server_id =
+            Some(Arc::new(BTreeMap::from([(2148, 1_000_000_000)])));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+
+        // Open the corpse window (stack index 1 above the imported item).
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_USE_ITEM,
+                101,
+                0,
+                100,
+                0,
+                7,
+                0xf9,
+                0x0b,
+                1,
+                0,
+            ]),
+        )
+        .unwrap();
+        let opened = read_data_frame(&mut stream);
+        assert_eq!(
+            opened.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_OPEN_CONTAINER
+        );
+
+        // Take all twelve gold coins from corpse child 0 into the empty right hand.
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                0xff,
+                0xff,
+                0x4f,
+                0x00,
+                0x00,
+                0x64,
+                0x08,
+                0x00,
+                0xff,
+                0xff,
+                5,
+                0x00,
+                0x00,
+                12,
+            ]),
+        )
+        .unwrap();
+        // The overweight take is refused visibly (pings skipped by the helper).
+        let refusal = read_data_frame(&mut stream);
+        assert!(
+            String::from_utf8_lossy(&refusal.0).contains("cannot carry"),
+            "overweight corpse take refused visibly"
+        );
+
+        // Durable state: the corpse keeps its child and the hand stays empty.
+        drop(stream);
+        game.shutdown().unwrap();
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let (_, records) = database.runtime_map_items().unwrap().expect("registry");
+        assert_eq!(records[0].children.len(), 1);
+        assert_eq!(records[0].children[0].server_id, 2148);
+        assert!(database
+            .player_equipment(1)
+            .unwrap()
+            .item(EquipmentSlot::RightHand)
+            .is_none());
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn native_throw_item_picks_up_a_dropped_ground_stack_into_equipment() {
         let database_path = database_path("native-ground-pickup");
         let database = EngineDatabase::open(&database_path).unwrap();
@@ -3352,6 +3527,132 @@ mod tests {
                 .map(|item| (item.server_id, item.count)),
             Some((2148, 10))
         );
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn native_throw_refuses_overweight_ground_pickup_with_a_status_message() {
+        let database_path = database_path("native-ground-pickup-overweight");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        let stack_position = Position {
+            x: 101,
+            y: 101,
+            z: 7,
+        };
+        let source_revision = native_config.world_map.as_ref().unwrap().source_revision();
+        {
+            let mut database = EngineDatabase::open(&database_path).unwrap();
+            database
+                .replace_runtime_map_items(
+                    source_revision,
+                    &[RuntimeMapItemRecord {
+                        position: stack_position,
+                        ordinal: 0,
+                        server_id: 2148,
+                        count: 10,
+                        children: Vec::new(),
+                        despawn_tick: None,
+                    }],
+                )
+                .unwrap();
+        }
+
+        let mut catalog = NativeItemPresentationCatalog::default();
+        catalog
+            .insert(
+                2148,
+                forgotten_core::NativeItemPresentation {
+                    client_thing_id: 2148,
+                    requires_classic_740_subtype: false,
+                },
+            )
+            .unwrap();
+        native_config.item_presentation_catalog = Some(Arc::new(catalog));
+        // Ten coins outweigh any vitals capacity, so the pickup must refuse.
+        native_config.item_weight_by_server_id =
+            Some(Arc::new(BTreeMap::from([(2148, 1_000_000_000)])));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        read_data_frame(&mut stream);
+
+        // Pick the whole dropped stack up from its solo-tile tail index into the right hand.
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
+        let daylight_bootstrap = read_data_frame(&mut stream);
+        assert_eq!(
+            daylight_bootstrap.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
+        );
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_THROW_ITEM,
+                101,
+                0,
+                101,
+                0,
+                7,
+                0x64,
+                0x08,
+                0,
+                0xff,
+                0xff,
+                5,
+                0,
+                0,
+                10,
+            ]),
+        )
+        .unwrap();
+        // The overweight pickup is refused visibly (pings skipped by the helper).
+        let refusal = read_data_frame(&mut stream);
+        assert!(
+            String::from_utf8_lossy(&refusal.0).contains("cannot carry"),
+            "overweight ground pickup refused visibly"
+        );
+
+        // Durable state: the ground stack stays registered and the hand stays empty.
+        drop(stream);
+        game.shutdown().unwrap();
+        let database = EngineDatabase::open(&database_path).unwrap();
+        assert!(database.runtime_map_items().unwrap().is_some());
+        assert!(database
+            .player_equipment(1)
+            .unwrap()
+            .item(EquipmentSlot::RightHand)
+            .is_none());
         let _ = fs::remove_file(database_path);
     }
 
@@ -8525,6 +8826,8 @@ mod tests {
         )
         .unwrap();
         read_data_frame(&mut stream);
+
+        // Permanent daylight follows the bootstrap burst; the map never renders night.
         let daylight_bootstrap = read_data_frame(&mut stream);
         assert_eq!(
             daylight_bootstrap.0,
@@ -10456,7 +10759,7 @@ mod tests {
         native_config.shop_catalog = Some(Arc::new(shop_catalog));
         // One unit outweighs any vitals capacity; the affordable buy must refuse.
         native_config.item_weight_by_server_id =
-            Some(Arc::new(BTreeMap::from([(2666, 1_000_000)])));
+            Some(Arc::new(BTreeMap::from([(2666, 1_000_000_000)])));
         let game = start_native_otclient_game(native_config, &database_path).unwrap();
         let mut stream = TcpStream::connect(game.local_addr()).unwrap();
         write_frame(
@@ -12802,7 +13105,7 @@ mod tests {
         config.world_map = Some(Arc::new(source_map));
         config.item_presentation_catalog = Some(Arc::new(catalog));
         // One unit outweighs any vitals capacity, so the pickup must refuse.
-        config.item_weight_by_server_id = Some(Arc::new(BTreeMap::from([(4526, 1_000_000)])));
+        config.item_weight_by_server_id = Some(Arc::new(BTreeMap::from([(4526, 1_000_000_000)])));
         let game = start_native_otclient_game(config, &database_path).unwrap();
         let mut client = TcpStream::connect(game.local_addr()).unwrap();
         write_frame(
