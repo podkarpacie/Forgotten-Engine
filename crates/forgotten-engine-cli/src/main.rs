@@ -1,24 +1,25 @@
 use forgotten_config::{
-    apply_legacy_item_metadata, creature_callback_name, ensure_content_skeleton, load,
-    load_consumable_catalog, load_declarative_npc_dialogue_catalog, load_declarative_shop_catalog,
+    apply_legacy_item_metadata, creature_callback_name, ensure_content_skeleton,
+    export_world_map_to_femap, load, load_consumable_catalog,
+    load_declarative_npc_dialogue_catalog, load_declarative_shop_catalog,
     load_declarative_spell_catalog, load_declarative_weapon_catalog, load_legacy_item_catalog,
-    load_quest_catalog, load_tfs_action_registry, load_tfs_content_inventory,
-    load_tfs_creaturescript_registry, load_tfs_entity_catalog, load_tfs_movement_registry,
-    load_tfs_public_channel_catalog, load_tfs_talkaction_registry, load_tfs_vocation_registry,
-    load_world_companions, load_world_map, materialize_tfs_spawn_templates,
-    materialize_tfs_static_spawns, movement_callback_name, range_callback_name,
-    resolve_action_callback, resolve_creature_callback, resolve_movement_callback,
-    resolve_tfs_registry_script_reference, resolve_tfs_spawn_references, validate_content,
-    world_map_path, write_template, ConsumableCatalog, DeclarativeNpcDialogueCatalog,
-    DeclarativeShopCatalog, DeclarativeSpellCatalog, DeclarativeWeaponCatalog, EngineConfig,
-    LegacyPublicChannelCatalog, LegacyWorldCompanionData, QuestCatalog, TfsActionRegistry,
-    TfsCreatureScriptRegistry, TfsEntityCatalog, TfsMoveEventRegistry, TfsMoveEventType,
-    TfsRegistryCategory, TfsVocationRegistry,
+    load_legacy_item_names, load_quest_catalog, load_tfs_action_registry,
+    load_tfs_content_inventory, load_tfs_creaturescript_registry, load_tfs_entity_catalog,
+    load_tfs_movement_registry, load_tfs_public_channel_catalog, load_tfs_talkaction_registry,
+    load_tfs_vocation_registry, load_world_companions, load_world_map,
+    materialize_tfs_spawn_templates, materialize_tfs_static_spawns, movement_callback_name,
+    range_callback_name, resolve_action_callback, resolve_creature_callback,
+    resolve_movement_callback, resolve_tfs_registry_script_reference, resolve_tfs_spawn_references,
+    validate_content, world_map_path, write_template, ConsumableCatalog,
+    DeclarativeNpcDialogueCatalog, DeclarativeShopCatalog, DeclarativeSpellCatalog,
+    DeclarativeWeaponCatalog, EngineConfig, LegacyPublicChannelCatalog, LegacyWorldCompanionData,
+    QuestCatalog, TfsActionRegistry, TfsCreatureScriptRegistry, TfsEntityCatalog,
+    TfsMoveEventRegistry, TfsMoveEventType, TfsRegistryCategory, TfsVocationRegistry,
 };
 use forgotten_core::{
     DeathLossPolicy, EquipmentSlot, ItemInstance, Player, PlayerContainer, PlayerRegenerationRules,
-    PlayerRespawnState, PlayerSkill, PlayerVitals, RegenerationRule, SkillProgress, VocationId,
-    WorldMap, WorldMapSource, WorldState,
+    PlayerRespawnState, PlayerSkill, PlayerVitals, Position, RegenerationRule, SkillProgress,
+    VocationId, WorldMap, WorldMapItem, WorldMapSource, WorldMapTile, WorldMapTown, WorldState,
 };
 use forgotten_host::{
     start, start_game_session, start_native_otclient_game_with_bridge, start_native_otclient_login,
@@ -36,6 +37,7 @@ use forgotten_scripting::{
     SandboxedLuaCallbackDispatcher, SandboxedLuaCallbackInput, ScriptEventDispatcher,
     MAX_SANDBOXED_LUA_CALLBACK_NAME_BYTES,
 };
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
@@ -81,6 +83,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "account" => account_command(&arguments),
         "player" => player_command(&arguments),
         "compatibility" => compatibility(&arguments),
+        "debug-map" => debug_map_command(&arguments),
         "version" | "--version" | "-V" => version(),
         "help" | "--help" | "-h" => {
             print_help();
@@ -1881,6 +1884,288 @@ fn respawn_persisted_player(
     Ok((outcome.position, outcome.vitals))
 }
 
+/// Bounds for the generated debug map: a modest walkable floor with room for a
+/// 256-item showroom grid, a depot tile, and a spawn camp. Everything is fixed and
+/// deterministic so regenerated maps are byte-identical for the same inputs.
+const DEBUG_MAP_FILL_X0: u16 = 92;
+const DEBUG_MAP_FILL_X1: u16 = 124;
+const DEBUG_MAP_FILL_Y0: u16 = 92;
+const DEBUG_MAP_FILL_Y1: u16 = 120;
+const DEBUG_MAP_FLOOR_Z: u8 = 7;
+const DEBUG_MAP_GROUND_THING_ID: u16 = 102;
+const DEBUG_MAP_SPAWN_X: u16 = 100;
+const DEBUG_MAP_SPAWN_Y: u16 = 100;
+const DEBUG_MAP_GRID_ORIGIN_X: u16 = 104;
+const DEBUG_MAP_GRID_ORIGIN_Y: u16 = 100;
+const DEBUG_MAP_GRID_COLUMNS: usize = 16;
+const DEBUG_MAP_DEPOT_X: u16 = 100;
+const DEBUG_MAP_DEPOT_Y: u16 = 102;
+const DEBUG_MAP_SPAWN_CENTER_X: u16 = 110;
+const DEBUG_MAP_SPAWN_CENTER_Y: u16 = 104;
+const DEBUG_MAP_SPAWN_RADIUS: u16 = 3;
+const DEBUG_MAP_MAX_SHOWROOM_ITEMS: usize = 256;
+const DEBUG_MAP_MAX_SPAWN_MONSTERS: usize = 8;
+const DEBUG_MAP_MAX_SPAWN_NPCS: usize = 2;
+const DEBUG_MAP_MONSTER_OFFSETS: [(u16, u16); 8] = [
+    (0, 0),
+    (1, 0),
+    (0, 1),
+    (1, 1),
+    (2, 0),
+    (0, 2),
+    (2, 2),
+    (2, 1),
+];
+const DEBUG_MAP_NPC_OFFSETS: [(u16, u16); 2] = [(3, 0), (0, 3)];
+
+/// One generated debug world: the map plus an optional sibling spawn document and
+/// placement counts for the operator report.
+struct DebugMapBuild {
+    map: WorldMap,
+    spawns_document: Option<String>,
+    tiles: usize,
+    items_placed: usize,
+    items_capped: usize,
+    monsters_placed: usize,
+    monsters_capped: usize,
+    npcs_placed: usize,
+    npcs_capped: usize,
+    depot_item: Option<u16>,
+}
+
+fn escape_debug_xml_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Builds a deterministic debug world from operator content: a walkable floor, one
+/// tile per named item in server-ID order (capped), a depot-locker tile when an
+/// imported item name contains "depot" (matching the UseItem depot routing), a
+/// Debug town with its temple waypoint on the spawn, and one spawn camp for the
+/// first known monsters and NPCs. Inputs beyond the caps are counted, never placed.
+fn build_debug_map(
+    map_name: &str,
+    named_items: &BTreeMap<u16, String>,
+    monsters: &[String],
+    npcs: &[String],
+) -> Result<DebugMapBuild, Box<dyn std::error::Error>> {
+    let spawn = Position {
+        x: DEBUG_MAP_SPAWN_X,
+        y: DEBUG_MAP_SPAWN_Y,
+        z: DEBUG_MAP_FLOOR_Z,
+    };
+    let mut map = WorldMap::new(map_name, spawn);
+    let mut tiles = 0_usize;
+    for x in DEBUG_MAP_FILL_X0..DEBUG_MAP_FILL_X1 {
+        for y in DEBUG_MAP_FILL_Y0..DEBUG_MAP_FILL_Y1 {
+            map.set_tile(
+                Position {
+                    x,
+                    y,
+                    z: DEBUG_MAP_FLOOR_Z,
+                },
+                WorldMapTile {
+                    ground_thing_id: DEBUG_MAP_GROUND_THING_ID,
+                    walkable: true,
+                },
+            )?;
+            tiles += 1;
+        }
+    }
+    let mut items_placed = 0_usize;
+    for (index, server_id) in named_items
+        .keys()
+        .take(DEBUG_MAP_MAX_SHOWROOM_ITEMS)
+        .enumerate()
+    {
+        map.set_tile_items(
+            Position {
+                x: DEBUG_MAP_GRID_ORIGIN_X + (index % DEBUG_MAP_GRID_COLUMNS) as u16,
+                y: DEBUG_MAP_GRID_ORIGIN_Y + (index / DEBUG_MAP_GRID_COLUMNS) as u16,
+                z: DEBUG_MAP_FLOOR_Z,
+            },
+            vec![WorldMapItem {
+                server_id: *server_id,
+                client_thing_id: None,
+                count: 1,
+                action_id: None,
+                unique_id: None,
+                text: None,
+                description: None,
+                teleport_destination: None,
+                duration: None,
+                charges: None,
+                children: Vec::new(),
+            }],
+        )?;
+        items_placed += 1;
+    }
+    let depot_item = named_items
+        .iter()
+        .find(|(_, name)| name.to_ascii_lowercase().contains("depot"))
+        .map(|(server_id, _)| *server_id);
+    if let Some(server_id) = depot_item {
+        map.set_tile_items(
+            Position {
+                x: DEBUG_MAP_DEPOT_X,
+                y: DEBUG_MAP_DEPOT_Y,
+                z: DEBUG_MAP_FLOOR_Z,
+            },
+            vec![WorldMapItem {
+                server_id,
+                client_thing_id: None,
+                count: 1,
+                action_id: None,
+                unique_id: None,
+                text: None,
+                description: None,
+                teleport_destination: None,
+                duration: None,
+                charges: None,
+                children: Vec::new(),
+            }],
+        )?;
+    }
+    map.set_town(WorldMapTown {
+        id: 1,
+        name: "Debug".into(),
+        temple_position: spawn,
+    })?;
+    map.set_waypoint("temple", spawn)?;
+    let placed_monsters: Vec<&String> =
+        monsters.iter().take(DEBUG_MAP_MAX_SPAWN_MONSTERS).collect();
+    let placed_npcs: Vec<&String> = npcs.iter().take(DEBUG_MAP_MAX_SPAWN_NPCS).collect();
+    let spawns_document = if placed_monsters.is_empty() && placed_npcs.is_empty() {
+        None
+    } else {
+        let mut document = String::from("<spawns>\n");
+        document.push_str(&format!(
+            "  <spawn centerx=\"{}\" centery=\"{}\" centerz=\"{}\" radius=\"{}\">\n",
+            DEBUG_MAP_SPAWN_CENTER_X,
+            DEBUG_MAP_SPAWN_CENTER_Y,
+            DEBUG_MAP_FLOOR_Z,
+            DEBUG_MAP_SPAWN_RADIUS,
+        ));
+        for (name, (dx, dy)) in placed_monsters.iter().zip(DEBUG_MAP_MONSTER_OFFSETS.iter()) {
+            document.push_str(&format!(
+                "    <monster name=\"{}\" x=\"{}\" y=\"{}\" spawntime=\"60\"/>\n",
+                escape_debug_xml_attribute(name),
+                dx,
+                dy,
+            ));
+        }
+        for (name, (dx, dy)) in placed_npcs.iter().zip(DEBUG_MAP_NPC_OFFSETS.iter()) {
+            document.push_str(&format!(
+                "    <npc name=\"{}\" x=\"{}\" y=\"{}\"/>\n",
+                escape_debug_xml_attribute(name),
+                dx,
+                dy,
+            ));
+        }
+        document.push_str("  </spawn>\n</spawns>\n");
+        Some(document)
+    };
+    Ok(DebugMapBuild {
+        map,
+        spawns_document,
+        tiles,
+        items_placed,
+        items_capped: named_items.len().saturating_sub(items_placed),
+        monsters_placed: placed_monsters.len(),
+        monsters_capped: monsters.len().saturating_sub(placed_monsters.len()),
+        npcs_placed: placed_npcs.len(),
+        npcs_capped: npcs.len().saturating_sub(placed_npcs.len()),
+        depot_item,
+    })
+}
+
+fn debug_map_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments.len() < 2 || arguments.len() > 3 {
+        return Err("usage: debug-map <directory> [map-name]".into());
+    }
+    let directory = required_path(arguments, 1)?;
+    let map_name = arguments
+        .get(2)
+        .map(String::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("debug");
+    if map_name.contains('/')
+        || map_name.contains('\\')
+        || map_name.contains("..")
+        || map_name.trim().is_empty()
+    {
+        return Err("debug map name must be a plain file stem".into());
+    }
+    let config = load(&directory)?;
+    let world_directory = config.content_directory.join("world");
+    let femap_path = world_directory.join(format!("{map_name}.femap"));
+    let spawn_path = world_directory.join(format!("{map_name}-spawn.xml"));
+    if femap_path.exists() || spawn_path.exists() {
+        return Err(format!(
+            "debug map already exists: {} (remove it first to regenerate)",
+            femap_path.display()
+        )
+        .into());
+    }
+    let item_names = load_legacy_item_names(&config.content_directory.join("items"))?;
+    let (monsters, npcs) = match load_tfs_entity_catalog(&config) {
+        Ok(catalog) => (
+            catalog
+                .monsters
+                .iter()
+                .map(|entity| entity.name.clone())
+                .collect::<Vec<_>>(),
+            catalog
+                .npcs
+                .iter()
+                .map(|entity| entity.name.clone())
+                .collect::<Vec<_>>(),
+        ),
+        Err(error) => {
+            println!(
+                "> warning: entity catalog unavailable ({error}); continuing without monsters"
+            );
+            (Vec::new(), Vec::new())
+        }
+    };
+    let build = build_debug_map(map_name, &item_names, &monsters, &npcs)?;
+    fs::create_dir_all(&world_directory)?;
+    fs::write(&femap_path, export_world_map_to_femap(&build.map)?)?;
+    if let Some(spawns) = &build.spawns_document {
+        fs::write(&spawn_path, spawns)?;
+    }
+    println!(
+        "debug-map name={} file={} tiles={} items={} capped-items={} monsters={} capped-monsters={} npcs={} capped-npcs={} depot={} spawns={}",
+        map_name,
+        femap_path.display(),
+        build.tiles,
+        build.items_placed,
+        build.items_capped,
+        build.monsters_placed,
+        build.monsters_capped,
+        build.npcs_placed,
+        build.npcs_capped,
+        build
+            .depot_item
+            .map_or_else(|| "none".into(), |id| id.to_string()),
+        build
+            .spawns_document
+            .as_ref()
+            .map_or_else(|| "none".into(), |_| spawn_path.display().to_string()),
+    );
+    if item_names.is_empty() {
+        println!("> note: no items.otb names found; the showroom floor is empty");
+    }
+    if build.monsters_placed == 0 && build.npcs_placed == 0 {
+        println!("> note: no monster/npc definitions found; no spawn file written");
+    }
+    println!("set mapName to \"{map_name}\" in config.lua to load it");
+    Ok(())
+}
+
 fn player_command(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let action = arguments
         .get(1)
@@ -2890,6 +3175,8 @@ Commands:
   player storage <directory> <player-id> <get|set|count|list> [key] [value]
   command <directory> broadcast <message>
   command <directory> reload-scripts
+  debug-map <directory> [map-name]
+  debug-map <directory> [map-name]
   script dispatch <directory> <actions|creaturescripts|events|globalevents|movements|spells|talkactions|weapons> <declared-relative-script> <callback-name> <event-kind> <subject-id> <value>
   compatibility [--json]
   version"#
@@ -3033,6 +3320,7 @@ mod tests {
             "player storage <directory> <player-id> <get|set|count|list> [key] [value]",
             "command <directory> broadcast <message>",
             "command <directory> reload-scripts",
+            "debug-map <directory> [map-name]",
             "script dispatch <directory>",
             "compatibility",
             "version",
@@ -3060,6 +3348,169 @@ mod tests {
         ])
         .expect_err("offline reload must fail closed");
         assert!(error.to_string().contains("requires a running server"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn debug_map_builder_lays_out_items_depot_town_and_spawn_camp() {
+        let named_items = BTreeMap::from([
+            (100, "sword".to_string()),
+            (200, "Depot Box".to_string()),
+            (300, "ham".to_string()),
+        ]);
+        let build = build_debug_map(
+            "debug",
+            &named_items,
+            &["Rat".to_string(), "Bat".to_string()],
+            &["Guide".to_string()],
+        )
+        .unwrap();
+        assert_eq!(build.tiles, 32 * 28);
+        assert_eq!((build.items_placed, build.items_capped), (3, 0));
+        assert_eq!(build.depot_item, Some(200));
+        assert_eq!((build.monsters_placed, build.monsters_capped), (2, 0));
+        assert_eq!((build.npcs_placed, build.npcs_capped), (1, 0));
+        assert_eq!(
+            build.map.spawn(),
+            Position {
+                x: 100,
+                y: 100,
+                z: 7
+            }
+        );
+        // Every showroom tile is walkable, so loader validation accepts the map.
+        for (index, server_id) in [100, 200, 300].iter().enumerate() {
+            let position = Position {
+                x: 104 + (index % 16) as u16,
+                y: 100 + (index / 16) as u16,
+                z: 7,
+            };
+            assert!(build.map.is_walkable(position));
+            assert_eq!(
+                build.map.tile_items(position).unwrap()[0].server_id,
+                *server_id
+            );
+        }
+        assert_eq!(
+            build
+                .map
+                .tile_items(Position {
+                    x: 100,
+                    y: 102,
+                    z: 7
+                })
+                .unwrap()[0]
+                .server_id,
+            200
+        );
+        assert_eq!(build.map.towns().next().unwrap().name, "Debug");
+        assert_eq!(
+            build.map.waypoint("temple"),
+            Some(Position {
+                x: 100,
+                y: 100,
+                z: 7
+            })
+        );
+        let spawns = build.spawns_document.unwrap();
+        assert!(spawns.contains(r#"<monster name="Rat" x="0" y="0" spawntime="60"/>"#));
+        assert!(spawns.contains(r#"<npc name="Guide" x="3" y="0"/>"#));
+    }
+
+    #[test]
+    fn debug_map_builder_caps_inputs_and_escapes_xml_names() {
+        let named_items: BTreeMap<u16, String> =
+            (1..=300).map(|id| (id, format!("item {id}"))).collect();
+        let monsters: Vec<String> = (0..10).map(|index| format!("Beast{index}")).collect();
+        let build = build_debug_map("debug", &named_items, &monsters, &[]).unwrap();
+        assert_eq!((build.items_placed, build.items_capped), (256, 44));
+        assert_eq!((build.monsters_placed, build.monsters_capped), (8, 2));
+        assert_eq!(build.depot_item, None);
+        assert!(build.spawns_document.is_some());
+        // An empty world builds a bare floor: no items, no depot, no spawn file.
+        let bare = build_debug_map("debug", &BTreeMap::new(), &[], &[]).unwrap();
+        assert_eq!((bare.items_placed, bare.items_capped), (0, 0));
+        assert_eq!(bare.depot_item, None);
+        assert!(bare.spawns_document.is_none());
+        assert_eq!(bare.map.tile_count(), 32 * 28);
+        // Operator names are XML-escaped in the spawn document.
+        let escaped =
+            build_debug_map("debug", &BTreeMap::new(), &["A&B".to_string()], &[]).unwrap();
+        assert!(escaped
+            .spawns_document
+            .unwrap()
+            .contains(r#"<monster name="A&amp;B""#));
+    }
+
+    #[test]
+    fn debug_map_command_writes_loadable_world_files() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("forgotten-engine-debug-map-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        write_template(&directory, profile_by_id("fe-7.4").unwrap()).unwrap();
+        ensure_content_skeleton(&directory).unwrap();
+        fs::create_dir_all(directory.join("data/monster")).unwrap();
+        fs::create_dir_all(directory.join("data/npc/scripts")).unwrap();
+        fs::write(
+            directory.join("data/monster/Rat.xml"),
+            r#"<monster name="Rat" nameDescription="a rat" corpse="3073" speed="134" experience="25"><health now="20" max="20"/><look type="21"/><attacks><attack name="melee" interval="2000" min="0" max="-40"/></attacks></monster>"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.join("data/npc/Alice.xml"),
+            r#"<npc name="Alice" script="bless.lua"/>"#,
+        )
+        .unwrap();
+        fs::write(
+            directory.join("data/npc/scripts/bless.lua"),
+            "-- private script",
+        )
+        .unwrap();
+        // Regenerate over the skeleton map name so the stock config loads it back.
+        fs::remove_file(directory.join("data/world/forgotten.femap")).unwrap();
+        debug_map_command(&[
+            "debug-map".into(),
+            directory.display().to_string(),
+            "forgotten".into(),
+        ])
+        .unwrap();
+        let femap_path = directory.join("data/world/forgotten.femap");
+        let spawn_path = directory.join("data/world/forgotten-spawn.xml");
+        assert!(femap_path.is_file());
+        assert!(spawn_path.is_file());
+        // A second run refuses instead of overwriting operator content.
+        assert!(debug_map_command(&[
+            "debug-map".into(),
+            directory.display().to_string(),
+            "forgotten".into(),
+        ])
+        .is_err());
+        // The written files load back through the stock loaders with resolved spawns.
+        let config = load(&directory).unwrap();
+        let world_map = load_world_map(&config).unwrap();
+        assert_eq!(world_map.tile_count(), 32 * 28);
+        // No items.otb here, so the floor is bare but walkable.
+        assert!(
+            world_map
+                .tile(Position {
+                    x: 104,
+                    y: 100,
+                    z: 7
+                })
+                .unwrap()
+                .walkable
+        );
+        let companions = load_world_companions(&config, &world_map).unwrap();
+        assert_eq!(companions.spawns.len(), 1);
+        let resolution =
+            resolve_tfs_spawn_references(&companions, &load_tfs_entity_catalog(&config).unwrap());
+        assert_eq!(resolution.spawn_creature_count, 2);
+        assert_eq!(resolution.resolved_creature_count, 2);
+        assert!(resolution.unresolved_monsters.is_empty());
+        assert!(resolution.unresolved_npcs.is_empty());
         let _ = fs::remove_dir_all(directory);
     }
 

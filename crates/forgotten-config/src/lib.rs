@@ -42,7 +42,9 @@ pub use channels::{
 pub use consumables::{
     load_consumable_catalog, parse_consumables_xml, ConsumableCatalog, ConsumableEffect,
 };
-pub use items::{LegacyItemCatalog, LegacyItemDefinition, LegacyItemSlotType};
+pub use items::{
+    load_legacy_item_names, LegacyItemCatalog, LegacyItemDefinition, LegacyItemSlotType,
+};
 pub use legacy_xml::{
     LegacyHouse, LegacySpawnArea, LegacySpawnCreature, LegacySpawnKind, LegacyWorldCompanionData,
 };
@@ -2280,6 +2282,46 @@ experienceStages = {
                 .len(),
             1
         );
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn femap_worlds_load_sibling_spawn_companions() {
+        let world = temporary_world("femap-companions");
+        fs::create_dir_all(&world).unwrap();
+        write_template(&world, FE_7_4_PROFILE).unwrap();
+        ensure_content_skeleton(&world).unwrap();
+        let config = load(&world).unwrap();
+        let position = Position {
+            x: 100,
+            y: 100,
+            z: 7,
+        };
+        let mut map = WorldMap::new(config.map_name.clone(), position);
+        map.set_tile(
+            position,
+            WorldMapTile {
+                ground_thing_id: 102,
+                walkable: true,
+            },
+        )
+        .unwrap();
+        // Absent sibling files still yield empty companions: no behavior change
+        // for existing FE-owned worlds.
+        let empty = load_world_companions(&config, &map).unwrap();
+        assert!(empty.spawns.is_empty());
+        assert!(empty.spawn_file.is_none());
+        // A present sibling spawn file loads and validates like an OTBM companion.
+        fs::write(
+            world.join(format!("data/world/{}-spawn.xml", config.map_name)),
+            r#"<spawns><spawn centerx="100" centery="100" centerz="7" radius="2"><monster name="Rat" x="0" y="0" spawntime="60"/></spawn></spawns>"#,
+        )
+        .unwrap();
+        let loaded = load_world_companions(&config, &map).unwrap();
+        assert_eq!(loaded.spawns.len(), 1);
+        assert_eq!(loaded.spawns[0].creatures.len(), 1);
+        assert_eq!(loaded.spawns[0].creatures[0].name, "Rat");
+        assert_eq!(loaded.spawns[0].creatures[0].position, position);
         let _ = fs::remove_dir_all(world);
     }
 

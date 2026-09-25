@@ -57,23 +57,25 @@ pub(crate) fn load_legacy_world_companions(
     config: &EngineConfig,
     world_map: &WorldMap,
 ) -> Result<LegacyWorldCompanionData, ConfigError> {
-    let WorldMapSource::Otbm(header) = world_map.source() else {
-        return Ok(LegacyWorldCompanionData {
-            spawn_file: None,
-            house_file: None,
-            spawns: Vec::new(),
-            houses: Vec::new(),
-        });
-    };
     let directory = config.content_directory.join("world");
-    let spawn_name = header
-        .spawn_file
-        .clone()
-        .unwrap_or_else(|| format!("{}-spawn.xml", config.map_name));
-    let house_name = header
-        .house_file
-        .clone()
-        .unwrap_or_else(|| format!("{}-house.xml", config.map_name));
+    let (spawn_name, house_name) = match world_map.source() {
+        WorldMapSource::Otbm(header) => (
+            header
+                .spawn_file
+                .clone()
+                .unwrap_or_else(|| format!("{}-spawn.xml", config.map_name)),
+            header
+                .house_file
+                .clone()
+                .unwrap_or_else(|| format!("{}-house.xml", config.map_name)),
+        ),
+        // FE-owned maps share the same sibling-file convention; absent files still
+        // yield empty companions exactly as before.
+        WorldMapSource::FeMapV1 => (
+            format!("{}-spawn.xml", config.map_name),
+            format!("{}-house.xml", config.map_name),
+        ),
+    };
     let spawn_path = resolve_companion_path(&directory, &spawn_name)?;
     let house_path = resolve_companion_path(&directory, &house_name)?;
     let spawns = if spawn_path.is_file() {

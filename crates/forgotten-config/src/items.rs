@@ -3,6 +3,8 @@ use forgotten_core::{NativeItemPresentation, NativeItemPresentationCatalog, Play
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path;
 
 const OTB_IDENTIFIER: &[u8; 4] = b"OTBI";
 const NODE_START: u8 = 0xfe;
@@ -320,6 +322,23 @@ impl LegacyItemCatalog {
     pub fn is_empty(&self) -> bool {
         self.definitions.is_empty()
     }
+}
+
+/// Loads the operator `items.otb` + `items.xml` name table from an item directory for
+/// content tooling, without requiring an OTBM world. Absent files yield an empty table
+/// (the caller skips item-driven output); malformed files fail loudly like the
+/// OTBM-gated catalog path. Used by the debug-map generator to lay out named items.
+pub fn load_legacy_item_names(item_directory: &Path) -> Result<BTreeMap<u16, String>, ConfigError> {
+    let otb_path = item_directory.join("items.otb");
+    let xml_path = item_directory.join("items.xml");
+    if !otb_path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let mut catalog = parse_items_otb(&fs::read(&otb_path).map_err(ConfigError::Io)?)?;
+    if xml_path.is_file() {
+        apply_items_xml(&mut catalog, &fs::read(&xml_path).map_err(ConfigError::Io)?)?;
+    }
+    Ok(catalog.xml_name_by_server_id())
 }
 
 #[derive(Debug)]
@@ -1262,6 +1281,59 @@ mod tests {
         let normalized = crate::apply_legacy_item_metadata(&map, &catalog).unwrap();
         assert_eq!(normalized.tile(position).unwrap().ground_thing_id, 102);
         assert!(!normalized.is_walkable(position));
+    }
+
+    #[test]
+    fn legacy_item_names_load_from_otb_and_xml_without_an_otbm_world() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("forgotten-engine-item-names-{nonce}"));
+        // Absent files yield an empty table instead of an error.
+        assert_eq!(load_legacy_item_names(&directory).unwrap(), BTreeMap::new());
+        fs::create_dir_all(&directory).unwrap();
+        // An XML file alone is not enough: names attach to OTB identities.
+        fs::write(
+            directory.join("items.xml"),
+            r#"<items><item id="2594"><attribute key="name" value="depot locker"/></item></items>"#,
+        )
+        .unwrap();
+        assert_eq!(load_legacy_item_names(&directory).unwrap(), BTreeMap::new());
+        // Two OTB identities, one XML name: only the named one is listed.
+        let mut root = 0u32.to_le_bytes().to_vec();
+        root.push(ROOT_ATTR_VERSION);
+        root.extend_from_slice(&140u16.to_le_bytes());
+        root.extend_from_slice(&3u32.to_le_bytes());
+        root.extend_from_slice(&57u32.to_le_bytes());
+        root.extend_from_slice(&1098u32.to_le_bytes());
+        root.extend([0u8; 128]);
+        let mut coin = FLAG_BLOCK_SOLID.to_le_bytes().to_vec();
+        coin.push(ITEM_ATTR_SERVER_ID);
+        coin.extend_from_slice(&2u16.to_le_bytes());
+        coin.extend_from_slice(&2148u16.to_le_bytes());
+        coin.push(ITEM_ATTR_CLIENT_ID);
+        coin.extend_from_slice(&2u16.to_le_bytes());
+        coin.extend_from_slice(&2148u16.to_le_bytes());
+        let mut locker = FLAG_BLOCK_SOLID.to_le_bytes().to_vec();
+        locker.push(ITEM_ATTR_SERVER_ID);
+        locker.extend_from_slice(&2u16.to_le_bytes());
+        locker.extend_from_slice(&2594u16.to_le_bytes());
+        locker.push(ITEM_ATTR_CLIENT_ID);
+        locker.extend_from_slice(&2u16.to_le_bytes());
+        locker.extend_from_slice(&2594u16.to_le_bytes());
+        let mut bytes = OTB_IDENTIFIER.to_vec();
+        bytes.extend(framed_node(
+            0,
+            &root,
+            &[framed_node(1, &coin, &[]), framed_node(1, &locker, &[])],
+        ));
+        fs::write(directory.join("items.otb"), &bytes).unwrap();
+        assert_eq!(
+            load_legacy_item_names(&directory).unwrap(),
+            BTreeMap::from([(2594, "depot locker".to_string())])
+        );
+        let _ = fs::remove_dir_all(directory);
     }
 }
 

@@ -125,6 +125,7 @@ The following commands are part of FEâ€™s public local-first interface. The
 | `player skill <directory> <player-id> <skill> <level> [percent]` | Stores a bounded typed classic skill value for an existing local character. | Additive only; no skill-try or advancement-formula claim. |
 | `player storage <directory> <player-id> <get\|set\|count\|list> [key] [value]` | Inspects the durable per-player script storage jail (`get` prints `absent` for unset keys). | Additive only; key/value damage stays signed 64-bit. |
 | `command <directory> broadcast <message>` | Records the bounded administrator broadcast command. | Extend only through an allowlisted typed command family. |
+| `debug-map <directory> [map-name]` | Generates a deterministic debug world (walkable floor, named-item showroom, depot tile, town, spawn camp) from operator content without touching live worlds. | Additive only; never overwrites existing map files. |
 | `command <directory> reload-scripts` | Asks the running world's operator bridge to re-read every file-backed script callback in place. | Requires a running server; offline use fails closed. |
 | `compatibility`, `version`, `help` | Gives profile/capability/build guidance. | Remain stable, discoverable, and scriptable. |
 
