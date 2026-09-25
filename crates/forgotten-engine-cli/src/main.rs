@@ -2887,7 +2887,9 @@ Commands:
   player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>
   player container-add <directory> <player-id> <container-id> <server-item-id> [count]
   player container-remove <directory> <player-id> <container-id> <item-index>
+  player storage <directory> <player-id> <get|set|count|list> [key] [value]
   command <directory> broadcast <message>
+  command <directory> reload-scripts
   script dispatch <directory> <actions|creaturescripts|events|globalevents|movements|spells|talkactions|weapons> <declared-relative-script> <callback-name> <event-kind> <subject-id> <value>
   compatibility [--json]
   version"#
@@ -3028,7 +3030,9 @@ mod tests {
             "player container-create <directory> <player-id> <container-id> <container-server-item-id> <capacity> <name>",
             "player container-add <directory> <player-id> <container-id> <server-item-id> [count]",
             "player container-remove <directory> <player-id> <container-id> <item-index>",
+            "player storage <directory> <player-id> <get|set|count|list> [key] [value]",
             "command <directory> broadcast <message>",
+            "command <directory> reload-scripts",
             "script dispatch <directory>",
             "compatibility",
             "version",
@@ -3038,6 +3042,25 @@ mod tests {
                 "missing stable CLI command: {command}"
             );
         }
+    }
+
+    #[test]
+    fn reload_scripts_command_fails_closed_without_a_running_server() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("forgotten-engine-reload-offline-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        let error = command_line(&[
+            "command".into(),
+            directory.display().to_string(),
+            "reload-scripts".into(),
+        ])
+        .expect_err("offline reload must fail closed");
+        assert!(error.to_string().contains("requires a running server"));
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
