@@ -1,7 +1,8 @@
 //! Owned UseItem routing past consumables: backpack-in-hand container windows, runtime
 //! corpse opening from the durable registry, and map-item routing (teleport pads, read-only
-//! text, validated generic use). Each handler consumes its record on match and falls through
-//! otherwise, preserving the session loop's sequential routing order.
+//! text, depot windows for depot-named items, validated generic use). Each handler consumes
+//! its record on match and falls through otherwise, preserving the session loop's
+//! sequential routing order.
 
 use super::npc_shop::handle_native_depot_open;
 use super::*;
