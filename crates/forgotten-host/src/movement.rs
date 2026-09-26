@@ -371,6 +371,32 @@ pub fn native_hasted_speed(effective_speed: u16, speed_bonus_percent: u16) -> u1
     u16::try_from(hasted).unwrap_or(2_000).clamp(1, 2_000)
 }
 
+/// Speed-derived walk delay for one voluntary step, shared by the click-walk
+/// scheduler and every immediate step source (manual cardinal/diagonal moves
+/// and single-step click paths). All voluntary steps advance the same
+/// per-session cooldown, so input spam can never stack steps faster than the
+/// configured pace no matter which frames carry it.
+pub(crate) fn native_walk_step_delay(
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    shared_world: &SharedNativeWorld,
+    config: &NativeOtClientHostConfig,
+    character_id: u64,
+) -> Result<Duration, HostError> {
+    let equipment = shared_world.player_equipment(character_id)?;
+    let effective_speed = native_hasted_speed(
+        native_effective_player_speed(
+            snapshot.player_speed,
+            &equipment,
+            config.item_speed_bonus_by_server_id.as_deref(),
+        ),
+        shared_world.player_speed_bonus_percent(character_id),
+    );
+    Ok(native_autowalk_step_delay(
+        effective_speed,
+        snapshot.server_beat,
+    ))
+}
+
 /// Classic haste duration for spell-granted speed conditions (utani hur family).
 pub(crate) const NATIVE_HASTE_DURATION_SECONDS: u16 = 25;
 
@@ -479,10 +505,13 @@ pub(crate) fn apply_native_turn_action(
 }
 
 /// Applies one click-walk path: replaces any active walk, or creates a speed-derived scheduled
-/// task when idle. A single-step path takes its step immediately through the cardinal mover.
+/// task when idle. A single-step path takes its step immediately only when the shared walk
+/// cooldown is free; otherwise it queues behind the cooldown like any other path, so
+/// spam-clicking adjacent tiles can never step faster than the configured pace.
 pub(crate) fn apply_native_autowalk_action(
     ctx: &mut SessionContext<'_>,
     path: Vec<NativeOtClientAutoWalkDirection>,
+    next_walk_at: &mut Instant,
 ) -> Result<(), HostError> {
     if let Some(task) = ctx.active_click_walk.as_mut() {
         let previous_steps = task.queued_steps.len();
@@ -496,18 +525,11 @@ pub(crate) fn apply_native_autowalk_action(
             ),
         );
     } else {
-        let equipment = ctx.shared_world.player_equipment(ctx.character_id)?;
-        let effective_speed = native_hasted_speed(
-            native_effective_player_speed(
-                ctx.snapshot.player_speed,
-                &equipment,
-                ctx.config.item_speed_bonus_by_server_id.as_deref(),
-            ),
-            ctx.shared_world
-                .player_speed_bonus_percent(ctx.character_id),
-        );
-        let step_delay = native_autowalk_step_delay(effective_speed, ctx.snapshot.server_beat);
-        let mut task = NativeActiveClickWalk::from_path(path, Instant::now() + step_delay);
+        let step_delay =
+            native_walk_step_delay(ctx.snapshot, ctx.shared_world, ctx.config, ctx.character_id)?;
+        let now = Instant::now();
+        let mut task =
+            NativeActiveClickWalk::from_path(path, (*next_walk_at).max(now + step_delay));
         native_diagnostic(
             ctx.config.extended_diagnostics,
             ctx.peer,
@@ -520,7 +542,7 @@ pub(crate) fn apply_native_autowalk_action(
         if task.queued_steps.is_empty() {
             return Ok(());
         }
-        if task.queued_steps.len() == 1 {
+        if task.queued_steps.len() == 1 && now >= *next_walk_at {
             let Some(direction) = task.queued_steps.pop_front() else {
                 return Ok(());
             };
@@ -545,6 +567,7 @@ pub(crate) fn apply_native_autowalk_action(
                     ),
                 );
                 *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
+                *next_walk_at = Instant::now() + step_delay;
                 *ctx.active_click_walk = Some(task);
             } else {
                 native_diagnostic(
@@ -564,11 +587,25 @@ pub(crate) fn apply_native_autowalk_action(
 }
 
 /// Applies one manual cardinal step through the shared map mover, cancelling any click-walk and
-/// refreshing visibility only on a real move. Manual steps never fail the session.
+/// refreshing visibility only on a real move. Steps arriving inside the shared walk cooldown
+/// degrade to a turn (facing update, no displacement), so key spam paces like click spam.
+/// Manual steps never fail the session.
 pub(crate) fn apply_native_cardinal_move_action(
     ctx: &mut SessionContext<'_>,
     direction: NativeOtClientCardinalDirection,
+    next_walk_at: &mut Instant,
 ) -> Result<(), HostError> {
+    let step_delay =
+        native_walk_step_delay(ctx.snapshot, ctx.shared_world, ctx.config, ctx.character_id)?;
+    if Instant::now() < *next_walk_at {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            &format!("movement=cardinal direction={direction:?} outcome=exhausted-turn"),
+        );
+        apply_native_turn_action(ctx, direction)?;
+        return Ok(());
+    }
     let cancelled_click_walk = ctx.active_click_walk.take().is_some();
     let moved = move_native_map_player(
         &mut *ctx.stream,
@@ -603,16 +640,29 @@ pub(crate) fn apply_native_cardinal_move_action(
     }
     if moved {
         *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
+        *next_walk_at = Instant::now() + step_delay;
     }
     Ok(())
 }
 
 /// Applies one manual diagonal step through the shared diagonal mover. Same cancel, diagnostic,
-/// and visibility contract as the cardinal step.
+/// visibility, and cooldown contract as the cardinal step.
 pub(crate) fn apply_native_diagonal_move_action(
     ctx: &mut SessionContext<'_>,
     direction: NativeOtClientAutoWalkDirection,
+    next_walk_at: &mut Instant,
 ) -> Result<(), HostError> {
+    let step_delay =
+        native_walk_step_delay(ctx.snapshot, ctx.shared_world, ctx.config, ctx.character_id)?;
+    if Instant::now() < *next_walk_at {
+        native_diagnostic(
+            ctx.config.extended_diagnostics,
+            ctx.peer,
+            &format!("movement=diagonal direction={direction:?} outcome=exhausted-turn"),
+        );
+        apply_native_turn_action(ctx, direction.cardinal_steps()[1])?;
+        return Ok(());
+    }
     let cancelled_click_walk = ctx.active_click_walk.take().is_some();
     let moved = move_native_map_player_diagonal(
         &mut *ctx.stream,
@@ -647,6 +697,7 @@ pub(crate) fn apply_native_diagonal_move_action(
     }
     if moved {
         *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
+        *next_walk_at = Instant::now() + step_delay;
     }
     Ok(())
 }

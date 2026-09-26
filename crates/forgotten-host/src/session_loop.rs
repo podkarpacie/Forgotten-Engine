@@ -473,6 +473,10 @@ pub(crate) fn handle_native_otclient_game(
     let mut player_position = initial_position;
     let mut facing = NativeOtClientCardinalDirection::South;
     let mut active_click_walk: Option<NativeActiveClickWalk> = None;
+    // Authoritative walk cooldown shared by every voluntary step source (click-walk
+    // scheduler, manual cardinal/diagonal moves, single-step click paths). The first
+    // step is free; each executed step re-arms it for one speed-derived delay.
+    let mut next_walk_at = Instant::now();
     let mut last_regeneration_tick = Instant::now();
     let mut last_condition_tick = Instant::now();
     let mut closed_container_ids = BTreeSet::new();
@@ -1204,20 +1208,15 @@ pub(crate) fn handle_native_otclient_game(
                             );
                             observed_visibility_epoch = shared_world.visibility_epoch();
                             if let Some(task) = active_click_walk.as_mut() {
-                                let equipment = shared_world.player_equipment(character.id)?;
-                                let effective_speed = native_hasted_speed(
-                                    native_effective_player_speed(
-                                        snapshot.player_speed,
-                                        &equipment,
-                                        config.item_speed_bonus_by_server_id.as_deref(),
-                                    ),
-                                    shared_world.player_speed_bonus_percent(character.id),
-                                );
-                                task.next_step_deadline = Instant::now()
-                                    + native_autowalk_step_delay(
-                                        effective_speed,
-                                        snapshot.server_beat,
-                                    );
+                                let rearmed = Instant::now()
+                                    + native_walk_step_delay(
+                                        &snapshot,
+                                        shared_world,
+                                        config,
+                                        character.id,
+                                    )?;
+                                task.next_step_deadline = rearmed;
+                                next_walk_at = rearmed;
                             }
                         } else {
                             native_diagnostic(
@@ -2587,7 +2586,7 @@ pub(crate) fn handle_native_otclient_game(
                         observed_visibility_epoch: &mut observed_visibility_epoch,
                         observed_vitals_epoch: &mut observed_vitals_epoch,
                     };
-                    apply_native_autowalk_action(&mut ctx, path)?;
+                    apply_native_autowalk_action(&mut ctx, path, &mut next_walk_at)?;
                     if *ctx.player_position != pre_step_position {
                         let departed = pre_step_position;
                         let arrival = *ctx.player_position;
@@ -2616,7 +2615,7 @@ pub(crate) fn handle_native_otclient_game(
                         observed_visibility_epoch: &mut observed_visibility_epoch,
                         observed_vitals_epoch: &mut observed_vitals_epoch,
                     };
-                    apply_native_cardinal_move_action(&mut ctx, direction)?;
+                    apply_native_cardinal_move_action(&mut ctx, direction, &mut next_walk_at)?;
                     if *ctx.player_position != pre_step_position {
                         let departed = pre_step_position;
                         let arrival = *ctx.player_position;
@@ -2645,7 +2644,7 @@ pub(crate) fn handle_native_otclient_game(
                         observed_visibility_epoch: &mut observed_visibility_epoch,
                         observed_vitals_epoch: &mut observed_vitals_epoch,
                     };
-                    apply_native_diagonal_move_action(&mut ctx, direction)?;
+                    apply_native_diagonal_move_action(&mut ctx, direction, &mut next_walk_at)?;
                     if *ctx.player_position != pre_step_position {
                         let departed = pre_step_position;
                         let arrival = *ctx.player_position;

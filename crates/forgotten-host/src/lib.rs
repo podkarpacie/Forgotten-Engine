@@ -17960,6 +17960,10 @@ mod tests {
         assert_eq!(&latest_path_movement.0[7..12], &[100, 0, 100, 0, 7]);
         let latest_path_edge = read_data_frame(&mut stream);
         assert_eq!(latest_path_edge.0[0], 0x68);
+        // The shared walk cooldown (~681ms at speed 220) is still armed by the
+        // latest scheduled step; wait it out so the manual move below exercises
+        // a genuine step instead of an exhausted turn.
+        thread::sleep(Duration::from_millis(800));
         write_frame(&mut stream, &Frame(vec![0x67])).unwrap();
         let manual_movement = read_data_frame(&mut stream);
         assert_eq!(&manual_movement.0[1..7], &[100, 0, 100, 0, 7, 1]);
@@ -18043,6 +18047,8 @@ mod tests {
             101
         );
 
+        // Cooldown is armed by the south step; wait it out for a genuine step.
+        thread::sleep(Duration::from_millis(800));
         write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
         let second_east = read_data_frame(&mut stream);
         assert_eq!(&second_east.0[1..7], &[101, 0, 101, 0, 7, 1]);
@@ -18050,6 +18056,9 @@ mod tests {
         let second_east_edge = read_data_frame(&mut stream);
         assert_eq!(second_east_edge.0[0], 0x66);
 
+        // Genuine wall rejection needs a free cooldown (an exhausted turn
+        // emits the same cancel bytes for a different reason).
+        thread::sleep(Duration::from_millis(800));
         write_frame(&mut stream, &Frame(vec![0x66])).unwrap();
         let blocked_movement = read_data_frame(&mut stream);
         assert_eq!(
@@ -18063,6 +18072,9 @@ mod tests {
             102
         );
 
+        // The blocked east attempt does not re-arm the cooldown, but the
+        // earlier east step still does; wait it out for a genuine diagonal.
+        thread::sleep(Duration::from_millis(800));
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -18084,6 +18096,8 @@ mod tests {
         let diagonal_position = database.characters_for_account(account_id).unwrap()[0].position;
         assert_eq!(diagonal_position.x, 101);
         assert_eq!(diagonal_position.y, 100);
+        // Same genuine-rejection reasoning as the blocked east step above.
+        thread::sleep(Duration::from_millis(800));
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -18327,6 +18341,9 @@ mod tests {
             }
         );
 
+        // Each chained teleport rides a voluntary step; pace them so every
+        // link exercises a genuine step instead of an exhausted turn.
+        thread::sleep(Duration::from_millis(800));
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -18362,6 +18379,7 @@ mod tests {
             }
         );
 
+        thread::sleep(Duration::from_millis(800));
         write_frame(
             &mut stream,
             &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_NORTH]),
@@ -18395,6 +18413,7 @@ mod tests {
             }
         );
 
+        thread::sleep(Duration::from_millis(800));
         write_frame(
             &mut stream,
             &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_NORTH]),
@@ -18557,6 +18576,104 @@ mod tests {
                 215
             ]
         );
+
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn rapid_manual_moves_pace_through_the_shared_walk_cooldown() {
+        // Spam-click/key-mash regression: the first manual step moves, an
+        // immediate second degrades to a facing-only turn (cancel-walk frame,
+        // position untouched), and a step after one full delay moves again.
+        let database_path = database_path("native-walk-cooldown");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut stream).unwrap();
+        let _daylight = read_data_frame(&mut stream);
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_EAST]),
+        )
+        .unwrap();
+        let first = read_data_frame(&mut stream);
+        assert_eq!(
+            first.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
+        );
+        assert_eq!(&first.0[7..12], &[101, 0, 100, 0, 7]);
+        let _first_edge = read_data_frame(&mut stream);
+
+        // Still inside the ~681ms cooldown: turn-only, no displacement.
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_EAST]),
+        )
+        .unwrap();
+        let exhausted = read_data_frame(&mut stream);
+        assert_eq!(
+            exhausted.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK,
+                NativeOtClientCardinalDirection::East.protocol_direction()
+            ]
+        );
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].position,
+            Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            }
+        );
+
+        // After one full delay the same input steps again.
+        thread::sleep(Duration::from_millis(800));
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_EAST]),
+        )
+        .unwrap();
+        let second = read_data_frame(&mut stream);
+        assert_eq!(
+            second.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
+        );
+        assert_eq!(&second.0[7..12], &[102, 0, 100, 0, 7]);
 
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
