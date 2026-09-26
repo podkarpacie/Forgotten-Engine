@@ -17,6 +17,13 @@ impl WorldState {
             if entity.name.trim().is_empty() {
                 return Err(CoreError::EmptyStaticSpawnName);
             }
+            // Summonable templates carry the conventional unplaced position (0,0,0):
+            // they exist only so operator /spawn can materialize them by name. They
+            // install dormant so they never occupy tiles, never enter viewport
+            // snapshots, and never collide on restart restores. A genuine map spawn
+            // at the origin would previously brick the boot; now it degrades to a
+            // dormant summonable instead.
+            let placed = entity.position != Position { x: 0, y: 0, z: 0 };
             if creatures
                 .insert(
                     entity.id,
@@ -27,7 +34,7 @@ impl WorldState {
                         loot: collection.loot_table(entity.id).to_vec(),
                         spawn_position: entity.position,
                         monster_spawn_area: collection.monster_spawn_area(entity.id),
-                        active: true,
+                        active: placed,
                         health_percent: entity.health_percent,
                         activated_at_tick: self.tick,
                         inactive_since_tick: None,
@@ -235,9 +242,15 @@ impl WorldState {
     }
 
     /// Returns an ordered, bounded restart snapshot for every installed static creature.
+    /// Dormant summonable templates (inactive at the conventional unplaced origin) are
+    /// excluded: persisting them wrote hundreds of placeholder rows that both bloated
+    /// game-start snapshots past the frame bound and collided on the next restore.
+    /// Inactive creatures at real positions (awaiting respawn) still persist.
     pub fn static_creature_runtime_snapshot(&self) -> Vec<StaticCreatureRuntimeSnapshot> {
+        const UNPLACED_ORIGIN: Position = Position { x: 0, y: 0, z: 0 };
         self.static_creatures
             .iter()
+            .filter(|(_, runtime)| runtime.active || runtime.entity.position != UNPLACED_ORIGIN)
             .map(|(id, runtime)| StaticCreatureRuntimeSnapshot {
                 id: *id,
                 position: runtime.entity.position,
@@ -256,19 +269,27 @@ impl WorldState {
     }
 
     /// Restores runtime state for matching installed static spawn IDs after a restart. Unknown
-    /// records are ignored to make map/catalog upgrades safe. Target state and timing metadata
-    /// are explicitly non-durable and are cleared/reset. This method validates all matching
-    /// records and their prospective occupancy before it changes any authoritative state.
+    /// records are ignored to make map/catalog upgrades safe. Records parked at the
+    /// conventional unplaced origin (dormant summonable templates persisted by older
+    /// builds) are likewise skipped instead of colliding there and bricking the boot.
+    /// Target state and timing metadata are explicitly non-durable and are cleared/reset.
+    /// This method validates all matching records and their prospective occupancy before
+    /// it changes any authoritative state.
     pub fn restore_static_creature_runtime(
         &mut self,
         records: &[StaticCreatureRuntimeSnapshot],
     ) -> Result<StaticCreatureRuntimeRestoreSummary, CoreError> {
+        const UNPLACED_ORIGIN: Position = Position { x: 0, y: 0, z: 0 };
         let mut seen = BTreeSet::new();
         let mut known_records = Vec::new();
         let mut ignored_unknown = 0;
         for record in records {
             if !seen.insert(record.id) {
                 return Err(CoreError::DuplicateStaticSpawnId(record.id));
+            }
+            if record.position == UNPLACED_ORIGIN {
+                ignored_unknown += 1;
+                continue;
             }
             if record.health_percent > 100 {
                 return Err(CoreError::InvalidStaticCreatureHealthPercent(

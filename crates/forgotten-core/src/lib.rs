@@ -9340,6 +9340,86 @@ mod tests {
     }
 
     #[test]
+    fn unplaced_summonable_templates_install_dormant_and_never_poison_snapshots() {
+        let placed = FeTfsStaticEntity {
+            id: 0x4000_0001,
+            name: "Rat".into(),
+            name_description: String::new(),
+            position: Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            },
+            look_type: 21,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 134,
+            health_percent: 100,
+            direction: 2,
+        };
+        let template = FeTfsStaticEntity {
+            id: 0x5000_0001,
+            name: "Demon".into(),
+            name_description: String::new(),
+            position: Position { x: 0, y: 0, z: 0 },
+            look_type: 30,
+            head: 0,
+            body: 0,
+            legs: 0,
+            feet: 0,
+            addons: 0,
+            speed: 100,
+            health_percent: 100,
+            direction: 2,
+        };
+        let mut world = WorldState::default();
+        world
+            .install_static_creatures(
+                &FeTfsStaticSpawnCollection::new(vec![placed, template]).unwrap(),
+            )
+            .unwrap();
+
+        // The template installs dormant: no tile occupancy, no viewport presence,
+        // but still resolvable by name for operator /spawn.
+        let lifecycle = world.static_creature_lifecycle(0x5000_0001).unwrap();
+        assert!(!lifecycle.active);
+        assert!(!world.is_static_creature_occupied(Position { x: 0, y: 0, z: 0 }));
+        assert_eq!(world.active_static_spawn_collection().entities.len(), 1);
+        assert!(world.static_creature(0x5000_0001).is_some());
+
+        // Snapshots exclude the dormant template, so game-start frames stay small
+        // and the database never accumulates placeholder rows.
+        let snapshot = world.static_creature_runtime_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].id, 0x4000_0001);
+
+        // Legacy poison rows (dormant templates persisted by older builds) restore
+        // as ignored instead of colliding at the origin and bricking the boot.
+        let poison = StaticCreatureRuntimeSnapshot {
+            id: 0x5000_0001,
+            position: Position { x: 0, y: 0, z: 0 },
+            active: true,
+            health_percent: 100,
+            reactivation_remaining_seconds: None,
+            direct_melee_cooldown_remaining_ticks: None,
+            direct_melee_damage_sequence: 0,
+        };
+        assert_eq!(
+            world.restore_static_creature_runtime(
+                &snapshot.iter().cloned().chain([poison]).collect::<Vec<_>>()
+            ),
+            Ok(StaticCreatureRuntimeRestoreSummary {
+                restored: 1,
+                ignored_unknown: 1,
+            })
+        );
+        assert!(!world.static_creature_lifecycle(0x5000_0001).unwrap().active);
+    }
+
+    #[test]
     fn deterministic_static_creature_policy_selects_safe_adjacent_steps_only() {
         let mut map = WorldMap::new(
             "policy",
