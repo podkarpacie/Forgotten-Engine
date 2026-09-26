@@ -243,22 +243,34 @@ pub(crate) fn handle_native_otclient_game(
         empty_world.player_look_type,
         empty_world.player_speed,
     )?;
-    let mut initialization =
-        encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players(
-            &config.client_profile,
-            &snapshot,
-            world_map.as_ref(),
-            Some(&active_static_spawns),
-            Some(&visible_players),
-        )
-        .map_err(HostError::Protocol)?;
+    // Game-start framing: the three record groups (login state, full map viewport,
+    // bootstrap+modes) travel as one transport frame while they fit, preserving the exact
+    // historical byte stream that existing clients and captures expect
+    // (login, map, bootstrap, modes). Past the 8 KiB transport bound (dense maps with
+    // ground on every tile), the same record groups travel as three frames in the same
+    // order instead of erroring the session.
+    // Frames are transport envelopes only; record parsing is order-preserving.
+    let login_state_frame =
+        encode_native_otclient_game_login_state(&config.client_profile, &snapshot)
+            .map_err(HostError::Protocol)?;
+    let map_frame = encode_native_otclient_map_viewport_with_static_spawns_and_players(
+        &config.client_profile,
+        &snapshot,
+        world_map.as_ref(),
+        Some(&active_static_spawns),
+        Some(&visible_players),
+    )
+    .map_err(HostError::Protocol)?;
+    let mut bootstrap_frame =
+        encode_native_otclient_player_bootstrap(&config.client_profile, &snapshot)
+            .map_err(HostError::Protocol)?;
     let fight_mode_state = shared_world.player_fight_mode_state(character.id)?;
     let mode = match fight_mode_state.mode {
         PlayerFightMode::Attack => NativeOtClientFightMode::Attack,
         PlayerFightMode::Balanced => NativeOtClientFightMode::Balanced,
         PlayerFightMode::Defense => NativeOtClientFightMode::Defense,
     };
-    initialization.0.extend_from_slice(
+    bootstrap_frame.0.extend_from_slice(
         &encode_native_otclient_player_modes(
             &config.client_profile,
             NativeOtClientFightModeRequest {
@@ -270,6 +282,10 @@ pub(crate) fn handle_native_otclient_game(
         .map_err(HostError::Protocol)?
         .0,
     );
+    let initialization = login_state_frame;
+    let initialization_bytes = initialization.0.len() + map_frame.0.len() + bootstrap_frame.0.len();
+    let split_initialization = map_frame.0.len() + bootstrap_frame.0.len() + initialization.0.len()
+        > forgotten_protocol::MAX_FRAME_SIZE;
     let equipment_frames = native_classic_equipment_frames(
         &config.client_profile,
         config.item_presentation_catalog.as_deref(),
@@ -320,7 +336,16 @@ pub(crate) fn handle_native_otclient_game(
     let mut observed_containers_epoch = shared_world.containers_epoch();
     let mut observed_party_epoch = shared_world.party_epoch();
     let mut observed_dead = shared_world.player_respawn_state(character.id)?.dead;
-    write_frame(stream, &initialization)?;
+    if split_initialization {
+        write_frame(stream, &initialization)?;
+        write_frame(stream, &map_frame)?;
+        write_frame(stream, &bootstrap_frame)?;
+    } else {
+        let mut single = initialization;
+        single.0.extend_from_slice(&map_frame.0);
+        single.0.extend_from_slice(&bootstrap_frame.0);
+        write_frame(stream, &single)?;
+    }
     if character.outfit.look_type == player_outfit.look_type && player_outfit.look_type != 0 {
         let hydrated_outfit = encode_native_otclient_creature_outfit(
             &config.client_profile,
@@ -427,7 +452,7 @@ pub(crate) fn handle_native_otclient_game(
         eprintln!(
             "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} equipment-records={}/{} skipped-unmapped={} container-records={}/{} skipped-unmapped-or-nested={} static-health-records={} vip-records={} skipped-vip-records={} vip-presence-updates={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
             character.name,
-            initialization.0.len(),
+            initialization_bytes,
             equipment_frames.len(),
             bootstrap_equipment.len(),
             bootstrap_equipment.len().saturating_sub(equipment_frames.len()),

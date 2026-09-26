@@ -224,35 +224,35 @@ use forgotten_protocol::{
     encode_native_otclient_distance_effect, encode_native_otclient_empty_quest_log,
     encode_native_otclient_failure_message, encode_native_otclient_game_announcement,
     encode_native_otclient_game_cancel_walk_facing, encode_native_otclient_game_death,
-    encode_native_otclient_game_initialization_with_map_and_static_spawns_and_players,
-    encode_native_otclient_game_login_error, encode_native_otclient_game_ping,
-    encode_native_otclient_game_ping_back, encode_native_otclient_login_error,
-    encode_native_otclient_look_message, encode_native_otclient_magic_effect,
+    encode_native_otclient_game_login_error, encode_native_otclient_game_login_state,
+    encode_native_otclient_game_ping, encode_native_otclient_game_ping_back,
+    encode_native_otclient_login_error, encode_native_otclient_look_message,
+    encode_native_otclient_magic_effect,
     encode_native_otclient_map_step_with_static_spawns_and_players,
     encode_native_otclient_map_viewport_with_static_spawns,
     encode_native_otclient_map_viewport_with_static_spawns_and_players,
     encode_native_otclient_move_creature_at, encode_native_otclient_open_container,
     encode_native_otclient_open_npc_trade, encode_native_otclient_open_public_channel,
-    encode_native_otclient_own_trade, encode_native_otclient_player_goods,
-    encode_native_otclient_player_modes, encode_native_otclient_player_skills,
-    encode_native_otclient_player_state_bits, encode_native_otclient_player_stats,
-    encode_native_otclient_private_message_from, encode_native_otclient_public_channel_say,
-    encode_native_otclient_public_say, encode_native_otclient_quest_line,
-    encode_native_otclient_quest_list, encode_native_otclient_read_only_text_window,
-    encode_native_otclient_set_inventory, encode_native_otclient_status_message,
-    encode_native_otclient_whisper, encode_native_otclient_world_light,
-    encode_native_otclient_yell, encode_status_binary, encode_status_metrics, encode_status_xml,
-    generate_legacy_74_game_challenge, xtea_encrypt_packet, CharacterListEntry,
-    CompatibilityProfile, EmptyWorldMovementAck, Frame, InitialWorldSnapshot,
-    Legacy74GameSessionState, LegacyRsaPrivateKey, NativeOtClientAutoWalkDirection,
-    NativeOtClientCardinalDirection, NativeOtClientClassicChannel, NativeOtClientClassicItemRecord,
-    NativeOtClientClassicOpenContainer, NativeOtClientClassicOutfit,
-    NativeOtClientClassicPartyShield, NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode,
-    NativeOtClientFightModeRequest, NativeOtClientGameAction, NativeOtClientPlayerGood,
-    NativeOtClientPlayerVitals, NativeOtClientPosition, NativeOtClientProfile,
-    NativeOtClientShopItem, NativeOtClientTradeItem, NativeOtClientVisiblePlayer, OtClientEndpoint,
-    ProtocolError, StatusPlayer, StatusRequest, StatusSnapshot, MAX_FRAME_SIZE,
-    MAX_LOGIN_STRING_BYTES, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES,
+    encode_native_otclient_own_trade, encode_native_otclient_player_bootstrap,
+    encode_native_otclient_player_goods, encode_native_otclient_player_modes,
+    encode_native_otclient_player_skills, encode_native_otclient_player_state_bits,
+    encode_native_otclient_player_stats, encode_native_otclient_private_message_from,
+    encode_native_otclient_public_channel_say, encode_native_otclient_public_say,
+    encode_native_otclient_quest_line, encode_native_otclient_quest_list,
+    encode_native_otclient_read_only_text_window, encode_native_otclient_set_inventory,
+    encode_native_otclient_status_message, encode_native_otclient_whisper,
+    encode_native_otclient_world_light, encode_native_otclient_yell, encode_status_binary,
+    encode_status_metrics, encode_status_xml, generate_legacy_74_game_challenge,
+    xtea_encrypt_packet, CharacterListEntry, CompatibilityProfile, EmptyWorldMovementAck, Frame,
+    InitialWorldSnapshot, Legacy74GameSessionState, LegacyRsaPrivateKey,
+    NativeOtClientAutoWalkDirection, NativeOtClientCardinalDirection, NativeOtClientClassicChannel,
+    NativeOtClientClassicItemRecord, NativeOtClientClassicOpenContainer,
+    NativeOtClientClassicOutfit, NativeOtClientClassicPartyShield,
+    NativeOtClientEmptyWorldSnapshot, NativeOtClientFightMode, NativeOtClientFightModeRequest,
+    NativeOtClientGameAction, NativeOtClientPlayerGood, NativeOtClientPlayerVitals,
+    NativeOtClientPosition, NativeOtClientProfile, NativeOtClientShopItem, NativeOtClientTradeItem,
+    NativeOtClientVisiblePlayer, OtClientEndpoint, ProtocolError, StatusPlayer, StatusRequest,
+    StatusSnapshot, MAX_FRAME_SIZE, MAX_LOGIN_STRING_BYTES, NATIVE_OTCLIENT_MAX_CHAT_TEXT_BYTES,
     NATIVE_OTCLIENT_MESSAGE_GM_BROADCAST, NATIVE_OTCLIENT_MESSAGE_SAY,
     NATIVE_OTCLIENT_MESSAGE_WHISPER, NATIVE_OTCLIENT_MESSAGE_YELL, NATIVE_OTCLIENT_PLAYER_ID_END,
     NATIVE_OTCLIENT_PLAYER_ID_START,
@@ -18426,6 +18426,136 @@ mod tests {
                 y: 103,
                 z: 7,
             }
+        );
+
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn dense_map_splits_game_initialization_into_three_ordered_frames() {
+        let database_path = database_path("native-dense-split-init");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        // Freeze wander so no unsolicited viewport refresh races the init read.
+        native_config.static_creature_wander_policy =
+            forgotten_core::StaticCreatureDecisionPolicy::Disabled;
+        native_config.static_creature_wander_every_ticks = 0;
+        // 32 viewport-clustered static entities push the historical single-frame
+        // layout past the 8 KiB transport bound, forcing the 3-frame split.
+        // The viewport scan is x-outer, so entities at x_idx 9..17 all come
+        // after the player tile (x_idx 8) and the local-player record keeps
+        // its budget priority.
+        let mut spawns = Vec::new();
+        for index in 0..32_u32 {
+            let x = 101 + (index % 9) as u16;
+            let y = 94 + (index / 9) as u16;
+            spawns.push(forgotten_core::FeTfsStaticEntity {
+                id: NATIVE_OTCLIENT_PLAYER_ID_END + 1 + index,
+                name: format!("DenseRat{index:02}"),
+                name_description: String::new(),
+                position: Position { x, y, z: 7 },
+                look_type: 21,
+                head: 0,
+                body: 0,
+                legs: 0,
+                feet: 0,
+                addons: 0,
+                speed: 220,
+                health_percent: 100,
+                direction: 2,
+            });
+        }
+        native_config.static_spawns =
+            Some(Arc::new(FeTfsStaticSpawnCollection::new(spawns).unwrap()));
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        // Split layout: bare login-state, full map viewport, bootstrap+modes.
+        let login = read_frame(&mut stream).unwrap();
+        assert_eq!(
+            login.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+        assert_eq!(login.0.len(), 8);
+        let map = read_frame(&mut stream).unwrap();
+        assert_eq!(map.0[0], forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP);
+        let bootstrap = read_frame(&mut stream).unwrap();
+        assert!(bootstrap
+            .0
+            .contains(&forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_STATS));
+        assert!(bootstrap.0.windows(4).any(|window| window
+            == [
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_PLAYER_MODES,
+                1,
+                0,
+                0,
+            ]));
+        // Concatenated wire order must match the historical single-frame stream.
+        let mut concatenated = login.0.clone();
+        concatenated.extend_from_slice(&map.0);
+        concatenated.extend_from_slice(&bootstrap.0);
+        assert!(
+            concatenated.len() > forgotten_protocol::MAX_FRAME_SIZE,
+            "dense fixture should exceed single-frame bound, got {}",
+            concatenated.len()
+        );
+        assert_eq!(
+            concatenated[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_LOGIN_STATE
+        );
+        assert_eq!(
+            concatenated[8],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert_eq!(&concatenated[9..14], &[100, 0, 100, 0, 7]);
+        assert!(concatenated.windows(6).any(|window| window == b"Knight"));
+        assert!(concatenated.windows(8).any(|window| window == b"DenseRat"));
+        // Stream stays framed: drain per-spawn health frames, then daylight.
+        let mut saw_health = false;
+        let daylight = loop {
+            let frame = read_data_frame(&mut stream);
+            if frame.0.first() == Some(&forgotten_protocol::NATIVE_OTCLIENT_GAME_CREATURE_HEALTH) {
+                saw_health = true;
+                continue;
+            }
+            break frame;
+        };
+        assert!(saw_health, "expected static health frames before daylight");
+        assert_eq!(
+            daylight.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_WORLD_LIGHT,
+                255,
+                215
+            ]
         );
 
         game.shutdown().unwrap();
