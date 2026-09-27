@@ -1211,22 +1211,22 @@ pub(crate) fn handle_native_otclient_game(
                             );
                             observed_visibility_epoch = shared_world.visibility_epoch();
                             if let Some(task) = active_click_walk.as_mut() {
-                                let rearmed = Instant::now()
-                                    + native_walk_step_delay(
-                                        &snapshot,
-                                        shared_world,
-                                        config,
-                                        character.id,
-                                    )?;
-                                task.next_step_deadline = rearmed;
-                                next_walk_at = rearmed;
+                                let single_delay = native_walk_step_delay(
+                                    &snapshot,
+                                    shared_world,
+                                    config,
+                                    character.id,
+                                )?;
+                                task.next_step_deadline = Instant::now() + single_delay;
+                                advance_walk_cooldown(&mut next_walk_at, single_delay, false);
                                 task.steps_executed = task.steps_executed.saturating_add(1);
                             }
                         } else if player_position != pre_step_position {
                             // Stepped-on teleport through the scheduler: the mover reports
                             // false yet relocated the player. Pace the pad chain and resync
-                            // the epoch like a plain step, but end the click-walk here: the
-                            // queued path was planned from the departure side.
+                            // the epoch like a plain step, doubling for a floor change, but
+                            // end the click-walk here: the queued path was planned from the
+                            // departure side.
                             native_diagnostic(
                                 config.extended_diagnostics,
                                 peer,
@@ -1236,13 +1236,14 @@ pub(crate) fn handle_native_otclient_game(
                                 ),
                             );
                             observed_visibility_epoch = shared_world.visibility_epoch();
-                            next_walk_at = Instant::now()
-                                + native_walk_step_delay(
-                                    &snapshot,
-                                    shared_world,
-                                    config,
-                                    character.id,
-                                )?;
+                            let single_delay = native_walk_step_delay(
+                                &snapshot,
+                                shared_world,
+                                config,
+                                character.id,
+                            )?;
+                            let floor_changed = player_position.z != pre_step_position.z;
+                            advance_walk_cooldown(&mut next_walk_at, single_delay, floor_changed);
                             active_click_walk = None;
                         } else {
                             native_diagnostic(

@@ -18838,6 +18838,254 @@ mod tests {
     }
 
     #[test]
+    fn walk_step_boundary_tolerance_accepts_slightly_early_input() {
+        // Held-key repeats and client timers quantize to their own grids, so a
+        // legitimately-paced input may land a few milliseconds before the ~681ms
+        // window closes. It must step (chained cadence keeps the average exact),
+        // not stall a full repeat interval.
+        let database_path = database_path("native-walk-boundary");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut stream).unwrap();
+        let _daylight = read_data_frame(&mut stream);
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_EAST]),
+        )
+        .unwrap();
+        let first = read_data_frame(&mut stream);
+        assert_eq!(
+            first.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
+        );
+        let _first_edge = read_data_frame(&mut stream);
+
+        // ~30ms inside the window: gated without tolerance, steps with it.
+        thread::sleep(Duration::from_millis(640));
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_EAST]),
+        )
+        .unwrap();
+        let second = read_data_frame(&mut stream);
+        assert_eq!(
+            second.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
+        );
+        assert_eq!(&second.0[7..12], &[102, 0, 100, 0, 7]);
+
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn floor_changing_teleport_re_arms_the_double_step_cost() {
+        // Classic floor changes cost double like diagonals. A same-floor pad
+        // would free the cooldown after ~681ms; a z-changing one must still
+        // gate at +1000ms and step again past ~1362ms.
+        let database_path = database_path("native-floor-change-cost");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let mut native_config = native_empty_world_config("127.0.0.1:0".parse().unwrap());
+        {
+            let world_map = Arc::get_mut(native_config.world_map.as_mut().unwrap()).unwrap();
+            for position in [
+                Position {
+                    x: 100,
+                    y: 100,
+                    z: 6,
+                },
+                Position {
+                    x: 101,
+                    y: 100,
+                    z: 6,
+                },
+            ] {
+                world_map
+                    .set_tile(
+                        position,
+                        WorldMapTile {
+                            ground_thing_id: 102,
+                            walkable: true,
+                        },
+                    )
+                    .unwrap();
+            }
+            world_map
+                .set_tile_items(
+                    Position {
+                        x: 101,
+                        y: 100,
+                        z: 7,
+                    },
+                    vec![forgotten_core::WorldMapItem {
+                        server_id: 1988,
+                        client_thing_id: Some(1988),
+                        count: 1,
+                        action_id: None,
+                        unique_id: None,
+                        text: None,
+                        description: None,
+                        teleport_destination: Some(Position {
+                            x: 100,
+                            y: 100,
+                            z: 6,
+                        }),
+                        duration: None,
+                        charges: None,
+                        children: Vec::new(),
+                    }],
+                )
+                .unwrap();
+        }
+        let game = start_native_otclient_game(native_config, &database_path).unwrap();
+
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut stream).unwrap();
+        let _daylight = read_data_frame(&mut stream);
+
+        // Step east onto the stair pad: teleports down to z=6.
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_EAST]),
+        )
+        .unwrap();
+        let effect = read_data_frame(&mut stream);
+        assert_eq!(
+            effect.0,
+            vec![
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_MAGIC_EFFECT,
+                100,
+                0,
+                100,
+                0,
+                6,
+                10,
+            ]
+        );
+        let arrival_viewport = read_data_frame(&mut stream);
+        assert_eq!(
+            arrival_viewport.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_FULL_MAP
+        );
+        assert_eq!(&arrival_viewport.0[1..6], &[100, 0, 100, 0, 6]);
+
+        // Past the single delay but inside the double: silent, no displacement.
+        thread::sleep(Duration::from_millis(1000));
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_EAST]),
+        )
+        .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue
+                }
+                Ok(frame) => panic!("floor-change cooldown should be silent, got {frame:?}"),
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break
+                }
+                Err(error) => panic!("native session ended during cooldown probe: {error}"),
+            }
+        }
+        stream.set_read_timeout(None).unwrap();
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].position,
+            Position {
+                x: 100,
+                y: 100,
+                z: 6,
+            }
+        );
+
+        // Past the double delay the same input steps again.
+        thread::sleep(Duration::from_millis(600));
+        write_frame(
+            &mut stream,
+            &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_EAST]),
+        )
+        .unwrap();
+        let stepped = read_data_frame(&mut stream);
+        assert_eq!(
+            stepped.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
+        );
+        assert_eq!(&stepped.0[7..12], &[101, 0, 100, 0, 6]);
+
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn stop_echo_does_not_kill_a_fresh_click_walk_but_kills_after_progress() {
         // The stock client answers every cancel-walk frame with a Stop echo
         // plus a 500ms auto-walk retry. A Stop for an older cancellation must

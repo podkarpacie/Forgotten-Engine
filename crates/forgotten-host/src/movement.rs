@@ -397,18 +397,28 @@ pub(crate) fn native_walk_step_delay(
     ))
 }
 
-/// Diagonal walk delay: the stock client animates a diagonal step over twice the cardinal
-/// duration on protocol 740 and older (`factor = 2` in `Creature::getStepDuration`, versus 3
-/// on newer versions). A manual diagonal covers two tiles in one action, so it re-arms the
-/// shared cooldown for two single delays; anything less outruns the client's own animation
-/// and every following input arrives "early" forever.
-pub(crate) fn native_diagonal_walk_step_delay(
-    snapshot: &NativeOtClientEmptyWorldSnapshot,
-    shared_world: &SharedNativeWorld,
-    config: &NativeOtClientHostConfig,
-    character_id: u64,
-) -> Result<Duration, HostError> {
-    Ok(native_walk_step_delay(snapshot, shared_world, config, character_id)?.saturating_mul(2))
+/// Early-arrival tolerance for voluntary step inputs. Held-key repeats and client timers
+/// quantize to their own grids, so a legitimately-paced input can land a few milliseconds
+/// before the cooldown closes; dropping it would stall every step by a full repeat interval.
+/// Inputs more than this early are still spam and gate silently.
+pub(crate) const WALK_EARLY_TOLERANCE: Duration = Duration::from_millis(50);
+
+/// Advances the shared walk cooldown after an executed displacement. Chained to the previous
+/// deadline (never to arrival time), so the average pace stays exactly one delay per step no
+/// matter how early within tolerance the input arrived. `double_cost` covers diagonal actions
+/// and floor changes, matching the stock client's double animation for both; the two never
+/// stack, mirroring the classic cost model.
+pub(crate) fn advance_walk_cooldown(
+    next_walk_at: &mut Instant,
+    single_delay: Duration,
+    double_cost: bool,
+) {
+    let delay = if double_cost {
+        single_delay.saturating_mul(2)
+    } else {
+        single_delay
+    };
+    *next_walk_at = (*next_walk_at).max(Instant::now()) + delay;
 }
 
 /// Classic haste duration for spell-granted speed conditions (utani hur family).
@@ -574,7 +584,7 @@ pub(crate) fn apply_native_autowalk_action(
         if task.queued_steps.is_empty() {
             return Ok(());
         }
-        if task.queued_steps.len() == 1 && now >= *next_walk_at {
+        if task.queued_steps.len() == 1 && now + WALK_EARLY_TOLERANCE >= *next_walk_at {
             let Some(direction) = task.queued_steps.pop_front() else {
                 return Ok(());
             };
@@ -600,12 +610,13 @@ pub(crate) fn apply_native_autowalk_action(
                     ),
                 );
                 *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
-                *next_walk_at = Instant::now() + step_delay;
+                advance_walk_cooldown(next_walk_at, step_delay, false);
                 task.steps_executed = 1;
                 *ctx.active_click_walk = Some(task);
             } else if *ctx.player_position != pre_step_position {
                 // Stepped-on teleport: the mover reports false yet relocated the
-                // player, so pace and resync exactly like a plain step.
+                // player, so pace and resync exactly like a plain step, doubling
+                // for a floor change like a diagonal.
                 native_diagnostic(
                     ctx.config.extended_diagnostics,
                     ctx.peer,
@@ -615,7 +626,8 @@ pub(crate) fn apply_native_autowalk_action(
                     ),
                 );
                 *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
-                *next_walk_at = Instant::now() + step_delay;
+                let floor_changed = ctx.player_position.z != pre_step_position.z;
+                advance_walk_cooldown(next_walk_at, step_delay, floor_changed);
             } else {
                 native_diagnostic(
                     ctx.config.extended_diagnostics,
@@ -646,7 +658,11 @@ pub(crate) fn apply_native_cardinal_move_action(
 ) -> Result<(), HostError> {
     let step_delay =
         native_walk_step_delay(ctx.snapshot, ctx.shared_world, ctx.config, ctx.character_id)?;
-    if Instant::now() < *next_walk_at {
+    // Early tolerance: repeats and client timers quantize to their own grids, so a
+    // legitimately-paced input may land a few milliseconds before the window closes.
+    // Only deeper earliness is spam. The re-arm below chains to the deadline, so the
+    // average pace stays exactly one delay per step.
+    if Instant::now() + WALK_EARLY_TOLERANCE < *next_walk_at {
         native_diagnostic(
             ctx.config.extended_diagnostics,
             ctx.peer,
@@ -690,10 +706,11 @@ pub(crate) fn apply_native_cardinal_move_action(
     // Displacement, not the mover's boolean, drives pacing and epoch sync: a stepped-on
     // teleport reports `moved == false` yet relocates the player, and leaving it unsynced
     // emits a phantom full-viewport refresh on the next heartbeat pass while leaving pad
-    // chains unpaced.
+    // chains unpaced. A floor-changing teleport costs double like a diagonal, never more.
     if *ctx.player_position != pre_step_position {
         *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
-        *next_walk_at = Instant::now() + step_delay;
+        let floor_changed = ctx.player_position.z != pre_step_position.z;
+        advance_walk_cooldown(next_walk_at, step_delay, floor_changed);
     }
     Ok(())
 }
@@ -706,13 +723,12 @@ pub(crate) fn apply_native_diagonal_move_action(
     direction: NativeOtClientAutoWalkDirection,
     next_walk_at: &mut Instant,
 ) -> Result<(), HostError> {
-    let step_delay = native_diagonal_walk_step_delay(
-        ctx.snapshot,
-        ctx.shared_world,
-        ctx.config,
-        ctx.character_id,
-    )?;
-    if Instant::now() < *next_walk_at {
+    // Diagonal actions always cost double (the client's own ×2 animation), whether the
+    // displacement is a plain double step or a teleport; floor changes never stack a
+    // third multiple on top.
+    let step_delay =
+        native_walk_step_delay(ctx.snapshot, ctx.shared_world, ctx.config, ctx.character_id)?;
+    if Instant::now() + WALK_EARLY_TOLERANCE < *next_walk_at {
         native_diagnostic(
             ctx.config.extended_diagnostics,
             ctx.peer,
@@ -757,7 +773,7 @@ pub(crate) fn apply_native_diagonal_move_action(
     // `moved == false` and must still pace pad chains and resync the epoch.
     if *ctx.player_position != pre_step_position {
         *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
-        *next_walk_at = Instant::now() + step_delay;
+        advance_walk_cooldown(next_walk_at, step_delay, true);
     }
     Ok(())
 }
