@@ -202,6 +202,7 @@ fn serve_operator_bridge(listener: TcpListener, runtime: Arc<BridgeRuntime>) {
     while !runtime.shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut stream, peer)) => {
+                let _ = stream.set_nodelay(true);
                 if !peer.ip().is_loopback() {
                     continue;
                 }

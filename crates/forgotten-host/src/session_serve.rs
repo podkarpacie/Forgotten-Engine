@@ -25,6 +25,9 @@ pub(crate) fn serve(
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut stream, peer)) => {
+                // Match the stock client (TCP_NODELAY): tiny walk/ping frames must never
+                // wait on Nagle batching, or every step inherits a delayed-ACK stall.
+                stream.set_nodelay(true)?;
                 let active = active_connections.fetch_add(1, Ordering::SeqCst);
                 if active >= config.max_connections {
                     active_connections.fetch_sub(1, Ordering::SeqCst);
@@ -85,6 +88,9 @@ pub(crate) fn serve_status(
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut stream, peer)) => {
+                // Match the stock client (TCP_NODELAY): tiny walk/ping frames must never
+                // wait on Nagle batching, or every step inherits a delayed-ACK stall.
+                stream.set_nodelay(true)?;
                 let active = active_connections.fetch_add(1, Ordering::SeqCst);
                 if active >= config.max_connections {
                     active_connections.fetch_sub(1, Ordering::SeqCst);
@@ -142,6 +148,9 @@ pub(crate) fn serve_game_session(
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut stream, peer)) => {
+                // Match the stock client (TCP_NODELAY): tiny walk/ping frames must never
+                // wait on Nagle batching, or every step inherits a delayed-ACK stall.
+                stream.set_nodelay(true)?;
                 let active = active_connections.fetch_add(1, Ordering::SeqCst);
                 if active >= config.max_connections {
                     active_connections.fetch_sub(1, Ordering::SeqCst);
@@ -226,6 +235,9 @@ pub(crate) fn serve_native_otclient_login(
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((mut stream, peer)) => {
+                // Match the stock client (TCP_NODELAY): tiny walk/ping frames must never
+                // wait on Nagle batching, or every step inherits a delayed-ACK stall.
+                stream.set_nodelay(true)?;
                 let active = active_connections.fetch_add(1, Ordering::SeqCst);
                 if active >= config.max_connections {
                     active_connections.fetch_sub(1, Ordering::SeqCst);
@@ -333,6 +345,9 @@ pub(crate) fn serve_native_otclient_game(
         }
         match listener.accept() {
             Ok((mut stream, peer)) => {
+                // Match the stock client (TCP_NODELAY): tiny walk/ping frames must never
+                // wait on Nagle batching, or every step inherits a delayed-ACK stall.
+                stream.set_nodelay(true)?;
                 let active = active_connections.fetch_add(1, Ordering::SeqCst);
                 if active >= config.max_connections {
                     active_connections.fetch_sub(1, Ordering::SeqCst);
