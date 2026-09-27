@@ -1222,6 +1222,28 @@ pub(crate) fn handle_native_otclient_game(
                                 next_walk_at = rearmed;
                                 task.steps_executed = task.steps_executed.saturating_add(1);
                             }
+                        } else if player_position != pre_step_position {
+                            // Stepped-on teleport through the scheduler: the mover reports
+                            // false yet relocated the player. Pace the pad chain and resync
+                            // the epoch like a plain step, but end the click-walk here: the
+                            // queued path was planned from the departure side.
+                            native_diagnostic(
+                                config.extended_diagnostics,
+                                peer,
+                                &format!(
+                                    "scheduler=click-walk-step direction={direction:?} outcome=teleported position={},{},{}",
+                                    player_position.x, player_position.y, player_position.z
+                                ),
+                            );
+                            observed_visibility_epoch = shared_world.visibility_epoch();
+                            next_walk_at = Instant::now()
+                                + native_walk_step_delay(
+                                    &snapshot,
+                                    shared_world,
+                                    config,
+                                    character.id,
+                                )?;
+                            active_click_walk = None;
                         } else {
                             native_diagnostic(
                                 config.extended_diagnostics,

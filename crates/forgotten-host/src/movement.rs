@@ -397,6 +397,20 @@ pub(crate) fn native_walk_step_delay(
     ))
 }
 
+/// Diagonal walk delay: the stock client animates a diagonal step over twice the cardinal
+/// duration on protocol 740 and older (`factor = 2` in `Creature::getStepDuration`, versus 3
+/// on newer versions). A manual diagonal covers two tiles in one action, so it re-arms the
+/// shared cooldown for two single delays; anything less outruns the client's own animation
+/// and every following input arrives "early" forever.
+pub(crate) fn native_diagonal_walk_step_delay(
+    snapshot: &NativeOtClientEmptyWorldSnapshot,
+    shared_world: &SharedNativeWorld,
+    config: &NativeOtClientHostConfig,
+    character_id: u64,
+) -> Result<Duration, HostError> {
+    Ok(native_walk_step_delay(snapshot, shared_world, config, character_id)?.saturating_mul(2))
+}
+
 /// Classic haste duration for spell-granted speed conditions (utani hur family).
 pub(crate) const NATIVE_HASTE_DURATION_SECONDS: u16 = 25;
 
@@ -564,6 +578,7 @@ pub(crate) fn apply_native_autowalk_action(
             let Some(direction) = task.queued_steps.pop_front() else {
                 return Ok(());
             };
+            let pre_step_position = *ctx.player_position;
             if move_native_map_player(
                 &mut *ctx.stream,
                 &ctx.config.client_profile,
@@ -588,6 +603,19 @@ pub(crate) fn apply_native_autowalk_action(
                 *next_walk_at = Instant::now() + step_delay;
                 task.steps_executed = 1;
                 *ctx.active_click_walk = Some(task);
+            } else if *ctx.player_position != pre_step_position {
+                // Stepped-on teleport: the mover reports false yet relocated the
+                // player, so pace and resync exactly like a plain step.
+                native_diagnostic(
+                    ctx.config.extended_diagnostics,
+                    ctx.peer,
+                    &format!(
+                        "scheduler=click-walk-step direction={direction:?} outcome=teleported position={},{},{}",
+                        ctx.player_position.x, ctx.player_position.y, ctx.player_position.z
+                    ),
+                );
+                *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
+                *next_walk_at = Instant::now() + step_delay;
             } else {
                 native_diagnostic(
                     ctx.config.extended_diagnostics,
@@ -627,6 +655,7 @@ pub(crate) fn apply_native_cardinal_move_action(
         return Ok(());
     }
     let cancelled_click_walk = ctx.active_click_walk.take().is_some();
+    let pre_step_position = *ctx.player_position;
     let moved = move_native_map_player(
         &mut *ctx.stream,
         &ctx.config.client_profile,
@@ -658,7 +687,11 @@ pub(crate) fn apply_native_cardinal_move_action(
             "scheduler=click-walk-cancel reason=manual-cardinal active=true",
         );
     }
-    if moved {
+    // Displacement, not the mover's boolean, drives pacing and epoch sync: a stepped-on
+    // teleport reports `moved == false` yet relocates the player, and leaving it unsynced
+    // emits a phantom full-viewport refresh on the next heartbeat pass while leaving pad
+    // chains unpaced.
+    if *ctx.player_position != pre_step_position {
         *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
         *next_walk_at = Instant::now() + step_delay;
     }
@@ -673,8 +706,12 @@ pub(crate) fn apply_native_diagonal_move_action(
     direction: NativeOtClientAutoWalkDirection,
     next_walk_at: &mut Instant,
 ) -> Result<(), HostError> {
-    let step_delay =
-        native_walk_step_delay(ctx.snapshot, ctx.shared_world, ctx.config, ctx.character_id)?;
+    let step_delay = native_diagonal_walk_step_delay(
+        ctx.snapshot,
+        ctx.shared_world,
+        ctx.config,
+        ctx.character_id,
+    )?;
     if Instant::now() < *next_walk_at {
         native_diagnostic(
             ctx.config.extended_diagnostics,
@@ -684,6 +721,7 @@ pub(crate) fn apply_native_diagonal_move_action(
         return Ok(());
     }
     let cancelled_click_walk = ctx.active_click_walk.take().is_some();
+    let pre_step_position = *ctx.player_position;
     let moved = move_native_map_player_diagonal(
         &mut *ctx.stream,
         &ctx.config.client_profile,
@@ -715,7 +753,9 @@ pub(crate) fn apply_native_diagonal_move_action(
             "scheduler=click-walk-cancel reason=manual-diagonal active=true",
         );
     }
-    if moved {
+    // Same displacement rule as the cardinal step: teleports relocate with
+    // `moved == false` and must still pace pad chains and resync the epoch.
+    if *ctx.player_position != pre_step_position {
         *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
         *next_walk_at = Instant::now() + step_delay;
     }

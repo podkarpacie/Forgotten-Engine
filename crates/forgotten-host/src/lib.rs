@@ -18100,8 +18100,9 @@ mod tests {
         let diagonal_position = database.characters_for_account(account_id).unwrap()[0].position;
         assert_eq!(diagonal_position.x, 101);
         assert_eq!(diagonal_position.y, 100);
-        // Same genuine-rejection reasoning as the blocked east step above.
-        thread::sleep(Duration::from_millis(800));
+        // The diagonal re-arms two single delays (~1362ms), so the genuine
+        // wall rejection needs a longer wait than cardinal steps.
+        thread::sleep(Duration::from_millis(1500));
         write_frame(
             &mut stream,
             &Frame(vec![
@@ -18402,7 +18403,8 @@ mod tests {
             }
         );
 
-        thread::sleep(Duration::from_millis(800));
+        // The diagonal link re-arms a double delay (~1362ms).
+        thread::sleep(Duration::from_millis(1500));
         write_frame(
             &mut stream,
             &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_NORTH]),
@@ -18712,6 +18714,124 @@ mod tests {
             forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
         );
         assert_eq!(&second.0[7..12], &[102, 0, 100, 0, 7]);
+
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn rapid_diagonal_moves_pace_at_twice_the_cardinal_delay() {
+        // The stock client animates a 740 diagonal over twice the cardinal duration
+        // (Creature::getStepDuration factor 2), so one manual diagonal re-arms two
+        // single delays. An immediate second diagonal is silent; after ~1362ms it steps.
+        let database_path = database_path("native-diagonal-cooldown");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut stream).unwrap();
+        let _daylight = read_data_frame(&mut stream);
+
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_EAST,
+            ]),
+        )
+        .unwrap();
+        let first = read_data_frame(&mut stream);
+        assert_eq!(
+            first.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
+        );
+        assert_eq!(&first.0[7..12], &[101, 0, 101, 0, 7]);
+        let _first_edges = read_data_frame(&mut stream);
+        let _first_edge_two = read_data_frame(&mut stream);
+
+        // Still inside the double delay: silent no-op, position untouched.
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_EAST,
+            ]),
+        )
+        .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue
+                }
+                Ok(frame) => panic!("exhausted diagonal should be silent, got {frame:?}"),
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break
+                }
+                Err(error) => panic!("native session ended during cooldown probe: {error}"),
+            }
+        }
+        stream.set_read_timeout(None).unwrap();
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].position,
+            Position {
+                x: 101,
+                y: 101,
+                z: 7,
+            }
+        );
+
+        // After the double delay the same input steps again.
+        thread::sleep(Duration::from_millis(1500));
+        write_frame(
+            &mut stream,
+            &Frame(vec![
+                forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_SOUTH_EAST,
+            ]),
+        )
+        .unwrap();
+        let second = read_data_frame(&mut stream);
+        assert_eq!(
+            second.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
+        );
+        assert_eq!(&second.0[7..12], &[102, 0, 102, 0, 7]);
 
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);
