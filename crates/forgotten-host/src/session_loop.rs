@@ -1217,8 +1217,20 @@ pub(crate) fn handle_native_otclient_game(
                                     config,
                                     character.id,
                                 )?;
-                                task.next_step_deadline = Instant::now() + single_delay;
-                                advance_walk_cooldown(&mut next_walk_at, single_delay, false);
+                                // Chain to the due deadline, not to completion: executing one
+                                // step costs ~15-20ms (SQLite persistence per step), and chaining
+                                // to completion would bake that overhead into every period as a
+                                // visible per-step gap against the client's own animation clock.
+                                // Clamp forward on pathological overload so a huge backlog
+                                // slips one period instead of bursting catch-up steps.
+                                let due = task.next_step_deadline + single_delay;
+                                let chained = if due < Instant::now() {
+                                    Instant::now() + single_delay
+                                } else {
+                                    due
+                                };
+                                task.next_step_deadline = chained;
+                                next_walk_at = chained;
                                 task.steps_executed = task.steps_executed.saturating_add(1);
                             }
                         } else if player_position != pre_step_position {

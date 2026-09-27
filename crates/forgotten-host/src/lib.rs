@@ -19086,6 +19086,81 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_click_walk_holds_exact_cadence_without_execution_creep() {
+        // Executing one step costs ~15-20ms (SQLite persistence per step). Chaining the next
+        // deadline to completion would bake that overhead into every period as a visible
+        // per-step gap against the client's animation clock; chaining to the due deadline
+        // keeps confirms phase-locked. The per-delta mean telescopes, so it stays exact
+        // under load while any systematic creep fails the bound.
+        let database_path = database_path("native-step-cadence");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut stream).unwrap();
+        let _daylight = read_data_frame(&mut stream);
+
+        write_frame(&mut stream, &Frame(vec![0x64, 8, 1, 1, 1, 1, 1, 1, 1, 1])).unwrap();
+        let mut times = Vec::new();
+        for _ in 0..8 {
+            let movement = read_data_frame(&mut stream);
+            assert_eq!(
+                movement.0[0],
+                forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
+            );
+            times.push(Instant::now());
+            let _edge = read_data_frame(&mut stream);
+        }
+        let deltas: Vec<f64> = times
+            .windows(2)
+            .map(|w| w[1].saturating_duration_since(w[0]).as_secs_f64() * 1000.0)
+            .collect();
+        assert_eq!(deltas.len(), 7);
+        for delta in &deltas {
+            assert!(*delta < 800.0, "step cadence stalled: deltas={deltas:.1?}");
+        }
+        let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+        assert!(
+            mean < 690.0,
+            "step cadence creeps past the 681ms deadline: mean={mean:.1}ms deltas={deltas:.1?}"
+        );
+
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
     fn stop_echo_does_not_kill_a_fresh_click_walk_but_kills_after_progress() {
         // The stock client answers every cancel-walk frame with a Stop echo
         // plus a 500ms auto-walk retry. A Stop for an older cancellation must
