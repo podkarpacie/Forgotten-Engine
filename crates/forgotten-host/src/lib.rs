@@ -18252,11 +18252,30 @@ mod tests {
             vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CLEAR_TARGET]
         );
         write_frame(&mut stream, &Frame(vec![0x69])).unwrap();
-        let cancelled = read_data_frame(&mut stream);
-        assert_eq!(
-            cancelled.0,
-            vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK, 3]
-        );
+        // An idle Stop is silent: the client already halted locally, and an
+        // echo frame here would ping-pong with its stop handler forever.
+        // Bounded ping-skipping read so a 1s heartbeat can never flake this.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue
+                }
+                Ok(frame) => panic!("expected silence after idle stop, got {frame:?}"),
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break
+                }
+                Err(error) => panic!("native session ended during stop probe: {error}"),
+            }
+        }
+        stream.set_read_timeout(None).unwrap();
         write_frame(&mut stream, &Frame(vec![0x71])).unwrap();
         let turned = read_data_frame(&mut stream);
         assert_eq!(
@@ -18674,6 +18693,127 @@ mod tests {
             forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
         );
         assert_eq!(&second.0[7..12], &[102, 0, 100, 0, 7]);
+
+        game.shutdown().unwrap();
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn stop_echo_does_not_kill_a_fresh_click_walk_but_kills_after_progress() {
+        // The stock client answers every cancel-walk frame with a Stop echo
+        // plus a 500ms auto-walk retry. A Stop for an older cancellation must
+        // not murder a task born after it; a Stop after real progress must.
+        let database_path = database_path("native-stop-echo-grace");
+        let database = EngineDatabase::open(&database_path).unwrap();
+        let account_id = database
+            .create_account_with_password("operator", "correct horse battery staple")
+            .unwrap();
+        database
+            .save_player(&Player {
+                id: 1,
+                account_id: account_id as u64,
+                name: "Knight".into(),
+                position: Position {
+                    x: 100,
+                    y: 100,
+                    z: 7,
+                },
+                level: 8,
+                experience: 4_900,
+                skill_points: 3,
+            })
+            .unwrap();
+        let game = start_native_otclient_game(
+            native_empty_world_config("127.0.0.1:0".parse().unwrap()),
+            &database_path,
+        )
+        .unwrap();
+
+        let mut stream = TcpStream::connect(game.local_addr()).unwrap();
+        write_frame(
+            &mut stream,
+            &native_game_request(
+                account_id.try_into().unwrap(),
+                "Knight",
+                "correct horse battery staple",
+            ),
+        )
+        .unwrap();
+        let _initialization = read_frame(&mut stream).unwrap();
+        let _daylight = read_data_frame(&mut stream);
+
+        // Two-step click path: task created, zero steps executed.
+        write_frame(&mut stream, &Frame(vec![0x64, 2, 1, 1])).unwrap();
+        // Immediate stale echo: must be ignored (silence), task survives.
+        write_frame(&mut stream, &Frame(vec![0x69])).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue
+                }
+                Ok(frame) => panic!("stale stop echo should be silent, got {frame:?}"),
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break
+                }
+                Err(error) => panic!("native session ended during stop probe: {error}"),
+            }
+        }
+        stream.set_read_timeout(None).unwrap();
+
+        // First scheduled step still arrives: the task survived the echo.
+        let first = read_data_frame(&mut stream);
+        assert_eq!(
+            first.0[0],
+            forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE
+        );
+        assert_eq!(&first.0[7..12], &[101, 0, 100, 0, 7]);
+        let _first_edge = read_data_frame(&mut stream);
+
+        // A Stop after real progress kills: no second step within a full delay.
+        write_frame(&mut stream, &Frame(vec![0x69])).unwrap();
+        let silence_until = Instant::now() + Duration::from_millis(900);
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    if Instant::now() >= silence_until {
+                        break;
+                    }
+                    continue;
+                }
+                Ok(frame) => panic!("killed walk should stay silent, got {frame:?}"),
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    if Instant::now() >= silence_until {
+                        break;
+                    }
+                }
+                Err(error) => panic!("native session ended during stop probe: {error}"),
+            }
+        }
+        stream.set_read_timeout(None).unwrap();
+        assert_eq!(
+            database.characters_for_account(account_id).unwrap()[0].position,
+            Position {
+                x: 101,
+                y: 100,
+                z: 7,
+            }
+        );
 
         game.shutdown().unwrap();
         let _ = fs::remove_file(database_path);

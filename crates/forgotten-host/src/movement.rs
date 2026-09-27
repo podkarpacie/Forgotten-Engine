@@ -434,9 +434,16 @@ pub(crate) enum NativePlayerInteractionOutcome {
 /// A single server-owned native click-walk task. Client paths may replace its queued directions,
 /// but never its next-step deadline. This mirrors the classic one-active-event behavior without
 /// importing implementation code from another server.
+///
+/// `steps_executed` and `stop_grace_until` exist because the stock client answers every
+/// cancel-walk frame with a Stop echo and a 500ms auto-walk retry: a Stop that arrives for an
+/// older cancellation must not murder a task born after it. Only a Stop that lands after real
+/// progress (or past the gesture grace) takes the task.
 pub(crate) struct NativeActiveClickWalk {
     pub(crate) queued_steps: VecDeque<NativeOtClientCardinalDirection>,
     pub(crate) next_step_deadline: Instant,
+    pub(crate) steps_executed: u32,
+    pub(crate) stop_grace_until: Instant,
 }
 
 impl NativeActiveClickWalk {
@@ -447,11 +454,19 @@ impl NativeActiveClickWalk {
         Self {
             queued_steps: native_click_walk_steps(path),
             next_step_deadline,
+            steps_executed: 0,
+            stop_grace_until: Instant::now(),
         }
     }
 
-    pub(crate) fn replace_path(&mut self, path: Vec<NativeOtClientAutoWalkDirection>) {
+    pub(crate) fn replace_path(
+        &mut self,
+        path: Vec<NativeOtClientAutoWalkDirection>,
+        stop_grace_until: Instant,
+    ) {
         self.queued_steps = native_click_walk_steps(path);
+        self.steps_executed = 0;
+        self.stop_grace_until = stop_grace_until;
     }
 }
 
@@ -516,7 +531,9 @@ pub(crate) fn apply_native_autowalk_action(
     if let Some(task) = ctx.active_click_walk.as_mut() {
         let previous_steps = task.queued_steps.len();
         let replacement_steps = native_click_walk_steps(path.clone()).len();
-        task.replace_path(path);
+        let step_delay =
+            native_walk_step_delay(ctx.snapshot, ctx.shared_world, ctx.config, ctx.character_id)?;
+        task.replace_path(path, Instant::now() + step_delay);
         native_diagnostic(
             ctx.config.extended_diagnostics,
             ctx.peer,
@@ -530,6 +547,7 @@ pub(crate) fn apply_native_autowalk_action(
         let now = Instant::now();
         let mut task =
             NativeActiveClickWalk::from_path(path, (*next_walk_at).max(now + step_delay));
+        task.stop_grace_until = now + step_delay;
         native_diagnostic(
             ctx.config.extended_diagnostics,
             ctx.peer,
@@ -568,6 +586,7 @@ pub(crate) fn apply_native_autowalk_action(
                 );
                 *ctx.observed_visibility_epoch = ctx.shared_world.visibility_epoch();
                 *next_walk_at = Instant::now() + step_delay;
+                task.steps_executed = 1;
                 *ctx.active_click_walk = Some(task);
             } else {
                 native_diagnostic(

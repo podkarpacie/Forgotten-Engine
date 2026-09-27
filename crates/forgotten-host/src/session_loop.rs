@@ -1217,6 +1217,7 @@ pub(crate) fn handle_native_otclient_game(
                                     )?;
                                 task.next_step_deadline = rearmed;
                                 next_walk_at = rearmed;
+                                task.steps_executed = task.steps_executed.saturating_add(1);
                             }
                         } else {
                             native_diagnostic(
@@ -2526,22 +2527,28 @@ pub(crate) fn handle_native_otclient_game(
                 break;
             }
             NativeOtClientGameAction::Stop => {
-                let cancelled_click_walk = active_click_walk.take().is_some();
+                // Stop is the client's own halt confirmation (it already stopped locally and
+                // answers every cancel-walk frame with one of these plus a 500ms auto-walk
+                // retry), so echoing another cancel frame here would ping-pong forever: each
+                // echo triggers the next Stop, murdering every task including retries. Take
+                // the task only for real progress or a stale gesture; a Stop echo for an
+                // older cancellation must not kill a task born after it. Never write back.
+                let now = Instant::now();
+                let stale_echo = active_click_walk
+                    .as_ref()
+                    .is_some_and(|task| task.steps_executed == 0 && now < task.stop_grace_until);
+                let cancelled_click_walk = if stale_echo {
+                    false
+                } else {
+                    active_click_walk.take().is_some()
+                };
                 native_diagnostic(
                     config.extended_diagnostics,
                     peer,
                     &format!(
-                        "scheduler=click-walk-cancel reason=stop active={cancelled_click_walk}"
+                        "scheduler=click-walk-cancel reason=stop active={cancelled_click_walk} stale-echo={stale_echo}"
                     ),
                 );
-                write_frame(
-                    stream,
-                    &encode_native_otclient_game_cancel_walk_facing(
-                        &config.client_profile,
-                        facing.protocol_direction(),
-                    )
-                    .map_err(HostError::Protocol)?,
-                )?;
             }
             NativeOtClientGameAction::Turn(direction) => {
                 // Manual turn; see movement.rs. Turns never fail the session.
