@@ -607,7 +607,9 @@ pub(crate) fn apply_native_autowalk_action(
 
 /// Applies one manual cardinal step through the shared map mover, cancelling any click-walk and
 /// refreshing visibility only on a real move. Steps arriving inside the shared walk cooldown
-/// degrade to a turn (facing update, no displacement), so key spam paces like click spam.
+/// are a silent no-op: the task, facing, and wire stay untouched. Any frame here (even a
+/// cancel) makes the stock client echo Stop and schedule a 500ms auto-walk retry, churning
+/// the walk into a stuttering halt; doing nothing converges on the next free input instead.
 /// Manual steps never fail the session.
 pub(crate) fn apply_native_cardinal_move_action(
     ctx: &mut SessionContext<'_>,
@@ -620,9 +622,8 @@ pub(crate) fn apply_native_cardinal_move_action(
         native_diagnostic(
             ctx.config.extended_diagnostics,
             ctx.peer,
-            &format!("movement=cardinal direction={direction:?} outcome=exhausted-turn"),
+            &format!("movement=cardinal direction={direction:?} outcome=exhausted-ignored"),
         );
-        apply_native_turn_action(ctx, direction)?;
         return Ok(());
     }
     let cancelled_click_walk = ctx.active_click_walk.take().is_some();
@@ -665,7 +666,8 @@ pub(crate) fn apply_native_cardinal_move_action(
 }
 
 /// Applies one manual diagonal step through the shared diagonal mover. Same cancel, diagnostic,
-/// visibility, and cooldown contract as the cardinal step.
+/// visibility, and cooldown contract as the cardinal step: exhausted inputs are a silent
+/// no-op so the stock client's cancel echo can never churn the walk.
 pub(crate) fn apply_native_diagonal_move_action(
     ctx: &mut SessionContext<'_>,
     direction: NativeOtClientAutoWalkDirection,
@@ -677,9 +679,8 @@ pub(crate) fn apply_native_diagonal_move_action(
         native_diagnostic(
             ctx.config.extended_diagnostics,
             ctx.peer,
-            &format!("movement=diagonal direction={direction:?} outcome=exhausted-turn"),
+            &format!("movement=diagonal direction={direction:?} outcome=exhausted-ignored"),
         );
-        apply_native_turn_action(ctx, direction.cardinal_steps()[1])?;
         return Ok(());
     }
     let cancelled_click_walk = ctx.active_click_walk.take().is_some();

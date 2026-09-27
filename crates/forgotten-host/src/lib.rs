@@ -18661,20 +18661,35 @@ mod tests {
         assert_eq!(&first.0[7..12], &[101, 0, 100, 0, 7]);
         let _first_edge = read_data_frame(&mut stream);
 
-        // Still inside the ~681ms cooldown: turn-only, no displacement.
+        // Still inside the ~681ms cooldown: silent no-op. Anything on the wire
+        // here (even a cancel) makes the stock client echo Stop and schedule
+        // a retry that churns the walk, so the server sends nothing at all.
         write_frame(
             &mut stream,
             &Frame(vec![forgotten_protocol::NATIVE_OTCLIENT_CLIENT_WALK_EAST]),
         )
         .unwrap();
-        let exhausted = read_data_frame(&mut stream);
-        assert_eq!(
-            exhausted.0,
-            vec![
-                forgotten_protocol::NATIVE_OTCLIENT_GAME_CANCEL_WALK,
-                NativeOtClientCardinalDirection::East.protocol_direction()
-            ]
-        );
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.0 == vec![forgotten_protocol::NATIVE_OTCLIENT_GAME_PING] => {
+                    continue
+                }
+                Ok(frame) => panic!("exhausted manual should be silent, got {frame:?}"),
+                Err(HostError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break
+                }
+                Err(error) => panic!("native session ended during cooldown probe: {error}"),
+            }
+        }
+        stream.set_read_timeout(None).unwrap();
         assert_eq!(
             database.characters_for_account(account_id).unwrap()[0].position,
             Position {
