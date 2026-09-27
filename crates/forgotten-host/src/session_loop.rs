@@ -21,6 +21,9 @@ pub(crate) fn handle_native_otclient_game(
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(config.session_timeout))?;
     stream.set_write_timeout(Some(config.session_timeout))?;
+    // `--debug` packet tracing covers this thread's whole session, including the login
+    // request below. Only opcode/length lines are emitted, never bodies or credentials.
+    let _packet_trace = packet_trace_guard(peer, config.debug_packets);
     let request = decode_native_otclient_game_request(&read_frame(stream)?, &config.client_profile)
         .map_err(HostError::Protocol)?;
     if auth_rate_limiter.is_blocked(peer.ip()) {

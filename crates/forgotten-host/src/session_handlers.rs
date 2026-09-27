@@ -3,6 +3,56 @@
 //! password-session and legacy 7.4 login handling).
 
 use super::*;
+use std::cell::Cell;
+
+// Thread-scoped packet tracing for `--debug`. Sessions run one thread per connection, so a
+// thread-local peer set for exactly the session duration can never observe another session's
+// frames. Tests never arm it, so their output is unchanged. Only direction, opcode, and
+// length are ever rendered; bodies and credentials never reach the log.
+thread_local! {
+    static PACKET_TRACE_PEER: Cell<Option<SocketAddr>> = const { Cell::new(None) };
+}
+
+/// Arms per-frame opcode/length tracing on this thread until dropped. No-op when disabled.
+pub(crate) struct PacketTraceGuard {
+    armed: bool,
+}
+
+pub(crate) fn packet_trace_guard(peer: SocketAddr, enabled: bool) -> PacketTraceGuard {
+    if enabled {
+        PACKET_TRACE_PEER.set(Some(peer));
+    }
+    PacketTraceGuard { armed: enabled }
+}
+
+impl Drop for PacketTraceGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            PACKET_TRACE_PEER.set(None);
+        }
+    }
+}
+
+/// One packet-trace line: direction, opcode, and length only. The frame body is deliberately
+/// not an argument, so no call site can accidentally log credentials or chat text.
+pub(crate) fn packet_trace_line(
+    direction: &str,
+    peer: SocketAddr,
+    opcode: u8,
+    len: usize,
+) -> String {
+    format!("> Native OTCv8 packet dir={direction} peer={peer} opcode=0x{opcode:02x} bytes={len}")
+}
+
+fn emit_packet_trace(direction: &str, frame: &Frame) {
+    if let Some(peer) = PACKET_TRACE_PEER.get() {
+        let opcode = frame.0.first().copied().unwrap_or_default();
+        eprintln!(
+            "{}",
+            packet_trace_line(direction, peer, opcode, frame.0.len())
+        );
+    }
+}
 
 pub(crate) fn handle_game_session(
     stream: &mut TcpStream,
@@ -405,10 +455,13 @@ pub fn read_frame(stream: &mut TcpStream) -> Result<Frame, HostError> {
     encoded.extend_from_slice(&header);
     encoded.resize(declared + 2, 0);
     stream.read_exact(&mut encoded[2..])?;
-    decode(&encoded).map_err(HostError::Protocol)
+    let frame = decode(&encoded).map_err(HostError::Protocol)?;
+    emit_packet_trace("in", &frame);
+    Ok(frame)
 }
 
 pub fn write_frame(stream: &mut TcpStream, frame: &Frame) -> Result<(), HostError> {
+    emit_packet_trace("out", frame);
     let encoded = encode(frame).map_err(HostError::Protocol)?;
     stream.write_all(&encoded)?;
     stream.flush()?;
@@ -431,4 +484,23 @@ pub(crate) fn decode_probe(frame: &Frame) -> Result<(), HostError> {
 pub(crate) fn record_event(database_path: &Path, level: &str, message: &str) {
     let _ = EngineDatabase::open(database_path)
         .and_then(|database| database.record_event(level, message));
+}
+
+#[cfg(test)]
+mod packet_trace_tests {
+    use super::*;
+
+    #[test]
+    fn packet_trace_line_reports_direction_opcode_and_length_only() {
+        let peer: SocketAddr = "127.0.0.1:7175".parse().unwrap();
+        let opcode = forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE;
+        let line = packet_trace_line("out", peer, opcode, 42);
+        // Exact format pin: direction, opcode, and length render; the
+        // formatter takes no body argument, so frame contents (credentials,
+        // chat text) can never reach the log through this path.
+        assert_eq!(
+            line,
+            "> Native OTCv8 packet dir=out peer=127.0.0.1:7175 opcode=0x6d bytes=42"
+        );
+    }
 }

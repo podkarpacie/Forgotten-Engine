@@ -397,6 +397,9 @@ pub struct NativeOtClientHostConfig {
     pub session_timeout: Duration,
     /// Emits bounded session metadata only. Packet bodies and credentials are never logged.
     pub extended_diagnostics: bool,
+    /// Traces every native session frame as direction/opcode/length only. Implied by `--debug`
+    /// (which also enables `extended_diagnostics`). Bodies and credentials are never logged.
+    pub debug_packets: bool,
     pub empty_world: Option<NativeOtClientEmptyWorldConfig>,
     /// Immutable startup map source. The game service creates one synchronized owner from this
     /// map and sessions/heartbeat then consume detached immutable snapshots from that owner.
@@ -1252,6 +1255,7 @@ mod tests {
             max_connections: 2,
             session_timeout: Duration::from_millis(250),
             extended_diagnostics: false,
+            debug_packets: false,
             empty_world: None,
             world_map: None,
             item_presentation_catalog: None,

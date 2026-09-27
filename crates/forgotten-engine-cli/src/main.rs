@@ -72,6 +72,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_host(
                 options.directory,
                 options.extended_diagnostics,
+                options.debug_packets,
                 options.verbose,
             )
         }
@@ -351,11 +352,14 @@ fn required_path(
 }
 
 /// One parsed `run` invocation. `verbose` re-enables the full step-by-step startup banner that
-/// the condensed Cloud/supervisor default output omits (plan v49 slice 20).
+/// the condensed Cloud/supervisor default output omits (plan v49 slice 20). `debug_packets`
+/// traces every native session frame as direction/opcode/length lines and implies
+/// `extended_diagnostics`; bodies and credentials are never logged either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunOptions {
     directory: PathBuf,
     extended_diagnostics: bool,
+    debug_packets: bool,
     verbose: bool,
 }
 
@@ -364,15 +368,20 @@ fn run_options(arguments: &[String]) -> Result<RunOptions, Box<dyn std::error::E
     let mut options = RunOptions {
         directory,
         extended_diagnostics: false,
+        debug_packets: false,
         verbose: false,
     };
     for flag in &arguments[2..] {
         match flag.as_str() {
             "--ed" | "--extended-debug" => options.extended_diagnostics = true,
+            "--debug" => {
+                options.extended_diagnostics = true;
+                options.debug_packets = true;
+            }
             "--verbose" => options.verbose = true,
             _ => {
                 return Err(format!(
-                    "unknown run option `{flag}`; use --ed for bounded extended diagnostics or --verbose for the full startup banner"
+                    "unknown run option `{flag}`; use --ed for bounded extended diagnostics, --debug to add per-frame packet tracing, or --verbose for the full startup banner"
                 )
                 .into())
             }
@@ -669,6 +678,7 @@ fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Er
 fn run_host(
     directory: PathBuf,
     extended_diagnostics: bool,
+    debug_packets: bool,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Forgotten Engine - {}", env!("CARGO_PKG_VERSION"));
@@ -716,6 +726,11 @@ fn run_host(
         if extended_diagnostics {
             println!(
                 "> Extended diagnostics enabled: native session metadata is logged; credentials and packet bodies are excluded."
+            );
+        }
+        if debug_packets {
+            println!(
+                "> Packet tracing enabled: every native session frame is logged as direction/opcode/length only."
             );
         }
     }
@@ -1016,6 +1031,7 @@ fn run_host(
             max_connections: config.max_connections(),
             session_timeout: Duration::from_secs(5),
             extended_diagnostics,
+            debug_packets,
             empty_world,
             world_map: Some(Arc::clone(&world_map)),
             item_presentation_catalog: item_presentation_catalog.map(Arc::new),
@@ -3149,7 +3165,7 @@ Commands:
   init <directory> [--profile fe-7.4]
   validate <directory>
   tfs-audit <directory>
-  run <directory> [--ed] [--verbose]
+  run <directory> [--ed] [--debug] [--verbose]
   status <directory>
   generate-key <directory>
   backup <directory>
@@ -3228,6 +3244,7 @@ mod tests {
             RunOptions {
                 directory: PathBuf::from("native-world"),
                 extended_diagnostics: true,
+                debug_packets: false,
                 verbose: false,
             }
         );
@@ -3242,6 +3259,7 @@ mod tests {
             RunOptions {
                 directory: PathBuf::from("native-world"),
                 extended_diagnostics: true,
+                debug_packets: false,
                 verbose: false,
             }
         );
@@ -3252,6 +3270,19 @@ mod tests {
             RunOptions {
                 directory: PathBuf::from("native-world"),
                 extended_diagnostics: false,
+                debug_packets: false,
+                verbose: false,
+            }
+        );
+
+        // --debug implies extended diagnostics and adds per-frame packet tracing.
+        let debug = vec!["run".into(), "native-world".into(), "--debug".into()];
+        assert_eq!(
+            run_options(&debug).unwrap(),
+            RunOptions {
+                directory: PathBuf::from("native-world"),
+                extended_diagnostics: true,
+                debug_packets: true,
                 verbose: false,
             }
         );
@@ -3263,6 +3294,7 @@ mod tests {
             RunOptions {
                 directory: PathBuf::from("native-world"),
                 extended_diagnostics: false,
+                debug_packets: false,
                 verbose: true,
             }
         );
@@ -3278,6 +3310,7 @@ mod tests {
             RunOptions {
                 directory: PathBuf::from("native-world"),
                 extended_diagnostics: true,
+                debug_packets: false,
                 verbose: true,
             }
         );
@@ -3293,7 +3326,7 @@ mod tests {
             "init <directory>",
             "validate <directory>",
             "tfs-audit <directory>",
-            "run <directory> [--ed] [--verbose]",
+            "run <directory> [--ed] [--debug] [--verbose]",
             "status <directory>",
             "generate-key <directory>",
             "backup <directory>",
