@@ -16,7 +16,10 @@ const MAX_ENTITY_DEFINITION_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ENTITY_XML_DEPTH: usize = 32;
 /// Bounded flat loot entries retained per monster definition. Nested containers and chance
 /// tuning remain outside this import boundary.
-const MAX_MONSTER_LOOT_ITEMS: usize = 32;
+/// Bosses in stock 7.4 data declare up to 57 flat loot entries (apocalypse,
+/// infernatil, bazir, orshabaal), so this bound is sized for real data rather
+/// than a hand-written sample.
+const MAX_MONSTER_LOOT_ITEMS: usize = 256;
 const MAX_ENTITY_DEFINITIONS: usize = 200_000;
 /// Bounded TFS `nameDescription` article text ("a rat") retained for Look replies.
 const MAX_ENTITY_NAME_DESCRIPTION_BYTES: usize = 128;
@@ -931,7 +934,12 @@ fn parse_loot_item_event(
         .ok_or_else(|| invalid("monster loot item is missing its chance attribute"))?
         .parse::<u32>()
         .map_err(|_| invalid("monster loot chance must be an unsigned integer"))?;
-    let max_count = match optional_attribute_string(event, b"maxcount")? {
+    // 7.4 data spells this `countmax` while later TFS spells it `maxcount`; accept
+    // either so a stock world keeps its real stack sizes instead of defaulting
+    // every drop to a single item.
+    let max_count = match optional_attribute_string(event, b"maxcount")?
+        .or(optional_attribute_string(event, b"countmax")?)
+    {
         Some(value) => value
             .parse::<u16>()
             .map_err(|_| invalid("monster loot maxcount must be an unsigned integer"))?,
@@ -982,8 +990,18 @@ fn parse_appearance_event(
             });
         }
         b"health" => {
-            *max_health = optional_attribute_u16(event, b"max")?;
-            *current_health = optional_attribute_u16(event, b"now")?;
+            // Real 7.4 monster data declares health above u16 (for example
+            // `<health now="110000" max="110000"/>`), so this cannot be read as
+            // u16 without rejecting a stock world. FE's creature vitals are still
+            // u16, so an oversized value saturates here; widening the vitals
+            // model to u32 is tracked as follow-up work.
+            *max_health = Some(
+                optional_attribute_u32(event, b"max")?
+                    .unwrap_or_default()
+                    .min(u32::from(u16::MAX)) as u16,
+            );
+            *current_health = optional_attribute_u32(event, b"now")?
+                .map(|value| value.min(u32::from(u16::MAX)) as u16);
         }
         _ => {}
     }
@@ -1076,6 +1094,19 @@ fn optional_attribute_u8(event: &BytesStart<'_>, name: &[u8]) -> Result<Option<u
     optional_attribute_string(event, name)?
         .map(|value| {
             value.parse::<u8>().map_err(|_| {
+                invalid(format!(
+                    "TFS entity XML has invalid {} value",
+                    String::from_utf8_lossy(name)
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn optional_attribute_u32(event: &BytesStart<'_>, name: &[u8]) -> Result<Option<u32>, ConfigError> {
+    optional_attribute_string(event, name)?
+        .map(|value| {
+            value.parse::<u32>().map_err(|_| {
                 invalid(format!(
                     "TFS entity XML has invalid {} value",
                     String::from_utf8_lossy(name)

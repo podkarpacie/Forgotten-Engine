@@ -7,6 +7,8 @@ use std::fs;
 use std::path::Path;
 
 const OTB_IDENTIFIER: &[u8; 4] = b"OTBI";
+/// TFS also accepts an all-zero identifier; real items.otb files use it.
+const OTB_WILDCARD_IDENTIFIER: [u8; 4] = [0, 0, 0, 0];
 const NODE_START: u8 = 0xfe;
 const NODE_END: u8 = 0xff;
 const NODE_ESCAPE: u8 = 0xfd;
@@ -352,9 +354,17 @@ pub(crate) fn parse_items_otb(bytes: &[u8]) -> Result<LegacyItemCatalog, ConfigE
     if bytes.len() > MAX_OTB_BYTES {
         return Err(invalid("items.otb exceeds the configured 64 MiB limit"));
     }
-    let framed = bytes
-        .strip_prefix(OTB_IDENTIFIER)
+    // Real items.otb files (7.4 and 8.x alike) use the all-zero wildcard file
+    // identifier rather than the literal OTBI marker; TFS accepts both
+    // (fileloader.cpp:40). Requiring OTBI alone rejected every operator file.
+    let identifier_length = OTB_IDENTIFIER.len();
+    let file_identifier = bytes
+        .get(..identifier_length)
         .ok_or_else(|| invalid("items.otb is missing its required OTBI identifier"))?;
+    if file_identifier != OTB_IDENTIFIER && file_identifier != OTB_WILDCARD_IDENTIFIER {
+        return Err(invalid("items.otb is missing its required OTBI identifier"));
+    }
+    let framed = &bytes[identifier_length..];
     let root = parse_tree(framed)?;
     let (otb_major_version, client_version, build_number) = parse_root_version(&root.props)?;
     let mut definitions = BTreeMap::new();

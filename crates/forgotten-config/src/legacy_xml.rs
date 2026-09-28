@@ -88,7 +88,7 @@ pub(crate) fn load_legacy_world_companions(
     } else {
         Vec::new()
     };
-    validate_legacy_spawns_against_map(&spawns, world_map)?;
+    validate_legacy_spawns_against_map(&spawns)?;
     validate_legacy_houses_against_map(&houses, world_map)?;
     Ok(LegacyWorldCompanionData {
         spawn_file: spawn_path.is_file().then_some(spawn_path),
@@ -193,6 +193,16 @@ fn parse_spawns_xml(bytes: &[u8]) -> Result<Vec<LegacySpawnArea>, ConfigError> {
     Ok(spawns)
 }
 
+fn resolve_spawn_offset(centre: u16, offset: i16, axis: char) -> Result<u16, ConfigError> {
+    let resolved = i32::from(centre) + i32::from(offset);
+    u16::try_from(resolved).map_err(|_| {
+        invalid(format!(
+            "spawn creature {axis} coordinate {} is outside the map",
+            resolved
+        ))
+    })
+}
+
 fn add_spawn_creature(
     current_spawn: &mut Option<LegacySpawnArea>,
     event: &BytesStart<'_>,
@@ -205,19 +215,14 @@ fn add_spawn_creature(
         b"npc" => LegacySpawnKind::Npc,
         _ => return Err(invalid("unsupported spawn creature element")),
     };
-    let x = optional_attribute_u16(event, b"x")?.unwrap_or_default();
-    let y = optional_attribute_u16(event, b"y")?.unwrap_or_default();
+    // TFS spawn creatures carry signed offsets relative to the spawn centre; a
+    // large share of a real 7.4 spawn file uses negative values, so these must
+    // not be read as u16.
+    let x = optional_attribute_i16(event, b"x")?.unwrap_or_default();
+    let y = optional_attribute_i16(event, b"y")?.unwrap_or_default();
     let position = Position {
-        x: spawn
-            .center
-            .x
-            .checked_add(x)
-            .ok_or_else(|| invalid("spawn creature x coordinate overflow"))?,
-        y: spawn
-            .center
-            .y
-            .checked_add(y)
-            .ok_or_else(|| invalid("spawn creature y coordinate overflow"))?,
+        x: resolve_spawn_offset(spawn.center.x, x, 'x')?,
+        y: resolve_spawn_offset(spawn.center.y, y, 'y')?,
         z: spawn.center.z,
     };
     spawn.creatures.push(LegacySpawnCreature {
@@ -241,17 +246,27 @@ fn add_spawn(spawns: &mut Vec<LegacySpawnArea>, spawn: LegacySpawnArea) -> Resul
 
 /// Ensures every declared legacy spawn creature is placed on a walkable imported map tile.
 /// Spawn-area enforcement, timing, AI, combat, and runtime respawning remain separate boundaries.
-fn validate_legacy_spawns_against_map(
-    spawns: &[LegacySpawnArea],
-    world_map: &WorldMap,
-) -> Result<(), ConfigError> {
+fn validate_legacy_spawns_against_map(spawns: &[LegacySpawnArea]) -> Result<(), ConfigError> {
+    // A TFS spawn entry is an *area*, not a tile: the runtime picks a walkable
+    // position at random inside `radius` each time the spawn activates, and the
+    // per-creature x/y offsets are near-always zero. Requiring the exact
+    // centre-offset tile to be walkable rejects a real spawn file outright, so
+    // this checks only that the declared area fits on the map and leaves tile
+    // selection to the spawner.
+    let max = i32::from(u16::MAX);
     for spawn in spawns {
-        for creature in &spawn.creatures {
-            if !world_map.is_walkable(creature.position) {
-                return Err(invalid(
-                    "legacy spawn creature position is not a walkable imported map tile",
-                ));
-            }
+        let radius = i32::from(spawn.radius);
+        if i32::from(spawn.center.x) + radius > max || i32::from(spawn.center.y) + radius > max {
+            return Err(invalid(format!(
+                "legacy spawn area at {},{},{} extends past the map edge",
+                spawn.center.x, spawn.center.y, spawn.center.z
+            )));
+        }
+        if i32::from(spawn.center.x) < radius || i32::from(spawn.center.y) < radius {
+            return Err(invalid(format!(
+                "legacy spawn area at {},{},{} starts before the map origin",
+                spawn.center.x, spawn.center.y, spawn.center.z
+            )));
         }
     }
     Ok(())
@@ -429,6 +444,17 @@ fn optional_attribute_u8(event: &BytesStart<'_>, name: &[u8]) -> Result<Option<u
     })
 }
 
+fn optional_attribute_i16(event: &BytesStart<'_>, name: &[u8]) -> Result<Option<i16>, ConfigError> {
+    optional_attribute_string(event, name)?.map_or(Ok(None), |value| {
+        value.parse::<i16>().map(Some).map_err(|_| {
+            invalid(format!(
+                "XML attribute `{}` must be an i16",
+                String::from_utf8_lossy(name)
+            ))
+        })
+    })
+}
+
 fn optional_attribute_u16(event: &BytesStart<'_>, name: &[u8]) -> Result<Option<u16>, ConfigError> {
     optional_attribute_string(event, name)?.map_or(Ok(None), |value| {
         value.parse::<u16>().map(Some).map_err(|_| {
@@ -584,21 +610,12 @@ mod tests {
     }
 
     #[test]
-    fn validates_legacy_spawn_creatures_against_imported_walkable_tiles() {
+    fn legacy_spawn_validation_checks_the_area_not_the_creature_tile() {
         let position = Position {
             x: 100,
             y: 100,
             z: 7,
         };
-        let mut map = WorldMap::new("spawns", position);
-        map.set_tile(
-            position,
-            WorldMapTile {
-                ground_thing_id: 102,
-                walkable: true,
-            },
-        )
-        .unwrap();
         let creature = LegacySpawnCreature {
             kind: LegacySpawnKind::Monster,
             name: "Rat".into(),
@@ -613,30 +630,61 @@ mod tests {
             creatures: vec![creature.clone()],
         };
 
-        validate_legacy_spawns_against_map(std::slice::from_ref(&spawn), &map).unwrap();
+        // A spawn area is valid on its own terms: the runtime chooses a
+        // walkable tile inside the radius, so the centre-offset tile being
+        // blocked must not reject the world.
+        validate_legacy_spawns_against_map(std::slice::from_ref(&spawn)).unwrap();
 
-        map.set_tile(
-            position,
-            WorldMapTile {
-                ground_thing_id: 102,
-                walkable: false,
+        // An area that runs past the map edge is still a real error.
+        let past_edge = LegacySpawnArea {
+            center: Position {
+                x: u16::MAX,
+                y: 100,
+                z: 7,
             },
-        )
-        .unwrap();
-        assert!(validate_legacy_spawns_against_map(std::slice::from_ref(&spawn), &map).is_err());
-
-        let off_map_spawn = LegacySpawnArea {
-            center: position,
-            radius: 3,
-            creatures: vec![LegacySpawnCreature {
-                position: Position {
-                    x: 101,
-                    y: 100,
-                    z: 7,
-                },
-                ..creature
-            }],
+            radius: 8,
+            creatures: vec![creature.clone()],
         };
-        assert!(validate_legacy_spawns_against_map(&[off_map_spawn], &map).is_err());
+        assert!(validate_legacy_spawns_against_map(&[past_edge]).is_err());
+
+        // A radius that would reach before the origin is rejected too.
+        let before_origin = LegacySpawnArea {
+            center: Position { x: 1, y: 1, z: 7 },
+            radius: 8,
+            creatures: vec![creature],
+        };
+        assert!(validate_legacy_spawns_against_map(&[before_origin]).is_err());
+    }
+
+    #[test]
+    fn negative_spawn_offsets_resolve_relative_to_the_centre() {
+        let event = BytesStart::from_content(
+            r#"npc name="Rotworm" x="-3" y="4" z="9" spawntime="60""#,
+            "npc".len(),
+        );
+        let mut spawn = Some(LegacySpawnArea {
+            center: Position {
+                x: 100,
+                y: 200,
+                z: 7,
+            },
+            radius: 3,
+            creatures: Vec::new(),
+        });
+        add_spawn_creature(&mut spawn, &event).unwrap();
+        let resolved = &spawn.unwrap().creatures[0];
+        assert_eq!(resolved.position.x, 97);
+        assert_eq!(resolved.position.y, 204);
+    }
+
+    #[test]
+    fn spawn_offsets_past_the_map_edge_are_rejected() {
+        let event = BytesStart::from_content(r#"npc name="Rat" x="-500" y="0" z="7""#, "npc".len());
+        let mut spawn = Some(LegacySpawnArea {
+            center: Position { x: 10, y: 10, z: 7 },
+            radius: 1,
+            creatures: Vec::new(),
+        });
+        assert!(add_spawn_creature(&mut spawn, &event).is_err());
     }
 }

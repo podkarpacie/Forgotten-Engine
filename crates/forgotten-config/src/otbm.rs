@@ -37,6 +37,26 @@ const OTBM_ATTR_COUNT: u8 = 15;
 const OTBM_ATTR_DURATION: u8 = 16;
 const OTBM_ATTR_RUNE_CHARGES: u8 = 12;
 const OTBM_ATTR_CHARGES: u8 = 22;
+// Item-attribute ids from TFS AttrTypes_t (item.h). Named here because the
+// payload widths differ per attribute and an off-by-one is silently corrupting.
+const OTBM_ATTR_DEPOT_ID: u8 = 10;
+const OTBM_ATTR_HOUSE_DOOR_ID: u8 = 14;
+const OTBM_ATTR_DECAYING_STATE: u8 = 17;
+const OTBM_ATTR_WRITTEN_DATE: u8 = 18;
+const OTBM_ATTR_WRITTEN_BY: u8 = 19;
+const OTBM_ATTR_SLEEPER_GUID: u8 = 20;
+const OTBM_ATTR_SLEEP_START: u8 = 21;
+const OTBM_ATTR_NAME: u8 = 24;
+const OTBM_ATTR_ARTICLE: u8 = 25;
+const OTBM_ATTR_PLURAL_NAME: u8 = 26;
+const OTBM_ATTR_WEIGHT: u8 = 27;
+const OTBM_ATTR_ATTACK: u8 = 28;
+const OTBM_ATTR_DEFENSE: u8 = 29;
+const OTBM_ATTR_EXTRA_DEFENSE: u8 = 30;
+const OTBM_ATTR_ARMOR: u8 = 31;
+const OTBM_ATTR_HIT_CHANCE: u8 = 32;
+const OTBM_ATTR_SHOOT_RANGE: u8 = 33;
+const OTBM_ATTR_DECAY_TO: u8 = 35;
 // Bounds sized against real operator maps rather than hand-built fixtures: the
 // original 7.4 world is a ~62 MiB OTBM and a full 8.x world is ~90 MiB, both of
 // which carry millions of tile nodes. These remain hard caps (a malformed or
@@ -446,16 +466,50 @@ fn parse_item_payload(
             OTBM_ATTR_COUNT => item.count = cursor.read_u8()?.max(1),
             OTBM_ATTR_DURATION => item.duration = Some(cursor.read_u32()?),
             OTBM_ATTR_CHARGES => item.charges = Some(cursor.read_u16()?),
-            // Preserved in the source world later through item-specific metadata; these fields do
-            // not change FE's initial map topology and have fixed-width payloads.
-            10 | 14 => {
+            // Widths below mirror TFS Item::readAttr (item.cpp:371-658) exactly. A
+            // wrong width here silently desynchronises the cursor and turns every
+            // later attribute into garbage, so these are not guesses: ATTR_DEPOT_ID
+            // skips 2, ATTR_HOUSEDOORID skips 1, and ATTR_WRITTENBY is a
+            // length-prefixed string rather than a fixed integer.
+            OTBM_ATTR_DEPOT_ID => {
                 let _ = cursor.read_u16()?;
             }
-            17 => {
+            OTBM_ATTR_HOUSE_DOOR_ID => {
                 let _ = cursor.read_u8()?;
             }
-            18..=21 => {
+            OTBM_ATTR_DECAYING_STATE => {
+                let _ = cursor.read_u8()?;
+            }
+            OTBM_ATTR_WRITTEN_DATE => {
                 let _ = cursor.read_u32()?;
+            }
+            OTBM_ATTR_WRITTEN_BY => {
+                let _ = cursor.read_string()?;
+            }
+            OTBM_ATTR_SLEEPER_GUID | OTBM_ATTR_SLEEP_START => {
+                let _ = cursor.read_u32()?;
+            }
+            // Name/description attributes are carried by items.otb rather than the
+            // map, but the map stream still contains them and the cursor must
+            // advance past them correctly.
+            OTBM_ATTR_NAME | OTBM_ATTR_ARTICLE | OTBM_ATTR_PLURAL_NAME => {
+                let _ = cursor.read_string()?;
+            }
+            OTBM_ATTR_WEIGHT => {
+                let _ = cursor.read_u32()?;
+            }
+            OTBM_ATTR_ATTACK
+            | OTBM_ATTR_DEFENSE
+            | OTBM_ATTR_EXTRA_DEFENSE
+            | OTBM_ATTR_ARMOR
+            | OTBM_ATTR_DECAY_TO => {
+                let _ = cursor.read_u32()?;
+            }
+            OTBM_ATTR_HIT_CHANCE => {
+                let _ = cursor.read_u8()?;
+            }
+            OTBM_ATTR_SHOOT_RANGE => {
+                let _ = cursor.read_u8()?;
             }
             other => return Err(invalid(format!("unsupported OTBM item attribute {other}"))),
         }

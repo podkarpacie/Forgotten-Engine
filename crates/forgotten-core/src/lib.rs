@@ -110,7 +110,7 @@ impl Position {
 /// 450 bytes per tile in practice; loading a full world is memory-bound until
 /// that moves to a sparse chunked store. This cap is a correctness guard, not a
 /// performance target.
-pub const MAX_WORLD_MAP_TILES: usize = 4_000_000;
+pub const MAX_WORLD_MAP_TILES: usize = 16_000_000;
 pub const MAX_WORLD_MAP_ITEMS_PER_TILE: usize = 64;
 pub const MAX_WORLD_MAP_TOWNS: usize = 8_192;
 pub const MAX_WORLD_MAP_WAYPOINTS: usize = 8_192;
