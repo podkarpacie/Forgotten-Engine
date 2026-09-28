@@ -103,7 +103,14 @@ impl Position {
     }
 }
 
-pub const MAX_WORLD_MAP_TILES: usize = 65_536;
+/// Upper bound on retained map tiles. Sized for real operator worlds: the
+/// original 7.4 map is a 32768x32768 multi-floor OTBM carrying roughly two
+/// million tiles, so the previous 65_536 cap could only ever hold synthetic
+/// fixtures. NOTE: `WorldMap` stores tiles in a `BTreeMap`, which costs roughly
+/// 450 bytes per tile in practice; loading a full world is memory-bound until
+/// that moves to a sparse chunked store. This cap is a correctness guard, not a
+/// performance target.
+pub const MAX_WORLD_MAP_TILES: usize = 4_000_000;
 pub const MAX_WORLD_MAP_ITEMS_PER_TILE: usize = 64;
 pub const MAX_WORLD_MAP_TOWNS: usize = 8_192;
 pub const MAX_WORLD_MAP_WAYPOINTS: usize = 8_192;

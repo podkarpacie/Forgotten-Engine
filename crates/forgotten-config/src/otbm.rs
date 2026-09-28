@@ -7,7 +7,12 @@ const OTB_NODE_START: u8 = 0xfe;
 const OTB_NODE_END: u8 = 0xff;
 const OTB_NODE_ESCAPE: u8 = 0xfd;
 const OTBM_IDENTIFIER: &[u8; 4] = b"OTBM";
+/// TFS also accepts an all-zero file identifier alongside the literal `OTBM`
+/// marker, and real map-editor output commonly uses the wildcard form.
+const OTBM_WILDCARD_IDENTIFIER: [u8; 4] = [0, 0, 0, 0];
 const OTBM_ROOT: u8 = 1;
+/// Root node type written by real map-editor output; TFS never checks it.
+const OTBM_ROOT_WRITER_LEGACY: u8 = 0;
 const OTBM_MAP_DATA: u8 = 2;
 const OTBM_TILE_AREA: u8 = 4;
 const OTBM_TILE: u8 = 5;
@@ -32,8 +37,13 @@ const OTBM_ATTR_COUNT: u8 = 15;
 const OTBM_ATTR_DURATION: u8 = 16;
 const OTBM_ATTR_RUNE_CHARGES: u8 = 12;
 const OTBM_ATTR_CHARGES: u8 = 22;
-const MAX_OTBM_BYTES: usize = 64 * 1024 * 1024;
-const MAX_OTBM_NODES: usize = 300_000;
+// Bounds sized against real operator maps rather than hand-built fixtures: the
+// original 7.4 world is a ~62 MiB OTBM and a full 8.x world is ~90 MiB, both of
+// which carry millions of tile nodes. These remain hard caps (a malformed or
+// hostile file still cannot allocate without limit); the byte cap is the
+// primary guard and the node cap is a redundant backstop beneath it.
+const MAX_OTBM_BYTES: usize = 192 * 1024 * 1024;
+const MAX_OTBM_NODES: usize = 12_000_000;
 const MAX_OTBM_NODE_DEPTH: usize = 64;
 const MAX_OTBM_STRING_BYTES: usize = 8 * 1024;
 
@@ -131,12 +141,19 @@ pub(crate) fn parse_otbm_world_map(
     if bytes.len() > MAX_OTBM_BYTES {
         return Err(invalid("OTBM file exceeds the configured 64 MiB limit"));
     }
-    let framed_bytes = bytes
-        .strip_prefix(OTBM_IDENTIFIER)
+    let identifier_length = OTBM_IDENTIFIER.len();
+    let file_identifier = bytes
+        .get(..identifier_length)
         .ok_or_else(|| invalid("OTBM file is missing its required OTBM identifier"))?;
+    if file_identifier != OTBM_IDENTIFIER && file_identifier != OTBM_WILDCARD_IDENTIFIER {
+        return Err(invalid("OTBM file is missing its required OTBM identifier"));
+    }
+    let framed_bytes = &bytes[identifier_length..];
     let root = parse_tree(framed_bytes)?;
-    if root.kind != OTBM_ROOT {
-        return Err(invalid("OTBM root node is not ROOTV1"));
+    // TFS does not validate the root node type; real map-editor output writes 0
+    // there while FE's own writer emits OTBM_ROOTV1 (1). Accept both.
+    if root.kind != OTBM_ROOT && root.kind != OTBM_ROOT_WRITER_LEGACY {
+        return Err(invalid("OTBM root node is not a recognized ROOTV1 node"));
     }
     let header = parse_header(&root.props)?;
     if root.children.len() != 1 || root.children[0].kind != OTBM_MAP_DATA {

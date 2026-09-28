@@ -492,7 +492,7 @@ mod packet_trace_tests {
 
     #[test]
     fn packet_trace_line_reports_direction_opcode_and_length_only() {
-        let peer: SocketAddr = "127.0.0.1:7175".parse().unwrap();
+        let peer = SocketAddr::from(([127, 0, 0, 1], 7175));
         let opcode = forgotten_protocol::NATIVE_OTCLIENT_GAME_MOVE_CREATURE;
         let line = packet_trace_line("out", peer, opcode, 42);
         // Exact format pin: direction, opcode, and length render; the
