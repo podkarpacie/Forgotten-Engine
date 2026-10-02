@@ -184,6 +184,12 @@ impl SharedNativeMap {
             .transpose()?
             .unwrap_or_default();
         let mut source_item_indices = BTreeMap::new();
+        // `WorldMap::source_revision()` hashes every tile in the map, so it is a
+        // full O(tiles) pass. Calling it per item index made this loop
+        // O(items * tiles) - with the original 7.4 world (7,296,174 tiles) that
+        // is ~10^12 operations: startup pinned one core forever with flat
+        // memory and no progress. Compute it once.
+        let source_revision = source.source_revision();
         for (position, items) in source.tile_item_entries() {
             source_item_indices.insert(
                 position,
@@ -193,7 +199,7 @@ impl SharedNativeMap {
                             return None;
                         };
                         (!removed_source_items.contains(&WorldMapItemSourceIdentity {
-                            map_revision: source.source_revision(),
+                            map_revision: source_revision,
                             position,
                             item_index,
                         }))
