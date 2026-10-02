@@ -1,0 +1,23 @@
+[package]
+name = "forgotten-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Deliberately no new external dependency. forgotten-protocol gives us Frame,
+# encode/decode, and the native opcode/type constants; everything else here is
+# std (TcpStream, process::Command, thread, time, env). tempfile was considered
+# and rejected per review — std::env::temp_dir() + a random suffix is enough for
+# a test harness and keeps this crate out of the dependency-tree MSRV problem
+# that root-caused the earlier toolchain confusion.
+[dependencies]
+forgotten-protocol = { path = "../forgotten-protocol" }
+
+# No dependency on forgotten-engine-cli. That crate is bin-only (it has a
+# [[bin]] target and no lib target), so cargo refuses to resolve it as a
+# dependency at all ("ignoring invalid dependency ... which is missing a lib
+# target") and never defines CARGO_BIN_EXE_forgotten-engine. The harness
+# therefore locates the built binary at runtime, relative to the test
+# executable's own path, rather than via a compile-time env var. See
+# `process::cli_binary_path`.
+[dev-dependencies]

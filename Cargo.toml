@@ -8,6 +8,7 @@ members = [
   "crates/forgotten-config",
   "crates/forgotten-host",
   "crates/forgotten-engine-cli",
+  "crates/forgotten-harness",
 ]
 
 [workspace.package]
