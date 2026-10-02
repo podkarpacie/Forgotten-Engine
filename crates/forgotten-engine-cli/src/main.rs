@@ -210,6 +210,30 @@ fn load_independent_native_startup_content(
     )
 }
 
+/// Resolves a registry-declared script name to the relative path that actually
+/// exists under a category directory.
+///
+/// Real TFS/OTServ content keeps its callbacks in a `scripts/` subdirectory
+/// (`data/talkactions/scripts/premium_player.lua`) while the XML declares only
+/// the bare filename (`script="premium_player.lua"`). FE's own layout puts them
+/// directly in the category directory. Both are accepted, searched in that order,
+/// so a stock world registers instead of failing with `SourceReadFailed`.
+///
+/// Falls back to the declared name when nothing matches, so the caller's error
+/// message still names the path the registry actually asked for.
+fn resolve_registry_script_relative_path(category_directory: &Path, declared: &Path) -> PathBuf {
+    if category_directory.join(declared).is_file() {
+        return declared.to_path_buf();
+    }
+    for subdirectory in ["scripts", "lib"] {
+        let candidate = Path::new(subdirectory).join(declared);
+        if category_directory.join(&candidate).is_file() {
+            return candidate;
+        }
+    }
+    declared.to_path_buf()
+}
+
 fn build_talkaction_dispatcher(
     config: &EngineConfig,
 ) -> Result<Option<SandboxedLuaCallbackDispatcher>, String> {
@@ -219,20 +243,50 @@ fn build_talkaction_dispatcher(
     }
     let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
     for entry in registry.iter() {
-        dispatcher
-            .register_callback_file(
-                entry.words.as_str(),
-                &config.content_directory,
-                &entry.script,
-            )
-            .map_err(|error| {
-                format!(
-                    "talkaction `{}` registration rejected: {error:?}",
-                    entry.words
-                )
-            })?;
+        register_or_defer(
+            &mut dispatcher,
+            entry.words.as_str(),
+            &config.content_directory.join("talkactions"),
+            &entry.script,
+            "talkaction",
+        )?;
     }
     Ok(Some(dispatcher))
+}
+
+/// Registers one registry callback, or reports it as deferred when its script
+/// cannot be found on disk.
+///
+/// Real legacy content routinely references a Lua callback FE cannot resolve:
+/// OTServ 7.4 movement events name a *global function* (`function="onEquipItem"`)
+/// rather than a script file, and several stock registries point at scripts that
+/// were never shipped with the data pack. Failing startup on those made an
+/// otherwise-valid 7.4 world refuse to boot at all.
+///
+/// A missing script is therefore skipped with a visible warning rather than
+/// treated as fatal. The warning is deliberately loud and names the category,
+/// the callback, and the path, so a genuinely broken world is still diagnosable
+/// - this is a deferral, not a silent swallow.
+fn register_or_defer(
+    dispatcher: &mut SandboxedLuaCallbackDispatcher,
+    callback_name: &str,
+    category_directory: &Path,
+    declared_script: &Path,
+    category_label: &str,
+) -> Result<(), String> {
+    let relative_path = resolve_registry_script_relative_path(category_directory, declared_script);
+    if !category_directory.join(&relative_path).is_file() {
+        eprintln!(
+            "> deferred {category_label} `{callback_name}`: no script at {}",
+            category_directory.join(&relative_path).display()
+        );
+        return Ok(());
+    }
+    dispatcher
+        .register_callback_file(callback_name, category_directory, &relative_path)
+        .map_err(|error| {
+            format!("{category_label} `{callback_name}` registration rejected: {error:?}")
+        })
 }
 
 fn build_action_dispatcher(
@@ -249,6 +303,21 @@ fn build_action_dispatcher(
         return Ok((None, None));
     }
     let mut dispatcher = SandboxedLuaCallbackDispatcher::default();
+    let actions_directory = config.content_directory.join("actions");
+    // TFS content legitimately declares the same item action more than once (the
+    // stock 7.4 actions.xml has 5 such itemids out of 351), and TFS resolves that
+    // last-one-wins. The scripting layer deliberately rejects a duplicate callback
+    // name - that guarantee is correct for plugins and is covered by its own tests -
+    // so the content adapter drops the shadowed entries instead of loosening it.
+    let mut last_index_for_name: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for (index, entry) in registry.iter().enumerate() {
+        let callback_name = entry
+            .key
+            .callback_name()
+            .unwrap_or_else(|| range_callback_name(index));
+        last_index_for_name.insert(callback_name, index);
+    }
     for (index, entry) in registry.iter().enumerate() {
         // Singletons register under canonical names; ranges under positional
         // `action:range:{index}` names so overlaps never collide. Both derive from
@@ -257,15 +326,16 @@ fn build_action_dispatcher(
             .key
             .callback_name()
             .unwrap_or_else(|| range_callback_name(index));
-        dispatcher
-            .register_callback_file(
-                callback_name.as_str(),
-                &config.content_directory.join("actions"),
-                &entry.script,
-            )
-            .map_err(|error| {
-                format!("action `{callback_name}` registration rejected: {error:?}")
-            })?;
+        if last_index_for_name.get(&callback_name) != Some(&index) {
+            continue;
+        }
+        register_or_defer(
+            &mut dispatcher,
+            &callback_name,
+            &actions_directory,
+            &entry.script,
+            "action",
+        )?;
     }
     if dispatcher.is_empty() {
         return Ok((None, None));
@@ -291,15 +361,13 @@ fn build_movement_dispatcher(
         // Positional `movement:{type}:{index}` names for singletons and ranges alike,
         // derived from the same registry the host router resolves against.
         let callback_name = movement_callback_name(entry.movement_type, index);
-        dispatcher
-            .register_callback_file(
-                callback_name.as_str(),
-                &config.content_directory.join("movements"),
-                &entry.script,
-            )
-            .map_err(|error| {
-                format!("movement `{callback_name}` registration rejected: {error:?}")
-            })?;
+        register_or_defer(
+            &mut dispatcher,
+            &callback_name,
+            &config.content_directory.join("movements"),
+            &entry.script,
+            "movement",
+        )?;
     }
     if dispatcher.is_empty() {
         return Ok((None, None));
@@ -325,15 +393,13 @@ fn build_creature_dispatcher(
         // Positional `creature:{index}` names in name-sorted registry order, derived
         // from the same registry the host router resolves against.
         let callback_name = creature_callback_name(index);
-        dispatcher
-            .register_callback_file(
-                callback_name.as_str(),
-                &config.content_directory.join("creaturescripts"),
-                &entry.script,
-            )
-            .map_err(|error| {
-                format!("creature `{callback_name}` registration rejected: {error:?}")
-            })?;
+        register_or_defer(
+            &mut dispatcher,
+            &callback_name,
+            &config.content_directory.join("creaturescripts"),
+            &entry.script,
+            "creature",
+        )?;
     }
     if dispatcher.is_empty() {
         return Ok((None, None));

@@ -126,7 +126,14 @@ pub fn parse_tfs_globalevents_xml(bytes: &[u8]) -> Result<TfsGlobalEventRegistry
             }
             Event::Eof => break,
             Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_) => {}
-            Event::Text(text) if text.as_ref().iter().all(u8::is_ascii_whitespace) => {}
+            // Text content between registry elements is ignored rather than rejected. Legacy
+            // TFS/OTServ data commonly contains a malformed comment - a bare `-- text` line
+            // where `<!-- text -->` was meant - which is a text node, and a single one of those
+            // would otherwise reject an entire otherwise-valid world. Registry parsing only
+            // ever extracts attributes (script/item references that are separately path-checked
+            // and run inside the Lua sandbox), so a text node carries no executable meaning and
+            // tolerating it costs nothing. Unknown *elements* are still rejected below.
+            Event::Text(_) => {}
             _ => return Err(invalid("unsupported TFS globalevent registry XML node")),
         }
         buffer.clear();

@@ -18,7 +18,10 @@ use std::sync::{
 pub const MAX_SANDBOXED_LUA_SOURCE_BYTES: usize = 4 * 1024;
 pub const MAX_SANDBOXED_LUA_MEMORY_BYTES: usize = 64 * 1024;
 pub const MAX_SANDBOXED_LUA_INSTRUCTIONS: u32 = 10_000;
-pub const MAX_SANDBOXED_LUA_CALLBACKS: usize = 64;
+/// Callback registry capacity. Sized for real TFS content rather than a fixture:
+/// the stock 7.4 `actions.xml` alone declares 351 entries, which the previous
+/// limit of 64 rejected with `CallbackLimit` before the world could start.
+pub const MAX_SANDBOXED_LUA_CALLBACKS: usize = 4_096;
 pub const MAX_SANDBOXED_LUA_CALLBACK_NAME_BYTES: usize = 64;
 pub const MAX_SANDBOXED_LUA_CALLBACK_EVENT_KIND_BYTES: usize = 64;
 pub const MAX_SANDBOXED_LUA_CALLBACK_ARGUMENT_BYTES: usize = 255;

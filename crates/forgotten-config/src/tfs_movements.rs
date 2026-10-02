@@ -212,7 +212,10 @@ pub fn parse_tfs_movements_xml(bytes: &[u8]) -> Result<TfsMoveEventRegistry, Con
                 }
             }
             Event::Empty(event) => {
-                if !root_seen || depth + 1 != 2 || event.name().as_ref() != b"moveevent" {
+                if !root_seen
+                    || depth + 1 != 2
+                    || !matches!(event.name().as_ref(), b"moveevent" | b"movevent")
+                {
                     return Err(invalid("TFS movement entry is malformed"));
                 }
                 registry.insert(parse_movement_entry(&event)?)?;
@@ -227,7 +230,14 @@ pub fn parse_tfs_movements_xml(bytes: &[u8]) -> Result<TfsMoveEventRegistry, Con
             }
             Event::Eof => break,
             Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_) => {}
-            Event::Text(text) if text.as_ref().iter().all(u8::is_ascii_whitespace) => {}
+            // Text content between registry elements is ignored rather than rejected. Legacy
+            // TFS/OTServ data commonly contains a malformed comment - a bare `-- text` line
+            // where `<!-- text -->` was meant - which is a text node, and a single one of those
+            // would otherwise reject an entire otherwise-valid world. Registry parsing only
+            // ever extracts attributes (script/item references that are separately path-checked
+            // and run inside the Lua sandbox), so a text node carries no executable meaning and
+            // tolerating it costs nothing. Unknown *elements* are still rejected below.
+            Event::Text(_) => {}
             _ => return Err(invalid("unsupported TFS movement registry XML node")),
         }
         buffer.clear();
@@ -253,7 +263,9 @@ fn parse_movement_entry(event: &BytesStart<'_>) -> Result<TfsMoveEventEntry, Con
             .map_err(|error| invalid(format!("invalid TFS movement attribute value: {error}")))?
             .into_owned();
         match attribute.key.as_ref() {
-            b"type" => {
+            // OTServ 7.4 spells the event kind `event`; later TFS spells it
+            // `type`. Both are accepted so a stock 7.4 world parses.
+            b"type" | b"event" => {
                 if movement_type.is_some() {
                     return Err(invalid("duplicate TFS movement type attribute"));
                 }
@@ -268,7 +280,11 @@ fn parse_movement_entry(event: &BytesStart<'_>) -> Result<TfsMoveEventEntry, Con
                 }
                 slot = Some(value);
             }
-            b"script" => {
+            // OTServ 7.4 names a Lua global (`function="onEquipItem"`) rather than
+            // a script file. FE resolves callbacks by file, so this is recorded in
+            // the same slot and resolves only when a matching file exists; otherwise
+            // the callback is skipped as deferred rather than failing startup.
+            b"script" | b"function" => {
                 if script.is_some() {
                     return Err(invalid("duplicate TFS movement script attribute"));
                 }
