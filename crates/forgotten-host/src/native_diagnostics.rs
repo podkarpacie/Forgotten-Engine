@@ -10,7 +10,7 @@ pub(crate) fn native_diagnostic_record(
     peer: SocketAddr,
     event: &str,
 ) -> Option<String> {
-    enabled.then(|| format!("> Native OTCv8 trace peer={peer} {event}"))
+    enabled.then(|| format!("> Native OTClient trace peer={peer} {event}"))
 }
 
 pub(crate) fn native_diagnostic(enabled: bool, peer: SocketAddr, event: &str) {

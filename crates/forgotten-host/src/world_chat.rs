@@ -537,7 +537,7 @@ pub(crate) fn apply_native_chat_routing(
     };
     if ctx.config.extended_diagnostics {
         eprintln!(
-            "> Native OTCv8 chat received mode={} bytes={} recipients={recipient_count}",
+            "> Native OTClient chat received mode={} bytes={} recipients={recipient_count}",
             request.mode,
             request.message.len()
         );

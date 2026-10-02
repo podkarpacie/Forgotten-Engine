@@ -667,10 +667,10 @@ fn audit_tfs_conversion(directory: PathBuf) -> Result<(), Box<dyn std::error::Er
                 .join(", ")
         );
     }
-    if config.otclient_v8_native_enabled {
-        println!("> Native OTCv8 is enabled through the explicitly configured profile.");
+    if config.otclient_native_enabled {
+        println!("> Native OTClient is enabled through the explicitly configured profile.");
     } else {
-        println!("> Native OTCv8 is disabled. Configure it explicitly only after choosing a matching lawful client asset set.");
+        println!("> Native OTClient is disabled. Configure it explicitly only after choosing a matching lawful client asset set.");
     }
     Ok(())
 }
@@ -816,24 +816,24 @@ fn run_host(
     } else {
         None
     };
-    let native_config = if config.otclient_v8_native_enabled {
-        let advertised_ip: IpAddr = config.advertised_otclient_v8_host.parse().map_err(|_| {
-            "advertisedOtClientV8Host must be an IPv4 or IPv6 address for the native client path"
+    let native_config = if config.otclient_native_enabled {
+        let advertised_ip: IpAddr = config.advertised_otclient_host.parse().map_err(|_| {
+            "advertisedOtClientHost must be an IPv4 or IPv6 address for the native client path"
         })?;
-        let empty_world = if config.otclient_v8_native_empty_world_enabled {
+        let empty_world = if config.otclient_native_empty_world_enabled {
             // The asset-free diagnostic fixture is exactly "empty-world enabled with zero
             // everything". Any world that actually loaded map content defaults its ground id so
             // floors never render as nothing.
             let asset_free_fixture =
-                config.otclient_v8_empty_world_ground_thing_id == 0 && world_map.tile_count() == 0;
+                config.otclient_empty_world_ground_thing_id == 0 && world_map.tile_count() == 0;
             let effective_ground_thing_id = if asset_free_fixture {
                 0
-            } else if config.otclient_v8_empty_world_ground_thing_id == 0 {
+            } else if config.otclient_empty_world_ground_thing_id == 0 {
                 forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_GROUND_THING_ID
             } else {
-                config.otclient_v8_empty_world_ground_thing_id
+                config.otclient_empty_world_ground_thing_id
             };
-            let player_look_type: u16 = config.otclient_v8_player_look_type;
+            let player_look_type: u16 = config.otclient_player_look_type;
             let (player_look_type, outfit_first_look_type, outfit_last_look_type): (u16, u8, u8) =
                 if player_look_type == 0 && !asset_free_fixture {
                     // Operator never chose an appearance for a real world; zero renders as the
@@ -844,12 +844,12 @@ fn run_host(
                         forgotten_protocol::NATIVE_OTCLIENT_DEFAULT_OUTFIT_LAST_LOOK_TYPE,
                     )
                 } else {
-                    let first = config.otclient_v8_outfit_first_look_type;
-                    let last = config.otclient_v8_outfit_last_look_type;
+                    let first = config.otclient_outfit_first_look_type;
+                    let last = config.otclient_outfit_last_look_type;
                     if first == 0 || last == 0 {
                         return Err(
-                            "otclientV8OutfitFirstLookType/LastLookType must be configured when \
-                         otclientV8PlayerLookType is set"
+                            "otclientOutfitFirstLookType/LastLookType must be configured when \
+                         otclientPlayerLookType is set"
                                 .into(),
                         );
                     }
@@ -857,20 +857,20 @@ fn run_host(
                         player_look_type,
                         first
                             .try_into()
-                            .map_err(|_| "otclientV8OutfitFirstLookType must fit u8")?,
+                            .map_err(|_| "otclientOutfitFirstLookType must fit u8")?,
                         last.try_into()
-                            .map_err(|_| "otclientV8OutfitLastLookType must fit u8")?,
+                            .map_err(|_| "otclientOutfitLastLookType must fit u8")?,
                     )
                 };
             Some(NativeOtClientEmptyWorldConfig {
                 ground_thing_id: effective_ground_thing_id,
                 player_look_type: player_look_type
                     .try_into()
-                    .map_err(|_| "otclientV8PlayerLookType must fit the selected native profile")?,
+                    .map_err(|_| "otclientPlayerLookType must fit the selected native profile")?,
                 outfit_first_look_type,
                 outfit_last_look_type,
-                player_speed: config.otclient_v8_player_speed,
-                server_beat: config.otclient_v8_server_beat,
+                player_speed: config.otclient_player_speed,
+                server_beat: config.otclient_server_beat,
             })
         } else {
             None
@@ -1020,13 +1020,13 @@ fn run_host(
         }
         let static_spawns = combined_spawns;
         Some(NativeOtClientHostConfig {
-            bind_addr: config.otclient_v8_login_socket_addr(),
-            client_profile: config.otclient_v8_native_profile(),
+            bind_addr: config.otclient_login_socket_addr(),
+            client_profile: config.otclient_native_profile(),
             server_name: config.server_name.clone(),
             world_type: config.world_type,
             advertised_game_addr: SocketAddr::new(
                 advertised_ip,
-                config.advertised_otclient_v8_game_port,
+                config.advertised_otclient_game_port,
             ),
             max_connections: config.max_connections(),
             session_timeout: Duration::from_secs(5),
@@ -1123,7 +1123,7 @@ fn run_host(
     };
     let native_game = if let Some(native_config) = native_config {
         let mut native_game_config = native_config;
-        native_game_config.bind_addr = config.otclient_v8_game_socket_addr();
+        native_game_config.bind_addr = config.otclient_game_socket_addr();
         match start_native_otclient_game_with_bridge(
             native_game_config,
             &config.database_path,
@@ -1195,11 +1195,11 @@ fn run_host(
     }
     if let (Some(native_login), Some(native_game)) = (&native_login, &native_game) {
         println!(
-            "> Native OTClientV8 profile={} login={} game={} empty-world={}",
-            config.otclient_v8_protocol_version,
+            "> Native otclient profile={} login={} game={} empty-world={}",
+            config.otclient_protocol_version,
             native_login.local_addr(),
             native_game.local_addr(),
-            config.otclient_v8_native_empty_world_enabled,
+            config.otclient_native_empty_world_enabled,
         );
         if let Some(bridge_port) = native_game.operator_bridge_port() {
             println!(
@@ -3148,7 +3148,7 @@ fn version() -> Result<(), Box<dyn std::error::Error>> {
     );
     for profile in COMPATIBILITY_PROFILES {
         println!(
-            "  FE {} — {} / Tibia {}",
+            "  FE {} â€” {} / Tibia {}",
             profile.fe_release, profile.compatibility_reference, profile.tibia_protocol
         );
     }
@@ -3159,7 +3159,7 @@ fn help_text() -> &'static str {
     r#"Forgotten Engine
 
 Compatibility profiles:
-  fe-7.4  - Tibia 7.4 (native OTCv8 path; runnable classic profiles 740 and 760)
+  fe-7.4  - Tibia 7.4 (native OTClient path; runnable classic profiles 740 and 760)
 
 Commands:
   init <directory> [--profile fe-7.4]

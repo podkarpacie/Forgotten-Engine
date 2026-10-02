@@ -49,7 +49,7 @@ pub(crate) fn apply_native_player_interaction(
             | Err(HostError::Core(forgotten_core::CoreError::SelectedPlayerIsDead(_))) => {
                 if extended_diagnostics {
                     eprintln!(
-                        "> Native OTCv8 {:?} selection ignored native-id={native_selected_id}",
+                        "> Native OTClient {:?} selection ignored native-id={native_selected_id}",
                         kind
                     );
                 }
@@ -69,7 +69,7 @@ pub(crate) fn apply_native_player_interaction(
             )) => {
                 if extended_diagnostics {
                     eprintln!(
-                        "> Native OTCv8 static target selection ignored native-id={native_selected_id}"
+                        "> Native OTClient static target selection ignored native-id={native_selected_id}"
                     );
                 }
                 Ok(NativePlayerInteractionOutcome::Rejected)
@@ -80,7 +80,7 @@ pub(crate) fn apply_native_player_interaction(
     {
         if extended_diagnostics {
             eprintln!(
-                "> Native OTCv8 {:?} selection deferred native-id={native_selected_id}",
+                "> Native OTClient {:?} selection deferred native-id={native_selected_id}",
                 kind
             );
         }

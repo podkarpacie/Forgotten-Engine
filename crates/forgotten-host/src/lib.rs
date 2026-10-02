@@ -20976,7 +20976,7 @@ mod native_diagnostics_tests {
         assert!(native_diagnostic_record(false, peer, "action=ping").is_none());
         assert_eq!(
             native_diagnostic_record(true, peer, "action=ping").as_deref(),
-            Some("> Native OTCv8 trace peer=127.0.0.1:7175 action=ping")
+            Some("> Native OTClient trace peer=127.0.0.1:7175 action=ping")
         );
     }
 

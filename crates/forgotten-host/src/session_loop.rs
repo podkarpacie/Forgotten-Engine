@@ -453,7 +453,7 @@ pub(crate) fn handle_native_otclient_game(
     stream.set_read_timeout(Some(NATIVE_OTCLIENT_HEARTBEAT_INTERVAL))?;
     if config.extended_diagnostics {
         eprintln!(
-            "> Native OTCv8 map init sent peer={peer} player={} record-bytes={} equipment-records={}/{} skipped-unmapped={} container-records={}/{} skipped-unmapped-or-nested={} static-health-records={} vip-records={} skipped-vip-records={} vip-presence-updates={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
+            "> Native OTClient map init sent peer={peer} player={} record-bytes={} equipment-records={}/{} skipped-unmapped={} container-records={}/{} skipped-unmapped-or-nested={} static-health-records={} vip-records={} skipped-vip-records={} vip-presence-updates={} map={} tiles={} static-spawns={} login-state-opcode=0x0a map-opcode=0x64 asset-free={}",
             character.name,
             initialization_bytes,
             equipment_frames.len(),
@@ -1312,7 +1312,7 @@ pub(crate) fn handle_native_otclient_game(
             let opcode = request.0.first().copied().unwrap_or_default();
             if config.extended_diagnostics {
                 eprintln!(
-                    "> Native OTCv8 frame peer={peer} opcode=0x{opcode:02x} len={}",
+                    "> Native OTClient frame peer={peer} opcode=0x{opcode:02x} len={}",
                     request.0.len()
                 );
             }
@@ -2215,7 +2215,9 @@ pub(crate) fn handle_native_otclient_game(
             }
             NativeOtClientGameAction::IgnoredInteraction(opcode) => {
                 if config.extended_diagnostics {
-                    eprintln!("> Native OTCv8 compatibility action ignored opcode=0x{opcode:02x}");
+                    eprintln!(
+                        "> Native OTClient compatibility action ignored opcode=0x{opcode:02x}"
+                    );
                 }
             }
             NativeOtClientGameAction::RequestTrade {

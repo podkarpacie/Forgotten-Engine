@@ -69,7 +69,7 @@ Animated text is parsed with no mode translation on every classic protocol
 
 ## Outfit and appearance corrections
 
-- Config now defaults `otclientV8PlayerLookType` to citizen look type 128 (chooser range
+- Config now defaults `otclientPlayerLookType` to citizen look type 128 (chooser range
   128..=134) whenever native clients are enabled without an explicit appearance and the world
   is not the deliberate asset-free fixture. Zero look types rendered players as client-side
   invisibility effect #13 (`creature.h:148`, `getOutfit` at `protocolgameparse.cpp:3317`).

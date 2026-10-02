@@ -376,7 +376,9 @@ pub(crate) fn serve_native_otclient_game(
                         )
                     })();
                     if let Err(error) = result {
-                        eprintln!("> Native OTCv8 game session ended peer={peer} reason={error}");
+                        eprintln!(
+                            "> Native OTClient game session ended peer={peer} reason={error}"
+                        );
                         record_event(
                             &session_database_path,
                             "warn",

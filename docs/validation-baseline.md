@@ -6,6 +6,31 @@
 
 > Passing this baseline proves only the currently implemented paths. It is not evidence of complete Tibia gameplay compatibility, full TFS data-pack compatibility, performance at production load, or readiness for public hosting.
 
+## Target client: which OTClient, exactly
+
+The `otclient*` configuration keys and the "native OTClient" path refer to a
+**Midgard/OTClient-family client** speaking classic protocol 740 — the
+Forgotten Client this engine is paired with.
+
+**OTClientV8 is not the reference client for this path, and must not be treated as
+one.** Its message-mode map is not constructed for protocol versions below 760, so a
+740-selected OTCv8 client discards every server text record: no chat echo, no Look
+reply, no effective broadcast. That is precisely why FE also ships a runnable
+plain-classic-760 profile.
+
+Practical consequences:
+
+- Do not reintroduce a "V8" assumption into this path. Historically these keys were
+  spelled `otclientV8*`, which was factually wrong. Those spellings are still
+  accepted as **aliases** so existing `config.lua` files keep working, but the
+  canonical names are the unversioned `otclient*` forms.
+- Where docs cite OTClientV8 or OTCv8 (issue links, parser sources, protocol
+  evidence), those are **citations about a different client**, used as reference
+  material. They are intentionally left intact and are not claims about FE's
+  target.
+- New work must be validated against the 740 client's actual rendering behavior,
+  not inferred from OTCv8 behavior.
+
 ## Repeatable automated validation
 
 Run the following command from a clean checkout on every candidate build and after any behavior-changing merge:
@@ -45,7 +70,7 @@ Use a lawful, unmodified OTClientV8 build configured for the selected 740 profil
 | Game entry and map | The selected character joins the native 740 map with valid position, visible player state, and non-negative HUD values. | A black viewport, missing local player, invalid HUD values, or return to character list is a blocker. |
 | Player-stats framing | The initial `0xA0` player-stats record parses without end-of-input errors and reports the persisted level, health, mana, capacity, magic level, and bounded zero soul value. | Any `0xA0` parser EOF, shifted next opcode, or invalid HUD value is a release blocker. |
 | Quest Log acknowledgement | Opening Quest Log sends one parser-shaped empty `0xF0` response and leaves the native session connected. | A parser error, disconnect, or claimed quest content is a release blocker. |
-| Outfit dialog and persistence | Configure an inclusive valid classic range with `otclientV8OutfitFirstLookType` and `otclientV8OutfitLastLookType`, open Set Outfit, and verify the native `0xD2` request receives one classic `0xC8` dialog containing the current appearance and exactly that range. Select an in-range concrete look and colors, relog, and confirm the stored appearance is visible after map initialization. Attempt an out-of-range look and confirm the existing stored appearance remains unchanged. | A parser error, disconnect, missing dialog, range that excludes the current look, lost stored colors, accepted out-of-range look, unexpected newer-format fields, missing operator-owned assets, or acceptance of an unsupported look type is a release blocker. |
+| Outfit dialog and persistence | Configure an inclusive valid classic range with `otclientOutfitFirstLookType` and `otclientOutfitLastLookType`, open Set Outfit, and verify the native `0xD2` request receives one classic `0xC8` dialog containing the current appearance and exactly that range. Select an in-range concrete look and colors, relog, and confirm the stored appearance is visible after map initialization. Attempt an out-of-range look and confirm the existing stored appearance remains unchanged. | A parser error, disconnect, missing dialog, range that excludes the current look, lost stored colors, accepted out-of-range look, unexpected newer-format fields, missing operator-owned assets, or acceptance of an unsupported look type is a release blocker. |
 | Position persistence | Move through the supported native path, exit normally or close the client connection, relog, and confirm the map initializes at the saved tile. | A reset to spawn, stale coordinate, parser error, or disconnect is a release blocker. |
 | Equipment bootstrap | Provision catalog-mapped equipment in more than one fixed slot, log in, and confirm every mapped item is visible in its matching equipment slot. | A parser error, disconnect, missing mapped item, or displayed item without a validated client mapping is a release blocker. |
 | Equipment live refresh | From an authoritative shared-world equipment replacement, change one catalog-mapped slot, remove another, and replace a previously mapped item with an unmapped item. Confirm only the mapped set record and required stale-slot delete records are emitted in deterministic slot order. | A parser error, disconnect, stale slot, unmapped item display, duplicate record, client-driven item mutation, or any inferred transfer/stack/container behavior is a release blocker. |

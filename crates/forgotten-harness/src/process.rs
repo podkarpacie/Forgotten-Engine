@@ -8,7 +8,7 @@
 //!
 //! Port handling, explained because it isn't obvious from the CLI alone:
 //! `forgotten-engine run` has no `--port` flag. It binds whatever
-//! `otclientV8LoginPort` / `otclientV8GamePort` are set to in the world's
+//! `otclientLoginPort` / `otclientGamePort` are set to in the world's
 //! `config.lua`, which `init` seeds to the fixed defaults 7174/7175 - the
 //! exact fixed ports the task spec warned against, since they collide with
 //! an operator's already-running world. There is also no port-0 ephemeral
@@ -134,7 +134,7 @@ impl Drop for RunningWorld {
 /// sleeping a fixed guess.
 ///
 /// `protocol_version` should be 740 or 760 - see the note already on record
-/// in `config.lua`'s own template: "740 (legacy; stock OTCv8 discards all
+/// in `config.lua`'s own template: "740 (legacy; an unmodified OTCv8 at 740 discards all
 /// chat/look text) and 760 (recommended)". Milestone 1 does not assert on
 /// chat, so 740 is fine here; a later milestone touching Talk (Task A step
 /// 7) should very likely default to 760 instead, given that documented
@@ -210,20 +210,20 @@ fn patch_config_for_harness(
     let original = std::fs::read_to_string(&config_path)?;
     let patched = original
         .replace(
-            "otclientV8NativeEnabled = false",
-            "otclientV8NativeEnabled = true",
+            "otclientNativeEnabled = false",
+            "otclientNativeEnabled = true",
         )
         .replace(
-            "otclientV8LoginPort = 7174",
-            &format!("otclientV8LoginPort = {login_port}"),
+            "otclientLoginPort = 7174",
+            &format!("otclientLoginPort = {login_port}"),
         )
         .replace(
-            "otclientV8GamePort = 7175",
-            &format!("otclientV8GamePort = {game_port}"),
+            "otclientGamePort = 7175",
+            &format!("otclientGamePort = {game_port}"),
         )
         .replace(
-            "otclientV8ProtocolVersion = 0",
-            &format!("otclientV8ProtocolVersion = {protocol_version}"),
+            "otclientProtocolVersion = 0",
+            &format!("otclientProtocolVersion = {protocol_version}"),
         )
         .replace(
             "advertisedOtClientV8GamePort = 7175",
@@ -238,39 +238,36 @@ fn patch_config_for_harness(
         // classic knight look, and 102 the classic grass ground tile, matching
         // the values the operator's working debug sandbox uses.
         .replace(
-            "otclientV8NativeEmptyWorldEnabled = false",
-            "otclientV8NativeEmptyWorldEnabled = true",
+            "otclientNativeEmptyWorldEnabled = false",
+            "otclientNativeEmptyWorldEnabled = true",
         )
         .replace(
-            "otclientV8EmptyWorldGroundThingId = 0",
-            "otclientV8EmptyWorldGroundThingId = 102",
+            "otclientEmptyWorldGroundThingId = 0",
+            "otclientEmptyWorldGroundThingId = 102",
         )
-        .replace(
-            "otclientV8PlayerLookType = 0",
-            "otclientV8PlayerLookType = 128",
-        )
+        .replace("otclientPlayerLookType = 0", "otclientPlayerLookType = 128")
         // A nonzero look type also requires a coherent outfit range: the config
         // validator rejects `look_type != 0` unless first <= look <= last, and
         // init ships all three at 0. 128..131 is the classic knight outfit
         // chooser, again matching the operator's working debug sandbox.
         .replace(
-            "otclientV8OutfitFirstLookType = 0",
-            "otclientV8OutfitFirstLookType = 128",
+            "otclientOutfitFirstLookType = 0",
+            "otclientOutfitFirstLookType = 128",
         )
         .replace(
-            "otclientV8OutfitLastLookType = 0",
-            "otclientV8OutfitLastLookType = 131",
+            "otclientOutfitLastLookType = 0",
+            "otclientOutfitLastLookType = 131",
         );
     // Every replacement above is load-bearing. If init's template ever changes,
     // fail loudly instead of silently running against a world with the native
     // handshake off or the ports still at their operator defaults.
     for expected in [
-        "otclientV8NativeEnabled = true",
-        "otclientV8NativeEmptyWorldEnabled = true",
-        "otclientV8EmptyWorldGroundThingId = 102",
-        "otclientV8PlayerLookType = 128",
-        "otclientV8OutfitFirstLookType = 128",
-        "otclientV8OutfitLastLookType = 131",
+        "otclientNativeEnabled = true",
+        "otclientNativeEmptyWorldEnabled = true",
+        "otclientEmptyWorldGroundThingId = 102",
+        "otclientPlayerLookType = 128",
+        "otclientOutfitFirstLookType = 128",
+        "otclientOutfitLastLookType = 131",
     ] {
         if !patched.contains(expected) {
             return Err(HarnessError::Io(std::io::Error::other(format!(
@@ -280,8 +277,8 @@ fn patch_config_for_harness(
             ))));
         }
     }
-    if !patched.contains(&format!("otclientV8LoginPort = {login_port}"))
-        || !patched.contains(&format!("otclientV8GamePort = {game_port}"))
+    if !patched.contains(&format!("otclientLoginPort = {login_port}"))
+        || !patched.contains(&format!("otclientGamePort = {game_port}"))
     {
         return Err(HarnessError::Io(std::io::Error::other(format!(
             "config.lua still does not carry the harness ports \

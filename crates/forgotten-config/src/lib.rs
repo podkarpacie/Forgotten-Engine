@@ -177,23 +177,23 @@ pub struct EngineConfig {
     pub game_session_port: u16,
     pub advertised_game_session_host: String,
     pub advertised_game_session_port: u16,
-    pub otclient_v8_native_enabled: bool,
-    pub otclient_v8_login_port: u16,
-    pub otclient_v8_game_port: u16,
-    pub advertised_otclient_v8_host: String,
-    pub advertised_otclient_v8_game_port: u16,
-    pub otclient_v8_protocol_version: u16,
-    pub otclient_v8_numeric_account_ids: bool,
-    pub otclient_v8_login_packet_encryption: bool,
-    pub otclient_v8_protocol_checksum: bool,
-    pub otclient_v8_challenge_on_login: bool,
-    pub otclient_v8_native_empty_world_enabled: bool,
-    pub otclient_v8_empty_world_ground_thing_id: u16,
-    pub otclient_v8_player_look_type: u16,
-    pub otclient_v8_outfit_first_look_type: u16,
-    pub otclient_v8_outfit_last_look_type: u16,
-    pub otclient_v8_player_speed: u16,
-    pub otclient_v8_server_beat: u16,
+    pub otclient_native_enabled: bool,
+    pub otclient_login_port: u16,
+    pub otclient_game_port: u16,
+    pub advertised_otclient_host: String,
+    pub advertised_otclient_game_port: u16,
+    pub otclient_protocol_version: u16,
+    pub otclient_numeric_account_ids: bool,
+    pub otclient_login_packet_encryption: bool,
+    pub otclient_protocol_checksum: bool,
+    pub otclient_challenge_on_login: bool,
+    pub otclient_native_empty_world_enabled: bool,
+    pub otclient_empty_world_ground_thing_id: u16,
+    pub otclient_player_look_type: u16,
+    pub otclient_outfit_first_look_type: u16,
+    pub otclient_outfit_last_look_type: u16,
+    pub otclient_player_speed: u16,
+    pub otclient_server_beat: u16,
 }
 
 /// Declares the bounded source selected for authoritative experience stages. The legacy
@@ -231,21 +231,21 @@ impl EngineConfig {
         SocketAddr::new(self.bind_ip, self.game_session_port)
     }
 
-    pub fn otclient_v8_login_socket_addr(&self) -> SocketAddr {
-        SocketAddr::new(self.bind_ip, self.otclient_v8_login_port)
+    pub fn otclient_login_socket_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.bind_ip, self.otclient_login_port)
     }
 
-    pub fn otclient_v8_game_socket_addr(&self) -> SocketAddr {
-        SocketAddr::new(self.bind_ip, self.otclient_v8_game_port)
+    pub fn otclient_game_socket_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.bind_ip, self.otclient_game_port)
     }
 
-    pub fn otclient_v8_native_profile(&self) -> NativeOtClientProfile {
+    pub fn otclient_native_profile(&self) -> NativeOtClientProfile {
         NativeOtClientProfile {
-            protocol_version: self.otclient_v8_protocol_version,
-            numeric_account_ids: self.otclient_v8_numeric_account_ids,
-            login_packet_encryption: self.otclient_v8_login_packet_encryption,
-            protocol_checksum: self.otclient_v8_protocol_checksum,
-            challenge_on_login: self.otclient_v8_challenge_on_login,
+            protocol_version: self.otclient_protocol_version,
+            numeric_account_ids: self.otclient_numeric_account_ids,
+            login_packet_encryption: self.otclient_login_packet_encryption,
+            protocol_checksum: self.otclient_protocol_checksum,
+            challenge_on_login: self.otclient_challenge_on_login,
             max_padding_bytes: 128,
         }
     }
@@ -448,50 +448,45 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         optional_string_owned(&values, "advertisedGameSessionHost", bind_ip.to_string())?;
     let advertised_game_session_port =
         optional_u16(&values, "advertisedGameSessionPort", game_session_port)?;
-    let otclient_v8_login_port = optional_u16(&values, "otclientV8LoginPort", 7174)?;
-    let otclient_v8_game_port = optional_u16(&values, "otclientV8GamePort", 7175)?;
-    let advertised_otclient_v8_host =
-        optional_string_owned(&values, "advertisedOtClientV8Host", bind_ip.to_string())?;
-    let advertised_otclient_v8_game_port = optional_u16(
-        &values,
-        "advertisedOtClientV8GamePort",
-        otclient_v8_game_port,
-    )?;
-    let otclient_v8_native_enabled = optional_boolean(&values, "otclientV8NativeEnabled", false)?;
-    let otclient_v8_protocol_version = optional_u16(&values, "otclientV8ProtocolVersion", 0)?;
-    let otclient_v8_numeric_account_ids =
-        optional_boolean(&values, "otclientV8NumericAccountIds", true)?;
-    let otclient_v8_login_packet_encryption =
-        optional_boolean(&values, "otclientV8LoginPacketEncryption", false)?;
-    let otclient_v8_protocol_checksum =
-        optional_boolean(&values, "otclientV8ProtocolChecksum", false)?;
-    let otclient_v8_challenge_on_login =
-        optional_boolean(&values, "otclientV8ChallengeOnLogin", false)?;
-    let otclient_v8_native_empty_world_enabled =
-        optional_boolean(&values, "otclientV8NativeEmptyWorldEnabled", false)?;
-    let otclient_v8_empty_world_ground_thing_id =
-        optional_u16(&values, "otclientV8EmptyWorldGroundThingId", 0)?;
+    let otclient_login_port = optional_u16(&values, "otclientLoginPort", 7174)?;
+    let otclient_game_port = optional_u16(&values, "otclientGamePort", 7175)?;
+    let advertised_otclient_host =
+        optional_string_owned(&values, "advertisedOtClientHost", bind_ip.to_string())?;
+    let advertised_otclient_game_port =
+        optional_u16(&values, "advertisedOtClientGamePort", otclient_game_port)?;
+    let otclient_native_enabled = optional_boolean(&values, "otclientNativeEnabled", false)?;
+    let otclient_protocol_version = optional_u16(&values, "otclientProtocolVersion", 0)?;
+    let otclient_numeric_account_ids =
+        optional_boolean(&values, "otclientNumericAccountIds", true)?;
+    let otclient_login_packet_encryption =
+        optional_boolean(&values, "otclientLoginPacketEncryption", false)?;
+    let otclient_protocol_checksum = optional_boolean(&values, "otclientProtocolChecksum", false)?;
+    let otclient_challenge_on_login = optional_boolean(&values, "otclientChallengeOnLogin", false)?;
+    let otclient_native_empty_world_enabled =
+        optional_boolean(&values, "otclientNativeEmptyWorldEnabled", false)?;
+    let otclient_empty_world_ground_thing_id =
+        optional_u16(&values, "otclientEmptyWorldGroundThingId", 0)?;
     // Appearance and ground-id defaults are applied by the host at startup, where the loaded
     // world map distinguishes a real world from the deliberate asset-free diagnostic fixture.
     // This layer only validates explicit operator choices.
-    let otclient_v8_player_look_type = optional_u16(&values, "otclientV8PlayerLookType", 0)?;
-    let configured_otclient_v8_outfit_first_look_type =
-        optional_u16(&values, "otclientV8OutfitFirstLookType", 0)?;
-    let configured_otclient_v8_outfit_last_look_type =
-        optional_u16(&values, "otclientV8OutfitLastLookType", 0)?;
-    let otclient_v8_outfit_first_look_type = configured_otclient_v8_outfit_first_look_type;
-    let otclient_v8_outfit_last_look_type = configured_otclient_v8_outfit_last_look_type;
-    let otclient_v8_player_speed = optional_u16(&values, "otclientV8PlayerSpeed", 220)?;
-    let otclient_v8_server_beat = optional_u16(&values, "otclientV8ServerBeat", 50)?;
+    let otclient_player_look_type = optional_u16(&values, "otclientPlayerLookType", 0)?;
+    let configured_otclient_outfit_first_look_type =
+        optional_u16(&values, "otclientOutfitFirstLookType", 0)?;
+    let configured_otclient_outfit_last_look_type =
+        optional_u16(&values, "otclientOutfitLastLookType", 0)?;
+    let otclient_outfit_first_look_type = configured_otclient_outfit_first_look_type;
+    let otclient_outfit_last_look_type = configured_otclient_outfit_last_look_type;
+    let otclient_player_speed = optional_u16(&values, "otclientPlayerSpeed", 220)?;
+    let otclient_server_beat = optional_u16(&values, "otclientServerBeat", 50)?;
     let native_profile = NativeOtClientProfile {
-        protocol_version: otclient_v8_protocol_version,
-        numeric_account_ids: otclient_v8_numeric_account_ids,
-        login_packet_encryption: otclient_v8_login_packet_encryption,
-        protocol_checksum: otclient_v8_protocol_checksum,
-        challenge_on_login: otclient_v8_challenge_on_login,
+        protocol_version: otclient_protocol_version,
+        numeric_account_ids: otclient_numeric_account_ids,
+        login_packet_encryption: otclient_login_packet_encryption,
+        protocol_checksum: otclient_protocol_checksum,
+        challenge_on_login: otclient_challenge_on_login,
         max_padding_bytes: 128,
     };
-    if otclient_v8_native_enabled && !native_profile.supports_current_native_foundation() {
+    if otclient_native_enabled && !native_profile.supports_current_native_foundation() {
         let message = match native_profile.foundation() {
             NativeOtClientFoundation::Classic800RequiresRsaXtea => {
                 "protocol 800 requires parser-backed RSA/XTEA native transport, which is not implemented"
@@ -508,28 +503,27 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
             }
         };
         return Err(ConfigError::InvalidValue {
-            key: "otclientV8NativeEnabled",
+            key: "otclientNativeEnabled",
             message,
         });
     }
-    if otclient_v8_native_empty_world_enabled
-        && (!otclient_v8_native_enabled
+    if otclient_native_empty_world_enabled
+        && (!otclient_native_enabled
             || !native_profile.supports_current_native_foundation()
-            || otclient_v8_player_look_type > u8::MAX as u16
-            || otclient_v8_outfit_first_look_type > u8::MAX as u16
-            || otclient_v8_outfit_last_look_type > u8::MAX as u16
-            || (otclient_v8_player_look_type == 0
-                && (otclient_v8_outfit_first_look_type != 0
-                    || otclient_v8_outfit_last_look_type != 0))
-            || (otclient_v8_player_look_type != 0
-                && (otclient_v8_outfit_first_look_type == 0
-                    || otclient_v8_outfit_first_look_type > otclient_v8_player_look_type
-                    || otclient_v8_player_look_type > otclient_v8_outfit_last_look_type))
-            || otclient_v8_player_speed == 0
-            || otclient_v8_server_beat == 0)
+            || otclient_player_look_type > u8::MAX as u16
+            || otclient_outfit_first_look_type > u8::MAX as u16
+            || otclient_outfit_last_look_type > u8::MAX as u16
+            || (otclient_player_look_type == 0
+                && (otclient_outfit_first_look_type != 0 || otclient_outfit_last_look_type != 0))
+            || (otclient_player_look_type != 0
+                && (otclient_outfit_first_look_type == 0
+                    || otclient_outfit_first_look_type > otclient_player_look_type
+                    || otclient_player_look_type > otclient_outfit_last_look_type))
+            || otclient_player_speed == 0
+            || otclient_server_beat == 0)
     {
         return Err(ConfigError::InvalidValue {
-            key: "otclientV8NativeEmptyWorldEnabled",
+            key: "otclientNativeEmptyWorldEnabled",
             message: "requires an enabled supported native profile plus valid optional asset IDs and nonzero speed/server-beat values".into(),
         });
     }
@@ -575,23 +569,23 @@ pub fn load(world_directory: impl AsRef<Path>) -> Result<EngineConfig, ConfigErr
         game_session_port,
         advertised_game_session_host,
         advertised_game_session_port,
-        otclient_v8_native_enabled,
-        otclient_v8_login_port,
-        otclient_v8_game_port,
-        advertised_otclient_v8_host,
-        advertised_otclient_v8_game_port,
-        otclient_v8_protocol_version,
-        otclient_v8_numeric_account_ids,
-        otclient_v8_login_packet_encryption,
-        otclient_v8_protocol_checksum,
-        otclient_v8_challenge_on_login,
-        otclient_v8_native_empty_world_enabled,
-        otclient_v8_empty_world_ground_thing_id,
-        otclient_v8_player_look_type,
-        otclient_v8_outfit_first_look_type,
-        otclient_v8_outfit_last_look_type,
-        otclient_v8_player_speed,
-        otclient_v8_server_beat,
+        otclient_native_enabled,
+        otclient_login_port,
+        otclient_game_port,
+        advertised_otclient_host,
+        advertised_otclient_game_port,
+        otclient_protocol_version,
+        otclient_numeric_account_ids,
+        otclient_login_packet_encryption,
+        otclient_protocol_checksum,
+        otclient_challenge_on_login,
+        otclient_native_empty_world_enabled,
+        otclient_empty_world_ground_thing_id,
+        otclient_player_look_type,
+        otclient_outfit_first_look_type,
+        otclient_outfit_last_look_type,
+        otclient_player_speed,
+        otclient_server_beat,
     })
 }
 
@@ -1444,7 +1438,7 @@ pub fn validate_content(world_directory: impl AsRef<Path>) -> Result<ContentRepo
 
 pub fn template(profile: CompatibilityProfile) -> String {
     format!(
-        "-- Forgotten Engine configuration\n-- TFS-style layout; parsed as a bounded assignment subset during P0.\n\n-- Connection Config\nip = \"127.0.0.1\"\ngameProtocolPort = 7172\nstatusProtocolPort = 7171\nmaxPlayers = 0\nserverName = \"Forgotten Engine\"\n\n-- Legacy login foundation\n-- Set true only after providing an original 1024-bit RSA private key.\nlegacyLoginEnabled = false\nrsaPrivateKey = \"key.pem\"\n\n-- Legacy game-session foundation\n-- Separate opt-in port until official session compatibility is proven.\ngameSessionEnabled = false\ngameSessionPort = 7173\n-- Public endpoint advertised to a custom OTClient module; may be a proxy/domain/IP-changing endpoint.\nadvertisedGameSessionHost = \"127.0.0.1\"\nadvertisedGameSessionPort = 7173\n\n-- Native stock OTClientV8 foundation\n-- Select the compatible protocol and feature switches for this world; do not assume FE release versions.\notclientV8NativeEnabled = false\notclientV8LoginPort = 7174\notclientV8GamePort = 7175\notclientV8ProtocolVersion = 0\n-- Runnable classic profiles: 740 (legacy; stock OTCv8 discards all chat/look text) and 760\n-- (recommended; identical wire format plus client-side message rendering).\notclientV8NumericAccountIds = true\notclientV8LoginPacketEncryption = false\notclientV8ProtocolChecksum = false\notclientV8ChallengeOnLogin = false\n-- Address returned in the native legacy character list.\nadvertisedOtClientV8Host = \"127.0.0.1\"\nadvertisedOtClientV8GamePort = 7175\n\n-- Native empty-world fixture. Nonzero IDs must exist in operator-owned matching OTCv8 data; zero selects an asset-free fallback.\notclientV8NativeEmptyWorldEnabled = false\notclientV8EmptyWorldGroundThingId = 0\notclientV8PlayerLookType = 0\n-- Inclusive current-outfit chooser range for the classic dialog. Defaults to PlayerLookType.\notclientV8OutfitFirstLookType = 0\notclientV8OutfitLastLookType = 0\notclientV8PlayerSpeed = 220\notclientV8ServerBeat = 50\n\n-- Map\nmapName = \"forgotten\"\nworldType = \"pvp\"\n\n-- MySQL compatibility contract (SQLite remains the current storage backend)\nmysqlHost = \"127.0.0.1\"\nmysqlUser = \"forgottenengine\"\nmysqlDatabase = \"forgottenengine\"\n\n-- Forgotten Engine profile\nfeProfile = \"{}\"\ntibiaProtocol = \"{}\"\n",
+        "-- Forgotten Engine configuration\n-- TFS-style layout; parsed as a bounded assignment subset during P0.\n\n-- Connection Config\nip = \"127.0.0.1\"\ngameProtocolPort = 7172\nstatusProtocolPort = 7171\nmaxPlayers = 0\nserverName = \"Forgotten Engine\"\n\n-- Legacy login foundation\n-- Set true only after providing an original 1024-bit RSA private key.\nlegacyLoginEnabled = false\nrsaPrivateKey = \"key.pem\"\n\n-- Legacy game-session foundation\n-- Separate opt-in port until official session compatibility is proven.\ngameSessionEnabled = false\ngameSessionPort = 7173\n-- Public endpoint advertised to a custom OTClient module; may be a proxy/domain/IP-changing endpoint.\nadvertisedGameSessionHost = \"127.0.0.1\"\nadvertisedGameSessionPort = 7173\n\n-- Native stock OTClient-family foundation\n-- Targets a Midgard/OTClient-family client speaking classic protocol 740. These keys used to be spelled\n-- otclientV8*, which was misleading: OTClientV8 is NOT the reference client here, because its\n-- message-mode map is empty below 760. The old spellings are still accepted as aliases so existing\n-- configs keep working; new configs should use the names below.\n-- Select the compatible protocol and feature switches for this world; do not assume FE release versions.\notclientNativeEnabled = false\notclientLoginPort = 7174\notclientGamePort = 7175\notclientProtocolVersion = 0\n-- Runnable classic profiles: 740 (legacy; an unmodified OTCv8 at 740 discards all chat/look text) and 760\n-- (recommended; identical wire format plus client-side message rendering).\notclientNumericAccountIds = true\notclientLoginPacketEncryption = false\notclientProtocolChecksum = false\notclientChallengeOnLogin = false\n-- Address returned in the native legacy character list.\nadvertisedOtClientHost = \"127.0.0.1\"\nadvertisedOtClientGamePort = 7175\n\n-- Native empty-world fixture. Nonzero IDs must exist in operator-owned matching client data; zero selects an asset-free fallback.\notclientNativeEmptyWorldEnabled = false\notclientEmptyWorldGroundThingId = 0\notclientPlayerLookType = 0\n-- Inclusive current-outfit chooser range for the classic dialog. Defaults to PlayerLookType.\notclientOutfitFirstLookType = 0\notclientOutfitLastLookType = 0\notclientPlayerSpeed = 220\notclientServerBeat = 50\n\n-- Map\nmapName = \"forgotten\"\nworldType = \"pvp\"\n\n-- MySQL compatibility contract (SQLite remains the current storage backend)\nmysqlHost = \"127.0.0.1\"\nmysqlUser = \"forgottenengine\"\nmysqlDatabase = \"forgottenengine\"\n\n-- Forgotten Engine profile\nfeProfile = \"{}\"\ntibiaProtocol = \"{}\"\n",
         profile.id, profile.tibia_protocol
     )
 }
@@ -1467,6 +1461,9 @@ fn parse_assignments(contents: &str) -> Result<BTreeMap<String, Literal>, Config
         {
             continue;
         }
+        // Resolve deprecated `otclient*` spellings before the recognized-key
+        // check, so an old config keeps its values under the new names.
+        let key = canonical_config_key(key);
         if !is_recognized_config_key(key) {
             continue;
         }
@@ -1543,24 +1540,56 @@ fn is_recognized_config_key(key: &str) -> bool {
             | "gameSessionPort"
             | "advertisedGameSessionHost"
             | "advertisedGameSessionPort"
-            | "otclientV8NativeEnabled"
-            | "otclientV8LoginPort"
-            | "otclientV8GamePort"
-            | "advertisedOtClientV8Host"
-            | "advertisedOtClientV8GamePort"
-            | "otclientV8ProtocolVersion"
-            | "otclientV8NumericAccountIds"
-            | "otclientV8LoginPacketEncryption"
-            | "otclientV8ProtocolChecksum"
-            | "otclientV8ChallengeOnLogin"
-            | "otclientV8NativeEmptyWorldEnabled"
-            | "otclientV8EmptyWorldGroundThingId"
-            | "otclientV8PlayerLookType"
-            | "otclientV8OutfitFirstLookType"
-            | "otclientV8OutfitLastLookType"
-            | "otclientV8PlayerSpeed"
-            | "otclientV8ServerBeat"
+            | "otclientNativeEnabled"
+            | "otclientLoginPort"
+            | "otclientGamePort"
+            | "advertisedOtClientHost"
+            | "advertisedOtClientGamePort"
+            | "otclientProtocolVersion"
+            | "otclientNumericAccountIds"
+            | "otclientLoginPacketEncryption"
+            | "otclientProtocolChecksum"
+            | "otclientChallengeOnLogin"
+            | "otclientNativeEmptyWorldEnabled"
+            | "otclientEmptyWorldGroundThingId"
+            | "otclientPlayerLookType"
+            | "otclientOutfitFirstLookType"
+            | "otclientOutfitLastLookType"
+            | "otclientPlayerSpeed"
+            | "otclientServerBeat"
     )
+}
+
+/// Maps a deprecated `otclient*` / `advertisedOtClient*` assignment name
+/// onto its current `otclient*` equivalent.
+///
+/// The "V8" names were wrong: this profile targets a Midgard/OTClient-family
+/// client speaking classic protocol 740, and otclient's message-mode map is
+/// empty below 760, so it is not the reference client for this path. The keys
+/// are still honoured because unrecognized assignments are silently skipped
+/// (see `parse_assignments`), which means dropping the old names outright would
+/// make every existing world quietly fall back to defaults.
+fn canonical_config_key(key: &str) -> &str {
+    match key {
+        "otclientV8NativeEnabled" => "otclientNativeEnabled",
+        "otclientV8LoginPort" => "otclientLoginPort",
+        "otclientV8GamePort" => "otclientGamePort",
+        "advertisedOtClientV8Host" => "advertisedOtClientHost",
+        "advertisedOtClientV8GamePort" => "advertisedOtClientGamePort",
+        "otclientV8ProtocolVersion" => "otclientProtocolVersion",
+        "otclientV8NumericAccountIds" => "otclientNumericAccountIds",
+        "otclientV8LoginPacketEncryption" => "otclientLoginPacketEncryption",
+        "otclientV8ProtocolChecksum" => "otclientProtocolChecksum",
+        "otclientV8ChallengeOnLogin" => "otclientChallengeOnLogin",
+        "otclientV8NativeEmptyWorldEnabled" => "otclientNativeEmptyWorldEnabled",
+        "otclientV8EmptyWorldGroundThingId" => "otclientEmptyWorldGroundThingId",
+        "otclientV8PlayerLookType" => "otclientPlayerLookType",
+        "otclientV8OutfitFirstLookType" => "otclientOutfitFirstLookType",
+        "otclientV8OutfitLastLookType" => "otclientOutfitLastLookType",
+        "otclientV8PlayerSpeed" => "otclientPlayerSpeed",
+        "otclientV8ServerBeat" => "otclientServerBeat",
+        other => other,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1796,7 +1825,7 @@ mod tests {
         fs::write(
             world.join(CONFIG_FILE_NAME),
             format!(
-                "{}otclientV8NativeEnabled = true\notclientV8ProtocolVersion = 760\notclientV8NativeEmptyWorldEnabled = true\n",
+                "{}otclientNativeEnabled = true\notclientProtocolVersion = 760\notclientNativeEmptyWorldEnabled = true\n",
                 template(FE_7_4_PROFILE)
             ),
         )
@@ -1805,16 +1834,54 @@ mod tests {
         let config = load(&world).unwrap();
         // The config layer preserves operator zeros verbatim; the host applies the citizen and
         // ground defaults at startup once it knows whether a real map was loaded.
-        assert_eq!(config.otclient_v8_player_look_type, 0);
-        assert_eq!(config.otclient_v8_outfit_first_look_type, 0);
-        assert_eq!(config.otclient_v8_outfit_last_look_type, 0);
-        assert_eq!(config.otclient_v8_empty_world_ground_thing_id, 0);
+        assert_eq!(config.otclient_player_look_type, 0);
+        assert_eq!(config.otclient_outfit_first_look_type, 0);
+        assert_eq!(config.otclient_outfit_last_look_type, 0);
+        assert_eq!(config.otclient_empty_world_ground_thing_id, 0);
         let _ = fs::remove_dir_all(world);
     }
 
     #[test]
     fn loads_a_profile_driven_native_otclient_endpoint() {
         let world = temporary_world("native-otclient");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}otclientNativeEnabled = true\notclientLoginPort = 7264\notclientGamePort = 7265\nadvertisedOtClientHost = \"203.0.113.24\"\nadvertisedOtClientGamePort = 7265\notclientProtocolVersion = 740\notclientNumericAccountIds = true\notclientLoginPacketEncryption = false\notclientProtocolChecksum = false\notclientChallengeOnLogin = false\notclientNativeEmptyWorldEnabled = true\notclientEmptyWorldGroundThingId = 102\notclientPlayerLookType = 128\notclientOutfitFirstLookType = 128\notclientOutfitLastLookType = 131\notclientPlayerSpeed = 220\notclientServerBeat = 50\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+
+        let config = load(&world).unwrap();
+        assert!(config.otclient_native_enabled);
+        assert_eq!(config.otclient_login_socket_addr().port(), 7264);
+        assert_eq!(config.otclient_game_socket_addr().port(), 7265);
+        assert_eq!(config.advertised_otclient_host, "203.0.113.24");
+        assert_eq!(config.advertised_otclient_game_port, 7265);
+        assert!(config.otclient_native_empty_world_enabled);
+        assert_eq!(config.otclient_empty_world_ground_thing_id, 102);
+        assert_eq!(config.otclient_player_look_type, 128);
+        assert_eq!(config.otclient_outfit_first_look_type, 128);
+        assert_eq!(config.otclient_outfit_last_look_type, 131);
+        assert_eq!(config.otclient_player_speed, 220);
+        assert_eq!(config.otclient_server_beat, 50);
+        assert!(config
+            .otclient_native_profile()
+            .supports_current_native_foundation());
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn accepts_legacy_otclient_v8_keys_as_aliases() {
+        // The `otclientV8*` spellings were wrong (this profile targets a
+        // Midgard/OTClient-family client at 740, and OTClientV8's message-mode
+        // map is empty below 760), but they are still honoured. Unrecognized
+        // assignments are silently skipped, so without aliases an existing
+        // world would quietly fall back to every default - the worst possible
+        // failure mode, and entirely invisible to the operator.
+        let world = temporary_world("legacy-otclient-v8-keys");
         fs::create_dir_all(&world).unwrap();
         fs::write(
             world.join(CONFIG_FILE_NAME),
@@ -1826,21 +1893,39 @@ mod tests {
         .unwrap();
 
         let config = load(&world).unwrap();
-        assert!(config.otclient_v8_native_enabled);
-        assert_eq!(config.otclient_v8_login_socket_addr().port(), 7264);
-        assert_eq!(config.otclient_v8_game_socket_addr().port(), 7265);
-        assert_eq!(config.advertised_otclient_v8_host, "203.0.113.24");
-        assert_eq!(config.advertised_otclient_v8_game_port, 7265);
-        assert!(config.otclient_v8_native_empty_world_enabled);
-        assert_eq!(config.otclient_v8_empty_world_ground_thing_id, 102);
-        assert_eq!(config.otclient_v8_player_look_type, 128);
-        assert_eq!(config.otclient_v8_outfit_first_look_type, 128);
-        assert_eq!(config.otclient_v8_outfit_last_look_type, 131);
-        assert_eq!(config.otclient_v8_player_speed, 220);
-        assert_eq!(config.otclient_v8_server_beat, 50);
-        assert!(config
-            .otclient_v8_native_profile()
-            .supports_current_native_foundation());
+        assert!(config.otclient_native_enabled);
+        assert_eq!(config.otclient_login_socket_addr().port(), 7264);
+        assert_eq!(config.otclient_game_socket_addr().port(), 7265);
+        assert_eq!(config.advertised_otclient_host, "203.0.113.24");
+        assert_eq!(config.advertised_otclient_game_port, 7265);
+        assert!(config.otclient_native_empty_world_enabled);
+        assert_eq!(config.otclient_empty_world_ground_thing_id, 102);
+        assert_eq!(config.otclient_player_look_type, 128);
+        assert_eq!(config.otclient_outfit_first_look_type, 128);
+        assert_eq!(config.otclient_outfit_last_look_type, 131);
+        assert_eq!(config.otclient_player_speed, 220);
+        assert_eq!(config.otclient_server_beat, 50);
+        let _ = fs::remove_dir_all(world);
+    }
+
+    #[test]
+    fn a_current_key_wins_over_a_legacy_alias() {
+        // If a config somehow carries both spellings, the current name must be
+        // the one that takes effect rather than whichever was parsed last.
+        let world = temporary_world("current-key-beats-legacy-alias");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(
+            world.join(CONFIG_FILE_NAME),
+            format!(
+                "{}otclientNativeEnabled = true\notclientV8LoginPort = 1111\notclientLoginPort = 7264\notclientV8GamePort = 2222\notclientGamePort = 7265\nadvertisedOtClientHost = \"203.0.113.24\"\nadvertisedOtClientGamePort = 7265\notclientProtocolVersion = 740\notclientNumericAccountIds = true\notclientNativeEmptyWorldEnabled = true\n",
+                template(FE_7_4_PROFILE)
+            ),
+        )
+        .unwrap();
+
+        let config = load(&world).unwrap();
+        assert_eq!(config.otclient_login_socket_addr().port(), 7264);
+        assert_eq!(config.otclient_game_socket_addr().port(), 7265);
         let _ = fs::remove_dir_all(world);
     }
 
@@ -1851,7 +1936,7 @@ mod tests {
         fs::write(
             world.join(CONFIG_FILE_NAME),
             format!(
-                "{}otclientV8NativeEnabled = true\notclientV8ProtocolVersion = 740\notclientV8NativeEmptyWorldEnabled = true\notclientV8PlayerLookType = 128\notclientV8OutfitFirstLookType = 129\notclientV8OutfitLastLookType = 131\n",
+                "{}otclientNativeEnabled = true\notclientProtocolVersion = 740\notclientNativeEmptyWorldEnabled = true\notclientPlayerLookType = 128\notclientOutfitFirstLookType = 129\notclientOutfitLastLookType = 131\n",
                 template(FE_7_4_PROFILE)
             ),
         )
@@ -1860,7 +1945,7 @@ mod tests {
         assert!(matches!(
             load(&world),
             Err(ConfigError::InvalidValue {
-                key: "otclientV8NativeEmptyWorldEnabled",
+                key: "otclientNativeEmptyWorldEnabled",
                 ..
             })
         ));
@@ -1911,7 +1996,7 @@ experienceStages = {
         assert_eq!(config.static_creature_target_attack_damage, 0);
         assert_eq!(config.static_creature_target_pursuit_range, 0);
         assert_eq!(config.death_loss_percent, -1);
-        assert!(!config.otclient_v8_native_enabled);
+        assert!(!config.otclient_native_enabled);
         let _ = fs::remove_dir_all(world);
     }
 
@@ -2156,7 +2241,7 @@ experienceStages = {
         fs::write(
             world.join(CONFIG_FILE_NAME),
             format!(
-                "{}otclientV8NativeEnabled = true\notclientV8ProtocolVersion = 740\notclientV8LoginPacketEncryption = true\n",
+                "{}otclientNativeEnabled = true\notclientProtocolVersion = 740\notclientLoginPacketEncryption = true\n",
                 template(FE_7_4_PROFILE)
             ),
         )
@@ -2165,7 +2250,7 @@ experienceStages = {
         assert!(matches!(
             load(&world),
             Err(ConfigError::InvalidValue {
-                key: "otclientV8NativeEnabled",
+                key: "otclientNativeEnabled",
                 ..
             })
         ));
@@ -2179,7 +2264,7 @@ experienceStages = {
         fs::write(
             world.join(CONFIG_FILE_NAME),
             format!(
-                "{}otclientV8NativeEnabled = true\notclientV8ProtocolVersion = 800\notclientV8LoginPacketEncryption = true\n",
+                "{}otclientNativeEnabled = true\notclientProtocolVersion = 800\notclientLoginPacketEncryption = true\n",
                 template(FE_7_4_PROFILE)
             ),
         )
@@ -2188,7 +2273,7 @@ experienceStages = {
         assert!(matches!(
             load(&world),
             Err(ConfigError::InvalidValue {
-                key: "otclientV8NativeEnabled",
+                key: "otclientNativeEnabled",
                 ..
             })
         ));
@@ -2202,21 +2287,21 @@ experienceStages = {
         fs::write(
             world.join(CONFIG_FILE_NAME),
             format!(
-                "{}otclientV8NativeEnabled = true\notclientV8ProtocolVersion = 740\notclientV8NativeEmptyWorldEnabled = true\n",
+                "{}otclientNativeEnabled = true\notclientProtocolVersion = 740\notclientNativeEmptyWorldEnabled = true\n",
                 template(FE_7_4_PROFILE)
             ),
         )
         .unwrap();
 
         let config = load(&world).unwrap();
-        assert!(config.otclient_v8_native_empty_world_enabled);
-        assert_eq!(config.otclient_v8_empty_world_ground_thing_id, 0);
-        assert_eq!(config.otclient_v8_player_look_type, 0);
+        assert!(config.otclient_native_empty_world_enabled);
+        assert_eq!(config.otclient_empty_world_ground_thing_id, 0);
+        assert_eq!(config.otclient_player_look_type, 0);
 
         fs::write(
             world.join(CONFIG_FILE_NAME),
             format!(
-                "{}otclientV8NativeEnabled = true\notclientV8ProtocolVersion = 740\notclientV8NativeEmptyWorldEnabled = true\notclientV8PlayerSpeed = 0\n",
+                "{}otclientNativeEnabled = true\notclientProtocolVersion = 740\notclientNativeEmptyWorldEnabled = true\notclientPlayerSpeed = 0\n",
                 template(FE_7_4_PROFILE)
             ),
         )
@@ -2225,7 +2310,7 @@ experienceStages = {
         assert!(matches!(
             load(&world),
             Err(ConfigError::InvalidValue {
-                key: "otclientV8NativeEmptyWorldEnabled",
+                key: "otclientNativeEmptyWorldEnabled",
                 ..
             })
         ));

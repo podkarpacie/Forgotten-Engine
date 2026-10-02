@@ -41,7 +41,9 @@ pub(crate) fn packet_trace_line(
     opcode: u8,
     len: usize,
 ) -> String {
-    format!("> Native OTCv8 packet dir={direction} peer={peer} opcode=0x{opcode:02x} bytes={len}")
+    format!(
+        "> Native OTClient packet dir={direction} peer={peer} opcode=0x{opcode:02x} bytes={len}"
+    )
 }
 
 fn emit_packet_trace(direction: &str, frame: &Frame) {
@@ -500,7 +502,7 @@ mod packet_trace_tests {
         // chat text) can never reach the log through this path.
         assert_eq!(
             line,
-            "> Native OTCv8 packet dir=out peer=127.0.0.1:7175 opcode=0x6d bytes=42"
+            "> Native OTClient packet dir=out peer=127.0.0.1:7175 opcode=0x6d bytes=42"
         );
     }
 }
