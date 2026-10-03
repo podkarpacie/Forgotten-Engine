@@ -408,9 +408,15 @@ fn parse_tile(node: &Node, base: Position, world_map: &mut WorldMap) -> Result<(
             },
         )
         .map_err(|error| invalid(format!("OTBM tile at {},{},{}: {error}", x, y, base.z)))?;
-    world_map
-        .set_tile_items(position, items)
-        .map_err(|error| invalid(format!("OTBM tile at {},{},{}: {error}", x, y, base.z)))?;
+    // Only record a tile-item list when the tile actually has items. Inserting
+    // an empty Vec for every tile gave the real 7.4 world a second full
+    // 7,296,174-entry BTreeMap with one heap allocation per tile, which was the
+    // single largest contributor to the ~10.9 GB startup peak.
+    if !items.is_empty() {
+        world_map
+            .set_tile_items(position, items)
+            .map_err(|error| invalid(format!("OTBM tile at {},{},{}: {error}", x, y, base.z)))?;
+    }
     world_map.set_tile_flags(position, flags);
     if let Some(house_id) = house_id {
         world_map

@@ -65,7 +65,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             required_path(&arguments, 1)?,
             selected_profile(&arguments, 2)?,
         ),
-        "validate" => validate(required_path(&arguments, 1)?, true),
+        "validate" => validate(required_path(&arguments, 1)?, true).map(|_| ()),
         "tfs-audit" => audit_tfs_conversion(required_path(&arguments, 1)?),
         "run" => {
             let options = run_options(&arguments)?;
@@ -493,7 +493,7 @@ fn init(
     Ok(())
 }
 
-fn validate(directory: PathBuf, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn validate(directory: PathBuf, verbose: bool) -> Result<LoadedWorld, Box<dyn std::error::Error>> {
     if verbose {
         println!(">> Loading config");
     }
@@ -524,7 +524,13 @@ fn validate(directory: PathBuf, verbose: bool) -> Result<(), Box<dyn std::error:
     if !verbose {
         // Condensed supervisor banner (plan v49 slice 20): the standalone `validate`
         // subcommand keeps the full summary; `run` prints endpoints only.
-        return Ok(());
+        return Ok(LoadedWorld {
+            config,
+            world_map,
+            item_catalog,
+            companions,
+            vocations,
+        });
     }
     println!(
         "> Validation complete: profile={} protocol={} game-port={} status-port={} map={} tiles={} spawn={},{},{} items={} spawns={} houses={} vocations={} data={} database={}",
@@ -544,7 +550,25 @@ fn validate(directory: PathBuf, verbose: bool) -> Result<(), Box<dyn std::error:
         content.data_directory.display(),
         database.path().display()
     );
-    Ok(())
+    Ok(LoadedWorld {
+        config,
+        world_map,
+        item_catalog,
+        companions,
+        vocations,
+    })
+}
+
+/// Everything the run path needs, produced once by `validate` so `run` does not
+/// re-parse the map. On the original 7.4 world the map is a 62 MiB OTBM holding
+/// 7,296,174 tiles and took ~55s per load, so the previous double load wasted
+/// more than a minute of every startup.
+struct LoadedWorld {
+    config: EngineConfig,
+    world_map: forgotten_core::WorldMap,
+    item_catalog: Option<forgotten_config::LegacyItemCatalog>,
+    companions: forgotten_config::LegacyWorldCompanionData,
+    vocations: Option<forgotten_config::TfsVocationRegistry>,
 }
 
 fn deferred_script_event_kind(category: TfsRegistryCategory) -> DeferredScriptEventKind {
@@ -748,10 +772,14 @@ fn run_host(
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Forgotten Engine - {}", env!("CARGO_PKG_VERSION"));
-    validate(directory.clone(), verbose)?;
-    let config = load(&directory)?;
-    let raw_world_map = load_world_map(&config)?;
-    let item_catalog = load_legacy_item_catalog(&config, &raw_world_map)?;
+    // Reuse everything `validate` already parsed. The map used to be parsed a
+    // second time here, which cost another ~55s on the original 7.4 world.
+    let LoadedWorld {
+        config,
+        world_map,
+        item_catalog,
+        ..
+    } = validate(directory.clone(), verbose)?;
     let item_presentation_catalog = item_catalog
         .as_ref()
         .map(|catalog| catalog.native_item_presentation_catalog())
@@ -780,10 +808,9 @@ fn run_host(
     let item_speed_bonus_by_server_id = item_catalog
         .as_ref()
         .map(|catalog| catalog.xml_speed_bonus_by_server_id());
-    let world_map = Arc::new(match &item_catalog {
-        Some(catalog) => apply_legacy_item_metadata(&raw_world_map, catalog)?,
-        None => raw_world_map,
-    });
+    // `validate` already applied the legacy item metadata, so the map must not be
+    // processed a second time here.
+    let world_map = Arc::new(world_map);
     let database = EngineDatabase::open(&config.database_path)?;
     database.record_event("info", "Forgotten Engine host startup requested")?;
 
