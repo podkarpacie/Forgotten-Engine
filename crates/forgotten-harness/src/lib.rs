@@ -374,8 +374,32 @@ pub fn run_login_to_world_init(
     login: LoginRequest,
     character_name: String,
 ) -> Result<GameOutcome, HarnessError> {
+    run_login_to_world_init_with_timeout(
+        login_addr,
+        game_addr,
+        login,
+        character_name,
+        Duration::from_secs(5),
+    )
+}
+
+/// Same as [`run_login_to_world_init`] with a caller-chosen response timeout.
+///
+/// The default 5s is fine for a small fixture world, but the original 7.4 world
+/// takes noticeably longer to assemble its world-initialization stream, and a
+/// real-world run against it will time out and be reported as a connection
+/// failure even though the login and character selection both succeeded. Give
+/// real-world runs a generous timeout and read the server's own log to
+/// distinguish "rejected" from "slow".
+pub fn run_login_to_world_init_with_timeout(
+    login_addr: std::net::SocketAddr,
+    game_addr: std::net::SocketAddr,
+    login: LoginRequest,
+    character_name: String,
+    timeout: Duration,
+) -> Result<GameOutcome, HarnessError> {
     let mut login_stream = TcpStream::connect(login_addr)?;
-    login_stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    login_stream.set_read_timeout(Some(timeout))?;
     send_frame(&mut login_stream, &encode_login_request(&login))?;
     let response = recv_frame(&mut login_stream)?;
     let outcome = decode_login_response(&response)?;
@@ -408,7 +432,7 @@ pub fn run_login_to_world_init(
                               // world deployment and a harness pointed at a
                               // loopback port under test behave the same way.
             let mut game_stream = TcpStream::connect(game_addr)?;
-            game_stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            game_stream.set_read_timeout(Some(timeout))?;
             send_frame(
                 &mut game_stream,
                 &encode_game_request(&GameRequest {
