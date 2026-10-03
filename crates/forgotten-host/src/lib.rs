@@ -611,7 +611,17 @@ pub struct SharedNativeWorld {
 /// documented atomic lock order with `SharedNativeWorld` before client routing is enabled.
 #[derive(Debug, Clone)]
 pub struct SharedNativeMap {
-    pub(crate) map: Arc<Mutex<WorldMap>>,
+    /// Copy-on-write map. The inner `Arc` is what makes `render_snapshot` cheap:
+    /// a snapshot clones the `Arc`, not the 7,296,174-tile map it points at.
+    /// Mutating goes through `SharedNativeMap::map_mut`, which uses
+    /// `Arc::make_mut`, so a copy happens only while a snapshot is still alive.
+    ///
+    /// This was `Arc<Mutex<WorldMap>>`, and `render_snapshot` did
+    /// `Arc::new(self.map.lock()?.clone())` - a full deep clone of the whole
+    /// world on every login, roughly 7 GB on the original 7.4 map. The test base
+    /// was observed passing 17.4 GB while handling one session and never
+    /// completing it.
+    pub(crate) map: Arc<Mutex<Arc<WorldMap>>>,
     pub(crate) source: Arc<WorldMap>,
     pub(crate) source_item_indices: Arc<Mutex<BTreeMap<Position, Vec<u8>>>>,
     pub(crate) removed_source_items: Arc<Mutex<BTreeSet<WorldMapItemSourceIdentity>>>,

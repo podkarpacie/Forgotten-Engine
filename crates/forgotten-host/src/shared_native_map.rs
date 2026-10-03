@@ -1,8 +1,28 @@
-﻿//! SharedNativeMap: the runtime mutable map owner. Wraps an immutable source map with
+//! SharedNativeMap: the runtime mutable map owner. Wraps an immutable source map with
 //! a mutable runtime overlay, a durable removal journal, source-item index tracking,
 //! and a revision counter for delta-baseline synchronization.
 
 use super::*;
+
+/// Exclusive map access that transparently performs the copy-on-write when a
+/// snapshot `Arc` is still outstanding. Existing `let mut map = owner.map_mut()?;`
+/// call sites keep working and keep their `&mut WorldMap` methods.
+pub(crate) struct MapGuard<'a>(std::sync::MutexGuard<'a, Arc<WorldMap>>);
+
+impl std::ops::Deref for MapGuard<'_> {
+    type Target = WorldMap;
+
+    fn deref(&self) -> &WorldMap {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for MapGuard<'_> {
+    fn deref_mut(&mut self) -> &mut WorldMap {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 impl SharedNativeMap {
     /// Startup-only constructor: with no journal supplied, recovery validates against nothing
     /// and cannot fail, so the expect documents a construction invariant rather than a runtime
@@ -209,7 +229,7 @@ impl SharedNativeMap {
             );
         }
         Ok(Self {
-            map: Arc::new(Mutex::new(map)),
+            map: Arc::new(Mutex::new(Arc::new(map))),
             source,
             source_item_indices: Arc::new(Mutex::new(source_item_indices)),
             removed_source_items: Arc::new(Mutex::new(removed_source_items)),
@@ -219,14 +239,32 @@ impl SharedNativeMap {
         })
     }
 
-    /// Returns an immutable point-in-time render snapshot. Callers never retain the map lock
+    /// Returns an immutable point-in-time render snapshot.
+    ///
+    /// This clones only the inner `Arc`, never the map it points at, so the cost
+    /// is O(1) regardless of world size. Callers still never retain the map lock
     /// while encoding or writing protocol frames.
     pub fn render_snapshot(&self) -> Result<Arc<WorldMap>, HostError> {
-        Ok(Arc::new(
+        Ok(Arc::clone(&*self.map_read()?))
+    }
+
+    /// Shared read access. The returned guard derefs to the live `WorldMap`.
+    pub fn map_read(&self) -> Result<std::sync::MutexGuard<'_, Arc<WorldMap>>, HostError> {
+        self.map
+            .lock()
+            .map_err(|_| HostError::SharedWorldUnavailable)
+    }
+
+    /// Exclusive access for mutation.
+    ///
+    /// Derefs to `&mut WorldMap` via `Arc::make_mut`, so the map is copied only
+    /// when a snapshot `Arc` is still outstanding. Holding this guard never
+    /// allocates for a world no snapshot references, which is the common case.
+    pub fn map_mut(&self) -> Result<MapGuard<'_>, HostError> {
+        Ok(MapGuard(
             self.map
                 .lock()
-                .map_err(|_| HostError::SharedWorldUnavailable)?
-                .clone(),
+                .map_err(|_| HostError::SharedWorldUnavailable)?,
         ))
     }
 
@@ -288,10 +326,7 @@ impl SharedNativeMap {
         position: Position,
         item_index: usize,
     ) -> Result<Option<WorldMapItem>, HostError> {
-        let map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let map = self.map_read()?;
         let registry = self
             .runtime_tile_items
             .lock()
@@ -322,10 +357,7 @@ impl SharedNativeMap {
         item: WorldMapItem,
         despawn_tick: Option<u64>,
     ) -> Result<Option<u64>, HostError> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut map = self.map_mut()?;
         let mut registry = self
             .runtime_tile_items
             .lock()
@@ -379,10 +411,7 @@ impl SharedNativeMap {
         database: &mut EngineDatabase,
         now_tick: u64,
     ) -> Result<Vec<Position>, HostError> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut map = self.map_mut()?;
         let mut registry = self
             .runtime_tile_items
             .lock()

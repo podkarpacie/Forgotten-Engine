@@ -24,10 +24,7 @@ impl SharedNativeMap {
         item_weight_by_server_id: Option<&BTreeMap<u16, u32>>,
     ) -> Result<Option<forgotten_core::PlayerGroundDropOutcome>, HostError> {
         let mut world = shared_world.lock()?;
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut map = self.map_mut()?;
         let mut registry = self
             .runtime_tile_items
             .lock()
@@ -200,10 +197,7 @@ impl SharedNativeMap {
             return Ok(None);
         }
         let mut world = shared_world.lock()?;
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut map = self.map_mut()?;
         let mut registry_guard = self
             .runtime_tile_items
             .lock()
@@ -456,10 +450,7 @@ impl SharedNativeMap {
         position: Position,
         items: Vec<WorldMapItem>,
     ) -> Result<u64, HostError> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut map = self.map_mut()?;
         let mut source_item_indices = self
             .source_item_indices
             .lock()
@@ -487,10 +478,7 @@ impl SharedNativeMap {
         runtime_item_index: usize,
         equipment_slot: EquipmentSlot,
     ) -> Result<SourceMapItemToEquipmentTransferOutcome, HostError> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut map = self.map_mut()?;
         let mut world = shared_world.lock()?;
         let mut source_item_indices = self
             .source_item_indices
@@ -628,10 +616,7 @@ impl SharedNativeMap {
         requested_count: u16,
         equipment_slot: EquipmentSlot,
     ) -> Result<SourceMapItemToEquipmentTransferOutcome, HostError> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut map = self.map_mut()?;
         let mut world = shared_world.lock()?;
         let mut source_item_indices = self
             .source_item_indices
@@ -812,10 +797,7 @@ impl SharedNativeMap {
         runtime_item_index: usize,
         container_id: u8,
     ) -> Result<SourceMapItemToContainerTransferOutcome, HostError> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut map = self.map_mut()?;
         let mut world = shared_world.lock()?;
         let mut source_item_indices = self
             .source_item_indices
@@ -952,10 +934,7 @@ impl SharedNativeMap {
         requested_count: u16,
         container_id: u8,
     ) -> Result<SourceMapItemToContainerTransferOutcome, HostError> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| HostError::SharedWorldUnavailable)?;
+        let mut map = self.map_mut()?;
         let mut world = shared_world.lock()?;
         let mut source_item_indices = self
             .source_item_indices
